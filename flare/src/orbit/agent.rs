@@ -1294,8 +1294,14 @@ fn run(agent: &Arc<Agent>, request: &Value) -> Result<Arc<Group>, Failure> {
     if rank == 0 {
         command.args(&grant.rank_zero);
     }
+    if grant.roce_ring && grant.roce_chain {
+        return Err("grant selects both a ring and a chain".into());
+    }
     if grant.roce_ring {
         command.arg("--roce-ring");
+    }
+    if grant.roce_chain {
+        command.arg("--roce-chain");
     }
     // The controller accepted the publisher at its own terminal; the rank still verifies the
     // package and matches the exact key and namespace before loading.
@@ -1872,6 +1878,7 @@ pub mod tests {
                 rank_zero: vec!["--port".into(), "8001".into()],
                 roce_ring: false,
                 transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -2329,6 +2336,7 @@ pub mod tests {
                 rank_zero: vec![],
                 roce_ring: false,
                 transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -2754,6 +2762,7 @@ pub mod tests {
                 ],
                 roce_ring: false,
                 transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -2845,7 +2854,8 @@ pub mod tests {
                 serving: vec![],
                 rank_zero: vec![],
                 roce_ring: ring,
-                transfer_fabric: Some(fabric::plan(&nodes, &records, ring).unwrap()),
+                roce_chain: false,
+                transfer_fabric: Some(fabric::plan(&nodes, &records, ring, false).unwrap()),
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -2949,7 +2959,7 @@ pub mod tests {
             );
 
             // A dead next hop never falls back to the management address. Cache hits need no hop.
-            grant.transfer_fabric = Some(fabric::plan(&nodes, &records, ring).unwrap());
+            grant.transfer_fabric = Some(fabric::plan(&nodes, &records, ring, false).unwrap());
             let closed = TcpListener::bind("127.0.0.1:0").unwrap();
             let port = closed.local_addr().unwrap().port();
             drop(closed);
@@ -3033,6 +3043,7 @@ pub mod tests {
                 rank_zero: vec![],
                 roce_ring: false,
                 transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,

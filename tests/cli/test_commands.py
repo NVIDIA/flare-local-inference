@@ -285,4 +285,11 @@ def test_fabric_streams_do_not_require_orbit_configuration(ring):
 
     args = _parser().parse_args(["export", "glm-5.3-flash", "--ranks", "4", "--transfer-streams", "16",
                                 *(["--roce-ring"] if ring else [])])
-    assert _checkpoint_fabric(args) == dict(ring=ring, streams=16)
+    assert _checkpoint_fabric(args) == dict(ring=ring, chain=False, streams=16)
+
+
+def test_fabric_transfers_follow_the_chain_shape():
+    from ignition.cli.serve import _checkpoint_fabric
+
+    args = _parser().parse_args(["export", "glm-5.3-flash", "--ranks", "4", "--roce-chain"])
+    assert _checkpoint_fabric(args) == dict(ring=False, chain=True, streams=8)

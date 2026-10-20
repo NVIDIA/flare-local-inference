@@ -4,7 +4,12 @@ use super::{Failure, grant::Grant, store::Node};
 use crate::fabric::Topology;
 pub use crate::fabric::discover;
 
-pub fn plan(nodes: &[Node], records: &[Vec<u8>], ring: bool) -> Result<Topology, Failure> {
+pub fn plan(
+    nodes: &[Node],
+    records: &[Vec<u8>],
+    ring: bool,
+    chain: bool,
+) -> Result<Topology, Failure> {
     let ports = nodes
         .iter()
         .map(|node| {
@@ -16,7 +21,7 @@ pub fn plan(nodes: &[Node], records: &[Vec<u8>], ring: bool) -> Result<Topology,
                 .map_err(Into::into)
         })
         .collect::<Result<Vec<_>, Failure>>()?;
-    Topology::plan(records, &ports, ring)
+    Topology::plan_shape(records, &ports, ring, chain)
 }
 
 pub fn topology(grant: &Grant) -> Result<&Topology, Failure> {
@@ -25,7 +30,10 @@ pub fn topology(grant: &Grant) -> Result<&Topology, Failure> {
         .as_ref()
         .ok_or("transfer lacks signed fabric endpoints")?;
     topology.validate()?;
-    if topology.links.len() != grant.members.len() || topology.ring != grant.roce_ring {
+    if topology.links.len() != grant.members.len()
+        || topology.ring != grant.roce_ring
+        || topology.chain != grant.roce_chain
+    {
         return Err("fabric topology differs from the launch membership".into());
     }
     for (rank, member) in grant.members.iter().enumerate() {
@@ -77,7 +85,7 @@ mod tests {
         .iter()
         .map(|s| s.as_bytes().to_vec())
         .collect::<Vec<_>>();
-        let ring = plan(&nodes, &records, true).unwrap();
+        let ring = plan(&nodes, &records, true, false).unwrap();
         for (rank, subnets) in [[4, 5], [6, 7], [2, 3], [0, 1]].into_iter().enumerate() {
             let edge = &ring.links[rank][(rank + 1) % 4];
             assert_eq!(edge.len(), 2);
@@ -89,6 +97,6 @@ mod tests {
         }
         let mut broken = records.clone();
         broken[2] = b"a 192.168.0.1/24\n".to_vec();
-        assert!(plan(&nodes, &broken, true).is_err());
+        assert!(plan(&nodes, &broken, true, false).is_err());
     }
 }

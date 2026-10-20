@@ -60,7 +60,7 @@ needs only Flare, the driver, and the package.
 Agent control uses encrypted TCP to the addresses recorded at pairing. Serving
 ranks distribute package payloads through dynamically allocated TCP listeners on
 the discovered CX7 interfaces. Direct mode connects to each peer; `--roce-ring`
-relays non-neighbor data through the ring. Serving distribution uses plain TCP
+relays non-neighbor data through the ring, and `--roce-chain` along a chain. Serving distribution uses plain TCP
 on the dedicated cluster fabric, with package signature verification and
 publisher acceptance before GPU loading. It requires no route keys or agents.
 Model collectives use RDMA. Agent-based prestaging with `orbit push` uses the
@@ -278,8 +278,9 @@ admits each peer once, serves checkpoint metadata and selected byte ranges,
 and coordinates preparation. Peers do not create full checkpoint shards.
 Keep checkpoint source files unchanged during loading.
 
-For a physical ring, add `--roce-ring` to rank zero's export or serve command.
-The peers' `--rank` values define physical ring order. Preparation does not
+For a physical ring, add `--roce-ring` to rank zero's export or serve command;
+for hosts cabled as a chain with no link between the first and last rank, add
+`--roce-chain` instead. The peers' `--rank` values define physical order. Preparation does not
 require Orbit agents, pairing, a cluster file, or controller keys. Every rank
 starts one native helper, exchanges its discovered fabric endpoints through
 the rendezvous, and keeps the helper alive while dependent transfers run.
@@ -470,4 +471,5 @@ not retry it automatically.
 `--roce-ring` connects neighbors in selected rank order and uses native CPU relays
 for other destinations. Transport supports 2 through 16 ranks, subject to each
 recipe's supported sizes. Four-Spark transport checks pass; physical ring cabling
-and full-model ring serving remain unqualified. See [RoCE ring transport](roce-ring.md).
+and full-model ring serving remain unqualified. `--roce-chain` uses the same relays
+over a chain with open ends. See [RoCE ring transport](roce-ring.md).

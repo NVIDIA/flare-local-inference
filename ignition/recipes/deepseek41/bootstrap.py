@@ -70,6 +70,7 @@ class PreparationConfig:
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
     roce_ring: bool = False
+    roce_chain: bool = False
     context: int = 1048576
     prefill_chunk_size: int = 4096
     max_active: int = 32
@@ -130,8 +131,11 @@ class PreparationConfig:
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != 4)
                 or any(type(d) is not int or d < 0 for d in self.devices)):
             raise ValueError("DeepSeek V4.1 Flash preparation requires four distinct GPUs")
-        if self.roce_ring and self.hosts is None:
-            raise ValueError("RoCE ring requires ranks on separate hosts")
+        from ignition.planning import host_shape_error
+
+        error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
+        if error:
+            raise ValueError(error)
         if not PAGE_TOKENS <= self.context <= 1048576 or self.context % PAGE_TOKENS:
             raise ValueError("DeepSeek context must be 128-aligned in [128,1048576]")
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
@@ -263,7 +267,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
                            (result_bytes + 15) // 16 * 16)
         decode_tokens = config.all_reduce_tokens
         runtime = create_roce_runtime(group, device, max_tokens=decode_tokens, pipe_tokens=tokens,
-            hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, package_storage=package_storage)
+            hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
         return runtime, runtime, runtime, runtime if layouts else None
     ipc = package_storage.peer_storage
     collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)

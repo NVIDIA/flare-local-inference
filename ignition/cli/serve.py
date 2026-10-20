@@ -25,7 +25,8 @@ def _checkpoint_fabric(args):
         if args.transfer_streams is not None:
             raise UsageError("--transfer-streams requires multiple host ranks")
         return None
-    return dict(ring=args.roce_ring, streams=8 if args.transfer_streams is None else args.transfer_streams)
+    return dict(ring=args.roce_ring, chain=args.roce_chain,
+                streams=8 if args.transfer_streams is None else args.transfer_streams)
 
 
 def _address(host: str, port: int) -> str:
@@ -106,10 +107,20 @@ def _publisher(configuration, args, model=None, hub_cache=None):
     return replace(signer, license=license)
 
 
+def _check_host_shape(args) -> None:
+    """Reject a host shape the rank count cannot form, before any model or GPU work."""
+    from ignition.planning import host_shape_error
+
+    error = host_shape_error(args.roce_ring, args.roce_chain, args.ranks if args.ranks > 1 else None)
+    if error:
+        raise UsageError(error)
+
+
 def export(args) -> int:
     from ignition.preparation.package_snapshot import export_options
     from .publishing import snapshot_destination, validate_repository
     configuration = Configuration.load(args.config)
+    _check_host_shape(args)
     model = resolve_model(configuration, args.model)
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
@@ -120,8 +131,6 @@ def export(args) -> int:
         args.output = args.output.with_name(args.output.name + ".safetensors")
     if args.output.exists():
         raise UsageError(f"export destination already exists: {args.output}")
-    if args.roce_ring and args.ranks < 2:
-        raise UsageError("--roce-ring requires at least two hosts")
     _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
@@ -146,8 +155,7 @@ def _export_hosts(args, *, export_path) -> int:
     from ignition.progress import phase
     from ignition.preparation.host_ranks import HostRendezvous, local_topology, source_identity, topology_gpu
 
-    if args.roce_ring and args.ranks < 2:
-        raise UsageError("--roce-ring requires at least two hosts in ring order")
+    _check_host_shape(args)
     if args.rendezvous is None:
         raise UsageError("--ranks greater than one requires --rendezvous ADDRESS:PORT for the peer hosts")
     progress = _serving_progress(args.verbose)
@@ -175,7 +183,7 @@ def _export_hosts(args, *, export_path) -> int:
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-                         roce_ring=args.roce_ring,
+                         roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
@@ -248,7 +256,7 @@ def _prepare(args, *, export_path) -> int:
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-                      roce_ring=args.roce_ring,
+                      roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
@@ -263,6 +271,8 @@ def _prepare(args, *, export_path) -> int:
         tuning = "" if not plan.tuning_gpus else " · tuning GPUs " + planning.format_gpus(gpu.index for gpu in plan.tuning_gpus)
         if plan.roce_ring:
             serial += " · experimental RoCE ring (native neighbor relays)"
+        if plan.roce_chain:
+            serial += " · experimental RoCE chain (native neighbor relays, open ends)"
         stage.update(f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
@@ -362,8 +372,7 @@ def serve(args) -> int:
     """
     from ignition.progress import phase
 
-    if args.roce_ring and args.ranks < 2:
-        raise UsageError("--roce-ring requires at least two hosts")
+    _check_host_shape(args)
     _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
@@ -419,7 +428,7 @@ def serve(args) -> int:
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-                         roce_ring=args.roce_ring,
+                         roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)

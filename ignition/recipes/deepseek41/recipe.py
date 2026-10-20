@@ -21,7 +21,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         image_concurrency=plan.image_concurrency,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
-        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, compile_decoder=compile_forwards,
+        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, max_active=plan.concurrency, context=plan.context,
         prefill_chunk_size=plan.prefill_chunk, minimum_pages=plan.minimum_pages,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,

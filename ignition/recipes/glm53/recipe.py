@@ -41,7 +41,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, compile_decoder=compile_forwards, retain_graphs=retain_graphs,
         image_concurrency=plan.image_concurrency, language_model_only=plan.language_model_only,
-        max_active=plan.concurrency, roce_ring=plan.roce_ring, context_parallel=plan.context_parallel, stream_overlap=plan.stream_overlap,
+        max_active=plan.concurrency, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain, context_parallel=plan.context_parallel, stream_overlap=plan.stream_overlap,
         context=plan.recipe.context, prefill_chunk_size=plan.prefill_chunk, minimum_pages=plan.minimum_pages,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,

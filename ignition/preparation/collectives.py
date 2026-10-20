@@ -13,7 +13,7 @@ def host_identity():
 
 
 def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, gather_bytes, package_storage=None,
-                        varlen_bytes=0, ring=False):
+                        varlen_bytes=0, ring=False, ring_open=False):
     """Allocate RoCEnante for ranks on separate DGX Sparks: BF16 hidden reductions and logit gathers.
 
     One runtime serves every reduction and gather in rank-serial order. Reductions of up
@@ -43,7 +43,7 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         raise ValueError("variable-length gather capacity must be a nonnegative multiple of 16 bytes")
     runtime = roce.AllReduce(exchange_group=group, device=device, max_size=nbytes, max_gather_bytes=gather_bytes,
                              pipe_bytes=pipe_bytes, region_allocator=region,
-                             ring=ring,
+                             ring=ring, **({"ring_open": True} if ring_open else {}),
                              **({"max_varlen_bytes": varlen_bytes} if varlen_bytes else {}))
     if package_storage is not None:
         package_storage.transports.append(runtime)

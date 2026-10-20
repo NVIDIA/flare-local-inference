@@ -1,3 +1,4 @@
+use flare_helios::execution::roce_fabric::Shape;
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
@@ -278,6 +279,10 @@ pub struct OrbitPush {
     #[arg(long)]
     pub roce_ring: bool,
 
+    /// Stream package data through fabric interfaces along the target nodes' chain order.
+    #[arg(long, conflicts_with = "roce_ring")]
+    pub roce_chain: bool,
+
     /// Parallel TCP streams per destination file over the fabric [default: 8].
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=64))]
     pub transfer_streams: Option<u8>,
@@ -295,6 +300,7 @@ impl OrbitPush {
             port: 8000,
             served_model_name: None,
             roce_ring: self.roce_ring,
+            roce_chain: self.roce_chain,
             rendezvous: None,
             rank: None,
             hosts: Vec::new(),
@@ -372,6 +378,11 @@ pub struct OrbitRun {
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=64), help_heading = "Multi-host options")]
     pub transfer_streams: Option<u8>,
 
+    /// Experimental chain in rank order: like --roce-ring, with no link between the first and
+    /// last rank; hosts cabled directly as a chain.
+    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    pub roce_chain: bool,
+
     /// IP address for rank zero's HTTP server [default: saved group or 127.0.0.1].
     #[arg(long, value_name = "ADDR", help_heading = "Serving options")]
     pub host: Option<IpAddr>,
@@ -400,7 +411,7 @@ pub struct OrbitRun {
 impl OrbitRun {
     /// Serving options every rank loads with.
     pub fn rank_options(&self, matches: &clap::ArgMatches) -> Vec<String> {
-        let mut options = self.serving.rank_options(self.roce_ring);
+        let mut options = self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain));
         // Explicit defaults must override saved values, while omitted defaults must not.
         if self.serving.kv_cache_limit == KvCacheLimit::Memory
             && matches.value_source("kv_cache_limit")
@@ -440,6 +451,7 @@ impl OrbitRun {
             port: self.port.unwrap_or(8000),
             served_model_name: self.served_model_name.clone(),
             roce_ring: self.roce_ring,
+            roce_chain: self.roce_chain,
             rendezvous: None,
             rank: None,
             hosts: Vec::new(),
@@ -504,6 +516,11 @@ pub struct Run {
     /// native CPU relays forward non-neighbor traffic. Also emulates a ring on a switch.
     #[arg(long, help_heading = "Multi-host options")]
     pub roce_ring: bool,
+
+    /// Experimental chain in rank order: like --roce-ring, with no link between the first and
+    /// last rank; hosts cabled directly as a chain.
+    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    pub roce_chain: bool,
 
     /// Rank zero's rendezvous address: where rank zero listens, or on a peer, where it joins rank zero.
     #[arg(long, value_name = "HOST:PORT", help_heading = "Multi-host options")]
@@ -740,7 +757,7 @@ impl Run {
     /// graphs and capacities on every host.
     #[cfg(test)]
     pub fn rank_options(&self) -> Vec<String> {
-        self.serving.rank_options(self.roce_ring)
+        self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain))
     }
 
     pub fn load_options(&self) -> LoadOptions {
@@ -756,7 +773,7 @@ impl ServingOptions {
     }
 
     /// Serving options every rank of a multi-host package must load with.
-    pub fn rank_options(&self, roce_ring: bool) -> Vec<String> {
+    pub fn rank_options(&self, shape: Shape) -> Vec<String> {
         let mut options = Vec::new();
         if self.kv_cache_limit != KvCacheLimit::Memory {
             options.extend(["--kv-cache-limit".into(), self.kv_cache_limit.to_string()]);
@@ -764,8 +781,10 @@ impl ServingOptions {
         if let Some(limit) = self.memory_limit {
             options.push(format!("--memory-limit={limit}"));
         }
-        if roce_ring {
-            options.push("--roce-ring".into());
+        match shape {
+            Shape::Mesh => {}
+            Shape::Ring => options.push("--roce-ring".into()),
+            Shape::Chain => options.push("--roce-chain".into()),
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -1196,6 +1215,20 @@ mod tests {
         assert_eq!(push.to, ["zero", "one", "two", "three"]);
         assert_eq!(push.transfer_streams, Some(8));
         assert!(push.run_args().roce_ring);
+        let arguments = ["flare", "orbit", "push", "model.safetensors", "--to", "zero,one,two"];
+        let parsed = Cli::try_parse_from([&arguments[..], &["--roce-chain"]].concat()).unwrap();
+        let Command::Orbit(OrbitArgs {
+            command: OrbitCommand::Push(push),
+            ..
+        }) = parsed.command
+        else {
+            panic!("expected prestaging command");
+        };
+        let run = push.run_args();
+        assert!(run.roce_chain && !run.roce_ring);
+        assert!(
+            Cli::try_parse_from([&arguments[..], &["--roce-chain", "--roce-ring"]].concat()).is_err()
+        );
     }
 
     #[test]

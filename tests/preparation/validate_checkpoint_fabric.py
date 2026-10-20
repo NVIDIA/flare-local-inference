@@ -1,6 +1,6 @@
 """Exercise rank-owned checkpoint reads and export channels on a configured Spark fabric.
 
-Run with --rank 0..N-1 and the same --ranks, --rendezvous, --streams and --ring on
+Run with --rank 0..N-1 and the same --ranks, --rendezvous, --streams and --ring or --chain on
 all hosts. The source fixture occupies 16 MiB; --mib controls bytes read per peer.
 The preparation token is the existing shared credential. No Orbit agent is used.
 """
@@ -46,7 +46,7 @@ def run(args):
                 (snapshot / 'config.json').write_text('{}')
                 checkpoint = SimpleNamespace(repository=str(snapshot), revision='fixture')
                 source = RootSource(snapshot, checkpoint)
-                fabric = FabricSource(source, key, identity, args.ranks, ring=args.ring, streams=args.streams)
+                fabric = FabricSource(source, key, identity, args.ranks, ring=args.ring, chain=args.chain, streams=args.streams)
                 with socket.create_server((host, int(port))) as listener:
                     listener.settimeout(120)
                     peers = {}
@@ -81,9 +81,9 @@ def run(args):
                 reports = [receive_object(control) for control in controls]
                 for control in controls:
                     send_object(control, 'close')
-                print(json.dumps({'rank': 0, 'ring': args.ring, 'streams': args.streams, 'peers': reports}), flush=True)
+                print(json.dumps({'rank': 0, 'ring': args.ring, 'chain': args.chain, 'streams': args.streams, 'peers': reports}), flush=True)
             else:
-                fabric = FabricTransport(args.rank, args.ranks, ring=args.ring, streams=args.streams)
+                fabric = FabricTransport(args.rank, args.ranks, ring=args.ring, chain=args.chain, streams=args.streams)
                 deadline = time.monotonic() + 120
                 while True:
                     try:
@@ -141,6 +141,7 @@ if __name__ == '__main__':
     parser.add_argument('--rendezvous', required=True)
     parser.add_argument('--streams', type=int, default=8, choices=range(1, 65))
     parser.add_argument('--ring', action='store_true')
+    parser.add_argument('--chain', action='store_true')
     parser.add_argument('--token-file', required=True)
     parser.add_argument('--mib', type=int, default=1024)
     parser.add_argument('--export-blocks', type=int, default=8)

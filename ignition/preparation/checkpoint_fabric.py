@@ -14,7 +14,7 @@ from .checkpoint_source import SourceServer, _exact
 class FabricTransport:
     """One native relay per rank; stdin lifetime bounds every listener and worker."""
 
-    def __init__(self, rank, world, *, ring, streams, source_port=0):
+    def __init__(self, rank, world, *, ring, streams, chain=False, source_port=0):
         from ignition.cli.runtime import binary
 
         if not 1 <= streams <= 64:
@@ -28,7 +28,7 @@ class FabricTransport:
             self.process = subprocess.Popen([str(binary()), "checkpoint-transport", "--socket", self.path],
                                             stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                             stderr=self.log, text=True)
-            self.endpoint = self._exchange(dict(rank=rank, world=world, ring=ring, streams=streams,
+            self.endpoint = self._exchange(dict(rank=rank, world=world, ring=ring, chain=chain, streams=streams,
                                                source_port=source_port))
         except BaseException:
             self.close(check=False)
@@ -86,7 +86,7 @@ class FabricTransport:
 class FabricSource:
     """Serve the admitted rank/stream slots from a private loopback checkpoint source."""
 
-    def __init__(self, source, key, identity, world, *, ring, streams):
+    def __init__(self, source, key, identity, world, *, ring, streams, chain=False):
         self.source, self.key, self.identity = source, key, identity
         self.world, self.streams = world, streams
         self.listener = socket.create_server(("127.0.0.1", 0))
@@ -95,7 +95,7 @@ class FabricSource:
         self.error = None
         self.stopping = threading.Event()
         try:
-            self.transport = FabricTransport(0, world, ring=ring, streams=streams,
+            self.transport = FabricTransport(0, world, ring=ring, chain=chain, streams=streams,
                                              source_port=self.listener.getsockname()[1])
         except BaseException:
             self.listener.close()

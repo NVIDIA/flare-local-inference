@@ -21,7 +21,7 @@ def from_plan(model, plan, *, compiled_forwards):
         max_concurrency=plan.concurrency, prefill_chunk=plan.prefill_chunk,
         image_concurrency=plan.image_concurrency, context_parallel=plan.context_parallel,
         stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
-        mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring,
+        mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes)
     if plan.expert_scale_compression is not None:

@@ -158,6 +158,7 @@ pub struct RunOptions {
     pub rank_zero: Vec<String>,
     pub roce_ring: bool,
     pub transfer_streams: Option<u8>,
+    pub roce_chain: bool,
     /// An executable to upload; absent means each node uses its installed agent executable.
     pub executable: Option<PathBuf>,
     /// Return once every rank has started instead of following the group.
@@ -182,6 +183,8 @@ pub struct LaunchOptions {
     /// Place and verify the package on the members without sending the executable or
     /// starting ranks; the returned launch then has no rank sessions.
     pub stage_only: bool,
+    /// Serve over a chain in rank order (exclusive with roce_ring).
+    pub roce_chain: bool,
 }
 
 /// A `flare orbit run` package argument.
@@ -494,7 +497,13 @@ impl Controller {
         }
         let mut rank_zero = spec.as_ref().map_or_else(Vec::new, |s| s.rank_zero.clone());
         rank_zero.extend(options.rank_zero.iter().cloned());
-        let roce_ring = options.roce_ring || spec.as_ref().is_some_and(|s| s.roce_ring);
+        // An explicit shape on the command line replaces the saved one; otherwise the saved shape holds.
+        let (roce_ring, roce_chain) = if options.roce_ring || options.roce_chain {
+            (options.roce_ring, options.roce_chain)
+        } else {
+            spec.as_ref()
+                .map_or((false, false), |s| (s.roce_ring, s.roce_chain))
+        };
         let transfer_streams = options
             .transfer_streams
             .or_else(|| spec.as_ref().and_then(|s| s.transfer_streams));
@@ -650,6 +659,7 @@ impl Controller {
                 gpus,
                 roce_ring,
                 transfer_streams,
+                roce_chain,
                 executable: options
                     .executable
                     .as_deref()
@@ -693,6 +703,7 @@ impl Controller {
                 roce_ring,
                 transfer_streams,
                 stage_only: false,
+                roce_chain,
             },
         )?;
         eprintln!(
@@ -740,6 +751,7 @@ impl Controller {
             placements: vec![Vec::new(); world],
             stage_only: true,
             roce_ring: run_args.roce_ring,
+            roce_chain: run_args.roce_chain,
             transfer_streams,
             ..LaunchOptions::default()
         };
@@ -757,9 +769,10 @@ impl Controller {
             );
             return Ok(());
         }
-        if run_args.roce_ring {
+        if run_args.roce_ring || run_args.roce_chain {
             return Err(
-                "--roce-ring push requires one target node per package rank, in ring order".into(),
+                "--roce-ring and --roce-chain push require one target node per package rank, in rank order"
+                    .into(),
             );
         }
         // Fewer or more nodes than ranks: each listed node gets the complete package, which
@@ -1023,8 +1036,12 @@ impl Controller {
                 format!("{} placements for {world} ranks", options.placements.len()).into(),
             );
         }
-        if options.roce_ring && !(package.needs.multi_host && (2..=16).contains(&world)) {
-            return Err("--roce-ring requires a multi-host package with 2..16 ranks".into());
+        if (options.roce_ring || options.roce_chain)
+            && !(package.needs.multi_host && (2..=16).contains(&world))
+        {
+            return Err(
+                "--roce-ring and --roce-chain require a multi-host package with 2..16 ranks".into(),
+            );
         }
         let streams = if world > 1 {
             package_streams(options.transfer_streams)?
@@ -1096,7 +1113,12 @@ impl Controller {
                     .request(frame::FABRIC, &json!({}))
                     .map_err(|e| at(&nodes[rank].name, e))
             }))?;
-            Some(super::fabric::plan(nodes, &records, options.roce_ring)?)
+            Some(super::fabric::plan(
+                nodes,
+                &records,
+                options.roce_ring,
+                options.roce_chain,
+            )?)
         } else {
             None
         };
@@ -1132,6 +1154,7 @@ impl Controller {
             roce_ring: options.roce_ring,
             transfer_fabric,
             single_host: !package.needs.multi_host,
+            roce_chain: options.roce_chain,
             issued,
             expires: issued + GRANT_SECONDS,
         };
@@ -2460,6 +2483,7 @@ mod tests {
                     roce_ring: true,
                     transfer_streams: Some(8),
                     stage_only: false,
+                    roce_chain: false,
                 },
             )
             .unwrap();

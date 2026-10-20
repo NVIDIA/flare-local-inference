@@ -102,6 +102,9 @@ pub struct Grant {
     /// over its GPUs, with no rendezvous.
     #[serde(default)]
     pub single_host: bool,
+    /// Serve over a chain in rank order; a grant without the field is not a chain.
+    #[serde(default)]
+    pub roce_chain: bool,
     pub issued: u64,
     pub expires: u64,
 }
@@ -224,6 +227,7 @@ mod tests {
             roce_ring: false,
             transfer_fabric: None,
             single_host: false,
+            roce_chain: false,
             issued: 100,
             expires: 700,
         }
