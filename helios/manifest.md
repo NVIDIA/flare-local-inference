@@ -146,7 +146,13 @@ one token and reports width one. Maintenance and non-sampling prefill emit
 zero tokens. Every graph in an ABI3 catalog writes the 24-field layout.
 The executor validates vector bounds, padding, epochs and transport-reserved
 fields before delivering records. The model contract validates field 12 before
-request state advances.
+request state advances. A speculative or verification completion requires a
+token vector whose verification width (field 15) equals the submitted graph's
+`token_capacity`, and its record's consumed-token increase since submission
+must equal its emitted count; such a completion without a token vector is
+invalid. Each speculative or verification graph declares one fixed
+`token_capacity`, so a finalizer writes that value into field 15 of every
+record it emits.
 
 The lane index is the physical request slot within the configured capacity. A captured finalizer scatters
 packed model rows through the request-slot mapping. Every launch writes the
