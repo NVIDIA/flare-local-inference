@@ -151,6 +151,21 @@ completion cursors, and frontend syntax. Field 4 is reserved; arbitrary Protobuf
 `Struct` configuration is not accepted. Execution ABI 2/3 and protected envelope
 version 4 are versioned separately from model-index versions 4 and 5.
 
+Two prepared-contract fields fail validation when absent or out of
+range. `vision` must decode to a well-formed `VisionCapabilities`: a
+text-only package encodes the explicit all-zero value (`feature_slots`,
+`features_per_request`, `max_images`, and `patches_per_feature` of 0
+with empty `patch_capacities`), and an absent or null `vision` fails
+the contract decode (a null submessage raises `invalid type: null,
+expected struct VisionCapabilities`). Every graph contract also carries
+`embedding_tables`, whose entries index the package's embedding-table
+catalog and are validated against the catalog size at package
+validation: a package that ships no embedding-table resources must
+give every graph an empty `embedding_tables`, and any entry outside
+the catalog fails with `graph requires an absent embedding-table
+resource`.
+
+
 Semantic bindings name a destination buffer and an enum-selected value source.
 Indexing distinguishes scalar, submission row, active row, physical request row,
 and packed-token storage. Offsets and padding are explicit. Omitted transfers
