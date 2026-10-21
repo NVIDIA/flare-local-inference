@@ -71,7 +71,10 @@ impl LaneValue {
 
     pub fn finish(&self, completion_ms: f64, horizon_ms: f64) -> f64 {
         debug_assert!(horizon_ms == 0.0 || completion_ms <= horizon_ms);
-        let mut value = self.decode(0.0, horizon_ms);
+        // Completion finalizes the response and releases request-owned resources.
+        // Give it one output-token-equivalent of useful value even when optional
+        // delivery fairness and age pricing are zero; no token credit is added.
+        let mut value = self.output_token + self.decode(0.0, horizon_ms);
         if horizon_ms > 0.0 {
             // A terminal delivery stops its age clock before the sequence ends.
             value += self.age_price
@@ -261,6 +264,13 @@ mod tests {
             value.decode(8.0, 30.0) - value.decode(1.0, 30.0),
             7.0 * 64.0
         );
+    }
+
+    #[test]
+    fn completion_has_base_value_without_delivery_or_age_prices() {
+        let value = LaneValue { output_token: 64.0, ..Default::default() };
+        assert_eq!(value.finish(1.0, 1.0), 64.0);
+        assert_eq!(value.finish(1.0, 8.0), 64.0);
     }
 
     #[test]

@@ -492,15 +492,18 @@ description includes geometry, semantic identity, token dependency span, and
 canonical feature range. Admission validates each image against its captured
 patch capacity and feature-window capacity. Total conversation image tokens
 are bounded by context, with encoded-body limits enforced separately.
-Feature-slot concurrency limits requests needing vision computation.
+Feature-slot concurrency limits resident image windows, not admitted logical
+requests. CPU tensor preparation and vision execution wait for a feature lease;
+initialization and restore can proceed without one.
 
 After prefix lookup, only images whose dependency spans extend past the
 consumed endpoint require tensors or vision graphs. A fixed CPU worker prepares
 those inputs. Host retention can reuse source descriptions and prepared
 tensors through the configured memory and disk tiers. Whole images are grouped
-into windows that fit the prepared feature arena. Each window's features are
-packed contiguously from zero without changing canonical prompt positions or
-indices. Prefill stops before the next window's first image dependency; atomic
+into windows bounded by the prepared arena and a soft prefill-chunk horizon.
+Whole images and atomic spans are never split to meet that horizon. Each
+window's features are packed contiguously from zero without changing canonical
+prompt positions or indices. Prefill stops before the next window's first image dependency; atomic
 image spans remain indivisible.
 
 A request spanning multiple windows reserves one private snapshot row. After
@@ -508,8 +511,11 @@ prefill consumes a window, a snapshot preserves complete continuation state,
 including partial cache pages and recurrent histories. Restore installs that
 state under a fresh execution generation before vision writes reuse the arena.
 The snapshot stays private, does not require host retention, and does not add
-cached-token usage. GPU fences protect the snapshot row, feature slot, and
-inputs through cancellation and retirement. Preemption and failed host restores
+cached-token usage. A window returns its feature lease after its last full image
+dependency span is consumed and submitted uses drain, without waiting for text
+tails, checkpoint copies, or decode. Existing eligible waiters receive returned
+leases before the restored owner queues its next window. GPU fences protect the
+snapshot row, feature slot, and inputs through cancellation and retirement. Preemption and failed host restores
 retain encoded sources and replan from the restored endpoint. See
 [host retention](../docs/prefix-cache-offload.md).
 

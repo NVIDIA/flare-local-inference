@@ -240,7 +240,8 @@ impl RequestScheduler {
     pub(super) fn eligible(&self, request: &LiveRequest) -> bool {
         if request.window_snapshot_ready
             || self.request_kind(request).is_none()
-            || (request.phase == RequestPhase::Vision && !request.conditioned_inputs_ready)
+            || (request.phase == RequestPhase::Vision
+                && (request.image_slot.is_none() || !request.conditioned_inputs_ready))
         {
             return false;
         }
@@ -480,7 +481,8 @@ impl RequestScheduler {
         value: LaneValue,
     ) -> f64 {
         if terminal_cleanup(r) {
-            return value.decode(0.0, duration_ns as f64 / 1e6);
+            let milliseconds = duration_ns as f64 / 1e6;
+            return value.finish(milliseconds, milliseconds);
         }
         let Some((mut following, work)) = self.next_progress(r, value) else {
             return 0.0;
@@ -717,7 +719,8 @@ impl RequestScheduler {
         for slot in
             bits(mask).filter(|s| terminal_cleanup(self.slots[*s].request.as_ref().unwrap()))
         {
-            terminal[count] = (slot, values[slot].decode(0.0, duration_ns as f64 / 1e6));
+            let milliseconds = duration_ns as f64 / 1e6;
+            terminal[count] = (slot, values[slot].finish(milliseconds, milliseconds));
             count += 1;
         }
         if count > 0 {

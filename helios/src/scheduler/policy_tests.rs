@@ -1377,6 +1377,26 @@ fn decode_waiting_selects_a_smaller_prefill_at_the_efficiency_knee() {
 }
 
 #[test]
+fn throughput_terminal_snapshot_completes_before_a_competing_long_prompt() {
+    for token_fairness in [0.0, PolicyConfig::throughput().token_fairness] {
+        let mut s = interactive_engine(2, false);
+        s.configure_policy(PolicyConfig { token_fairness, ..PolicyConfig::throughput() }).unwrap();
+        let short = add(&mut s, 1, 64, 1);
+        step(&mut s, 0);
+        step(&mut s, 0);
+        assert_eq!(s.request(short).unwrap().phase, RequestPhase::Snapshot);
+        let long = add(&mut s, 2, 32768, 128);
+        let start = s.now_ns;
+        while s.request(short).is_ok() && s.now_ns - start < 1000 * MS {
+            step(&mut s, 0);
+        }
+        assert!(s.request(short).is_err(), "a generated answer must not wait for unrelated prefill");
+        assert!(s.request(long).unwrap().consumed_tokens < 32768,
+            "terminal delivery needs useful value even without delivery fairness or age pricing");
+    }
+}
+
+#[test]
 fn terminal_snapshot_completes_while_another_long_prompt_is_still_prefilling() {
     let mut s = interactive_engine(2, false);
     let short = add(&mut s, 1, 64, 1);
