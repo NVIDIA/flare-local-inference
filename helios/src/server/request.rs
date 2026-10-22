@@ -128,6 +128,7 @@ pub(super) fn prepare_inference_cached(
                 } else {
                     ToolChoice::Auto
                 },
+                &request.checkpoint_hints,
             )?,
             None,
         ),

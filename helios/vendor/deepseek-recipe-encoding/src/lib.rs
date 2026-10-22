@@ -22,6 +22,7 @@ pub struct RenderedPrompt {
     pub image_sources: Vec<ImageSource>,
     /// UTF-8 byte ends of complete normalized messages, before the generation header.
     pub message_boundaries: Vec<usize>,
+    pub checkpoint_hints: Vec<usize>,
 }
 
 /// Failure to encode a conversation.
@@ -45,5 +46,9 @@ pub trait PromptEncoding {
     fn encode(&self, conversation: &Conversation) -> Result<Vec<u32>, EncodingError>;
 
     /// Render the conversation and the prefix for the next assistant turn.
-    fn render_conversation(&self, conversation: &Conversation) -> RenderedPrompt;
+    fn render_conversation(
+        &self,
+        conversation: &Conversation,
+        hints: &[(usize, usize)],
+    ) -> RenderedPrompt;
 }

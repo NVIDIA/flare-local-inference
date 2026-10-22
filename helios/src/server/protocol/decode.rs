@@ -158,7 +158,7 @@ fn chat_messages(body: &Value) -> Result<Vec<Message>> {
         })
         .collect()
 }
-fn anthropic_messages(body: &Value) -> Result<Vec<Message>> {
+fn anthropic_messages(body: &Value, hints: &mut Vec<(usize, usize)>) -> Result<Vec<Message>> {
     let mut messages = vec![];
     if present(body, "system") {
         messages.push(Message {
@@ -194,6 +194,16 @@ fn anthropic_messages(body: &Value) -> Result<Vec<Message>> {
                     }],
                     _ => plain_parts(&json!([block]), Protocol::Messages)?,
                 });
+                if role == Role::User
+                    && hints.len() < 4
+                    && present(block, "cache_control")
+                    && matches!(
+                        block["type"].as_str(),
+                        Some("text" | "image" | "tool_result")
+                    )
+                {
+                    hints.push((messages.len(), parts.len()));
+                }
             }
         } else {
             parts = plain_parts(&v["content"], Protocol::Messages)?;
@@ -717,10 +727,11 @@ pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Dec
     if protocol == Protocol::Messages && !count && options.output_limit.is_none() {
         return Err("max_tokens is required".into());
     }
+    let mut checkpoint_hints = Vec::new();
     let input = match protocol {
         Protocol::Chat => Input::Conversation(chat_messages(&body)?),
         Protocol::Messages => {
-            let messages = anthropic_messages(&body)?;
+            let messages = anthropic_messages(&body, &mut checkpoint_hints)?;
             if messages.last().is_some_and(|m| m.role == Role::Assistant) {
                 options
                     .template
@@ -736,6 +747,7 @@ pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Dec
     options.prompt_logprobs = prompt_logprobs;
     let request = Request {
         input,
+        checkpoint_hints,
         options,
         tools,
         tool_choice,
@@ -782,7 +794,7 @@ mod tests {
     }
     fn normalize_tool_arguments(message: &mut Value) -> Result<()> {
         let decoded = chat_messages(&json!({"messages":[message]}))?;
-        *message = template_messages(&decoded, ToolChoice::Auto)?.remove(0);
+        *message = template_messages(&decoded, ToolChoice::Auto, &[])?.remove(0);
         Ok(())
     }
     #[test]
@@ -839,14 +851,18 @@ mod native_prompt_tests {
             .into_iter()
             .collect();
         alphabet.sort_unstable();
+        let mut vocabulary = alphabet
+            .into_iter()
+            .enumerate()
+            .map(|(id, c)| (c.to_string(), id as u32))
+            .collect::<tokenizers::models::bpe::Vocab>();
+        for text in ["ĊĊ", "ĊĊĊ"] {
+            vocabulary.insert(text.into(), vocabulary.len() as u32);
+        }
         let model = tokenizers::models::bpe::BPE::builder()
             .vocab_and_merges(
-                alphabet
-                    .into_iter()
-                    .enumerate()
-                    .map(|(id, c)| (c.to_string(), id as u32))
-                    .collect::<tokenizers::models::bpe::Vocab>(),
-                vec![],
+                vocabulary,
+                vec![("Ċ".into(), "Ċ".into()), ("ĊĊ".into(), "Ċ".into())],
             )
             .build()
             .unwrap();
@@ -855,16 +871,19 @@ mod native_prompt_tests {
             tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
         ));
         tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
-        tokenizer.add_special_tokens(
-            [
-                "<｜begin▁of▁sentence｜>",
-                "<｜end▁of▁sentence｜>",
-                "<｜Assistant｜>",
-                "<think>",
-                "</think>",
-            ]
-            .map(|s| AddedToken::from(s, true)),
-        ).unwrap();
+        tokenizer
+            .add_special_tokens(
+                [
+                    "<｜begin▁of▁sentence｜>",
+                    "<｜end▁of▁sentence｜>",
+                    "<｜Assistant｜>",
+                    "<think>",
+                    "</think>",
+                    "<｜deepseek_image｜>",
+                ]
+                .map(|s| AddedToken::from(s, true)),
+            )
+            .unwrap();
         let eos = tokenizer.token_to_id("<｜end▁of▁sentence｜>").unwrap();
         let bytes = tokenizer.to_string(false).unwrap();
         let path = std::env::temp_dir().join(format!(
@@ -873,8 +892,25 @@ mod native_prompt_tests {
             std::thread::current().id()
         ));
         std::fs::write(&path, &bytes).unwrap();
+        let template = (encoder == PromptEncoder::Jinja).then(|| {
+            let text = concat!(
+                "{% for m in messages %}<{{ m.role }}>",
+                "{% if m.content is string %}{{ m.content }}{% else %}",
+                "{% for block in m.content %}{{ block.text }}{% if not loop.last %}{{ '\\n\\n' }}{% endif %}{% endfor %}{% endif %}",
+                "</{{ m.role }}>{% mark %}{% endfor %}<assistant>"
+            );
+            let path = path.with_extension("jinja");
+            std::fs::write(&path, text).unwrap();
+            Asset {
+                path,
+                range: None,
+                sha256: format!("{:x}", Sha256::digest(text.as_bytes())),
+            }
+        });
+        let template_path = template.as_ref().map(|asset| asset.path.clone());
         let settings: FrontendSettings = serde_json::from_value(
-            json!({"tokenizer":{},"eos_token_ids":[eos],"prompt_encoder":i32::from(encoder)}),
+            json!({"tokenizer":{},"eos_token_ids":[eos],"prompt_encoder":i32::from(encoder),
+                "image_placeholder_token_id":tokenizer.token_to_id("<｜deepseek_image｜>").unwrap()}),
         )
         .unwrap();
         let frontend = Frontend::load_with_settings(
@@ -885,13 +921,16 @@ mod native_prompt_tests {
                     range: None,
                 },
                 tokens: TokenizerSettings::default(),
-                chat_template: None,
+                chat_template: template,
             },
             Default::default(),
             &settings,
         )
         .unwrap();
         std::fs::remove_file(path).unwrap();
+        if let Some(path) = template_path {
+            std::fs::remove_file(path).unwrap();
+        }
         let mut config = crate::frontend::test_support::model_config(
             crate::frontend::test_support::contract("deepseek41"),
         );
@@ -903,6 +942,181 @@ mod native_prompt_tests {
         )
         .unwrap();
         (frontend, compiler, config)
+    }
+
+    #[test]
+    fn classifier_history_hints_survive_separator_merges_in_the_next_call() {
+        for encoder in [
+            PromptEncoder::DeepseekV4,
+            PromptEncoder::DeepseekV41,
+            PromptEncoder::Jinja,
+        ] {
+            let (frontend, compiler, config) = native(encoder);
+            let mut history: Vec<_> = (0..20)
+                .map(|index| {
+                    json!({
+                        "type": "text",
+                        "text": format!("Earlier action {index}: read file and check output.\n"),
+                    })
+                })
+                .collect();
+            history.last_mut().unwrap()["cache_control"] = json!({"type": "ephemeral"});
+            let action = json!({"type": "text", "text": "Proposed action: run the tests.\n",
+                "cache_control": {"type": "ephemeral"}});
+            let prepare = |blocks| {
+                let decoded = decode(
+                    Protocol::Messages,
+                    json!({"max_tokens": 4,
+                        "system": "Review actions for safety.",
+                        "messages": [{"role": "user", "content": blocks}]}),
+                    false,
+                )
+                .unwrap();
+                let prepared = crate::server::request::prepare_inference(
+                    &frontend,
+                    None,
+                    &compiler,
+                    &config,
+                    &decoded.request,
+                    0,
+                    false,
+                )
+                .unwrap();
+                let mut plain = decoded.request.clone();
+                plain.checkpoint_hints.clear();
+                let plain = crate::server::request::prepare_inference(
+                    &frontend, None, &compiler, &config, &plain, 0, false,
+                )
+                .unwrap();
+                assert_eq!(prepared.prompt.tokens, plain.prompt.tokens);
+                assert_eq!(prepared.rendered_prompt, plain.rendered_prompt);
+                (prepared, plain)
+            };
+            let mut blocks = history.clone();
+            blocks.extend([
+                action.clone(),
+                json!({"type": "text", "text": "Classify this action."}),
+            ]);
+            let (first, plain) = prepare(blocks);
+            history.extend([
+                action,
+                json!({"type": "text", "text": "New action: inspect results."}),
+                json!({"type": "text", "text": "Classify this action."}),
+            ]);
+            let (next, _) = prepare(history);
+            let last = "Earlier action 19: read file and check output.\n";
+            let end = first.rendered_prompt.find(last).unwrap() + last.len();
+            let encoding = frontend
+                .tokenizer()
+                .encode(first.rendered_prompt.as_str(), false)
+                .unwrap();
+            let offsets = encoding.get_offsets();
+            let cut = offsets.iter().take_while(|&&(_, stop)| stop <= end).count();
+            assert!(cut > 500, "{encoder:?}");
+            assert!(offsets[cut].0 < end && offsets[cut].1 > end, "{encoder:?}");
+            assert!(
+                first.prompt.message_boundaries.contains(&cut),
+                "{encoder:?}"
+            );
+            assert!(!plain.prompt.message_boundaries.contains(&cut));
+            assert!(next.prompt.tokens.starts_with(&first.prompt.tokens[..cut]));
+            assert_eq!(
+                first.prompt.message_boundaries.len(),
+                plain.prompt.message_boundaries.len() + 2
+            );
+        }
+    }
+
+    #[test]
+    fn messages_hint_cap_ignores_system_assistant_and_nested_result_controls() {
+        let image = json!({"type": "image", "source": {"type": "base64",
+            "media_type": "image/png", "data": "a"}, "cache_control": {}});
+        let body = json!({"max_tokens": 4,
+            "system": [{"type": "text", "text": "Policy", "cache_control": {}}],
+            "messages": [
+                {"role": "assistant", "content": [{"type": "text", "text": "Calls", "cache_control": {}},
+                    {"type": "tool_use", "id": "a", "name": "lookup", "input": {}},
+                    {"type": "tool_use", "id": "b", "name": "lookup", "input": {}}]},
+                {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": "b", "content": [
+                        {"type": "text", "text": "B", "cache_control": {}}]},
+                    {"type": "tool_result", "tool_use_id": "a", "is_error": true,
+                        "content": [image], "cache_control": {}},
+                    {"type": "text", "text": "History", "cache_control": {}},image,
+                    {"type": "text", "text": "Action", "cache_control": {}},
+                    {"type": "text", "text": "Ignored fifth hint", "cache_control": {}}]}]});
+        let decoded = decode(Protocol::Messages, body, false).unwrap();
+        assert_eq!(
+            decoded.request.checkpoint_hints,
+            [(2, 2), (2, 3), (2, 4), (2, 5)]
+        );
+        let Input::Conversation(messages) = &decoded.request.input else {
+            panic!()
+        };
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[2].parts.len(), 6);
+        for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+            let (frontend, _, _) = native(encoder);
+            let render = |hints: &[(usize, usize)]| {
+                frontend
+                    .render_chat(
+                        &template_messages(messages, ToolChoice::Auto, hints).unwrap(),
+                        &serde_json::Map::new(),
+                    )
+                    .unwrap()
+            };
+            let marked = render(&decoded.request.checkpoint_hints);
+            let plain = render(&[]);
+            assert_eq!(marked.text, plain.text);
+            assert_eq!(marked.token_ids, plain.token_ids);
+            assert_eq!(marked.image_sources, plain.image_sources);
+            assert_eq!(marked.image_sources.len(), 2);
+            let end = marked
+                .token_ids
+                .iter()
+                .rposition(|&id| id == frontend.image_placeholder_token_id().unwrap())
+                .unwrap()
+                + 1;
+            assert!(marked.message_boundaries.contains(&end));
+            assert!(!plain.message_boundaries.contains(&end));
+        }
+    }
+
+    #[test]
+    fn cache_controls_do_not_change_other_protocols() {
+        for (protocol, body) in [
+            (
+                Protocol::Chat,
+                json!({"messages": [{"role": "user", "content": [
+                {"type": "text", "text": "History", "cache_control": {}},
+                {"type": "text", "text": "Action", "cache_control": {}}]}]}),
+            ),
+            (
+                Protocol::Responses,
+                json!({"input": [{"role": "user", "content": [
+                {"type": "input_text", "text": "History", "cache_control": {}}]}]}),
+            ),
+            (
+                Protocol::Completions,
+                json!({"prompt": "History", "cache_control": {}}),
+            ),
+        ] {
+            let mut plain = body.clone();
+            plain.as_object_mut().unwrap().remove("cache_control");
+            for key in ["messages", "input"] {
+                if let Some(messages) = plain[key].as_array_mut() {
+                    for message in messages {
+                        for block in message["content"].as_array_mut().unwrap() {
+                            block.as_object_mut().unwrap().remove("cache_control");
+                        }
+                    }
+                }
+            }
+            let decoded = decode(protocol, body, false).unwrap();
+            let plain = decode(protocol, plain, false).unwrap();
+            assert!(decoded.request.checkpoint_hints.is_empty());
+            assert_eq!(decoded.request, plain.request);
+        }
     }
 
     #[test]

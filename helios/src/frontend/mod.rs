@@ -245,7 +245,10 @@ impl Frontend {
                 .into_iter()
                 .filter(|effort| {
                     context.insert("reasoning_effort".into(), (*effort).into());
-                    self.template.as_ref().unwrap().render(&context)
+                    self.template
+                        .as_ref()
+                        .unwrap()
+                        .render(&context, &[])
                         .is_ok()
                 })
                 .map(str::to_owned)
@@ -291,7 +294,10 @@ impl Frontend {
             );
             context.insert("add_generation_prompt".into(), false.into());
             context.insert("continue_final_message".into(), false.into());
-            self.template.as_ref().unwrap().render(&context)
+            self.template
+                .as_ref()
+                .unwrap()
+                .render(&context, &[])
                 .is_ok_and(|rendered| rendered.text.contains(marker))
         });
         if *supported {
@@ -539,9 +545,20 @@ impl Frontend {
         }
         let mut messages = messages.to_vec();
         let mut image_sources = Vec::new();
-        for message in &mut messages {
+        let mut checkpoint_hints = Vec::new();
+        for (index, message) in messages.iter_mut().enumerate() {
             if !message.is_object() {
                 return Err(deepseek::invalid("messages must contain objects"));
+            }
+            if let Some(Json::Array(hints)) =
+                message.as_object_mut().unwrap().remove("_checkpoint_hints")
+                && self.ordinary_tokenizer.is_none()
+            {
+                checkpoint_hints.extend(
+                    hints
+                        .iter()
+                        .filter_map(|hint| hint.as_u64().map(|count| (index, count as usize))),
+                );
             }
             if let Some(parts) = message.get_mut("content").and_then(Json::as_array_mut) {
                 for part in parts {
@@ -566,9 +583,17 @@ impl Frontend {
             .map(|field| self.mark_continuation(&mut messages, &field))
             .transpose()?;
         context.insert("messages".into(), Json::Array(messages));
-        let rendered = self.template.as_ref().unwrap().render(&context).map_err(|error| {
-            Error::frontend(FrontendError::Template(Failure::caused_by(error.message.clone(), error)))
-        })?;
+        let rendered = self
+            .template
+            .as_ref()
+            .unwrap()
+            .render(&context, &checkpoint_hints)
+            .map_err(|error| {
+                Error::frontend(FrontendError::Template(Failure::caused_by(
+                    error.message.clone(),
+                    error,
+                )))
+            })?;
         let marks = rendered.marks;
         let rendered = rendered.text;
         let mut segments: Vec<TokenSegment> = if self.ordinary_tokenizer.is_some() {
@@ -586,13 +611,32 @@ impl Frontend {
         };
         let mut segment_ends = Vec::with_capacity(segments.len() + 1);
         segment_ends.push(0usize);
-        for segment in &segments { segment_ends.push(segment_ends.last().unwrap() + segment.text.len()); }
-        let byte_boundaries = marks.into_iter().map(|mark| match mark {
-            jinja::Mark::Byte(byte) if self.ordinary_tokenizer.is_none() && byte <= *segment_ends.last().unwrap() => Ok(byte),
-            jinja::Mark::Position(count) if self.ordinary_tokenizer.is_some() => segment_ends.get(count).copied()
-                .ok_or_else(|| deepseek::invalid("mark position exceeds the rendered segment count")),
-            _ => Err(deepseek::invalid("text templates require byte marks; segmented templates require segment-count marks")),
-        }).collect::<Result<Vec<_>>>()?;
+        for segment in &segments {
+            segment_ends.push(segment_ends.last().unwrap() + segment.text.len());
+        }
+        let mut byte_boundaries = Vec::new();
+        let mut hint_bytes = Vec::new();
+        for mark in marks {
+            match mark {
+                jinja::Mark::Hint(byte) => hint_bytes.push(byte),
+                jinja::Mark::Byte(byte)
+                    if self.ordinary_tokenizer.is_none()
+                        && byte <= *segment_ends.last().unwrap() =>
+                {
+                    byte_boundaries.push(byte);
+                }
+                jinja::Mark::Position(count) if self.ordinary_tokenizer.is_some() => {
+                    byte_boundaries.push(*segment_ends.get(count).ok_or_else(|| {
+                        deepseek::invalid("mark position exceeds the rendered segment count")
+                    })?);
+                }
+                _ => {
+                    return Err(deepseek::invalid(
+                        "text templates require byte marks; segmented templates require segment-count marks",
+                    ));
+                }
+            }
+        }
         let mut text: String = segments
             .iter()
             .map(|segment| segment.text.as_str())
@@ -633,7 +677,8 @@ impl Frontend {
                 break;
             }
         }
-        let message_boundaries = boundaries::token_ends(&byte_boundaries, &offsets, text.len())?;
+        let message_boundaries =
+            boundaries::token_ends(&byte_boundaries, &hint_bytes, &offsets, text.len())?;
         Ok(RenderedPrompt {
             message_boundaries,
             text,

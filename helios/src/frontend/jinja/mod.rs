@@ -32,6 +32,7 @@ type Result<T> = std::result::Result<T, Error>;
 pub enum Mark {
     Byte(usize),
     Position(usize),
+    Hint(usize),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -57,8 +58,12 @@ impl CompiledTemplate {
         compiler::compile(source)
     }
 
-    pub fn render(&self, context: &Map<String, Json>) -> Result<RenderedTemplate> {
-        vm::render(self, context)
+    pub fn render(
+        &self,
+        context: &Map<String, Json>,
+        hints: &[(usize, usize)],
+    ) -> Result<RenderedTemplate> {
+        vm::render(self, context, hints)
     }
 
     pub fn annotation_spans(&self) -> &[std::ops::Range<usize>] {

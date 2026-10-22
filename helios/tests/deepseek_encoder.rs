@@ -94,12 +94,12 @@ fn official(encoder: PromptEncoder, conversation: &Conversation) -> String {
     match encoder {
         PromptEncoder::DeepseekV4 => {
             DeepseekV4Encoding::new()
-                .render_conversation(conversation)
+                .render_conversation(conversation, &[])
                 .prompt
         }
         PromptEncoder::DeepseekV41 => {
             DeepseekV41Encoding::new()
-                .render_conversation(conversation)
+                .render_conversation(conversation, &[])
                 .prompt
         }
         _ => unreachable!(),

@@ -29,15 +29,42 @@ struct Vm<'a> {
     stack: Vec<Value<'a>>,
     loops: Vec<Rc<LoopValue<'a>>>,
     output: String,
-    captures: Vec<String>,
+    captures: Vec<(String, Vec<usize>)>,
+    hint_positions: Vec<usize>,
     marks: Vec<Mark>,
     depth: usize,
+    hint_texts: Vec<&'a str>,
 }
 
 pub(super) fn render(
     template: &CompiledTemplate,
     context: &Map<String, Json>,
+    hints: &[(usize, usize)],
 ) -> Result<RenderedTemplate> {
+    let mut hint_texts = Vec::new();
+    for &(message, count) in hints {
+        let Some(message) = context
+            .get("messages")
+            .and_then(|messages| messages.get(message))
+        else {
+            continue;
+        };
+        let Some(content) = message.get("content") else {
+            continue;
+        };
+        let text = match content {
+            Json::String(text) if count == 1 => Some(text.as_str()),
+            Json::Array(parts) => count
+                .checked_sub(1)
+                .and_then(|index| parts.get(index))
+                .and_then(|part| part.get("text"))
+                .and_then(Json::as_str),
+            _ => None,
+        };
+        if let Some(text) = text {
+            hint_texts.push(text);
+        }
+    }
     let mut vm = Vm {
         template,
         slots: template
@@ -55,10 +82,13 @@ pub(super) fn render(
         loops: Vec::new(),
         output: String::new(),
         captures: Vec::new(),
+        hint_positions: Vec::new(),
         marks: Vec::new(),
         depth: 0,
+        hint_texts,
     };
     vm.run(0)?;
+    vm.marks.extend(vm.hint_positions.into_iter().map(Mark::Hint));
     Ok(RenderedTemplate {
         text: vm.output,
         marks: vm.marks,
@@ -116,6 +146,7 @@ impl<'a> Vm<'a> {
         value.clone()
     }
     fn store(&mut self, slot: u32, value: Value<'a>) {
+        let value = self.hinted(value);
         let index = slot as usize;
         if self.scope != 0 && self.stamps[index] != self.scope {
             self.undo.push((
@@ -147,6 +178,33 @@ impl<'a> Vm<'a> {
             }
         }
         Ok(())
+    }
+    fn hinted(&self, value: Value<'a>) -> Value<'a> {
+        if let Value::Str(text) = value
+            && self
+                .hint_texts
+                .iter()
+                .any(|hint| !text.is_empty() && std::ptr::eq(*hint, text))
+        {
+            return Value::marked(text.to_owned(), vec![text.len()]);
+        }
+        value
+    }
+    fn emit(&mut self, value: Value<'a>) {
+        self.hinted(value)
+            .append(&mut self.output, &mut self.hint_positions);
+    }
+    fn capture(&mut self) {
+        self.captures.push((
+            std::mem::take(&mut self.output),
+            std::mem::take(&mut self.hint_positions),
+        ));
+    }
+    fn end_capture(&mut self) -> Value<'a> {
+        let (output, hints) = self.captures.pop().unwrap();
+        let text = std::mem::replace(&mut self.output, output);
+        let positions = std::mem::replace(&mut self.hint_positions, hints);
+        Value::marked(text, positions)
     }
     fn run(&mut self, start: u32) -> Result<()> {
         self.depth += 1;
@@ -205,7 +263,8 @@ impl<'a> Vm<'a> {
                         if matches!(v, Value::Undefined) {
                             return Err(Error::new("undefined value"));
                         }
-                        self.stack.push(v.attr(&self.template.names[name as usize]));
+                        let value = self.hinted(v.attr(&self.template.names[name as usize]));
+                        self.stack.push(value);
                     }
                     I::Index => {
                         let key = self.pop();
@@ -213,7 +272,8 @@ impl<'a> Vm<'a> {
                         if matches!(v, Value::Undefined) {
                             return Err(Error::new("undefined value"));
                         }
-                        self.stack.push(v.index(&key));
+                        let value = self.hinted(v.index(&key));
+                        self.stack.push(value);
                     }
                     I::Slice => {
                         let step = self.pop();
@@ -303,7 +363,7 @@ impl<'a> Vm<'a> {
                     }
                     I::Emit => {
                         let v = self.pop();
-                        v.write(&mut self.output);
+                        self.emit(v);
                     }
                     I::Join(count, strict) | I::EmitJoined(count, strict) => {
                         let start = self.stack.len() - count as usize;
@@ -314,15 +374,17 @@ impl<'a> Vm<'a> {
                         let size = values.iter().map(|v| v.as_str().map_or(0, str::len)).sum();
                         if matches!(op, I::EmitJoined(..)) {
                             self.output.reserve(size);
-                            for v in self.stack.drain(start..) {
-                                v.write(&mut self.output);
+                            for index in start..self.stack.len() {
+                                self.emit(self.stack[index].clone());
                             }
+                            self.stack.truncate(start);
                         } else {
                             let mut text = String::with_capacity(size);
+                            let mut hints = Vec::new();
                             for v in self.stack.drain(start..) {
-                                v.write(&mut text);
+                                v.append(&mut text, &mut hints);
                             }
-                            self.stack.push(Value::string(text));
+                            self.stack.push(Value::marked(text, hints));
                         }
                     }
                     I::Drop => {
@@ -404,11 +466,10 @@ impl<'a> Vm<'a> {
                         self.store(slot, Value::Macro(closure));
                     }
                     I::Return => break,
-                    I::Capture => self.captures.push(std::mem::take(&mut self.output)),
+                    I::Capture => self.capture(),
                     I::EndCapture => {
-                        let text =
-                            std::mem::replace(&mut self.output, self.captures.pop().unwrap());
-                        self.stack.push(Value::string(text));
+                        let value = self.end_capture();
+                        self.stack.push(value);
                     }
                     I::Mark => self.marks.push(Mark::Byte(self.output.len())),
                     I::MarkPosition => {
@@ -477,15 +538,13 @@ impl<'a> Vm<'a> {
                 return Err(Error::new(format!("unknown macro argument {name}")));
             }
         }
-        let previous = if direct {
-            None
-        } else {
-            Some(std::mem::take(&mut self.output))
-        };
+        if !direct {
+            self.capture();
+        }
         self.run(mac.entry)?;
         self.leave();
-        Ok(if let Some(previous) = previous {
-            Value::string(std::mem::replace(&mut self.output, previous))
+        Ok(if !direct {
+            self.end_capture()
         } else {
             Value::Undefined
         })
@@ -512,14 +571,18 @@ fn binary<'a>(op: Binary, a: Value<'a>, b: Value<'a>) -> Result<Value<'a>> {
             return Ok(Value::Bool(found != matches!(op, B::NotIn)));
         }
         B::Concat => {
-            let mut text = a.text();
-            b.write(&mut text);
-            return Ok(Value::string(text));
+            let mut text = String::new();
+            let mut hints = Vec::new();
+            a.append(&mut text, &mut hints);
+            b.append(&mut text, &mut hints);
+            return Ok(Value::marked(text, hints));
         }
         B::Add if a.as_str().is_some() && b.as_str().is_some() => {
-            let mut text = a.text();
-            text.push_str(b.as_str().unwrap());
-            return Ok(Value::string(text));
+            let mut text = String::new();
+            let mut hints = Vec::new();
+            a.append(&mut text, &mut hints);
+            b.append(&mut text, &mut hints);
+            return Ok(Value::marked(text, hints));
         }
         B::Add if a.sequence() && b.sequence() && a.as_str().is_none() && b.as_str().is_none() => {
             let mut items = a.iter()?;
@@ -746,7 +809,14 @@ fn filter<'a>(
             if trimmed.len() == text.len() {
                 Ok(v)
             } else {
-                Ok(Value::string(trimmed.into()))
+                let start = trimmed.as_ptr() as usize - text.as_ptr() as usize;
+                let hints = v
+                    .hints()
+                    .iter()
+                    .filter(|end| **end > start && !trimmed.is_empty())
+                    .map(|end| (end - start).min(trimmed.len()))
+                    .collect();
+                Ok(Value::marked(trimmed.into(), hints))
             }
         }
         "capitalize" => {

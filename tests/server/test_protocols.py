@@ -130,6 +130,33 @@ def test_raw_completion_batch_and_zero_tokens(clients):
     assert raw.usage.prompt_tokens == 3
 
 
+@pytest.mark.parametrize("hinted", [False, True])
+def test_messages_block_hint_reuses_history_after_suffix_changes(clients, hinted):
+    _, anthropic, _ = clients
+    history = {"type": "text", "text": f"History {time.time_ns()}. "
+               + "An earlier action read a file and checked its output.\n" * 100}
+    if hinted:
+        history["cache_control"] = {"type": "ephemeral"}
+    blocks = [history, {"type": "text", "text": "First action: inspect the file. Reply OK."}]
+    kwargs = {"model": "local", "max_tokens": 1, "extra_body": EXTRA}
+    anthropic.messages.create(
+        messages=[{"role": "user", "content": "Warm the shared message preamble."}], **kwargs,
+    )
+    first = anthropic.messages.create(
+        messages=[{"role": "user", "content": blocks}], **kwargs,
+    )
+    blocks[1] = {"type": "text", "text": "Second action: run the tests. Reply OK."}
+    history.pop("cache_control", None)
+    second = anthropic.messages.create(
+        messages=[{"role": "user", "content": blocks}], **kwargs,
+    )
+    reused = (second.usage.cache_read_input_tokens or 0) - (first.usage.cache_read_input_tokens or 0)
+    if hinted:
+        assert reused > 500
+    else:
+        assert reused == 0
+
+
 @pytest.mark.parametrize("protocol", ["chat", "completions", "messages", "responses"])
 def test_cached_usage_buffered_and_streaming(clients, protocol):
     o, a, _ = clients

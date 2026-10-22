@@ -128,6 +128,8 @@ pub struct Options {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Request {
     pub input: Input,
+    // Message index and exclusive content-part end.
+    pub checkpoint_hints: Vec<(usize, usize)>,
     pub options: Options,
     pub tools: Vec<Tool>,
     pub tool_choice: ToolChoice,
@@ -193,7 +195,11 @@ fn content(parts: &[Part]) -> Result<Value> {
 }
 
 /// Converts semantic parts to the message context consumed by prepared templates.
-pub fn template_messages(messages: &[Message], tool_choice: ToolChoice) -> Result<Vec<Value>> {
+pub fn template_messages(
+    messages: &[Message],
+    tool_choice: ToolChoice,
+    hints: &[(usize, usize)],
+) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     let lower_instructions = messages
         .iter()
@@ -227,7 +233,7 @@ pub fn template_messages(messages: &[Message], tool_choice: ToolChoice) -> Resul
         out.push(json!({"role":"system","content":sections.join("\n\n")}));
     }
     let mut assistant_start = None;
-    for message in messages {
+    for (message_index, message) in messages.iter().enumerate() {
         if lower_instructions && matches!(message.role, Role::System | Role::Developer) {
             continue;
         }
@@ -240,30 +246,41 @@ pub fn template_messages(messages: &[Message], tool_choice: ToolChoice) -> Resul
         let before = out.len();
         let mut current = json!({"role": message.role, "content": ""});
         let mut ordinary = Vec::new();
-        let flush =
-            |current: &mut Value, ordinary: &mut Vec<Part>, out: &mut Vec<Value>| -> Result<()> {
-                current["content"] = content(ordinary)?;
-                ordinary.clear();
-                if current["content"] != ""
-                    || current.get("reasoning_content").is_some()
-                    || current.get("tool_calls").is_some()
-                {
-                    out.push(current.clone());
-                }
-                *current = json!({"role": message.role, "content":""});
-                Ok(())
-            };
-        for part in &message.parts {
+        let mut ordinary_hints = Vec::new();
+        let flush = |current: &mut Value,
+                     ordinary: &mut Vec<Part>,
+                     hints: &mut Vec<usize>,
+                     out: &mut Vec<Value>|
+         -> Result<()> {
+            current["content"] = content(ordinary)?;
+            ordinary.clear();
+            if !hints.is_empty() {
+                current["_checkpoint_hints"] = json!(hints);
+                hints.clear();
+            }
+            if current["content"] != ""
+                || current.get("reasoning_content").is_some()
+                || current.get("tool_calls").is_some()
+            {
+                out.push(current.clone());
+            }
+            *current = json!({"role": message.role, "content":""});
+            Ok(())
+        };
+        for (part_index, part) in message.parts.iter().enumerate() {
             match part {
                 Part::Text(_) | Part::Image(_) => {
                     if current.get("tool_calls").is_some() {
-                        flush(&mut current, &mut ordinary, &mut out)?;
+                        flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
                     }
                     ordinary.push(part.clone());
+                    if hints.contains(&(message_index, part_index + 1)) {
+                        ordinary_hints.push(ordinary.len());
+                    }
                 }
                 Part::Reasoning(text) => {
                     if !ordinary.is_empty() || current.get("tool_calls").is_some() {
-                        flush(&mut current, &mut ordinary, &mut out)?;
+                        flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
                     }
                     let previous = current
                         .get("reasoning_content")
@@ -291,7 +308,7 @@ pub fn template_messages(messages: &[Message], tool_choice: ToolChoice) -> Resul
                     content: parts,
                     is_error,
                 } => {
-                    flush(&mut current, &mut ordinary, &mut out)?;
+                    flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
                     let mut parts = parts.clone();
                     if *is_error {
                         parts.insert(0, Part::Text("Tool execution failed:".into()));
@@ -301,11 +318,15 @@ pub fn template_messages(messages: &[Message], tool_choice: ToolChoice) -> Resul
                     if let Some(id) = id {
                         result["tool_call_id"] = json!(id);
                     }
+                    if hints.contains(&(message_index, part_index + 1)) {
+                        // Zero denotes a complete tool result, including its wrapper.
+                        result["_checkpoint_hints"] = json!([0]);
+                    }
                     out.push(result);
                 }
             }
         }
-        flush(&mut current, &mut ordinary, &mut out)?;
+        flush(&mut current, &mut ordinary, &mut ordinary_hints, &mut out)?;
         if before == out.len() {
             out.push(json!({"role":message.role,"content":""}));
         }
@@ -435,7 +456,7 @@ mod tool_result_order_tests {
     }
 
     fn lower(messages: &[Message]) -> Vec<Value> {
-        template_messages(messages, ToolChoice::Auto).unwrap()
+        template_messages(messages, ToolChoice::Auto, &[]).unwrap()
     }
 
     #[test]

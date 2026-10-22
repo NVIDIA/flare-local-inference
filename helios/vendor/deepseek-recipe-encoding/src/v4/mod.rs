@@ -206,14 +206,19 @@ fn render_message(
 impl<T: EncodingV4> PromptEncoding for T {
     fn encode(&self, conversation: &Conversation) -> Result<Vec<u32>, EncodingError> {
         let tokenizer = self.tokenizer().ok_or(EncodingError::MissingTokenizer)?;
-        let rendered = self.render_conversation(conversation);
+        let rendered = self.render_conversation(conversation, &[]);
         tokenizer
             .encode_ids(&rendered.prompt)
             .map_err(EncodingError::Encode)
     }
 
-    fn render_conversation(&self, conversation: &Conversation) -> RenderedPrompt {
-        let mut messages = normalize_messages(self, &conversation.messages);
+    fn render_conversation(
+        &self,
+        conversation: &Conversation,
+        hints: &[(usize, usize)],
+    ) -> RenderedPrompt {
+        let mut hints = hints.to_vec();
+        let mut messages = normalize_messages(self, &conversation.messages, &mut hints);
         let has_tools =
             conversation.tool_choice != ToolChoice::None && !conversation.tools.is_empty();
         let format_schema = match &conversation.response_format {
@@ -224,6 +229,9 @@ impl<T: EncodingV4> PromptEncoding for T {
         };
         if has_tools || format_schema.is_some() {
             if !matches!(messages.first(), Some(InputMessage::System { .. })) {
+                for (index, _) in &mut hints {
+                    *index += 1;
+                }
                 messages.insert(
                     0,
                     InputMessage::System {
@@ -245,14 +253,26 @@ impl<T: EncodingV4> PromptEncoding for T {
         let mut prompt = BOS_TOKEN.to_string();
         let mut message_boundaries = Vec::with_capacity(messages.len() + 1);
         message_boundaries.push(prompt.len());
+        let mut checkpoint_hints = Vec::new();
         for index in 0..messages.len() {
-            prompt += &render_message(
+            let rendered = render_message(
                 self,
                 &messages,
                 index,
                 conversation.thinking_mode,
                 conversation.reasoning_effort,
             );
+            let content_start = match &messages[index] {
+                InputMessage::User { content, .. } => rendered.len() - content.len(),
+                InputMessage::Tool { content, .. } => {
+                    rendered.len() - content.len() - "</tool_result>".len()
+                }
+                _ => 0,
+            };
+            for &(_, offset) in hints.iter().filter(|&&(message, _)| message == index) {
+                checkpoint_hints.push(prompt.len() + content_start + offset);
+            }
+            prompt += &rendered;
             message_boundaries.push(prompt.len());
         }
         prompt.push_str(ASSISTANT_SP_TOKEN);
@@ -281,6 +301,7 @@ impl<T: EncodingV4> PromptEncoding for T {
             prompt,
             image_sources,
             message_boundaries,
+            checkpoint_hints,
         }
     }
 }
@@ -333,10 +354,24 @@ You MUST strictly follow the above defined tool name and parameter schemas to in
     )
 }
 
-fn normalize_messages(encoding: &impl EncodingV4, messages: &[InputMessage]) -> Vec<InputMessage> {
+fn normalize_messages(
+    encoding: &impl EncodingV4,
+    messages: &[InputMessage],
+    hints: &mut Vec<(usize, usize)>,
+) -> Vec<InputMessage> {
     let mut normalized = Vec::new();
     let mut has_non_system = false;
-    for message in messages.iter().cloned() {
+    let mut normalized_hints = Vec::with_capacity(hints.len());
+    for (index, message) in messages.iter().cloned().enumerate() {
+        let position = match (&message, normalized.last()) {
+            (InputMessage::User { .. }, Some(InputMessage::User { content, .. })) => {
+                (normalized.len() - 1, content.len() + 2)
+            }
+            _ => (normalized.len(), 0),
+        };
+        for &(_, offset) in hints.iter().filter(|&&(original, _)| original == index) {
+            normalized_hints.push((position.0, position.1 + offset));
+        }
         match message {
             InputMessage::System { content } if !encoding.supports_mid_conversation_system() => {
                 if !has_non_system {
@@ -381,11 +416,12 @@ fn normalize_messages(encoding: &impl EncodingV4, messages: &[InputMessage]) -> 
             }
         }
     }
-    sort_tool_results_by_call_order(&mut normalized);
+    *hints = normalized_hints;
+    sort_tool_results_by_call_order(&mut normalized, hints);
     normalized
 }
 
-fn sort_tool_results_by_call_order(messages: &mut [InputMessage]) {
+fn sort_tool_results_by_call_order(messages: &mut [InputMessage], hints: &mut [(usize, usize)]) {
     let mut order: Vec<String> = Vec::new();
     let mut idx = 0;
     while idx < messages.len() {
@@ -411,24 +447,34 @@ fn sort_tool_results_by_call_order(messages: &mut [InputMessage]) {
                     .filter(|&i| matches!(messages[i], InputMessage::Tool { .. }))
                     .collect();
                 if tool_idxs.len() > 1 && !order.is_empty() {
-                    let mut tools: Vec<InputMessage> = tool_idxs
+                    let mut tools: Vec<(usize, InputMessage)> = tool_idxs
                         .iter()
                         .map(|&i| {
-                            std::mem::replace(
-                                &mut messages[i],
-                                InputMessage::LatestReminder {
-                                    content: String::new(),
-                                },
+                            (
+                                i,
+                                std::mem::replace(
+                                    &mut messages[i],
+                                    InputMessage::LatestReminder {
+                                        content: String::new(),
+                                    },
+                                ),
                             )
                         })
                         .collect();
-                    tools.sort_by_key(|m| match m {
+                    tools.sort_by_key(|(_, m)| match m {
                         InputMessage::Tool { tool_call_id, .. } => {
                             order.iter().position(|id| id == tool_call_id).unwrap_or(0)
                         }
                         _ => 0,
                     });
-                    for (&i, tool) in tool_idxs.iter().zip(tools) {
+                    for (index, _) in hints.iter_mut() {
+                        if let Some(position) =
+                            tools.iter().position(|(original, _)| original == index)
+                        {
+                            *index = tool_idxs[position];
+                        }
+                    }
+                    for (&i, (_, tool)) in tool_idxs.iter().zip(tools) {
                         messages[i] = tool;
                     }
                 }

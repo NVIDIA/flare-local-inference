@@ -26,7 +26,7 @@ fn oracle(source: &str, context: &Json) -> std::result::Result<String, minijinja
 fn compare(source: &str, context: Json) {
     let expected = oracle(source, &context).map_err(|e| e.to_string());
     let actual = CompiledTemplate::compile(source)
-        .and_then(|t| t.render(context.as_object().unwrap()))
+        .and_then(|t| t.render(context.as_object().unwrap(), &[]))
         .map(|r| r.text);
     match (expected, actual) {
         (Ok(a), Ok(b)) => assert_eq!(a, b, "{source}"),
@@ -120,7 +120,7 @@ fn marks_are_zero_output_and_cannot_escape_captures() {
     )
     .unwrap();
     assert_eq!(
-        template.render(&Map::new()).unwrap(),
+        template.render(&Map::new(), &[]).unwrap(),
         RenderedTemplate {
             text: "éa👋".into(),
             marks: vec![
@@ -150,7 +150,7 @@ fn marks_are_zero_output_and_cannot_escape_captures() {
         assert!(
             CompiledTemplate::compile(&format!("{{% mark {position} %}}"))
                 .unwrap()
-                .render(&Map::new())
+                .render(&Map::new(), &[])
                 .is_err()
         );
     }
@@ -165,7 +165,7 @@ fn request_state_is_isolated_and_template_is_shareable() {
             scope.spawn(move || {
                 for _ in 0..32 {
                     let context = json!({"messages":vec!["x";n]});
-                    let result = template.render(context.as_object().unwrap()).unwrap();
+                    let result = template.render(context.as_object().unwrap(), &[]).unwrap();
                     assert_eq!(result.text, format!("{}{n}", "x".repeat(n)));
                     assert_eq!(result.marks.len(), n);
                 }
@@ -274,7 +274,7 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
                     .unwrap()
                     .extend(option.as_object().unwrap().clone());
                 let expected = oracle(&unmarked, &context);
-                let actual = compiled.render(context.as_object().unwrap());
+                let actual = compiled.render(context.as_object().unwrap(), &[]);
                 match (expected, actual) {
                     (Ok(expected), Ok(actual)) => {
                         assert_eq!(actual.text, expected, "{name}: history {h}, options {o}")
@@ -287,4 +287,89 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
             }
         }
     }
+}
+
+#[test]
+fn block_hint_marks_follow_string_output() {
+    let context = json!({"messages":[{"content":[{"text":"history"},{"text":"action"}]}]});
+    for (source, marked) in [
+        (
+            "{% for block in messages[0].content %}{{ block.text }}{% endfor %}",
+            true,
+        ),
+        (
+            "{% macro body() %}{{ messages[0].content[0].text }}{% endmacro %}{{ body() }}action",
+            true,
+        ),
+        (
+            "{% set body %}{{ messages[0].content[0].text }}{% endset %}{{ body }}action",
+            true,
+        ),
+        (
+            "{% macro body() %}{{ messages[0].content[0].text }}{% endmacro %}{% set text = body() %}{{ text }}action",
+            true,
+        ),
+        (
+            "{{ messages[0].content[0].text + messages[0].content[1].text }}",
+            true,
+        ),
+        (
+            "{{ messages[0].content[0].text|upper|lower }}action",
+            false,
+        ),
+    ] {
+        let rendered = CompiledTemplate::compile(source)
+            .unwrap()
+            .render(context.as_object().unwrap(), &[(0, 1)])
+            .unwrap();
+        assert_eq!(rendered.text, "historyaction");
+        assert_eq!(
+            rendered.marks,
+            if marked { vec![Mark::Hint(7)] } else { vec![] }
+        );
+    }
+}
+
+#[test]
+fn block_hints_preserve_byte_offsets_through_captures_trim_and_concatenation() {
+    let context = json!({"messages":[{"content":[{"text":" \té你好  "},{"text":" tail "}]}]});
+    let template = CompiledTemplate::compile(concat!(
+        "{% macro body() %}{% for part in messages[0].content %}{{ part.text }}{% endfor %}{% endmacro %}",
+        "{% set text = body()|trim %}{{ '<' + text + '>' }}",
+    ))
+    .unwrap();
+    let rendered = template
+        .render(context.as_object().unwrap(), &[(0, 1)])
+        .unwrap();
+    assert_eq!(rendered.text, "<é你好   tail>");
+    assert_eq!(rendered.marks, [Mark::Hint("<é你好  ".len())]);
+    let identical = json!({"messages":[{"content":[{"text":"same"},{"text":"same"}]}]});
+    let rendered = template
+        .render(identical.as_object().unwrap(), &[(0, 2)])
+        .unwrap();
+    assert_eq!(rendered.text, "<samesame>");
+    assert_eq!(rendered.marks, [Mark::Hint("<samesame".len())]);
+}
+
+#[test]
+fn qwen_content_macro_keeps_hints_only_when_its_result_is_emitted() {
+    let context = json!({"messages":[{"role":"user","content":[
+        {"type":"text","text":"  Earlier history.\n"},
+        {"type":"text","text":"Newest action."}]}],
+        "enable_thinking":false,"add_generation_prompt":true});
+    let template = CompiledTemplate::compile(include_str!(
+        "../../../../ignition/recipes/qwen38/assets/chat_template.jinja"
+    ))
+    .unwrap();
+    let plain = template.render(context.as_object().unwrap(), &[]).unwrap();
+    let marked = template
+        .render(context.as_object().unwrap(), &[(0, 1)])
+        .unwrap();
+    assert_eq!(marked.text, plain.text);
+    let hints: Vec<_> = marked
+        .marks
+        .into_iter()
+        .filter(|mark| matches!(mark, Mark::Hint(_)))
+        .collect();
+    assert_eq!(hints, [Mark::Hint(plain.text.find("Newest action.").unwrap())]);
 }

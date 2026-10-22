@@ -221,7 +221,7 @@ fn main() {
             let expected = template.render(&context).unwrap();
             let iterations =
                 (50_000_000 / start.elapsed().as_nanos().max(1)).clamp(1, 5000) as usize;
-            let actual = compiled.render(context.as_object().unwrap()).unwrap();
+            let actual = compiled.render(context.as_object().unwrap(), &[]).unwrap();
             assert_eq!(actual.text, expected, "{name}/{case}");
             if check_only {
                 println!(
@@ -242,7 +242,7 @@ fn main() {
             measure(&format!("owned,{name},{case}"), || {
                 black_box(
                     compiled
-                        .render(black_box(context.as_object().unwrap()))
+                        .render(black_box(context.as_object().unwrap()), &[])
                         .unwrap(),
                 );
             });
@@ -252,7 +252,7 @@ fn main() {
                 black_box(output);
             });
             concurrent(&format!("owned,{name},{case}"), iterations, || {
-                black_box(compiled.render(context.as_object().unwrap()).unwrap());
+                black_box(compiled.render(context.as_object().unwrap(), &[]).unwrap());
             });
         }
     }
