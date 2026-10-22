@@ -61,7 +61,7 @@ fn rejection_details(state: &HttpState, failure: Error) -> (StatusCode, String) 
     };
     (status(&failure), message)
 }
-fn decode_body(
+pub(super) fn decode_body(
     bytes: &[u8],
     encoding: &str,
     limit: usize,

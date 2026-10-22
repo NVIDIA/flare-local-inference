@@ -1,6 +1,7 @@
 //! Wire adapters. Model execution consumes `inference::Request` only.
 
 mod decode;
+pub(in crate::server) mod decisions;
 mod encode;
 use super::{inference, observation::ObservationOptions};
 pub(super) use decode::decode;

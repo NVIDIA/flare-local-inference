@@ -593,3 +593,59 @@ tests use temporary repositories and check a real read/edit/test task. Scheduler
 regressions in `tests/server/test_scheduler.py` run against ordinary, fixed-width,
 and adaptive speculative execution. These environment variables configure tests,
 not the native server.
+
+## System One decisions
+
+`POST /v1/systemone` accepts the [TypeSafe System One schema](https://api.typesafe.ai/openapi.json)
+for `noul`, `choice`, and `score` questions:
+
+```json
+{"model":"local","state":{"message":"Charged twice"},"questions":{
+  "refund":{"type":"noul","instructions":"Is a refund requested?"},
+  "team":{"type":"choice","criteria":{"billing":null,"support":"Other help"}},
+  "urgency":{"type":"score","criteria":["Routine","Urgent"]}}}
+```
+
+The response contains the loaded `model`, a named `answers` map, and
+`usage: {input_tokens, output_tokens}`. Noul returns `noul: P(true)`; Choice
+returns `choice`, named `probabilities`, and `confidence`; Score returns the
+probability-weighted zero-based `score`, original levels in `legend`, indexed
+`probabilities`, and `confidence`. Confidence follows the
+[Jev formulas](https://docs.typesafe.ai/confidence), with first-option tie breaking
+and singleton confidence one. Normalizing label probabilities does not provide
+empirical calibration for the loaded model.
+
+Requests require a model string, a string/object/array state and 1–64 named
+questions. Instructions and descriptions preserve structured JSON. Choice has
+1–128 criteria; Score has 1–10 nonnull levels. Available single-token labels and
+prepared context/output capacities may lower these limits. Schema failures return
+Jev-style HTTP 422 `detail` entries. Malformed JSON, incompatible templates and
+unsupported packages return 400; authentication and operational errors use the
+existing generation error format.
+
+The native scorer compiles independent questions after a common state message,
+verifies distinct single-token synthetic labels after the complete rendered
+prompt, and reads raw `logprob_token_ids` with one generated token per question.
+Questions execute sequentially, allowing ordinary prefix reuse after the first
+question. Usage sums actual logical prompt counts, including cached input, and
+actual generated read tokens. No prose or streaming is returned. Dropping a
+request cancels its current child through the ordinary generation lifetime.
+
+The scorer uses the normal assistant generation prompt with thinking disabled
+where supported and an `Answer:` cue in the final user turn. Labels are verified
+as the first assistant token against the actual rendered prompt, including with
+the native DeepSeek encoders. Older packages without requested-ID outputs require
+re-export.
+
+PNG/JPEG [image assets](https://docs.typesafe.ai/images) require
+`TypeSafe-Danger-Zone-Images: true` and a vision package. Supply base64 assets or
+uncompressed multipart/form-data with an application/json `request` part first,
+followed by uniquely named image parts. An asset's `part` takes precedence over
+`data_base64`; every part must belong to exactly one asset. References replace
+string values, including nested state/instructions/criteria, with whole-value
+matches first and then nonoverlapping left-to-right matches. Keys remain text;
+legends retain original references. Unused assets are rejected. Existing body,
+context and image limits apply, including to expanded prompts. Multipart content
+encoding must be identity (or absent); compressed multipart returns HTTP 415.
+JSON supports the usual compressed encodings. Box,
+audio/video and custom question types are unsupported.
