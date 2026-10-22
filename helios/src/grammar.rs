@@ -83,9 +83,7 @@ impl GrammarCompiler {
             || (json["decoder"]["type"] == "Sequence"
                 && json["decoder"]["decoders"]
                     .as_array()
-                    .is_some_and(|decoders| {
-                        decoders.iter().any(|d| d["type"] == "ByteFallback")
-                    }));
+                    .is_some_and(|decoders| decoders.iter().any(|d| d["type"] == "ByteFallback")));
         if !has_byte_decoder {
             return Err(Error::admission(
                 AdmissionError::Grammar,
@@ -740,6 +738,28 @@ mod tests {
         Tokenizer::from_bytes(tokenizer.to_string()).unwrap()
     }
 
+    /// SentencePiece-style vocabulary: `<unk>` is 0, `<0xNN>` byte tokens are 1..=256.
+    fn byte_fallback_tokenizer(decoders: Value) -> Tokenizer {
+        let mut vocab = serde_json::Map::new();
+        vocab.insert("<unk>".to_string(), json!(0));
+        for byte in 0..=255_u32 {
+            vocab.insert(format!("<0x{byte:02X}>"), json!(byte + 1));
+        }
+        let tokenizer = json!({
+            "version": "1.0", "truncation": null, "padding": null,
+            "added_tokens": [
+                {"id":257,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
+                {"id":258,"content":"<end>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
+            ],
+            "normalizer": null,
+            "pre_tokenizer": null,
+            "post_processor": null,
+            "decoder": {"type":"Sequence","decoders":decoders},
+            "model": {"type":"BPE","dropout":null,"unk_token":"<unk>","continuing_subword_prefix":null,"end_of_word_suffix":null,"fuse_unk":true,"byte_fallback":true,"vocab":vocab,"merges":[]}
+        });
+        Tokenizer::from_bytes(tokenizer.to_string()).unwrap()
+    }
+
     fn allowed(request: &RequestGrammar, token: u32) -> bool {
         request.mask()[token as usize / 32] as u32 & (1 << (token % 32)) != 0
     }
@@ -752,6 +772,34 @@ mod tests {
             }
         }
         request.advance(eos).is_ok()
+    }
+
+    #[test]
+    fn byte_fallback_decoder_compiles_byte_token_grammars() {
+        let tokenizer = byte_fallback_tokenizer(json!([
+            {"type":"Replace","pattern":{"String":"\u{2581}"},"content":" "},
+            {"type":"ByteFallback"},
+            {"type":"Fuse"}
+        ]));
+        let compiler = GrammarCompiler::new(&tokenizer, 320, &[257, 258]).unwrap();
+        let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
+        let advance_text = |text: &str| {
+            let mut request = compiler.compile_json_schema(&schema).unwrap();
+            for &byte in text.as_bytes() {
+                if request.advance(u32::from(byte) + 1).is_err() {
+                    return false;
+                }
+            }
+            request.advance(258).is_ok()
+        };
+        assert!(advance_text(r#"{"ok":true}"#));
+        assert!(!advance_text(r#"{"ok":1}"#));
+    }
+
+    #[test]
+    fn decoder_without_byte_tokens_is_rejected() {
+        let tokenizer = byte_fallback_tokenizer(json!([{"type":"Fuse"}]));
+        assert!(GrammarCompiler::new(&tokenizer, 320, &[257, 258]).is_err());
     }
 
     #[test]
