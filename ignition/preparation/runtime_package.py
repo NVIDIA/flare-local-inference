@@ -140,9 +140,19 @@ class _Cuda:
             raise RuntimeError(f"{name}: CUDA {status}: {message.value!r}")
 
     def download(self, address, nbytes):
-        data = (C.c_ubyte * nbytes)()
-        self.call("cuMemcpyDtoH_v2", data, C.c_uint64(address), C.c_size_t(nbytes))
-        return bytes(data)
+        if nbytes < 0:
+            raise ValueError("download size must be nonnegative")
+        if not nbytes:
+            return b""
+        # Export reads must not depend on the driver's pageable staging path:
+        # repeated reads of immutable allocations can return different bytes.
+        data = C.c_void_p()
+        self.call("cuMemHostAlloc", C.byref(data), C.c_size_t(nbytes), C.c_uint(0))
+        try:
+            self.call("cuMemcpyDtoH_v2", data, C.c_uint64(address), C.c_size_t(nbytes))
+            return C.string_at(data, nbytes)
+        finally:
+            self.call("cuMemFreeHost", data)
 
 
 def _merge_ranges(ranges):
