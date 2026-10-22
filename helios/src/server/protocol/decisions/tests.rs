@@ -566,3 +566,212 @@ async fn compressed_json_preserves_body_limits_and_releases_frontend_permits() {
         assert_eq!(slots.available_permits(), 1);
     }
 }
+
+fn decisions_body(question: Value) -> Value {
+    json!({"model":"local","input":"Charged twice","questions":[question]})
+}
+
+#[test]
+fn decisions_normalization_preserves_typed_values_names_and_message_joining() {
+    let input = json!({"model":"local","input":[
+        {"role":"user","content":[{"type":"input_text","text":"one"},{"type":"input_text","text":"two"}]},
+        {"role":"user","type":"message","content":"three"}],"questions":[
+        {"type":"predicate","name":"same","instructions":"refund?"},
+        {"type":"choice","name":"same","instructions":"which?","choices":[{"value":false},{"value":"false"}]},
+        {"type":"score","instructions":"urgency?","levels":[{"label":"Routine"},{"label":"Urgent","description":"Today"}]}],
+        "safety_identifier":null});
+    let original_questions = input["questions"].clone();
+    let (state, questions) = adapter::parse(input).unwrap();
+    assert_eq!(state, "one\ntwo\n\nthree");
+    assert_eq!(questions[1].options[0]["value"], false);
+    assert_eq!(questions[1].options[1]["value"], "false");
+    assert_eq!(
+        questions[2].options[1]["description"],
+        json!({"label":"Urgent","description":"Today"})
+    );
+    let answer = adapter::answer(&original_questions[1], &[0.75, 0.25], 0.4);
+    assert_eq!(answer["choice"], false);
+    assert_eq!(answer["name"], "same");
+    assert_eq!(answer["probabilities"][1]["value"], "false");
+}
+
+#[test]
+fn decisions_reject_unknown_fields_at_every_wire_level() {
+    let valid = decisions_body(json!({"type":"predicate","instructions":"refund?"}));
+    let mut invalid = Vec::new();
+    for key in ["extra", "assets", "stream"] {
+        let mut body = valid.clone();
+        body[key] = json!({});
+        invalid.push(body);
+    }
+    let mut body = valid.clone();
+    body["questions"][0]["extra"] = json!({});
+    invalid.push(body);
+    invalid.push(decisions_body(json!({"type":"choice","instructions":"x","choices":[{"value":true,"extra":0},{"value":false}]})));
+    invalid.push(decisions_body(json!({"type":"score","instructions":"x","levels":[{"label":"low","extra":0},{"label":"high"}]})));
+    let mut body = valid.clone();
+    body["input"] = json!([{"role":"user","content":"x","extra":0}]);
+    invalid.push(body);
+    let mut body = valid;
+    body["input"] = json!([{"role":"user","content":[{"type":"input_text","text":"x","extra":0}]}]);
+    invalid.push(body);
+    for body in invalid {
+        let parsed = adapter::parse(body);
+        assert!(parsed.is_err());
+    }
+}
+
+#[test]
+fn decisions_reject_images_other_roles_null_names_and_invalid_types() {
+    for input in [
+        Value::Null,
+        json!(true),
+        json!(1),
+        json!([{"role":"assistant","content":"x"}]),
+        json!([{"role":"user","type":null,"content":"x"}]),
+        json!([{"role":"user","content":[{"type":"input_image","image_url":"x"}]}]),
+        json!([{"role":"user","content":{"text":"x"}}]),
+    ] {
+        let mut body = decisions_body(json!({"type":"predicate","instructions":"x"}));
+        body["input"] = input;
+        assert!(adapter::parse(body).is_err());
+    }
+    for question in [
+        json!({"type":"predicate","name":null,"instructions":"x"}),
+        json!({"type":"predicate","name":false,"instructions":"x"}),
+        json!({"type":"predicate"}),
+        json!({"type":"noul","instructions":"x"}),
+        json!({"type":"choice","instructions":"x","choices":[{"value":true},{"value":true}]}),
+        json!({"type":"choice","instructions":"x","choices":[{"value":1},{"value":false}]}),
+        json!({"type":"score","instructions":"x","levels":[{"label":1},{"label":"high"}]}),
+    ] {
+        assert!(adapter::parse(decisions_body(question)).is_err());
+    }
+}
+
+#[test]
+fn decisions_limits_match_the_concrete_protocol_and_preserve_metadata_nullability() {
+    for count in [0, 1, 64, 65] {
+        let mut body = decisions_body(json!({"type":"predicate","instructions":"x"}));
+        body["questions"] = json!(vec![body["questions"][0].clone(); count]);
+        assert_eq!(adapter::parse(body).is_ok(), (1..=64).contains(&count));
+    }
+    for count in [1, 2, 128, 129] {
+        let choices: Vec<_> = (0..count)
+            .map(|index| json!({"value":index.to_string()}))
+            .collect();
+        assert_eq!(
+            adapter::parse(decisions_body(
+                json!({"type":"choice","instructions":"x","choices":choices})
+            ))
+            .is_ok(),
+            (2..=128).contains(&count)
+        );
+    }
+    for count in [1, 2, 10, 11] {
+        let body = decisions_body(json!({
+            "type": "score",
+            "instructions": "x",
+            "levels": vec![json!({"label": "level"}); count],
+        }));
+        let parsed = adapter::parse(body);
+        assert_eq!(parsed.is_ok(), (2..=10).contains(&count));
+    }
+    for value in [
+        Value::Null,
+        json!("é".repeat(128)),
+        json!("x".repeat(129)),
+        json!(1),
+    ] {
+        let valid = value.is_null()
+            || value
+                .as_str()
+                .is_some_and(|text| text.chars().count() <= 128);
+        let mut body = decisions_body(json!({"type":"predicate","instructions":"x"}));
+        body["safety_identifier"] = value;
+        assert_eq!(adapter::parse(body).is_ok(), valid);
+    }
+}
+
+#[test]
+fn equivalent_protocol_questions_compile_identically_and_share_label_probabilities() {
+    for (systemone, decisions) in [
+        (
+            json!({"type":"noul","instructions":"x"}),
+            json!({"type":"predicate","instructions":"x"}),
+        ),
+        (
+            json!({"type":"choice","instructions":"x","criteria":{"a":"A","b":null}}),
+            json!({"type":"choice","instructions":"x","choices":[{"value":"a","description":"A"},{"value":"b"}]}),
+        ),
+        (
+            json!({"type":"score","instructions":"x","criteria":["low",{"label":"high","description":"H"}]}),
+            json!({"type":"score","instructions":"x","levels":[{"label":"low"},{"label":"high","description":"H"}]}),
+        ),
+    ] {
+        let (_, left) = parse_systemone(
+            json!({"model":"local","state":"Charged twice","questions":{"q":systemone}}),
+        )
+        .unwrap();
+        let (state, right) = adapter::parse(decisions_body(decisions.clone())).unwrap();
+        let labels = [" A".to_owned(), " B".to_owned()];
+        let a = messages(
+            &state,
+            &left[0],
+            &labels,
+            &Map::new(),
+            &mut HashSet::new(),
+            4096,
+        )
+        .unwrap();
+        let b = messages(
+            &state,
+            &right[0],
+            &labels,
+            &Map::new(),
+            &mut HashSet::new(),
+            4096,
+        )
+        .unwrap();
+        assert_eq!(a, b);
+        let raw = crate::execution::TokenLogprobs {
+            token: 9,
+            logprob: -1.0,
+            top: vec![(7, -2.0), (9, -1.0)],
+        };
+        let (probabilities, mass) = probabilities(&[7, 9], &raw).unwrap();
+        let answer = adapter::answer(&decisions, &probabilities, mass);
+        assert!(answer["name"].is_null());
+        if decisions["type"] == "predicate" {
+            assert_eq!(answer["probability"], json!(probabilities[1]));
+        } else {
+            assert!((answer["confidence"].as_f64().unwrap() - (-1.0f64).exp()).abs() < 1e-15);
+        }
+    }
+}
+
+#[test]
+fn decisions_confidence_and_usage_do_not_adopt_jev_semantics_or_infer_cache_writes() {
+    let question = json!({"type":"choice","instructions":"x","choices":[{"value":"first"},{"value":"second"}]});
+    let answer = adapter::answer(&question, &[0.6, 0.4], 0.2);
+    assert_eq!(answer["confidence"], 0.12);
+    assert_eq!(answer["choice"], "first");
+    assert_eq!(
+        adapter::answer(&question, &[0.5, 0.5], 0.2)["choice"],
+        "first"
+    );
+    let question = json!({"type":"score","name":"s","levels":[{"label":"low"},{"label":"high"}]});
+    let answer = adapter::answer(&question, &[0.25, 0.75], 0.4);
+    assert_eq!(answer["score"], 0.75);
+    assert_eq!(answer["name"], "s");
+    assert_eq!(
+        answer["probabilities"][1],
+        json!({"value":1,"label":"high","probability":0.75})
+    );
+    assert_eq!(
+        adapter::usage([20, 7, 3]),
+        json!({"input_tokens":20,
+        "input_tokens_details":{"cached_tokens":7,"cache_write_tokens":0},"output_tokens":3,
+        "output_tokens_details":{"reasoning_tokens":0},"total_tokens":23})
+    );
+}

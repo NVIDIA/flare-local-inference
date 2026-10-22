@@ -1,5 +1,7 @@
 //! One-token label scoring shared by the decision protocols.
 
+mod adapter;
+
 use crate::server::{GenerationEvent, HttpState, Prompt, http, inference, protocol, request};
 use crate::{AdmissionError, Error, ExecutionError, Result};
 use axum::{
@@ -134,11 +136,24 @@ fn parse_systemone(
     Ok((body, questions))
 }
 
-pub(in crate::server) async fn systemone(
+pub(in crate::server) async fn generate(
     State(state): State<Arc<HttpState>>,
     Extension(ingress): Extension<Arc<OwnedSemaphorePermit>>,
     request: Request,
 ) -> Response {
+    let decisions = request.uri().path() == "/v1/decisions";
+    if decisions
+        && request
+            .headers()
+            .get("content-type")
+            .is_some_and(|value| value.as_bytes().starts_with(b"multipart/"))
+    {
+        return http::error(
+            protocol::Protocol::Chat,
+            StatusCode::BAD_REQUEST,
+            "decisions accepts text-only JSON input",
+        );
+    }
     let images_enabled = request
         .headers()
         .get("typesafe-danger-zone-images")
@@ -161,21 +176,33 @@ pub(in crate::server) async fn systemone(
     let prepare_state = state.clone();
     let prepared = tokio::task::spawn_blocking(move || {
         let _permit = permit;
-        let (body, questions) = parse_systemone(body)?;
-        let assets = image_assets(
-            &body.assets,
-            parts,
-            images_enabled,
-            prepare_state.max_body_bytes,
-        )
-        .map_err(|error| {
-            (
-                StatusCode::BAD_REQUEST,
-                protocol::Protocol::Chat.error(StatusCode::BAD_REQUEST, error),
+        let response_questions = body["questions"].clone();
+        let (input, questions, assets) = if decisions {
+            let (input, questions) = adapter::parse(body).map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    protocol::Protocol::Chat.error(StatusCode::BAD_REQUEST, error),
+                )
+            })?;
+            (input, questions, Map::new())
+        } else {
+            let (parsed, questions) = parse_systemone(body)?;
+            let assets = image_assets(
+                &parsed.assets,
+                parts,
+                images_enabled,
+                prepare_state.max_body_bytes,
             )
-        })?;
-        let prompts = prepare_questions(&prepare_state, &body.state, &questions, &assets).map_err(
-            |error| {
+            .map_err(|error| {
+                (
+                    StatusCode::BAD_REQUEST,
+                    protocol::Protocol::Chat.error(StatusCode::BAD_REQUEST, error),
+                )
+            })?;
+            (parsed.state, questions, assets)
+        };
+        let prompts =
+            prepare_questions(&prepare_state, &input, &questions, &assets).map_err(|error| {
                 let error = match error {
                     Error::Admission(_) => error,
                     _ => error.admission_context(AdmissionError::Invalid),
@@ -184,12 +211,11 @@ pub(in crate::server) async fn systemone(
                     crate::server::status(&error),
                     protocol::Protocol::Chat.failure(&error),
                 )
-            },
-        )?;
-        Ok::<_, (StatusCode, Value)>((body, prompts))
+            })?;
+        Ok::<_, (StatusCode, Value)>((response_questions, prompts))
     })
     .await;
-    let (body, prompts) = match prepared {
+    let (response_questions, prompts) = match prepared {
         Ok(Ok(value)) => value,
         Ok(Err((status, body))) => return (status, Json(body)).into_response(),
         Err(error) => {
@@ -203,17 +229,38 @@ pub(in crate::server) async fn systemone(
     let _ingress = ingress;
     match score(&state, prompts).await {
         Ok((scores, usage)) => {
-            let answers: Map<_, _> = body
-                .questions
-                .iter()
-                .zip(scores)
-                .map(|((name, question), (probabilities, _))| {
-                    (name.clone(), systemone_answer(question, &probabilities))
-                })
-                .collect();
+            let answers = if decisions {
+                Value::Array(
+                    response_questions
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .zip(scores)
+                        .map(|(question, (probabilities, mass))| {
+                            adapter::answer(question, &probabilities, mass)
+                        })
+                        .collect(),
+                )
+            } else {
+                let answers: Map<_, _> = response_questions
+                    .as_object()
+                    .unwrap()
+                    .iter()
+                    .zip(scores)
+                    .map(|((name, question), (probabilities, _))| {
+                        (name.clone(), systemone_answer(question, &probabilities))
+                    })
+                    .collect();
+                Value::Object(answers)
+            };
+            let usage = if decisions {
+                adapter::usage(usage)
+            } else {
+                json!({"input_tokens":usage[0],"output_tokens":usage[2]})
+            };
             Json(
                 json!({"model":state.model.config().model_id,"answers":answers,
-                "usage":{"input_tokens":usage[0],"output_tokens":usage[2]}}),
+                "usage":usage}),
             )
             .into_response()
         }

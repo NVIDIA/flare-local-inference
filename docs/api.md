@@ -649,3 +649,43 @@ context and image limits apply, including to expanded prompts. Multipart content
 encoding must be identity (or absent); compressed multipart returns HTTP 415.
 JSON supports the usual compressed encodings. Box,
 audio/video and custom question types are unsupported.
+
+## Decisions
+
+`POST /v1/decisions` adapts the System One scorer to the concrete vLLM Decisions
+text protocol. It accepts `model`, text `input` (or user messages containing text
+and `input_text` parts), and an ordered array of 1–64 `questions`:
+
+```json
+{"model":"local","input":"Charged twice","questions":[
+  {"type":"predicate","name":"refund","instructions":"Refund requested?"},
+  {"type":"choice","instructions":"Which team?","choices":[
+    {"value":"billing","description":"Payments"},{"value":false}]},
+  {"type":"score","instructions":"Urgency?","levels":[
+    {"label":"Routine"},{"label":"Urgent","description":"Act today"}]}]}
+```
+
+Instructions are required strings. Names are optional strings; omission returns
+`name: null`, explicit null is invalid, and duplicate names are permitted.
+Choices contain 2–128 distinct string/boolean values and optional string
+descriptions. Scores contain 2–10 labeled levels with optional descriptions.
+Single-token label availability and prepared capacities can further restrict
+these bounds. Text parts join with newlines and messages with blank lines.
+Nullable `safety_identifier` accepts up to 128 characters as inert caller metadata.
+Unknown fields, images/assets, other roles and unsupported question types return
+OpenAI-style HTTP 400 errors. Multipart is unsupported on this text-only route.
+
+The response has the loaded `model`, ordered `answers`, and `usage`. Predicate
+answers contain `probability`; Choice answers preserve the selected typed
+`choice` and an array of `{value, probability}` entries. Score answers contain
+`score` and `{value: index, label, probability}` entries. Choice/Score confidence
+is the winning label's full-vocabulary probability: its normalized probability
+multiplied by total raw label mass. System One retains its distinct Jev confidence
+formulas. Neither route promises empirical calibration.
+
+Usage sums actual logical input and generated read tokens across questions,
+including `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens: 0`
+and `total_tokens`. Cache writes are not measured and are reported as zero.
+The route shares System One's prompt compilation, exact-ID reads, sequential
+child lifetime, template constraints and older-package rejection; it adds no
+second scoring path.
