@@ -691,6 +691,8 @@ pub enum StoreEvent {
     },
     /// The copy-in for an inbound ticket finished; the worker reports it to the scheduler.
     Fetched { key: PrefixKey, result: Result<u64> },
+    /// No copy still reads the GPU checkpoint; retry its publication after progress.
+    Deferred { checkpoint: CheckpointId },
 }
 
 /// Counters every store maintains; rates are bytes per second of completed transfers.
@@ -700,6 +702,8 @@ pub struct StoreStats {
     pub hits: u64,
     pub reused_tokens: u64,
     pub stored: u64,
+    pub row_refills: u64,
+    pub progress: u64,
     pub store_skipped: u64,
     pub store_failed: u64,
     pub fetched: u64,
@@ -716,22 +720,46 @@ pub struct StoreStats {
     pub inbound_rate: f64,
 }
 
+#[derive(Clone, Copy)]
+pub enum LookupOutcome {
+    NoMatch,
+    CostRejected,
+    CapacityRejected,
+    EnqueueRejected,
+    Admitted,
+}
+
+/// Immediate disposition of a publication; only Queued transfers keep a GPU pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreOutcome {
+    Queued,
+    Present,
+    Retry(StoreReason),
+    Oversize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreReason {
+    Inflight,
+    Slabs,
+    Queue,
+    Budget,
+}
+
 /// A host tier the model worker drives without waiting on it.
 ///
 /// `store` and `fetch` enqueue work and return. `poll` reports completions.
-/// The worker pins the GPU checkpoint before `store` and unpins it when `store`
-/// returns `Ok(false)` or an error, or when the matching `StoreEvent::Stored`
-/// arrives. Ticket ids belong to the scheduler until `StoreEvent::Fetched`.
+/// The worker pins queued copy-outs until Stored or Deferred, retaining only
+/// checkpoint IDs for retries. Ticket IDs belong to the scheduler until Fetched.
 ///
 /// A store whose transfers can no longer be trusted reports the failure from
 /// `poll` and stops producing events. The worker then stops, so ids and pins
 /// held by transfers it cannot account for are never reused or released.
 pub trait PrefixStore {
-    /// Deepest record chain extending the GPU checkpoint at `resident` tokens.
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64) -> Option<HostHit>;
-    /// Copy a published checkpoint out. `Ok(false)` means the key is already
-    /// present or in flight, or no slabs could be freed, and no event follows.
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool>;
+    /// Deepest record chain extending `resident` and strictly below `before`.
+    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit>;
+    /// Only Queued promises an event and retains a GPU copy-out pin.
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
     /// Report completed work. `Err` means the store can no longer report

@@ -39,7 +39,7 @@ use crate::{
 
 use super::{
     HostHit, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PrefixStore, PublishedCheckpoint,
-    StoreEvent, StoreStats, Tier,
+    StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
     disk_store::{DiskStore, Staged, TransportEvent},
     geometry::invalid,
     index::Match,
@@ -415,15 +415,9 @@ impl CompositeStore {
         let (header, temporary, path) = match reserved {
             Ok(Some(reserved)) => reserved,
             Ok(None) => {
-                // The disk limit cannot hold the record, so it is retained
-                // nowhere: a memory copy without a disk record is never evicted.
                 self.remove_copy(key);
                 self.stats.store_skipped += 1;
-                events.push(StoreEvent::Stored {
-                    checkpoint,
-                    key,
-                    result: Ok(bytes),
-                });
+                events.push(StoreEvent::Deferred { checkpoint });
                 return;
             }
             Err(error) => {
@@ -769,26 +763,29 @@ impl CompositeStore {
 }
 
 impl PrefixStore for CompositeStore {
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64) -> Option<HostHit> {
+    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit> {
         self.stats.lookups += 1;
         let (memory, stale) = (&self.memory, &self.stale);
         let chain = self
             .disk
             .index_mut()
-            .lookup_where(history, resident, |node| {
+            .lookup_below(history, resident, before, |node| {
                 node.ready || resident_copy(memory, stale, &node.key, node.tail_pages, true)
             })?;
         let hit = if self.retains_chain(&chain) {
             self.hit(chain)
         } else {
-            let chain = self.disk.index_mut().lookup(history, resident, |_| true)?;
+            let chain = self
+                .disk
+                .index_mut()
+                .lookup_below(history, resident, before, |node| node.ready)?;
             self.disk.hit(chain)
         };
         self.stats.hits += 1;
         Some(hit)
     }
 
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool> {
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if checkpoint.tail_pages > checkpoint.chain_pages.len() {
             self.stats.store_failed += 1;
             return Err(invalid(format!(
@@ -798,19 +795,37 @@ impl PrefixStore for CompositeStore {
             )));
         }
         let key = checkpoint.key;
-        if self.outbound.contains_key(&key)
-            || self.disk.index().contains(&key)
-            || self.memory.index().contains(&key)
-        {
+        if self.outbound.contains_key(&key) {
             self.stats.store_skipped += 1;
-            return Ok(false);
+            return Ok(StoreOutcome::Retry(StoreReason::Inflight));
+        }
+        if let Some(outcome) = self.disk.store_status(checkpoint)? {
+            self.stats.store_skipped += 1;
+            return Ok(outcome);
+        }
+        if self.disk.index().contains(&key) {
+            if self
+                .memory
+                .index()
+                .node(&key)
+                .is_some_and(|node| node.pinned())
+            {
+                self.stats.store_skipped += 1;
+                return Ok(StoreOutcome::Retry(StoreReason::Inflight));
+            }
+            self.remove_copy(key);
+            return self.disk.store(checkpoint);
+        }
+        if self.memory.index().contains(&key) {
+            self.stats.store_skipped += 1;
+            return Ok(StoreOutcome::Retry(StoreReason::Inflight));
         }
         let (parent, tail) = self.disk.plan_record(checkpoint);
         let (pages, rows) = self.memory.reclaimable_slabs();
         if tail.len() > pages || rows == 0 {
             let result = self.disk.store(checkpoint);
             match &result {
-                Ok(false) => self.stats.store_skipped += 1,
+                Ok(outcome) if *outcome != StoreOutcome::Queued => self.stats.store_skipped += 1,
                 Err(_) => self.stats.store_failed += 1,
                 _ => {}
             }
@@ -832,7 +847,7 @@ impl PrefixStore for CompositeStore {
                     let _ = self.disk.index_mut().unpin(parent);
                 }
                 self.stats.store_skipped += 1;
-                return Ok(false);
+                return Ok(StoreOutcome::Retry(StoreReason::Slabs));
             }
             Err(error) => {
                 if let Some(parent) = &parent {
@@ -852,7 +867,7 @@ impl PrefixStore for CompositeStore {
                 write: None,
             },
         );
-        Ok(true)
+        Ok(StoreOutcome::Queued)
     }
 
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()> {
@@ -976,12 +991,16 @@ impl PrefixStore for CompositeStore {
                     result,
                 } => self.memory_stored(checkpoint, key, result, events),
                 StoreEvent::Fetched { key, result } => self.memory_fetched(key, result, events),
+                StoreEvent::Deferred { checkpoint } => {
+                    events.push(StoreEvent::Deferred { checkpoint })
+                }
             }
         }
         self.memory_events = memory_events;
         let mut transport_events = std::mem::take(&mut self.transport_events);
         let polled = self.disk.poll_transport(&mut transport_events);
         for event in transport_events.drain(..) {
+            self.stats.progress += 1;
             match event {
                 TransportEvent::Stored { id, result } if self.jobs.contains_key(&id) => {
                     self.disk_stored(id, result)
@@ -1025,6 +1044,8 @@ impl PrefixStore for CompositeStore {
             memory_bytes: memory.memory_bytes,
             disk_records: disk.disk_records,
             disk_bytes: disk.disk_bytes,
+            row_refills: disk.row_refills,
+            progress: disk.progress + memory.progress + self.stats.progress,
             ..self.stats
         }
     }
@@ -1331,7 +1352,7 @@ mod tests {
                 Instant::now() < deadline,
                 "condition not reached within 60 s"
             );
-            store.poll(events);
+            store.poll(events).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
     }
@@ -1369,6 +1390,7 @@ mod tests {
             .map(|event| match event {
                 StoreEvent::Stored { key, result, .. } => (*key, result.is_ok()),
                 StoreEvent::Fetched { .. } => panic!("unexpected fetch event"),
+                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
             })
             .collect()
     }
@@ -1379,6 +1401,7 @@ mod tests {
             .map(|event| match event {
                 StoreEvent::Fetched { key, result } => (*key, result.is_ok()),
                 StoreEvent::Stored { .. } => panic!("unexpected store event"),
+                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
             })
             .collect()
     }
@@ -1416,7 +1439,7 @@ mod tests {
             // Replace the retained copy after reopening the directory.
             let retained = landed(&mut store, useful, useful_record.bucket, 1, 3);
             let bytes = record_bytes(&store, &retained);
-            let hit = store.lookup(&full, 0).unwrap();
+            let hit = store.lookup(&full, 0, u64::MAX).unwrap();
             assert_eq!((hit.key, hit.tier, hit.pages), (child.key, Tier::Disk, 20));
             assert!(!store.retains_chain(&hit.chain));
             store
@@ -1448,7 +1471,7 @@ mod tests {
                 bytes
             );
             assert!(store.disk.index().nodes().all(|node| !node.pinned()));
-            assert!(store.lookup(&full, 0).is_some());
+            assert!(store.lookup(&full, 0, u64::MAX).is_some());
             store.close().unwrap();
         }
         fs::remove_dir_all(directory).unwrap();
@@ -1472,11 +1495,11 @@ mod tests {
             2,
             StateSlotId(2),
         );
-        assert!(store.store(&root).unwrap());
+        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.disk.stats().outbound_in_flight, 1);
         assert!(store.outbound.is_empty());
         assert_eq!(store.memory.pool().free_pages(), 4);
-        assert!(store.store(&child).unwrap());
+        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&child.key].parent, Some(root.key));
         let parent_pins = store.disk.index().node(&root.key).unwrap().pins();
         assert!(parent_pins > 0);
@@ -1487,7 +1510,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(60);
         while transport.is_empty() {
             assert!(Instant::now() < deadline);
-            store.disk.poll_transport(&mut transport);
+            store.disk.poll_transport(&mut transport).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
         for event in transport {
@@ -1529,7 +1552,11 @@ mod tests {
         store.memory.remove_record(&root.key).unwrap();
         let other = full.key_at(1000).unwrap();
         landed(&mut store, other, full.bucket_at(1000).unwrap(), 15, 2);
-        let chain = store.disk.index_mut().lookup(&full, 0, |_| true).unwrap();
+        let chain = store
+            .disk
+            .index_mut()
+            .lookup_below(&full, 0, u64::MAX, |node| node.ready)
+            .unwrap();
         assert!(store.retains_chain(&chain));
         store.memory.pin_record(&other).unwrap();
         assert!(!store.retains_chain(&chain));
@@ -1601,6 +1628,38 @@ mod tests {
     }
 
     #[test]
+    fn rejected_disk_endpoint_does_not_hide_a_warm_ancestor() {
+        let Some(directory) = test_directory("cost-fallback") else {
+            return;
+        };
+        let full = history(2000);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
+        let child = checkpoint(
+            &mut ids,
+            &full,
+            1300,
+            Some(700),
+            pages(0..20),
+            10,
+            StateSlotId(2),
+        );
+        let mut store = composite(&directory, 32, 4, 1 << 30);
+        written(&mut store, &root, None, 1);
+        written(&mut store, &child, Some(root.key), 2);
+        store.memory.remove_record(&child.key).unwrap();
+        let deep = store.lookup(&full, 0, u64::MAX).unwrap();
+        assert_eq!(deep.key, child.key);
+        assert!(!super::super::worth_fetching(&deep, 20e6));
+        let warm = store.lookup(&full, 0, deep.consumed_tokens).unwrap();
+        assert_eq!((warm.key, warm.tier), (root.key, Tier::Memory));
+        assert!(super::super::worth_fetching(&warm, 20e6));
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn store_dedupes_pins_the_parent_and_reports_a_failed_memory_copy() {
         let Some(directory) = test_directory("store") else {
             return;
@@ -1610,7 +1669,7 @@ mod tests {
         let mut ids = Ids::new();
         let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
         written(&mut store, &root, None, 1);
-        assert!(!store.store(&root).unwrap());
+        assert_ne!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
 
         // A child is shaped by the disk index and holds its parent in place
@@ -1624,8 +1683,8 @@ mod tests {
             10,
             StateSlotId(2),
         );
-        assert!(store.store(&child).unwrap());
-        assert!(!store.store(&child).unwrap());
+        assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
+        assert_ne!(store.store(&child).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 2);
         assert_eq!(store.stats().outbound_in_flight, 1);
         assert_eq!(store.disk.index().node(&root.key).unwrap().pins(), 1);
@@ -1636,7 +1695,7 @@ mod tests {
         // Without transfer threads the memory copy fails: the event reports
         // it, the parent is released, and nothing is left in either tier.
         let mut events = Vec::new();
-        store.poll(&mut events);
+        store.poll(&mut events).unwrap();
         assert_eq!(stored(&events), [(child.key, false)]);
         assert!(!store.memory.index().contains(&child.key));
         assert!(!store.disk.index().contains(&child.key));
@@ -1660,10 +1719,10 @@ mod tests {
             8,
             StateSlotId(3),
         );
-        assert!(store.store(&orphan).unwrap());
+        assert_eq!(store.store(&orphan).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound[&orphan.key].parent, None);
         assert_eq!(store.outbound[&orphan.key].tail_pages, 31);
-        store.poll(&mut events);
+        store.poll(&mut events).unwrap();
 
         let mut short = checkpoint(&mut ids, &full, 1000, None, pages(0..3), 3, StateSlotId(1));
         short.tail_pages = 15;
@@ -1707,11 +1766,11 @@ mod tests {
         assert_eq!(store.jobs.len(), 1);
 
         // While the write is in flight the record matches lookups from memory.
-        let hit = store.lookup(&full, 0).unwrap();
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!((hit.key, hit.tier, hit.pages), (root.key, Tier::Memory, 10));
         assert_eq!(hit.bytes, 10 * PAGE_RECORD + ROW_RECORD);
         assert!((hit.estimated_seconds - hit.bytes as f64 / INITIAL_MEMORY_RATE).abs() < 1e-12);
-        assert!(store.lookup(&history(300), 0).is_none());
+        assert!(store.lookup(&history(300), 0, u64::MAX).is_none());
         assert_eq!((store.stats().lookups, store.stats().hits), (2, 1));
 
         poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
@@ -1747,8 +1806,7 @@ mod tests {
         let row = header.row_segment as usize;
         assert!(file[row..row + ROW_RECORD as usize] == slabs[10][..]);
 
-        // A record the limit cannot hold is retained nowhere, with the event
-        // still reporting the landed copy so the GPU pin is released.
+        // Asynchronous reservation refusal releases the GPU pin for a later retry.
         let small_directory = directory.join("small");
         fs::create_dir(&small_directory).unwrap();
         let mut small = composite(&small_directory, 32, 4, 1);
@@ -1763,7 +1821,9 @@ mod tests {
         );
         let (_, big_bytes) = copy_landed(&mut small, &big, None, 2);
         small.memory_stored(big.id, big.key, Ok(big_bytes), &mut events);
-        assert_eq!(stored(&events), [(big.key, true)]);
+        assert!(
+            matches!(&events[..], [StoreEvent::Deferred { checkpoint }] if *checkpoint == big.id)
+        );
         events.clear();
         assert!(!small.memory.index().contains(&big.key));
         assert!(!small.disk.index().contains(&big.key));
@@ -1825,7 +1885,7 @@ mod tests {
         assert_eq!(node.location.header.parent, Some(root.key));
         assert_eq!(node.tail_pages, 10);
         assert_eq!(store.memory.index().node(&child.key).unwrap().parent, None);
-        let hit = store.lookup(&full, 0).unwrap();
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!(hit.chain.nodes, [root.key, child.key]);
         assert_eq!(hit.tier, Tier::Memory);
         let stats = store.stats();
@@ -1930,7 +1990,7 @@ mod tests {
         assert_eq!(store.stats().memory_records, 0);
 
         // The hit comes from disk and is priced for the file read plus the upload.
-        let hit = store.lookup(&full, 0).unwrap();
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!((hit.key, hit.tier, hit.pages), (root.key, Tier::Disk, 10));
         let bytes = 10 * PAGE_RECORD + ROW_RECORD;
         assert_eq!(hit.bytes, bytes);
@@ -1990,7 +2050,7 @@ mod tests {
         // Resident again, the record is a memory hit whose upload is handed
         // to the memory store at once; without transfer threads that upload
         // fails before `fetch` returns, leaving only the composite's pin.
-        let hit = store.lookup(&full, 0).unwrap();
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!(hit.tier, Tier::Memory);
         store.fetch(hit, ticket(10, 2)).unwrap();
         assert!(store.inbound[&root.key].uploading);
@@ -2022,7 +2082,7 @@ mod tests {
             .unwrap();
         assert!(partial.row.is_none());
         store.memory.complete_record(&root.key, true).unwrap();
-        let hit = store.lookup(&history(700), 0).unwrap();
+        let hit = store.lookup(&history(700), 0, u64::MAX).unwrap();
         assert_eq!((hit.key, hit.tier), (root.key, Tier::Disk));
         store.fetch(hit, ticket(10, 2)).unwrap();
         let node = store.memory.index().node(&root.key).unwrap();
@@ -2035,14 +2095,14 @@ mod tests {
             original
         );
 
-        let hit = store.lookup(&full, 500).unwrap();
+        let hit = store.lookup(&full, 500, u64::MAX).unwrap();
         assert_eq!(hit.chain.nodes, [root.key, child.key]);
         assert_eq!(
             (hit.chain.skip_pages, hit.pages, hit.tier),
             (7, 13, Tier::Memory)
         );
         store.memory.remove_record(&child.key).unwrap();
-        let hit = store.lookup(&full, 500).unwrap();
+        let hit = store.lookup(&full, 500, u64::MAX).unwrap();
         assert_eq!(hit.tier, Tier::Disk);
         let expected = (10 * PAGE_RECORD + ROW_RECORD) as f64 / store.disk_inbound_rate.0
             + hit.bytes as f64 / store.memory.stats().inbound_rate;
@@ -2111,10 +2171,10 @@ mod tests {
             pages: (100..103).map(PageId).collect(),
             slot: StateSlotId(slot),
         };
-        let first = store.lookup(&full, 0).unwrap();
+        let first = store.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!(first.chain.nodes, [root.key, left.key]);
         store.fetch(first, ticket(left.key, 1)).unwrap();
-        let second = store.lookup(&branch, 0).unwrap();
+        let second = store.lookup(&branch, 0, u64::MAX).unwrap();
         assert_eq!(second.chain.nodes, [root.key, right.key]);
         store.fetch(second, ticket(right.key, 2)).unwrap();
         assert!(matches!(
@@ -2219,8 +2279,11 @@ mod tests {
         assert!(!store.disk.index().contains(&second.key));
         assert!(store.memory.index().contains(&second.key));
         assert_eq!(store.stale, [second.key]);
-        assert_eq!(store.lookup(&history(1300), 0).unwrap().key, fourth.key);
-        store.poll(&mut events);
+        assert_eq!(
+            store.lookup(&history(1300), 0, u64::MAX).unwrap().key,
+            fourth.key
+        );
+        store.poll(&mut events).unwrap();
         assert!(store.memory.index().contains(&second.key));
         store.memory.unpin_record(&second.key).unwrap();
         poll_until(&mut store, &mut events, |store| store.stale.is_empty());
@@ -2263,7 +2326,7 @@ mod tests {
         assert!(store.memory.record(&root.key).unwrap().durable);
         assert_eq!(store.stats().stored, 1);
         // The closed store still answers: the key is indexed, so it is skipped.
-        assert!(!store.store(&root).unwrap());
+        assert_ne!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
         drop(store);
         fs::remove_dir_all(&directory).unwrap();
@@ -2364,7 +2427,7 @@ mod tests {
                     store.jobs.keys().collect::<Vec<_>>(),
                     store.stats()
                 );
-                store.poll(events);
+                store.poll(events).unwrap();
                 std::thread::sleep(Duration::from_millis(1));
             }
         };
@@ -2401,13 +2464,13 @@ mod tests {
                 slot: StateSlotId(2 + pair * 2),
             };
             let mut events = Vec::new();
-            assert!(store.store(&root).unwrap());
+            assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
             if wait_for_root_copy {
                 drain(&mut store, &mut events, &|store| {
                     store.stats().bytes_out > 0 && store.memory.record(&root.key).is_some()
                 });
             }
-            assert!(store.store(&child).unwrap());
+            assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
             drain(&mut store, &mut events, &|store| store.outbound.is_empty());
             let stored: Vec<_> = events
                 .iter()
@@ -2508,7 +2571,7 @@ mod tests {
         };
         let mut events = Vec::new();
         for checkpoint in [&root, &child, &grandchild] {
-            assert!(store.store(checkpoint).unwrap());
+            assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
             drain(&mut store, &mut events, &|store| store.outbound.is_empty());
         }
         assert_eq!(store.stats().stored, 7);
@@ -2545,7 +2608,7 @@ mod tests {
         )
         .unwrap();
         let mut store = CompositeStore::new(memory, disk).unwrap();
-        let hit = store.lookup(&history, 0).unwrap();
+        let hit = store.lookup(&history, 0, u64::MAX).unwrap();
         assert_eq!(
             (hit.key, hit.pages, hit.tier),
             (grandchild.key, 4, Tier::Disk)
@@ -2751,7 +2814,7 @@ mod tests {
             let mut events = Vec::new();
             while events.is_empty() {
                 assert!(Instant::now() < deadline, "no store event within 120 s");
-                store.poll(&mut events);
+                store.poll(&mut events).unwrap();
                 std::thread::sleep(Duration::from_millis(1));
             }
             assert_eq!(events.len(), 1, "{events:?}");
@@ -2765,13 +2828,13 @@ mod tests {
                     Instant::now() < deadline,
                     "condition not reached within 120 s"
                 );
-                store.poll(&mut events);
+                store.poll(&mut events).unwrap();
                 assert!(events.is_empty(), "{events:?}");
                 std::thread::sleep(Duration::from_millis(1));
             }
         }
         let store_and_land = |store: &mut CompositeStore, checkpoint: &PublishedCheckpoint| {
-            assert!(store.store(checkpoint).unwrap());
+            assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
             match wait_event(store) {
                 StoreEvent::Stored {
                     checkpoint: id,
@@ -2811,7 +2874,7 @@ mod tests {
         assert_eq!(stats.memory_bytes, record_bytes);
         write_pages(&mut write_unit, &sources, &|plane, _| 0xEE + plane as u64);
         write_row(&mut write_unit, source_slot, 0xEE);
-        let hit = store.lookup(&histories[0], 0).unwrap();
+        let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
         assert_eq!(
             (hit.key, hit.pages, hit.tier, hit.bytes),
             (first.key, 3, Tier::Memory, record_bytes)
@@ -2896,7 +2959,7 @@ mod tests {
         // is resident again afterwards.
         write_pages(&mut write_unit, &targets, &|_, _| 0xCC);
         write_row(&mut write_unit, target_slot, 0xCC);
-        let hit = store.lookup(&histories[0], 0).unwrap();
+        let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
         assert_eq!((hit.key, hit.tier), (first.key, Tier::Disk));
         assert!(hit.estimated_seconds > record_bytes as f64 / INITIAL_MEMORY_RATE);
         store.fetch(hit, ticket()).unwrap();
@@ -2925,7 +2988,7 @@ mod tests {
         let fourth = &checkpoints[3];
         let blocked = directory.join(record::temporary_name(&fourth.key));
         fs::create_dir(&blocked).unwrap();
-        assert!(store.store(fourth).unwrap());
+        assert_eq!(store.store(fourth).unwrap(), StoreOutcome::Queued);
         match wait_event(&mut store) {
             StoreEvent::Stored { key, result, .. } => {
                 assert_eq!(key, fourth.key);
@@ -3035,12 +3098,12 @@ mod tests {
             3,
             source_slot,
         );
-        assert!(store.store(&short).unwrap());
-        assert!(store.store(&large).unwrap());
+        assert_eq!(store.store(&short).unwrap(), StoreOutcome::Queued);
+        assert_eq!(store.store(&large).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.outbound.len(), 1);
         assert_eq!(store.disk.stats().outbound_in_flight, 1);
         assert_eq!(store.memory.pool().free_pages(), 0);
-        let hit = store.lookup(&histories[0], 0).unwrap();
+        let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
         assert!(!store.retains_chain(&hit.chain));
         store.fetch(hit, ticket()).unwrap();
         let mut events = Vec::new();
@@ -3060,6 +3123,7 @@ mod tests {
                     assert_eq!(key, first.key);
                     assert_eq!(result.unwrap(), record_bytes);
                 }
+                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
             }
         }
         assert!(stored_keys.contains(&short.key) && stored_keys.contains(&large.key));
@@ -3084,7 +3148,7 @@ mod tests {
         let mut store = open_small();
         write_pages(&mut write_unit, &targets, &|_, _| 0xA5);
         write_row(&mut write_unit, target_slot, 0xA5);
-        let hit = store.lookup(&fresh, 0).unwrap();
+        let hit = store.lookup(&fresh, 0, u64::MAX).unwrap();
         assert_eq!((hit.key, hit.pages, hit.tier), (large.key, 3, Tier::Disk));
         store
             .fetch(

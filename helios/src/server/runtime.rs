@@ -852,6 +852,8 @@ struct Worker<'a> {
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
     store: Option<Box<dyn crate::offload::PrefixStore>>,
+    deferred_stores: Vec<crate::cache::CheckpointId>,
+    store_progress: u64,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
     prefill_rate: f64,
@@ -880,6 +882,8 @@ impl<'a> Worker<'a> {
             receiver,
             queue_capacity,
             store: None,
+            deferred_stores: Vec::new(),
+            store_progress: 0,
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
             active: (0..config.limits.max_active).map(|_| None).collect(),
@@ -1132,7 +1136,13 @@ impl<'a> Worker<'a> {
             let admission = if let Some(store) =
                 self.store.as_mut().filter(|_| incoming.host_lookup && !spec.prompt_logprobs)
             {
-                admit_with_host_store(&mut self.scheduler, store.as_mut(), spec, self.prefill_rate)
+                admit_with_host_store(
+                    &mut self.scheduler,
+                    store.as_mut(),
+                    spec,
+                    self.prefill_rate,
+                    self.metrics,
+                )
             } else {
                 self.scheduler.admit(spec)
             };
@@ -1924,33 +1934,88 @@ impl<'a> Worker<'a> {
         let Some(store) = self.store.as_mut() else {
             return Ok(false);
         };
-        let mut progress = false;
-        for publication in self.scheduler.take_publications() {
-            progress = true;
-            // The checkpoint may have been evicted between readiness and this drain.
-            if self.scheduler.pin_checkpoint(publication.id).is_err() {
-                continue;
-            }
-            if !matches!(store.store(&publication), Ok(true)) {
-                self.scheduler.unpin_checkpoint(publication.id)?;
-            }
-        }
+        use crate::offload::{StoreEvent, StoreOutcome};
         let mut events = Vec::new();
         store.poll(&mut events)?;
+        let mut progress = !events.is_empty();
         let mut requeued = Vec::new();
+        let mut released = false;
         for event in events {
-            progress = true;
             match event {
-                crate::offload::StoreEvent::Stored { checkpoint, .. } => {
-                    // The pin taken before `store` is released; a checkpoint retired
-                    // meanwhile has no pin left and is ignored.
-                    let _ = self.scheduler.unpin_checkpoint(checkpoint);
+                StoreEvent::Stored { checkpoint, .. } => {
+                    self.scheduler.unpin_checkpoint(checkpoint)?;
+                    released = true;
                 }
-                crate::offload::StoreEvent::Fetched { key, result } => {
+                StoreEvent::Deferred { checkpoint } => {
+                    self.scheduler.unpin_checkpoint(checkpoint)?;
+                    released = true;
+                    if !self.deferred_stores.contains(&checkpoint) {
+                        self.deferred_stores.push(checkpoint);
+                    }
+                }
+                StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
                 }
             }
         }
+        if released {
+            for incoming in self
+                .pending
+                .iter_mut()
+                .chain(self.parked.iter_mut().map(|(incoming, _)| incoming))
+            {
+                incoming.blocked = None;
+            }
+        }
+        let current_progress = store.stats().progress;
+        let retry = current_progress != self.store_progress;
+        self.store_progress = current_progress;
+        let mut publications = self.scheduler.take_publications();
+        let retry_ids = self.deferred_stores.clone();
+        let mut waiting = Vec::new();
+        for id in self.deferred_stores.drain(..) {
+            if let Some(publication) = self.scheduler.publication(id) {
+                if retry {
+                    publications.push(publication);
+                } else {
+                    waiting.push(id);
+                }
+            } else {
+                self.metrics
+                    .host_retry_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        for publication in publications {
+            progress = true;
+            let outcome = store.store(&publication);
+            if let Ok(outcome) = outcome {
+                self.metrics.host_store_outcome(outcome);
+                match outcome {
+                    StoreOutcome::Queued => self.scheduler.pin_checkpoint(publication.id)?,
+                    StoreOutcome::Retry(_) => {
+                        if !waiting.contains(&publication.id) {
+                            waiting.push(publication.id);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if retry_ids.contains(&publication.id) {
+                    let counter = if outcome == StoreOutcome::Oversize {
+                        &self.metrics.host_retry_abandoned
+                    } else {
+                        &self.metrics.host_retry_success
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if retry_ids.contains(&publication.id) {
+                self.metrics
+                    .host_retry_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.deferred_stores = waiting;
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {
@@ -2025,11 +2090,25 @@ fn admit_with_host_store(
     store: &mut dyn crate::offload::PrefixStore,
     spec: RequestSpec,
     prefill_rate: f64,
+    metrics: &super::metrics::Metrics,
 ) -> Result<RequestHandle> {
     let plan = scheduler.plan_admission(&spec)?;
-    let hit = store
-        .lookup(plan.history(), plan.resident_tokens())
-        .filter(|hit| crate::offload::worth_fetching(hit, prefill_rate));
+    use crate::offload::LookupOutcome;
+    let mut before = u64::MAX;
+    let hit = loop {
+        let Some(hit) = store.lookup(plan.history(), plan.resident_tokens(), before) else {
+            if before == u64::MAX {
+                metrics.host_lookup_outcome(LookupOutcome::NoMatch);
+            }
+            break None;
+        };
+        metrics.host_lookup_cost(&hit, prefill_rate);
+        if crate::offload::worth_fetching(&hit, prefill_rate) {
+            break Some(hit);
+        }
+        metrics.host_lookup_outcome(LookupOutcome::CostRejected);
+        before = hit.consumed_tokens;
+    };
     let Some(hit) = hit else {
         let handle = scheduler.admit_planned(spec, plan, None)?.handle;
         // Lookups count once per admitted request, not per attempt of a waiting one.
@@ -2044,6 +2123,7 @@ fn admit_with_host_store(
     let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
         Ok(admitted) => admitted,
         Err(Error::Admission(AdmissionError::Capacity(_))) => {
+            metrics.host_lookup_outcome(LookupOutcome::CapacityRejected);
             let handle = scheduler.admit(spec)?;
             scheduler.record_host_lookup();
             return Ok(handle);
@@ -2052,15 +2132,18 @@ fn admit_with_host_store(
     };
     scheduler.record_host_lookup();
     let Some(ticket) = admitted.ticket else {
+        metrics.host_lookup_outcome(LookupOutcome::Admitted);
         return Ok(admitted.handle);
     };
     let key = ticket.key;
     if store.fetch(hit, ticket).is_err() {
+        metrics.host_lookup_outcome(LookupOutcome::EnqueueRejected);
         // No event follows a rejected fetch; this request is the ticket's only
         // waiter, so retire it and admit the request again without the store.
         scheduler.finish_inbound(key, false)?;
         return scheduler.admit(spec);
     }
+    metrics.host_lookup_outcome(LookupOutcome::Admitted);
     Ok(admitted.handle)
 }
 

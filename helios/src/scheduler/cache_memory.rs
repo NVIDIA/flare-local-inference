@@ -71,6 +71,85 @@ impl RequestScheduler {
         }
     }
 
+    fn pending_backing(&self) -> (Vec<bool>, Vec<SnapshotId>) {
+        let mut available = vec![false; self.limits.pages as usize];
+        let mut retiring_refs = vec![0; available.len()];
+        let mut snapshots = Vec::new();
+        for page in &self.free_pages {
+            available[page.0 as usize] = true;
+        }
+        for retirement in self.cache.pending_retirement() {
+            for page in &retirement.pages {
+                available[page.0 as usize] = true;
+            }
+            snapshots.push(retirement.snapshot);
+        }
+        for retirement in &self.retired {
+            for page in &retirement.pages {
+                available[page.0 as usize] = true;
+            }
+            snapshots.extend(retirement.snapshots.iter().flatten().copied());
+        }
+        for snapshot in &snapshots {
+            if let Some(range) = self.snapshot_pages.get(snapshot.0 as usize) {
+                for page in range.clone() {
+                    retiring_refs[page as usize] += 1;
+                }
+            }
+        }
+        for (page, refs) in retiring_refs.into_iter().enumerate() {
+            if refs > 0 && refs == self.page_snapshot_refs[page] {
+                available[page] = true;
+            }
+        }
+        (available, snapshots)
+    }
+
+    /// Project free backing after every already-retired owner reaches its fence.
+    pub(super) fn pending_page_count(&self) -> usize {
+        let (available, _) = self.pending_backing();
+        available.into_iter().filter(|free| *free).count()
+    }
+
+    pub(super) fn pending_resources(&self, pages: usize, snapshots: usize) -> bool {
+        if self.cache.pending_retirement().is_empty() && self.retired.is_empty() {
+            return false;
+        }
+        let (backing, retiring) = self.pending_backing();
+        let mut available = 0;
+        for free in &backing {
+            available += usize::from(*free);
+        }
+        if available < pages {
+            return false;
+        }
+        if snapshots == 0 {
+            return true;
+        }
+        let mut eligible = 0;
+        for snapshot in self.free_snapshots.iter().chain(&retiring) {
+            let mut cost = 0;
+            let mut usable = true;
+            if let Some(range) = self.snapshot_pages.get(snapshot.0 as usize) {
+                for page in range.clone() {
+                    if backing[page as usize] {
+                        cost += 1;
+                    } else if self.page_snapshot_refs[page as usize] == 0 {
+                        usable = false;
+                        break;
+                    }
+                }
+            }
+            if usable && available.saturating_sub(cost) >= pages {
+                eligible += 1;
+                if eligible == snapshots {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub(super) fn release_snapshot(&mut self, id: SnapshotId) {
         assert!(self.free_snapshots.insert(id), "snapshot released twice");
         if let Some(range) = self.snapshot_pages.get(id.0 as usize) {
@@ -151,5 +230,118 @@ mod tests {
         assert_eq!(s.stats().snapshot_backing_pages, 0);
         assert_eq!(s.free_page_count(), 16);
         assert_eq!(s.free_snapshot_count(), 1);
+    }
+    #[test]
+    fn page_pressure_compacts_aliases_with_free_snapshot_ids_and_preserves_fences() {
+        for delayed in [false, true] {
+            let mut s = super::super::tests::scheduler(2, 16, 4);
+            s.share_snapshot_pages(&[8..12, 10..14, 0..0, 0..0])
+                .unwrap();
+            let mut history = PrefixHistory::new([9; 32]);
+            history.append(&(0..128).collect::<Vec<_>>(), &[]).unwrap();
+            let a = s.reserve_snapshot(0).unwrap();
+            let b = s.reserve_snapshot(0).unwrap();
+            let mut parent = None;
+            for (endpoint, page, snapshot) in [(64, 0, a), (128, 1, b)] {
+                s.free_pages.remove(&PageId(page));
+                parent = Some(
+                    s.cache
+                        .publish(
+                            &history,
+                            &Publication {
+                                parent,
+                                consumed_tokens: endpoint,
+                                tail_pages: vec![PageId(page)],
+                                snapshot: StateSnapshot {
+                                    id: snapshot,
+                                    consumed_tokens: endpoint,
+                                },
+                                ready_after: Fence(0),
+                            },
+                        )
+                        .unwrap()
+                        .id(),
+                );
+            }
+            let child = parent.unwrap();
+            s.cache.pin(child).unwrap();
+            if delayed {
+                s.cache.mark_used(child, Fence(7)).unwrap();
+            }
+            let held = std::mem::take(&mut s.free_pages);
+            assert_eq!(s.free_snapshot_count(), 2);
+            let mut admission = super::super::tests::spec(64, 1);
+            admission.prompt.fill(99);
+            let result = s.admit(admission);
+            if delayed {
+                assert!(result.is_err());
+                assert_eq!(s.free_page_count(), 0);
+                assert_eq!(s.pending_page_count(), 2);
+                assert_eq!(s.stats().snapshot_backing_pages, 6);
+                let update = s.cache.advance_completed(Fence(7)).unwrap();
+                s.apply_completion(update);
+            } else {
+                s.cancel(result.unwrap()).unwrap();
+            }
+            assert_eq!(s.free_page_count(), 2);
+            assert_eq!(s.stats().snapshot_backing_pages, 4);
+            assert_eq!(s.page_snapshot_refs[10], 1);
+            assert_eq!(s.cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
+            s.free_pages.extend(held);
+        }
+    }
+
+    #[test]
+    fn decoder_growth_waits_for_pending_alias_reclamation() {
+        let mut s = super::super::tests::scheduler(1, 16, 4);
+        s.share_snapshot_pages(&[8..12, 10..14, 0..0, 0..0])
+            .unwrap();
+        let mut spec = super::super::tests::spec(60, 400);
+        spec.growable_output = true;
+        let handle = s.admit(spec).unwrap();
+        let request = s.request_mut(handle).unwrap();
+        request.phase = RequestPhase::Decode;
+        request.scheduled_consumed = 127;
+        let mut history = PrefixHistory::new([9; 32]);
+        history.append(&vec![7; 128], &[]).unwrap();
+        let a = s.reserve_snapshot(0).unwrap();
+        let b = s.reserve_snapshot(0).unwrap();
+        let mut parent = None;
+        for (endpoint, page, snapshot) in [(64, 2, a), (128, 3, b)] {
+            s.free_pages.remove(&PageId(page));
+            parent = Some(
+                s.cache
+                    .publish(
+                        &history,
+                        &Publication {
+                            parent,
+                            consumed_tokens: endpoint,
+                            tail_pages: vec![PageId(page)],
+                            snapshot: StateSnapshot {
+                                id: snapshot,
+                                consumed_tokens: endpoint,
+                            },
+                            ready_after: Fence(0),
+                        },
+                    )
+                    .unwrap()
+                    .id(),
+            );
+        }
+        let child = parent.unwrap();
+        s.cache.pin(child).unwrap();
+        s.cache.mark_used(child, Fence(7)).unwrap();
+        let held = std::mem::take(&mut s.free_pages);
+        s.refill_reservations().unwrap();
+        assert_eq!(s.stats().preemptions, 0);
+        assert!(!s.fits_next_rounds(s.request(handle).unwrap()));
+        assert_eq!(s.free_page_count(), 0);
+        assert_eq!(s.pending_page_count(), 2);
+        let update = s.cache.advance_completed(Fence(7)).unwrap();
+        s.apply_completion(update);
+        s.refill_reservations().unwrap();
+        assert!(s.fits_next_rounds(s.request(handle).unwrap()));
+        assert_eq!(s.stats().preemptions, 0);
+        s.free_pages.extend(held);
     }
 }

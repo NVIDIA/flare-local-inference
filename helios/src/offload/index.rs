@@ -213,31 +213,21 @@ impl<L> Index<L> {
     /// links reach a node whose parent is at or below `resident`, so the chain's
     /// pages, after skipping those the GPU already holds, are exactly the pages
     /// between the resident checkpoint and the endpoint.
-    pub fn lookup(
+    pub fn lookup_below(
         &mut self,
         history: &PrefixHistory,
         resident: u64,
-        usable: impl Fn(&Node<L>) -> bool,
-    ) -> Option<Match> {
-        self.lookup_where(history, resident, |node| node.ready && usable(node))
-    }
-
-    /// `lookup` with usability decided entirely by the predicate, including
-    /// readiness, for a store whose records can be served from elsewhere while
-    /// their own copies are incomplete.
-    pub fn lookup_where(
-        &mut self,
-        history: &PrefixHistory,
-        resident: u64,
+        before: u64,
         usable: impl Fn(&Node<L>) -> bool,
     ) -> Option<Match> {
         let block = HASH_BLOCK_TOKENS as u64;
-        let total = history.token_count();
+        let total = history.token_count().min(before.saturating_sub(1));
         let root = history.key_at(0)?;
         let boundaries = history.aligned_boundaries();
         let probes = boundaries
             .iter()
             .rev()
+            .filter(|boundary| boundary.consumed_tokens <= total)
             .chain(std::iter::once(&root))
             .take_while(|boundary| boundary.consumed_tokens + block > resident);
         for boundary in probes {
@@ -261,6 +251,10 @@ impl<L> Index<L> {
             }
         }
         None
+    }
+
+    pub fn complete(&self, key: &PrefixKey) -> bool {
+        self.chain(key, 0, &|node| node.ready).is_some()
     }
 
     fn chain(
@@ -343,37 +337,28 @@ impl<L> Index<L> {
         Ok(removed)
     }
 
-    /// Retire the least recently used unpinned leaf the predicate allows, or,
-    /// when `need_row` and no leaf qualifies, compact the least recently used
-    /// unpinned single-child ancestor that still has a row.
+    /// Retire the oldest eligible leaf or, when `need_row`, compactable ancestor.
     pub fn evict(
         &mut self,
         need_row: bool,
         evictable: impl Fn(&Node<L>) -> bool,
     ) -> Option<Eviction<L>> {
-        let leaf = self
-            .nodes
-            .values()
-            .filter(|node| node.ready && node.pins == 0 && node.children == 0 && evictable(node))
-            .min_by_key(|node| (node.accessed, node.key.consumed_tokens))
-            .map(|node| node.key);
-        if let Some(key) = leaf {
-            return self.remove(&key).ok().map(Eviction::Leaves);
-        }
-        if !need_row {
-            return None;
-        }
-        let ancestor = self
+        let candidate = self
             .nodes
             .values()
             .filter(|node| {
-                node.ready && node.row && node.pins == 0 && node.children == 1 && evictable(node)
+                node.ready
+                    && node.pins == 0
+                    && evictable(node)
+                    && (node.children == 0 || (need_row && node.row && node.children == 1))
             })
             .min_by_key(|node| (node.accessed, node.key.consumed_tokens))
-            .map(|node| node.key);
-        let key = ancestor?;
-        self.nodes.get_mut(&key).unwrap().row = false;
-        Some(Eviction::Compacted(key))
+            .map(|node| node.key)?;
+        if self.nodes[&candidate].children == 0 {
+            return self.remove(&candidate).ok().map(Eviction::Leaves);
+        }
+        self.nodes.get_mut(&candidate).unwrap().row = false;
+        Some(Eviction::Compacted(candidate))
     }
 }
 
@@ -419,7 +404,9 @@ mod tests {
             insert(&mut index, &full, 700, None);
             insert(&mut index, &full, 1300, Some(700));
             insert(&mut index, &full, 1990, Some(1300));
-            let found = index.lookup(&full, 0, |_| true).unwrap();
+            let found = index
+                .lookup_below(&full, 0, u64::MAX, |node| node.ready)
+                .unwrap();
             assert_eq!(found.consumed_tokens, 1990);
             assert_eq!(
                 found.nodes,
@@ -427,30 +414,44 @@ mod tests {
             );
             assert_eq!(found.skip_pages, 0);
             assert_eq!(found.pages, (1990 / pt) as usize);
-            let found = index.lookup(&full, 700, |_| true).unwrap();
+            let found = index
+                .lookup_below(&full, 700, u64::MAX, |node| node.ready)
+                .unwrap();
             assert_eq!(found.nodes.len(), 2);
             assert_eq!(found.pages, (1990 / pt - 700 / pt) as usize);
             assert_eq!(found.skip_pages, 0);
             // A resident checkpoint inside a node's tail skips the pages it already holds.
-            let found = index.lookup(&full, 1000, |_| true).unwrap();
+            let found = index
+                .lookup_below(&full, 1000, u64::MAX, |node| node.ready)
+                .unwrap();
             assert_eq!(found.nodes, [1300, 1990].map(|c| full.key_at(c).unwrap()));
             assert_eq!(found.skip_pages, (1000 / pt - 700 / pt) as usize);
             assert_eq!(found.pages, (1990 / pt - 1000 / pt) as usize);
-            assert!(index.lookup(&full, 1990, |_| true).is_none());
+            assert!(
+                index
+                    .lookup_below(&full, 1990, u64::MAX, |node| node.ready)
+                    .is_none()
+            );
             let shorter = history(1500);
-            let found = index.lookup(&shorter, 0, |_| true).unwrap();
+            let found = index
+                .lookup_below(&shorter, 0, u64::MAX, |node| node.ready)
+                .unwrap();
             assert_eq!(found.consumed_tokens, 1300);
             let mut diverged = history(1200);
             diverged.append(&[1, 2, 3, 4], &[]).unwrap();
             assert_eq!(
                 index
-                    .lookup(&diverged, 0, |_| true)
+                    .lookup_below(&diverged, 0, u64::MAX, |node| node.ready)
                     .unwrap()
                     .consumed_tokens,
                 700
             );
             let other = PrefixHistory::new([9; 32]);
-            assert!(index.lookup(&other, 0, |_| true).is_none());
+            assert!(
+                index
+                    .lookup_below(&other, 0, u64::MAX, |node| node.ready)
+                    .is_none()
+            );
         }
     }
 
@@ -470,9 +471,13 @@ mod tests {
             other => panic!("unexpected eviction {other:?}"),
         }
         // The compacted node no longer matches; the lookup falls back to its parent.
-        let found = index.lookup(&history(500), 0, |_| true).unwrap();
+        let found = index
+            .lookup_below(&history(500), 0, u64::MAX, |node| node.ready)
+            .unwrap();
         assert_eq!(found.consumed_tokens, 200);
-        let found = index.lookup(&full, 0, |_| true).unwrap();
+        let found = index
+            .lookup_below(&full, 0, u64::MAX, |node| node.ready)
+            .unwrap();
         assert_eq!(found.nodes.len(), 3);
         assert_eq!(found.pages, 9);
         assert!(index.evict(false, |_| true).is_none());
@@ -529,7 +534,9 @@ mod tests {
             }
         );
         index.unpin(&durable).unwrap();
-        let found = index.lookup(&full, 0, |_| true).unwrap();
+        let found = index
+            .lookup_below(&full, 0, u64::MAX, |node| node.ready)
+            .unwrap();
         assert_eq!(found.consumed_tokens, 600);
         assert!(index.remove(&full.key_at(300).unwrap()).is_err());
     }
@@ -595,13 +602,52 @@ mod tests {
         index
             .insert(key, None, full.bucket_at(500).unwrap(), 7, true, false, ())
             .unwrap();
-        assert!(index.lookup(&full, 0, |_| true).is_none());
+        assert!(
+            index
+                .lookup_below(&full, 0, u64::MAX, |node| node.ready)
+                .is_none()
+        );
         assert!(index.evict(true, |_| true).is_none());
         index.node_mut(&key).unwrap().ready = true;
-        assert_eq!(index.lookup(&full, 0, |_| true).unwrap().key, key);
-        assert!(index.lookup(&full, 0, |node| node.key != key).is_none());
+        assert_eq!(
+            index
+                .lookup_below(&full, 0, u64::MAX, |node| node.ready)
+                .unwrap()
+                .key,
+            key
+        );
+        assert!(
+            index
+                .lookup_below(&full, 0, u64::MAX, |node| node.ready && node.key != key)
+                .is_none()
+        );
         index.node_mut(&key).unwrap().ready = false;
-        assert!(index.lookup(&full, 0, |_| true).is_none());
-        assert_eq!(index.lookup_where(&full, 0, |_| true).unwrap().key, key);
+        assert!(
+            index
+                .lookup_below(&full, 0, u64::MAX, |node| node.ready)
+                .is_none()
+        );
+        assert_eq!(
+            index
+                .lookup_below(&full, 0, u64::MAX, |_| true)
+                .unwrap()
+                .key,
+            key
+        );
+    }
+    #[test]
+    fn rejected_endpoints_do_not_hide_a_shallower_chain_in_the_same_bucket() {
+        let full = history(1024);
+        let mut index = Index::new(64);
+        insert(&mut index, &full, 701, None);
+        insert(&mut index, &full, 710, Some(701));
+        insert(&mut index, &full, 900, Some(710));
+        let first = index.lookup_below(&full, 0, u64::MAX, |n| n.ready).unwrap();
+        assert_eq!(first.consumed_tokens, 900);
+        let second = index.lookup_below(&full, 0, 900, |n| n.ready).unwrap();
+        assert_eq!(second.consumed_tokens, 710);
+        let third = index.lookup_below(&full, 0, 710, |n| n.ready).unwrap();
+        assert_eq!(third.consumed_tokens, 701);
+        assert!(index.lookup_below(&full, 0, 701, |n| n.ready).is_none());
     }
 }
