@@ -91,3 +91,6 @@
 
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
     cross-node RoCEnante TP packages for Qwen3.8 and DeepSeek V4.1.
+
+[ ] Cancel HTTP frontend preparation on client disconnect, including cooperative
+    cancellation of blocking rendering/tokenization in server/http.rs.

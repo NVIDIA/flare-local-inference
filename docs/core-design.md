@@ -1338,8 +1338,11 @@ Only consumed history can define a checkpoint.
 
 ### Exact endpoint capture
 
-The shared frontend renders each message prefix without a generation header or
-assistant continuation. It accepts every nonempty rendered token sequence that
+The shared frontend probes the empty prefix, first message, and last two message
+ends without a generation header or assistant continuation. This bounds rendering
+and tokenization to four passes regardless of message count. Earlier turns can
+reuse checkpoints published by preceding requests; a cold request does not publish
+every historical endpoint. It accepts each nonempty rendered token sequence that
 is a strict prefix of the complete prompt, irrespective of message roles. A
 prefix may contain a template-generated preamble or end after any system,
 developer, user, assistant, or tool message. Templates can reject an incomplete

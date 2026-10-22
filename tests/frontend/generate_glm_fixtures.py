@@ -35,7 +35,8 @@ def generate(snapshot):
             boundary_messages[index + 1:end] = sorted(boundary_messages[index + 1:end],
                 key=lambda result: ranks[result["tool_call_id"]])
         boundaries = []
-        for count in range(len(boundary_messages) + 1):
+        length = len(boundary_messages)
+        for count in sorted({0, min(1, length), max(0, length - 1), length}):
             if count:
                 prefix = tokenizer.apply_chat_template(boundary_messages[:count], tokenize=True,
                     return_dict=False, **prefix_options)

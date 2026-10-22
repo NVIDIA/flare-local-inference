@@ -834,6 +834,54 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "server")]
+    #[test]
+    fn message_boundary_render_count_is_bounded() {
+        use std::sync::{Arc, Mutex};
+        let counts = Arc::new(Mutex::new(Vec::new()));
+        let recorded = counts.clone();
+        let mut frontend = role_frontend("");
+        frontend.template_source = format!(
+            "{{{{ record(messages|length) }}}}{}", frontend.template_source
+        );
+        frontend.environment
+            .add_template_owned("chat", frontend.template_source.clone()).unwrap();
+        frontend.environment.add_function("record", move |count: usize| {
+            recorded.lock().unwrap().push(count);
+            ""
+        });
+        let vocabulary = (0..128)
+            .map(|id| ((id as u8 as char).to_string(), id))
+            .collect::<tokenizers::models::bpe::Vocab>();
+        frontend.tokenizer = Tokenizer::new(
+            tokenizers::models::bpe::BPE::builder()
+                .vocab_and_merges(vocabulary, vec![]).build().unwrap(),
+        );
+        for length in [1, 2, 1000] {
+            let messages = vec![serde_json::json!({"role":"user","content":"hello"}); length];
+            let mut tokens = frontend.render_chat(&messages, &Map::new()).unwrap().token_ids;
+            tokens.push(0);
+            counts.lock().unwrap().clear();
+            let boundaries = crate::model::message_boundaries(
+                &frontend, &tokens, &messages, &Map::new(),
+            );
+            let expected = match length {
+                1 => vec![0, 1],
+                2 => vec![0, 1, 2],
+                _ => vec![0, 1, 999, 1000],
+            };
+            assert_eq!(*counts.lock().unwrap(), expected);
+            assert_eq!(
+                boundaries,
+                expected.into_iter().filter(|n| *n > 0)
+                    .map(|n| n * "user:hello\n".len()).collect::<Vec<_>>(),
+            );
+        }
+        counts.lock().unwrap().clear();
+        assert!(crate::model::message_boundaries(&frontend, &[0], &[], &Map::new()).is_empty());
+        assert_eq!(*counts.lock().unwrap(), [0]);
+    }
+
     #[test]
     fn inline_system_roles_follow_template_capability() {
         let source = serde_json::json!([

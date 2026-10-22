@@ -171,8 +171,19 @@ pub fn message_boundaries(
     let mut options = options.clone();
     options.insert("add_generation_prompt".into(), false.into());
     options.insert("continue_final_message".into(), false.into());
-    let mut boundaries = Vec::with_capacity(messages.len());
-    for count in 0..=messages.len() {
+    // Earlier turns can reuse checkpoints published by preceding requests.
+    let mut counts = [
+        0,
+        messages.len().min(1),
+        messages.len().saturating_sub(1),
+        messages.len(),
+    ];
+    counts.sort_unstable();
+    let mut boundaries = Vec::with_capacity(counts.len());
+    for (index, count) in counts.into_iter().enumerate() {
+        if index > 0 && counts[index - 1] == count {
+            continue;
+        }
         let Ok(prefix) = frontend.render_boundary(&messages[..count], &options) else {
             continue;
         };

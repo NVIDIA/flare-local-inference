@@ -198,7 +198,7 @@ fn named_selection_only_filters_tools_and_none_restores_a_text_turn() {
 }
 
 #[test]
-fn native_encoders_checkpoint_each_message_prefix() {
+fn native_encoders_checkpoint_instruction_and_recent_message_prefixes() {
     for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
         let fixture = Fixture::new(encoder);
         let messages = json!([
@@ -209,7 +209,7 @@ fn native_encoders_checkpoint_each_message_prefix() {
             {"role":"user","content":"Follow-up"}
         ]);
         let prepared = fixture.prepare(json!({"messages":messages})).unwrap();
-        for count in 1..=messages.as_array().unwrap().len() {
+        for count in [1, 4, 5] {
             let prefix = fixture.frontend.render_boundary(
                 &messages.as_array().unwrap()[..count], &Map::new()).unwrap();
             assert!(prepared.prompt.tokens.starts_with(&prefix.token_ids));

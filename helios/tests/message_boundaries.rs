@@ -78,9 +78,10 @@ fn check_messages(frontend: &Frontend, messages: &[Value]) -> (Vec<u32>, Vec<usi
         let prefix = frontend
             .render_boundary(&messages[..count], &Map::new())
             .unwrap();
-        assert!(
+        assert_eq!(
             boundaries.contains(&prefix.token_ids.len()),
-            "message {count} has no checkpoint"
+            count == 1 || count >= messages.len().saturating_sub(1),
+            "message {count}"
         );
         assert_eq!(
             rendered.token_ids[..prefix.token_ids.len()],
@@ -110,27 +111,26 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
         {"role":"user","content":""},
         {"role":"user","content":"Follow-up"}
     ]);
-    let (tokens, boundaries) = check_messages(&frontend, messages.as_array().unwrap());
-    assert_eq!(boundaries.len(), 8);
+    let messages = messages.as_array().unwrap();
+    for count in 1..=messages.len() {
+        check_messages(&frontend, &messages[..count]);
+    }
+    let (tokens, boundaries) = check_messages(&frontend, messages);
+    assert_eq!(boundaries.len(), 3);
     let mut changed = tokens.clone();
-    changed[boundaries[2] - 1] ^= 1;
+    changed[boundaries[1] - 1] ^= 1;
     assert_eq!(
-        message_boundaries(
-            &frontend,
-            &changed,
-            messages.as_array().unwrap(),
-            &Map::new()
-        ),
-        boundaries[..2]
+        message_boundaries(&frontend, &changed, messages, &Map::new()),
+        boundaries[..1]
     );
     assert_eq!(
         message_boundaries(
             &frontend,
-            &tokens[..boundaries[2]],
-            messages.as_array().unwrap(),
+            &tokens[..boundaries[1]],
+            messages,
             &Map::new()
         ),
-        boundaries[..2]
+        boundaries[..1]
     );
 }
 
@@ -148,10 +148,10 @@ fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns()
         {"role":"user","content":"Follow-up"}
     ]);
     let (tokens, boundaries) = check_messages(&frontend, messages.as_array().unwrap());
-    assert_eq!(boundaries.len(), 6);
+    assert_eq!(boundaries.len(), 4);
     let mut changed = messages.as_array().unwrap().clone();
     changed[2]["content"] = "Different question".into();
     let (other, other_boundaries) = check_messages(&frontend, &changed);
-    assert_eq!(boundaries[..3], other_boundaries[..3]);
-    assert_eq!(tokens[..boundaries[2]], other[..other_boundaries[2]]);
+    assert_eq!(boundaries[..2], other_boundaries[..2]);
+    assert_eq!(tokens[..boundaries[1]], other[..other_boundaries[1]]);
 }
