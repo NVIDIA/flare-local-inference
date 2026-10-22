@@ -357,8 +357,10 @@ class RecordedPreparationSession(PreparationSession):
                 "race_budget_bytes": self.race_budget, "headroom_bytes": self.headroom_bytes,
                 "cache_hits": sum(result.cache_hits for result in results),
                 "benchmarked_candidates": sum(result.benchmarked_candidates for result in results),
-                "restored_candidates": sum(result.restored_candidates for result in results),
-                "rejected_candidates": sum(result.rejected_candidates for result in results),
+                "restored_candidates": sum(getattr(result, "restored_candidates", 0)
+                                           for result in results),
+                "rejected_candidates": sum(getattr(result, "rejected_candidates", 0)
+                                           for result in results),
                 "elapsed_seconds": sum(result.elapsed_seconds for result in results),
                 "parent_cute_compilations": sum(result.parent_cute_compilations for result in results),
                 "parent_triton_compilations": sum(result.parent_triton_compilations for result in results),
