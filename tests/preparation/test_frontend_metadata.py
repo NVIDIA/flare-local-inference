@@ -18,7 +18,7 @@ from ignition.recipes.declaration import SamplingDefaults, SamplingRange
 def test_default_mode_uses_manually_declared_model_card_sampling(recipe):
     qwen = recipe.name in ("qwen38", "qwen38_dense")
     expected = dict(seed=0, temperature=1., top_p=1. if recipe.name in ("deepseek41", "kimi3") else .95,
-        top_k=20 if qwen else -1, min_p=0., repetition_penalty=1., presence_penalty=0., frequency_penalty=0.)
+        top_k=20 if qwen else 64 if recipe.name == "gemma4" else -1, min_p=0., repetition_penalty=1., presence_penalty=0., frequency_penalty=0.)
     if qwen:
         expected["ranges"] = {"temperature": {"min": .7, "max": 1.}, "top_p": {"min": .8, "max": .95},
                               "presence_penalty": {"min": 0., "max": 2.}}

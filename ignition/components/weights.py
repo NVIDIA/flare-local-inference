@@ -363,7 +363,9 @@ class DirectWeightLoader:
                     paths(),
                     index_path=self.manifest.index_path,
                     skip=lambda name: name not in selected,
-                    needs_values=lambda entry: entry.name.endswith((".weight_scale_2", ".input_scale")),
+                    needs_values=lambda entry: entry.name.endswith((
+                        ".weight_scale_2", ".input_scale", ".weight_global_scale", ".input_global_scale",
+                    )),
                 ))
             if self._sources.keys() != selected:
                 raise ValueError("direct loader tensor coverage differs from the inspected checkpoint")

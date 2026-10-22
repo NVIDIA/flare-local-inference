@@ -79,10 +79,17 @@ impl GrammarCompiler {
                 error,
             )))
         })?;
-        if json["decoder"]["type"] != "ByteLevel" {
+        let has_byte_decoder = json["decoder"]["type"] == "ByteLevel"
+            || (json["decoder"]["type"] == "Sequence"
+                && json["decoder"]["decoders"]
+                    .as_array()
+                    .is_some_and(|decoders| {
+                        decoders.iter().any(|d| d["type"] == "ByteFallback")
+                    }));
+        if !has_byte_decoder {
             return Err(Error::admission(
                 AdmissionError::Grammar,
-                "grammar requires the checkpoint ByteLevel decoder",
+                "grammar requires a ByteLevel or ByteFallback checkpoint decoder",
             ));
         }
         let bytes = token_bytes_from_tokenizer_json(&json).map_err(|error| {

@@ -19,6 +19,7 @@ from .declaration import Checkpoint, Recipe
 def recipes() -> tuple[Recipe, ...]:
     from .deepseek4.recipe import RECIPE as deepseek4
     from .deepseek41.recipe import RECIPE as deepseek41
+    from .gemma4.recipe import RECIPE as gemma4
     from .glm53.recipe import RECIPE as glm53
     from .qwen38.recipe import RECIPE as qwen38
     from .qwen38_dense.recipe import RECIPE as qwen38_dense
@@ -27,7 +28,7 @@ def recipes() -> tuple[Recipe, ...]:
     from .step5.recipe import RECIPE as step5
     from .nemotron_h.recipe import RECIPE as nemotron_h
 
-    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, step5, nemotron_h
+    return qwen38, qwen38_dense, glm53, deepseek41, deepseek4, mimo_v2, kimi3, step5, nemotron_h, gemma4
 
 
 def snapshot_directory(hub_cache: Path, checkpoint: Checkpoint) -> Path:
@@ -70,7 +71,10 @@ def _snapshot_cached(snapshot: Path) -> bool:
 
             inspect_indexed_checkpoint(snapshot)
             return True
-        index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+        index_path = snapshot / "model.safetensors.index.json"
+        if not index_path.exists() and (snapshot / "model.safetensors").is_file():
+            return (snapshot / "model.safetensors").stat().st_size > 0
+        index = json.loads(index_path.read_text())
         return all((snapshot / shard).is_file() for shard in set(index["weight_map"].values()))
     except (OSError, ValueError, KeyError, AttributeError, TypeError):
         return False
@@ -111,7 +115,12 @@ class ResolvedModel:
             if container is not None:
                 _csf_stored_bytes(container, snapshot)
                 return
-            index = json.loads((snapshot / "model.safetensors.index.json").read_text())
+            index_path = snapshot / "model.safetensors.index.json"
+            if not index_path.exists() and (snapshot / "model.safetensors").is_file():
+                if (snapshot / "model.safetensors").stat().st_size <= 0:
+                    raise UsageError(f"{snapshot} has an invalid safetensors file size")
+                return
+            index = json.loads(index_path.read_text())
         except FileNotFoundError:
             return
         except (OSError, ValueError) as error:
@@ -204,8 +213,10 @@ def resolve(model: str, hub_cache: Path | None = None) -> ResolvedModel:
         # The directory's path identifies its measurements on this host.
         revision = hashlib.sha256(str(directory).encode()).hexdigest()[:40]
         index = directory / "model.safetensors.index.json"
+        single = directory / "model.safetensors"
         stored = (_csf_stored_bytes(container, directory) if container is not None else
-                  _stored_bytes(index, str(directory)) if index.exists() else qualified.stored_bytes)
+                  _stored_bytes(index, str(directory)) if index.exists() else
+                  single.stat().st_size if single.is_file() else qualified.stored_bytes)
         return ResolvedModel(recipe, _replacement(qualified, str(directory), revision, stored), directory)
     repository, _, revision = model.partition("@")
     if "/" not in repository:
