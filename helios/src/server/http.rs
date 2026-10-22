@@ -340,7 +340,11 @@ pub(super) async fn generate(
         observation.include_usage,
         decoded.metadata,
     );
-    encoder.set_logprobs(decoded.request.options.logprobs, state.frontend.clone(), decoded.stream);
+    encoder.set_logprobs(
+        decoded.request.options.logprobs.clone(),
+        state.frontend.clone(),
+        decoded.stream,
+    );
     if decoded.request.options.prompt_logprobs.is_some() {
         encoder.set_prompt_logprobs(decoded.request.options.prompt_logprobs, state.frontend.clone(),
             decoded.echo && decoded.request.options.logprobs.is_some(), echo_chars);

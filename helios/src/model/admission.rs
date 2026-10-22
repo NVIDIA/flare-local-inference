@@ -123,6 +123,20 @@ impl Admission {
 #[cfg(feature = "server")]
 pub fn validate_prompt(config: &ModelConfig, prompt: &crate::server::Prompt) -> Result<()> {
     prompt.sampling.validate()?;
+    if !prompt.logprob_token_ids.is_empty() {
+        if config.logprob_token_id_capacity == 0 {
+            return Err("logprob_token_ids are not available in this model package; re-export to enable them".into());
+        }
+        let ids = &prompt.logprob_token_ids;
+        if !prompt.logprobs
+            || ids.len() > config.logprob_token_id_capacity
+            || ids.iter().enumerate().any(|(index, id)| {
+                *id as usize >= config.contract.vocabulary || ids[..index].contains(id)
+            })
+        {
+            return Err("invalid requested logprob token IDs or generation logprob gate".into());
+        }
+    }
     if prompt
         .tokens
         .len()

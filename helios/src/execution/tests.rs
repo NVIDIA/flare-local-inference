@@ -837,7 +837,7 @@ pub(super) fn with_logprobs(k: usize) -> ExecutionManifest {
         strides: vec![4 * MAX_OUTPUT_TOKENS * fields, MAX_OUTPUT_TOKENS * fields, fields, 1],
     });
     value.buffers.push(BufferDescriptor {
-        name: "logprob_requested".into(), address: 0x20000,
+        name: "logprob_requested".into(), address: if k == MAX_LOGPROB_TOKEN_IDS { 0x30000 } else { 0x20000 },
         nbytes: 16, dtype: Dtype::Int32, shape: vec![4], strides: vec![1],
     });
     value.graphs[0].input_bindings.push(InputBinding {
@@ -845,6 +845,28 @@ pub(super) fn with_logprobs(k: usize) -> ExecutionManifest {
         host_offset: value.input_frame_bytes, nbytes: 16,
     });
     value.input_frame_bytes += 16;
+    if k == MAX_LOGPROB_TOKEN_IDS {
+        for (name, address, shape, strides) in [
+            ("logprob_token_ids", 0x40000, vec![4, k], vec![k, 1]),
+            ("logprob_token_id_counts", 0x50000, vec![4], vec![1]),
+        ] {
+            let nbytes = shape.iter().product::<usize>() * 4;
+            value.buffers.push(BufferDescriptor {
+                name: name.into(),
+                address,
+                nbytes,
+                dtype: Dtype::Int32,
+                shape,
+                strides,
+            });
+            value.graphs[0].input_bindings.push(InputBinding {
+                buffer_name: name.into(),
+                host_offset: value.input_frame_bytes,
+                nbytes,
+            });
+            value.input_frame_bytes += nbytes;
+        }
+    }
     value
 }
 
@@ -853,10 +875,10 @@ fn old_execution_manifests_serve_without_logprob_outputs_and_partial_declaration
     let old = manifest();
     old.validate().unwrap();
     assert_eq!(old.max_top_logprobs().unwrap(), 0);
-    for k in [1, MAX_TOP_LOGPROBS] {
+    for k in (1..=MAX_TOP_LOGPROBS).chain([MAX_LOGPROB_TOKEN_IDS]) {
         let current = with_logprobs(k);
         current.validate().unwrap();
-        assert_eq!(current.max_top_logprobs().unwrap(), k);
+        assert_eq!(current.max_top_logprobs().unwrap(), k.min(MAX_TOP_LOGPROBS));
         for name in ["completion_logprobs", "logprob_requested"] {
             let mut partial = current.clone();
             partial.buffers.retain(|b| b.name != name);
@@ -898,26 +920,28 @@ fn logprob_readback_uses_only_emitted_positions_and_validates_chosen_ids() {
         }),
         ..Default::default()
     };
-    let fields = LOGPROB_FIELDS;
-    let mut words = vec![-1i32; 4 * MAX_OUTPUT_TOKENS * fields];
-    for (position, token) in [7, 8].into_iter().enumerate() {
-        let start = (2 * MAX_OUTPUT_TOKENS + position) * fields;
-        let row = &mut words[start..start + fields];
-        row[0] = token;
-        row[1] = (-3f32).to_bits() as i32;
-        row[2] = 5;
-        row[3] = (-2f32).to_bits() as i32;
+    for k in 1..=MAX_TOP_LOGPROBS {
+        let fields = 2 * (1 + k);
+        let mut words = vec![-1i32; 4 * MAX_OUTPUT_TOKENS * fields];
+        for (position, token) in [7, 8].into_iter().enumerate() {
+            let start = (2 * MAX_OUTPUT_TOKENS + position) * fields;
+            let row = &mut words[start..start + fields];
+            row[0] = token;
+            row[1] = (-3f32).to_bits() as i32;
+            row[2] = 5;
+            row[3] = (-2f32).to_bits() as i32;
+        }
+        let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let decoded = transport::decode_logprobs(&bytes, &records, k, fields, 1 << 2, &[]).unwrap();
+        assert!(decoded[0].iter().all(Option::is_none));
+        assert_eq!(decoded[2][0].as_ref().unwrap().token, 7);
+        assert_eq!(decoded[2][1].as_ref().unwrap().logprob, -3.);
+        assert_eq!(decoded[2][0].as_ref().unwrap().top.len(), 1);
+        assert!(decoded[2][2..].iter().all(Option::is_none));
+        records[2].vector.as_mut().unwrap().tokens[0] = 4;
+        assert!(transport::decode_logprobs(&bytes, &records, k, fields, 1 << 2, &[]).is_err());
+        records[2].vector.as_mut().unwrap().tokens[0] = 7;
     }
-    let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_ne_bytes()).collect();
-    let decoded = transport::decode_logprobs(&bytes, &records, MAX_TOP_LOGPROBS, 1 << 2).unwrap();
-    assert!(decoded[0].iter().all(Option::is_none));
-    assert_eq!(decoded[2][0].unwrap().token, 7);
-    assert_eq!(decoded[2][1].unwrap().logprob, -3.);
-    assert_eq!(decoded[2][0].unwrap().top_count, 1);
-    assert!(decoded[2][2..].iter().all(Option::is_none));
-    records[2].vector.as_mut().unwrap().tokens[0] = 4;
-    let decoded = transport::decode_logprobs(&bytes, &records, MAX_TOP_LOGPROBS, 1 << 2).unwrap();
-    assert!(decoded[2][0].is_none());
 }
 
 #[test]
@@ -974,6 +998,17 @@ fn prompt_catalog_storage_and_bindings_are_validated_together() {
     value.input_frame_bytes += 512 * 4;
     value.validate().unwrap();
     assert_eq!(value.prompt_logprob_capacity().unwrap(), 512);
+    let mut narrow = value.clone();
+    let output = narrow
+        .buffers
+        .iter_mut()
+        .find(|b| b.name == "completion_logprobs")
+        .unwrap();
+    output.shape[3] = 4;
+    output.strides = vec![4 * MAX_OUTPUT_TOKENS * 4, MAX_OUTPUT_TOKENS * 4, 4, 1];
+    output.nbytes = 2 * 4 * MAX_OUTPUT_TOKENS * 4 * 4;
+    assert_eq!(narrow.max_top_logprobs().unwrap(), 1);
+    assert!(narrow.validate().is_err());
     for name in ["prompt_logprobs", "prompt_target_tokens"] {
         let mut partial = value.clone();
         partial.buffers.retain(|b| b.name != name);
@@ -1037,4 +1072,68 @@ fn packed_combined_peer_agreement_ignores_only_undefined_inactive_vector_payload
     parallel::agree_packed(&root, &peer).unwrap();
     peer.records[3].generation += 1;
     assert!(parallel::agree_packed(&root, &peer).is_err(), "base epoch checks remain unchanged");
+}
+
+#[test]
+fn explicit_logprob_decoding_preserves_order_appends_sample_and_honors_pitch() {
+    for count in [1, 20, 21, 127, 128] {
+        for fields in [2 + 2 * count.max(MAX_TOP_LOGPROBS), LOGPROB_FIELDS] {
+            let mut records = [CompletionRecord::default(); 2];
+            records[1].status = 1;
+            records[1].token_id = 999;
+            let ids: Vec<u32> = (0..count as u32).rev().collect();
+            let selections = [vec![], ids.clone()];
+            let mut words = vec![-777i32; 2 * MAX_OUTPUT_TOKENS * fields];
+            let start = MAX_OUTPUT_TOKENS * fields;
+            words[start] = 999;
+            words[start + 1] = (-4f32).to_bits() as i32;
+            for (i, id) in ids.iter().enumerate() {
+                words[start + 2 + 2 * i] = *id as i32;
+                words[start + 3 + 2 * i] = (-2f32).to_bits() as i32;
+            }
+            let decode = |words: &[i32], records: &[CompletionRecord]| {
+                let bytes: Vec<_> = words.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                transport::decode_logprobs(
+                    &bytes,
+                    records,
+                    MAX_TOP_LOGPROBS,
+                    fields,
+                    2,
+                    &selections,
+                )
+            };
+            let result = decode(&words, &records).unwrap();
+            let value = result[1][0].as_ref().unwrap();
+            assert_eq!(value.top.len(), count + 1);
+            assert_eq!(
+                value.top[..count].iter().map(|p| p.0).collect::<Vec<_>>(),
+                ids
+            );
+            assert_eq!(value.top[count], (999, -4.));
+            assert!(result[1][1..].iter().all(Option::is_none));
+            words[start] = ids[0] as i32;
+            records[1].token_id = i64::from(ids[0]);
+            assert_eq!(
+                decode(&words, &records).unwrap()[1][0]
+                    .as_ref()
+                    .unwrap()
+                    .top
+                    .len(),
+                count
+            );
+            words[start + 2] = 999;
+            assert!(decode(&words, &records).is_err());
+        }
+    }
+    let current = with_logprobs(MAX_LOGPROB_TOKEN_IDS);
+    for name in ["logprob_token_ids", "logprob_token_id_counts"] {
+        let mut partial = current.clone();
+        partial.buffers.retain(|buffer| buffer.name != name);
+        assert!(partial.validate().is_err());
+        let mut missing = current.clone();
+        missing.graphs[0]
+            .input_bindings
+            .retain(|binding| binding.buffer_name != name);
+        assert!(missing.validate().is_err());
+    }
 }

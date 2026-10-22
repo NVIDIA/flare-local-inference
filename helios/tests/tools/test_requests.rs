@@ -51,6 +51,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let config = ModelConfig {
         max_top_logprobs: 0,
+        logprob_token_id_capacity: 0,
         prepared_sequence_tokens: 262144,
         contract: flare_helios::frontend::test_support::contract("qwen38"),
         model_id: text["model_id"].as_str().unwrap().into(),

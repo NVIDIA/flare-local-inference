@@ -319,7 +319,7 @@ impl PreparedGraphExecutor {
                     graph_index: completion.graph_index,
                     logprobs: completion.logprobs.map(|slots| slots.into_iter().map(|positions|
                         positions.into_iter().map(|entry| entry.map(|entry|
-                            (entry.token, entry.logprob, entry.top[..entry.top_count].to_vec()))).collect()).collect()),
+                            (entry.token, entry.logprob, entry.top))).collect()).collect()),
                     proposal_confidence: completion.proposal_confidence
                         .map(|rows| rows[..completion.records.len()].to_vec()),
                     speculative_survival: completion.speculative_survival

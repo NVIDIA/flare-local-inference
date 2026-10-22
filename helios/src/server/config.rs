@@ -126,6 +126,7 @@ impl Bootstrap {
             .map_err(|_| "prepared context extent overflow")?;
         let mut model = ModelConfig {
             max_top_logprobs: manifest.max_top_logprobs()?,
+            logprob_token_id_capacity: manifest.logprob_token_id_capacity(),
             prepared_sequence_tokens,
             contract,
             model_id: text("model_id")?.into(),

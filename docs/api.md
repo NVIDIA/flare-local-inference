@@ -59,13 +59,13 @@ Logprobs describe the raw next-token distribution over the complete vocabulary:
 `logit(token) - logsumexp(logits)`, with FP32 accumulation, before temperature,
 penalties, grammar masks, and top-k, top-p, or min-p filtering. Speculative output
 uses the target model's distribution at each committed position. The chosen token
-is always included, even when outside the alternatives. Alternatives are ordered
-by decreasing logprob, with increasing token ID for ties.
+is always included, even when outside the alternatives. Natural alternatives are
+ordered by decreasing logprob, with increasing token ID for ties.
 
-Every newly exported package provides up to 20 alternatives. Older packages serve
-unchanged, advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0`, and
-reject logprob requests with HTTP 400: `logprobs are not available in this model
-package`. Re-export to enable the feature.
+Every newly exported package provides up to 20 natural alternatives and supports
+explicit token IDs. Older packages retain their natural request limit (1..20),
+or advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0` when they have
+no generation logprob outputs. Unsupported requests return HTTP 400.
 
 For Chat Completions, set `logprobs: true` and optionally `top_logprobs: 0..20`.
 A positive `top_logprobs` requires `logprobs: true`; zero alone is accepted and
@@ -109,6 +109,22 @@ explicitly rejects logprob fields. Temperature zero remains rejected. Single-tok
 continuations work with `max_tokens: 1`, `continue_final_message: true`,
 `add_generation_prompt: false`, `logprobs: true`, and `top_logprobs: 20`, omitting
 temperature to use the model's prepared default.
+
+On Chat, Completions, and Responses, `logprob_token_ids: [id, ...]` replaces
+natural generation alternatives with those IDs in caller order. Existing generation
+logprob enablement is required. Supply at most 128 elements before deduplication;
+IDs must be nonnegative integers within the model vocabulary. Duplicates are
+removed in first-occurrence order. Null and empty arrays behave as omission.
+The sampled token is appended only when absent, so explicit results contain at
+most 129 entries. Values retain full-vocabulary normalization. Numeric top-k
+options still accept only 0..20 and do not truncate explicit results.
+
+Prompt scores and echoed prompt entries remain natural. Completions accepts
+validated IDs with `echo: true, max_tokens: 0`, which returns no generation
+positions. Completions maps retain their existing decoded-string collision
+behavior; use `return_tokens_as_token_ids: true` to distinguish IDs. Messages
+rejects `logprob_token_ids`. Older packages reject nonempty selections before
+admission with an explanation to re-export.
 
 ### Prompt log probabilities
 

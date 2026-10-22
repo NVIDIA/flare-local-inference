@@ -35,6 +35,7 @@ pub struct Prompt {
     /// Generate through end-of-sequence tokens until the output limit, as vLLM's `ignore_eos`.
     pub ignore_eos: bool,
     pub logprobs: bool,
+    pub logprob_token_ids: Vec<u32>,
     pub prompt_logprobs: bool,
 }
 
@@ -1293,7 +1294,7 @@ impl<'a> Worker<'a> {
     fn complete(
         &mut self,
         kind: GraphKind,
-        completion: crate::execution::FrameCompletion,
+        mut completion: crate::execution::FrameCompletion,
     ) -> Result<()> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
@@ -1440,7 +1441,7 @@ impl<'a> Worker<'a> {
                     let value = payload.get(position - lane.start_position as usize - 1)
                         .and_then(Option::as_ref).ok_or("scored prefill omitted a prompt token")?;
                     if value.value.token != prompt.tokens[position] || value.rank as usize > self.config.contract.vocabulary
-                        || value.value.top[..value.value.top_count].iter().any(|(t, _)| *t as usize >= self.config.contract.vocabulary) {
+                        || value.value.top.iter().any(|(t, _)| *t as usize >= self.config.contract.vocabulary) {
                         return Err(crate::Error::from("scored prefill returned an invalid token or rank"));
                     }
                     Ok(Some(value.clone()))
@@ -1491,8 +1492,9 @@ impl<'a> Worker<'a> {
                 let terminating_eos = !request.incoming.prompt.ignore_eos
                     && self.config.eos_token_ids.contains(&token.token);
                 let logprob = if request.incoming.prompt.logprobs && !terminating_eos {
-                    match completion.logprobs.as_ref().and_then(|v| v[slot][position]) {
-                        Some(value) if value.token == token.token => Some(value),
+                    match completion.logprobs.as_mut().and_then(|v| v[slot][position].take()) {
+                        Some(value) if value.token == token.token
+                            && value.top.iter().all(|(id, _)| (*id as usize) < self.config.contract.vocabulary) => Some(value),
                         _ => {
                             request.incoming.fail(Error::execution(
                                 ExecutionError::Completion,
@@ -1891,15 +1893,53 @@ impl<'a> Worker<'a> {
             ));
         }
         let mut flags = [0u8; crate::execution::REQUEST_LANES * size_of::<i32>()];
+        let mut counts = [0u8; crate::execution::REQUEST_LANES * size_of::<i32>()];
+        let mut selections = Vec::new();
         for lane in &step.lanes {
             let slot = lane.request.slot as usize;
-            if self.active[slot].as_ref().is_some_and(|a| a.incoming.prompt.logprobs) {
-                flags[slot * size_of::<i32>()..(slot + 1) * size_of::<i32>()].copy_from_slice(&1i32.to_ne_bytes());
+            if let Some(active) = &self.active[slot] {
+                let start = slot * size_of::<i32>();
+                let end = start + size_of::<i32>();
+                if active.incoming.prompt.logprobs {
+                    flags[start..end].copy_from_slice(&1i32.to_ne_bytes());
+                }
+                let ids = &active.incoming.prompt.logprob_token_ids;
+                counts[start..end].copy_from_slice(&(ids.len() as i32).to_ne_bytes());
+                if !ids.is_empty() {
+                    selections.push((
+                        slot,
+                        ids.iter()
+                            .flat_map(|id| id.to_ne_bytes())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
             }
         }
-        let mut uploads = crate::model::Inputs::uploads(self.inputs.as_ref().expect("worker inputs initialized before submission"));
+        let mut uploads = crate::model::Inputs::uploads(
+            self.inputs
+                .as_ref()
+                .expect("worker inputs initialized before submission"),
+        );
         if self.config.max_top_logprobs != 0 {
-            uploads.push(crate::execution::Upload { buffer: "logprob_requested", offset: 0, bytes: &flags[..self.config.limits.request_capacity() * size_of::<i32>()] });
+            uploads.push(crate::execution::Upload {
+                buffer: "logprob_requested",
+                offset: 0,
+                bytes: &flags[..self.config.limits.request_capacity() * size_of::<i32>()],
+            });
+        }
+        if self.config.logprob_token_id_capacity != 0 {
+            uploads.push(crate::execution::Upload {
+                buffer: "logprob_token_id_counts",
+                offset: 0,
+                bytes: &counts[..self.config.limits.request_capacity() * size_of::<i32>()],
+            });
+            for (slot, bytes) in &selections {
+                uploads.push(crate::execution::Upload {
+                    buffer: "logprob_token_ids",
+                    offset: slot * crate::execution::MAX_LOGPROB_TOKEN_IDS * size_of::<i32>(),
+                    bytes,
+                });
+            }
         }
         if executor.submit(
             graph,
@@ -2433,6 +2473,7 @@ mod tests {
                 stop_sequences: vec![],
                 stop_strings: vec![],
                 logprobs: false,
+                logprob_token_ids: vec![],
                 prompt_logprobs: false,
                 ignore_eos: false,
                 grammar: None,
