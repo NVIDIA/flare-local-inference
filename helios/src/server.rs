@@ -432,6 +432,7 @@ async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderM
         return ([(header::VARY, "accept")], Json(value)).into_response();
     }
     let mut text = state.model.metrics().render();
+    state.model.metrics().render_requests(&mut text);
     for (name, kind, help, value) in input_metrics {
         metrics::metric(&mut text, name, kind, help, value);
     }

@@ -51,7 +51,7 @@ fn prompt_prefill_gpu_and_native_costs() {
                     };
                     runtime.metrics().scheduler_trace.drain(&mut samples);
                     let started = Instant::now();
-                    let mut generation = runtime.generate(prompt).unwrap();
+                    let mut generation = runtime.generate(prompt, None).unwrap();
                     let mut positions = 0;
                     loop {
                         match generation.events.recv().await.unwrap() {

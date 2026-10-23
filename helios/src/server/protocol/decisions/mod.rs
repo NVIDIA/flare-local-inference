@@ -779,7 +779,7 @@ async fn score(
     let mut usage = [0; 3];
     for prompt in prompts {
         let ids = prompt.logprob_token_ids.clone();
-        let mut generation = state.model.generate(prompt)?;
+        let mut generation = state.model.generate(prompt, None)?;
         let mut scores = None;
         loop {
             match generation
