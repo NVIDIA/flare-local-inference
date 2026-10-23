@@ -839,7 +839,8 @@ mod native_prompt_tests {
     use super::*;
     use crate::{
         frontend::{
-            Asset, Frontend, FrontendAssets, FrontendSettings, PromptEncoder, TokenizerSettings,
+            Asset, Frontend, FrontendAssets, FrontendSettings, PromptEncoder, TemplateEncoding,
+            TokenizerSettings,
         },
         grammar::GrammarCompiler,
     };
@@ -847,6 +848,14 @@ mod native_prompt_tests {
     use tokenizers::{AddedToken, Tokenizer};
 
     fn native(encoder: PromptEncoder) -> (Frontend, GrammarCompiler, crate::model::ModelConfig) {
+        renderer(encoder, None, TemplateEncoding::Text)
+    }
+
+    fn renderer(
+        encoder: PromptEncoder,
+        template: Option<&str>,
+        encoding: TemplateEncoding,
+    ) -> (Frontend, GrammarCompiler, crate::model::ModelConfig) {
         let mut alphabet: Vec<_> = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
             .into_iter()
             .collect();
@@ -880,6 +889,20 @@ mod native_prompt_tests {
                     "<think>",
                     "</think>",
                     "<｜deepseek_image｜>",
+                    "<|im_start|>",
+                    "<|im_end|>",
+                    "<|vision_start|>",
+                    "<|image_pad|>",
+                    "<|video_pad|>",
+                    "<|vision_end|>",
+                    "<|open|>",
+                    "<|close|>",
+                    "<|sep|>",
+                    "<|end_of_msg|>",
+                    "<|media_pad|>",
+                    "<|media_begin|>",
+                    "<|media_content|>",
+                    "<|media_end|>",
                 ]
                 .map(|s| AddedToken::from(s, true)),
             )
@@ -893,12 +916,12 @@ mod native_prompt_tests {
         ));
         std::fs::write(&path, &bytes).unwrap();
         let template = (encoder == PromptEncoder::Jinja).then(|| {
-            let text = concat!(
+            let text = template.unwrap_or(concat!(
                 "{% for m in messages %}<{{ m.role }}>",
                 "{% if m.content is string %}{{ m.content }}{% else %}",
                 "{% for block in m.content %}{{ block.text }}{% if not loop.last %}{{ '\\n\\n' }}{% endif %}{% endfor %}{% endif %}",
                 "</{{ m.role }}>{% mark %}{% endfor %}<assistant>"
-            );
+            ));
             let path = path.with_extension("jinja");
             std::fs::write(&path, text).unwrap();
             Asset {
@@ -926,7 +949,8 @@ mod native_prompt_tests {
             Default::default(),
             &settings,
         )
-        .unwrap();
+        .unwrap()
+        .with_template_encoding(encoding);
         std::fs::remove_file(path).unwrap();
         if let Some(path) = template_path {
             std::fs::remove_file(path).unwrap();
@@ -942,6 +966,126 @@ mod native_prompt_tests {
         )
         .unwrap();
         (frontend, compiler, config)
+    }
+
+    #[test]
+    fn messages_image_hints_end_after_expansion_for_text_and_segmented_templates() {
+        use crate::frontend::images::{
+            ImageLimits, ImageProcessor, ImageSettings, QwenImageSettings,
+        };
+        use crate::model::contract::{ImageLayoutKind, ImageTokenLayout};
+        use base64::Engine;
+        let mut png = Vec::new();
+        {
+            let mut encoder = png::Encoder::new(&mut png, 64, 64);
+            encoder.set_color(png::ColorType::Rgb);
+            encoder.set_depth(png::BitDepth::Eight);
+            encoder
+                .write_header()
+                .unwrap()
+                .write_image_data(&vec![127; 64 * 64 * 3])
+                .unwrap();
+        }
+        let image = json!({"type":"image","source":{"type":"base64",
+            "media_type":"image/png", "data":base64::engine::general_purpose::STANDARD.encode(png)}});
+        for (template, encoding, layout, placeholder) in [
+            (
+                include_str!("../../../../ignition/recipes/qwen38/assets/chat_template.jinja"),
+                TemplateEncoding::Text,
+                ImageLayoutKind::Qwen,
+                "<|image_pad|>",
+            ),
+            (
+                include_str!("../../../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+                TemplateEncoding::TokenSegments,
+                ImageLayoutKind::Moonvit,
+                "<|media_pad|>",
+            ),
+        ] {
+            let (frontend, compiler, mut config) =
+                renderer(PromptEncoder::Jinja, Some(template), encoding);
+            let token = |text: &str| frontend.encode(text, false).unwrap()[0];
+            let settings = if layout == ImageLayoutKind::Qwen {
+                ImageSettings::Qwen(QwenImageSettings {
+                    min_pixels: 4096,
+                    max_pixels: 65536,
+                    position_side: 48,
+                    image_token_id: token(placeholder),
+                    video_token_id: token("<|video_pad|>"),
+                })
+            } else {
+                ImageSettings::Moonvit {}
+            };
+            let processor = ImageProcessor::load(settings, ImageLimits::default()).unwrap();
+            let geometry = processor.geometry(64, 64).unwrap();
+            config.contract.vision = crate::model::VisionCapabilities {
+                feature_slots: 2,
+                features_per_request: geometry.tokens * 2,
+                max_images: 2,
+                patches_per_feature: 4,
+                patch_capacities: vec![geometry.patches],
+            };
+            config.contract.frontend.image_layout = Some(layout);
+            config.contract.frontend.position_dimensions = if layout == ImageLayoutKind::Qwen {
+                3
+            } else {
+                0
+            };
+            config.contract.frontend.image_tokens = Some(ImageTokenLayout {
+                feature_token: token(placeholder),
+                span: None,
+            });
+            config.contract.frontend.rejected_tokens.clear();
+            let mut marked_image = image.clone();
+            marked_image["cache_control"] = json!({"type":"ephemeral"});
+            let body = json!({"max_tokens":4,"messages":[{"role":"user","content":[
+                image, {"type":"text","text":"Between images","cache_control":{}}, marked_image,
+                {"type":"text","text":"Changing suffix"}]}]});
+            let decoded = decode(Protocol::Messages, body.clone(), false).unwrap();
+            let prepare = |request| {
+                crate::server::request::prepare_inference(
+                    &frontend,
+                    Some(&processor),
+                    &compiler,
+                    &config,
+                    request,
+                    0,
+                    false,
+                )
+                .unwrap()
+            };
+            let marked = prepare(&decoded.request);
+            let mut plain_request = decoded.request.clone();
+            plain_request.checkpoint_hints.clear();
+            let plain = prepare(&plain_request);
+            assert_eq!(marked.rendered_prompt, plain.rendered_prompt);
+            assert_eq!(marked.prompt.tokens, plain.prompt.tokens);
+            assert_eq!(marked.prompt.conditioning, plain.prompt.conditioning);
+            assert_eq!(marked.prompt.conditioned_inputs.len(), 2);
+            let cut = marked.prompt.conditioned_inputs[1].token_span.end;
+            assert!(marked.prompt.conditioned_inputs[1].token_span.len() > 1);
+            assert!(!plain.prompt.message_boundaries.contains(&cut));
+            assert!(
+                marked.prompt.message_boundaries.contains(&cut),
+                "{layout:?}"
+            );
+            assert_eq!(
+                marked.prompt.message_boundaries.len(),
+                plain.prompt.message_boundaries.len() + 2
+            );
+            let mut next = body;
+            next["messages"][0]["content"][3]["text"] = json!("Different suffix");
+            let next = prepare(&decode(Protocol::Messages, next, false).unwrap().request);
+            assert!(next.prompt.tokens.starts_with(&marked.prompt.tokens[..cut]));
+            assert!(next.prompt.message_boundaries.contains(&cut));
+            assert!(marked.prompt.message_boundaries.iter().all(|end| {
+                marked
+                    .prompt
+                    .conditioned_inputs
+                    .iter()
+                    .all(|image| *end <= image.token_span.start || *end >= image.token_span.end)
+            }));
+        }
     }
 
     #[test]

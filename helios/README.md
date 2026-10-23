@@ -429,6 +429,13 @@ token starts at or after it. Overlapping Unicode spans and BPE tokens crossing a
 create partial-token cuts. Token endpoints are sorted, unique, and strictly
 inside the prompt. Image expansion adjusts them with one ordered pass.
 
+Advisory content-block hints travel separately from prompt text. Text hints keep
+their positions through captured strings and JSON serialization; segmented
+templates map JSON string positions back to decoded segment bytes before token
+mapping. Image hints retain indices into the rendered image-source list and
+resolve to the ends of prepared image spans after expansion. Hints do not change
+prompt bytes, token IDs, image conditioning, or ordinary/special-token selection.
+
 `Frontend::encode`, `decode`, and `incremental_decoder` use Hugging Face's Rust
 tokenizers library pinned to the fixture environment's version. Incremental
 decoding preserves incomplete UTF-8 between chunks and flushes remaining bytes

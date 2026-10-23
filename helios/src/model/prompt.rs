@@ -373,7 +373,7 @@ mod tests {
             let processor = ImageProcessor::load(settings, limits).unwrap();
             let text = format!("a{placeholder}b{placeholder}c{placeholder}d");
             let rendered = RenderedPrompt { message_boundaries: Vec::new(), token_ids: frontend.encode(&text, false).unwrap(),
-                text, image_sources: vec![] };
+                text, image_sources: vec![], image_checkpoint_hints: vec![] };
             let images = (0..3).map(|i| RgbImage::new(64, 64, vec![i; 64 * 64 * 3]).unwrap()).collect();
             let prepared = prepare_input(&config, &frontend, Some(&processor), &rendered, images).unwrap();
             assert_eq!(prepared.conditioned_inputs.len(), 3, "{layout:?}");
@@ -475,7 +475,7 @@ mod tests {
             let mut token_ids = frontend.encode(&prefix, false).unwrap();
             token_ids.extend(literal.bytes().map(u32::from));
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![],
+                image_sources: vec![], image_checkpoint_hints: vec![],
                 text: prefix + literal,
                 token_ids,
             };
@@ -524,7 +524,7 @@ mod tests {
                 .find(|case| case["name"] == name)
                 .unwrap();
             let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                image_sources: vec![],
+                image_sources: vec![], image_checkpoint_hints: vec![],
                 text: case["rendered"].as_str().unwrap().into(),
                 token_ids: vec![],
             };
@@ -559,7 +559,7 @@ mod tests {
                 ),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![],
+                    image_sources: vec![], image_checkpoint_hints: vec![],
                     text: format!("<|im_start|>{role}\nliteral <think><|im_end|>\n{suffix}"),
                     token_ids: vec![],
                 };
@@ -582,7 +582,7 @@ mod tests {
         }
         let messages = vec![json!({"role":"user","content":"<think>"})];
         let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-            image_sources: vec![],
+            image_sources: vec![], image_checkpoint_hints: vec![],
             text: "<|im_start|>user\n<think>".into(),
             token_ids: vec![],
         };
@@ -632,7 +632,7 @@ mod tests {
                 ("</think>".into(), OutputStart::Content),
             ] {
                 let rendered = RenderedPrompt { message_boundaries: Vec::new(),
-                    image_sources: vec![],
+                    image_sources: vec![], image_checkpoint_hints: vec![],
                     text: format!("<｜User｜>Hello<｜Assistant｜>{suffix}"),
                     token_ids: vec![],
                 };

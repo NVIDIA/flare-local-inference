@@ -306,6 +306,32 @@ impl<'a> Value<'a> {
         })
     }
 
+    pub fn json_hints<'j>(&self, json: &'j Json, hints: &mut Vec<(&'j str, Vec<usize>)>) {
+        match (self, json) {
+            (Self::String(value), Json::String(text)) if !value.1.is_empty() => {
+                hints.push((text, value.1.clone()));
+            }
+            (Self::List(values), Json::Array(items)) => {
+                for (value, item) in values.iter().zip(items) {
+                    value.json_hints(item, hints);
+                }
+            }
+            (Self::Map(values), Json::Object(items)) => {
+                for (key, item) in items {
+                    if let Some((_, value)) = values.iter().rev().find(|(name, _)| name == key) {
+                        value.json_hints(item, hints);
+                    }
+                }
+            }
+            (Self::Namespace(values), Json::Object(items)) => {
+                for (key, value) in values.borrow().iter() {
+                    value.json_hints(&items[key], hints);
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub fn equals(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Int(a), Self::Int(b)) => return a == b,

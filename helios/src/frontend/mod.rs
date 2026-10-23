@@ -182,8 +182,48 @@ struct TokenSegment {
     allow_special: bool,
 }
 
+fn token_segments(text: &str, hints: &mut Vec<usize>) -> serde_json::Result<Vec<TokenSegment>> {
+    if hints.is_empty() {
+        return serde_json::from_str(text);
+    }
+    #[derive(serde::Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct RawSegment<'a> {
+        #[serde(borrow)]
+        text: &'a serde_json::value::RawValue,
+        allow_special: bool,
+    }
+    let raw_segments: Vec<RawSegment<'_>> = serde_json::from_str(text)?;
+    let mut segments = Vec::with_capacity(raw_segments.len());
+    let mut positions = Vec::new();
+    let mut byte_start = 0;
+    for segment in raw_segments {
+        let raw = segment.text.get();
+        let start = raw.as_ptr() as usize - text.as_ptr() as usize;
+        let decoded: String = serde_json::from_str(raw)?;
+        for &hint in hints.iter() {
+            if hint > start && hint < start + raw.len() {
+                // The hint ends inside this JSON string, before its closing quote.
+                let mut prefix = raw[..hint - start].to_owned();
+                prefix.push('"');
+                let prefix: String = serde_json::from_str(&prefix)?;
+                positions.push(byte_start + prefix.len());
+            }
+        }
+        byte_start += decoded.len();
+        segments.push(TokenSegment {
+            text: decoded,
+            allow_special: segment.allow_special,
+        });
+    }
+    *hints = positions;
+    Ok(segments)
+}
+
 pub struct RenderedPrompt {
     pub image_sources: Vec<String>,
+    /// Indices in image_sources whose expanded spans end at requested checkpoints.
+    pub image_checkpoint_hints: Vec<usize>,
     pub text: String,
     pub token_ids: Vec<u32>,
     pub message_boundaries: Vec<usize>,
@@ -545,6 +585,7 @@ impl Frontend {
         }
         let mut messages = messages.to_vec();
         let mut image_sources = Vec::new();
+        let mut image_checkpoint_hints = Vec::new();
         let mut checkpoint_hints = Vec::new();
         for (index, message) in messages.iter_mut().enumerate() {
             if !message.is_object() {
@@ -552,7 +593,6 @@ impl Frontend {
             }
             if let Some(Json::Array(hints)) =
                 message.as_object_mut().unwrap().remove("_checkpoint_hints")
-                && self.ordinary_tokenizer.is_none()
             {
                 checkpoint_hints.extend(
                     hints
@@ -561,7 +601,7 @@ impl Frontend {
                 );
             }
             if let Some(parts) = message.get_mut("content").and_then(Json::as_array_mut) {
-                for part in parts {
+                for (part_index, part) in parts.iter_mut().enumerate() {
                     let kind = part
                         .get("type")
                         .and_then(Json::as_str)
@@ -573,6 +613,9 @@ impl Frontend {
                         let url = part["image_url"]["url"]
                             .as_str()
                             .ok_or_else(|| deepseek::invalid("image_url.url must be a string"))?;
+                        if checkpoint_hints.contains(&(index, part_index + 1)) {
+                            image_checkpoint_hints.push(image_sources.len());
+                        }
                         image_sources.push(url.to_owned());
                         *part = serde_json::json!({"type":"image"});
                     }
@@ -596,8 +639,15 @@ impl Frontend {
             })?;
         let marks = rendered.marks;
         let rendered = rendered.text;
+        let mut hint_bytes = marks
+            .iter()
+            .filter_map(|mark| match mark {
+                jinja::Mark::Hint(byte) => Some(*byte),
+                _ => None,
+            })
+            .collect();
         let mut segments: Vec<TokenSegment> = if self.ordinary_tokenizer.is_some() {
-            serde_json::from_str(&rendered).map_err(|error| {
+            token_segments(&rendered, &mut hint_bytes).map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
                     "chat template must render an array of text and allow_special segments",
                     error,
@@ -615,10 +665,9 @@ impl Frontend {
             segment_ends.push(segment_ends.last().unwrap() + segment.text.len());
         }
         let mut byte_boundaries = Vec::new();
-        let mut hint_bytes = Vec::new();
         for mark in marks {
             match mark {
-                jinja::Mark::Hint(byte) => hint_bytes.push(byte),
+                jinja::Mark::Hint(_) => {}
                 jinja::Mark::Byte(byte)
                     if self.ordinary_tokenizer.is_none()
                         && byte <= *segment_ends.last().unwrap() =>
@@ -684,6 +733,7 @@ impl Frontend {
             text,
             token_ids,
             image_sources,
+            image_checkpoint_hints,
         })
     }
 
@@ -1038,5 +1088,59 @@ mod tests {
         ));
         fs::remove_file(path).unwrap();
         fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn segment_hints_survive_json_escapes_key_order_and_nested_serialization() {
+        use jinja::{CompiledTemplate, Mark};
+        use serde_json::json;
+        let context = json!({"messages":[{"content":[{"text":"é\n\"\\😀"}]}]});
+        for ascii in ["true", "false"] {
+            for sort in ["true", "false"] {
+                let source = format!(
+                    concat!(
+                        "{{% set history = messages[0].content[0].text %}}",
+                        "{{% set segments = [{{'text': 'prefix' + history + 'tail', 'allow_special': false}},",
+                        "{{'text': history | tojson(ensure_ascii={0}), 'allow_special': true}}] %}}",
+                        "{{{{ segments | tojson(ensure_ascii={0}, sort_keys={1}, indent=2) }}}}",
+                    ),
+                    ascii, sort
+                );
+                let template = CompiledTemplate::compile(&source).unwrap();
+                let plain = template.render(context.as_object().unwrap(), &[]).unwrap();
+                let marked = template
+                    .render(context.as_object().unwrap(), &[(0, 1)])
+                    .unwrap();
+                assert_eq!(plain.text, marked.text);
+                let mut hints = marked
+                    .marks
+                    .into_iter()
+                    .map(|mark| match mark {
+                        Mark::Hint(byte) => byte,
+                        _ => panic!("unexpected mark"),
+                    })
+                    .collect();
+                let segments = token_segments(&marked.text, &mut hints).unwrap();
+                assert_eq!(segments[0].text, "prefixé\n\"\\😀tail");
+                assert!(!segments[0].allow_special);
+                assert!(segments[1].allow_special);
+                assert_eq!(
+                    hints,
+                    [
+                        "prefixé\n\"\\😀".len(),
+                        segments[0].text.len() + segments[1].text.len() - 1
+                    ]
+                );
+            }
+        }
+        let template = CompiledTemplate::compile(
+            "{{ {'text': messages[0].content[0].text, 'text': 'x'} | tojson }}",
+        )
+        .unwrap();
+        let rendered = template
+            .render(context.as_object().unwrap(), &[(0, 1)])
+            .unwrap();
+        assert_eq!(rendered.text, "{\"text\": \"x\"}");
+        assert!(rendered.marks.is_empty());
     }
 }

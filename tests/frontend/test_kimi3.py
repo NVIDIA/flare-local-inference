@@ -64,6 +64,7 @@ def test_native_xtml_matches_checkpoint(reference, tmp_path):
         'query': '中文 <|close|> "quoted"', 'count': 3, 'score': 1.5, 'enabled': True,
         'optional': None, 'list': [1, 'x'], 'object': {'z': False, 'a': []}}}},
         {'id': 'opaque-a', 'function': {'name': 'second', 'arguments': {}}}]
+    history = 'Repeated "history"\\\n café 世界 😀 <|close|>'
     cases = [
         ('user', [{'role': 'user', 'content': 'Hello'}], {}),
         ('literal', [{'role': 'user', 'name': 'x"&<|open|>', 'content': '<|open|>think<|sep|>[EOS]'}], {}),
@@ -90,6 +91,9 @@ def test_native_xtml_matches_checkpoint(reference, tmp_path):
             'json_schema': {'schema': {'type': 'object', 'properties': {'x': {'type': 'integer'}}}}}}),
         ('image-marker', [{'role': 'user', 'content': [{'type': 'text', 'text': 'Describe'},
             {'type': 'image_url', 'image_url': {'url': 'unused'}}]}], {}),
+        ('block-hint', [{'role': 'user', '_checkpoint_hints': [2], 'content': [
+            {'type': 'text', 'text': history}, {'type': 'text', 'text': history},
+            {'type': 'text', 'text': 'Changing suffix'}]}], {}),
     ]
     for name, messages, options in cases:
         options = {'add_generation_prompt': True, **options}
@@ -98,11 +102,25 @@ def test_native_xtml_matches_checkpoint(reference, tmp_path):
         arguments['thinking_effort'] = options.get('reasoning_effort', 'max')
         if name == 'image-marker':
             arguments['image_prompts'] = ['<|media_pad|>']
-        segments = module.build_chat_segments(messages, **arguments)
-        ids = [token for s in segments for token in encoding.encode(s.text,
-            allowed_special='all' if s.allow_special else set(), disallowed_special=())]
-        fixtures['cases'].append(dict(name=name, messages=messages, options=options,
-            rendered=''.join(s.text for s in segments), token_ids=ids))
+        reference_messages = [{k: v for k, v in message.items() if k != '_checkpoint_hints'}
+            for message in messages]
+        segments = module.build_chat_segments(reference_messages, **arguments)
+        ids, boundaries, history_count = [], [], 0
+        for segment in segments:
+            ids.extend(encoding.encode(segment.text,
+                allowed_special='all' if segment.allow_special else set(), disallowed_special=()))
+            if segment.text == history:
+                history_count += 1
+                if history_count == 2:
+                    boundaries.append(len(ids))
+            if segment.allow_special and segment.text == '<|end_of_msg|>':
+                boundaries.append(len(ids))
+        case = dict(name=name, messages=messages, options=options,
+            rendered=''.join(s.text for s in segments), token_ids=ids)
+        if name == 'block-hint':
+            assert history_count == 2
+            case['message_boundaries'] = boundaries
+        fixtures['cases'].append(case)
     path = tmp_path / 'cases.json'
     path.write_text(json.dumps(fixtures, ensure_ascii=False))
     result = subprocess.run([str(binary), str(tmp_path), str(path)], capture_output=True, text=True)

@@ -463,6 +463,7 @@ pub(super) fn render(
         text: rendered.prompt,
         token_ids,
         image_sources,
+        image_checkpoint_hints: Vec::new(),
         message_boundaries,
     })
 }

@@ -352,7 +352,7 @@ impl<'a> Vm<'a> {
                             }
                             I::Filter(_) => {
                                 let v = self.pop();
-                                filter(name, v, args, &kwargs)?
+                                filter(name, v, args, &kwargs, !self.hint_texts.is_empty())?
                             }
                             _ => {
                                 let v = self.pop();
@@ -776,6 +776,7 @@ fn filter<'a>(
     v: Value<'a>,
     args: &[Value<'a>],
     kw: &[(&str, Value<'a>)],
+    track_hints: bool,
 ) -> Result<Value<'a>> {
     match name {
         "safe" => Ok(v),
@@ -859,9 +860,17 @@ fn filter<'a>(
                 .iter()
                 .map(|(k, v)| Ok(((*k).to_owned(), v.to_json()?)))
                 .collect::<Result<Map<_, _>>>()?;
-            Ok(Value::string(
-                super::super::json::format_json(&v.to_json()?, &kwargs).map_err(Error::new)?,
-            ))
+            let json = v.to_json()?;
+            if !track_hints {
+                return Ok(Value::string(
+                    super::super::json::format_json(&json, &kwargs).map_err(Error::new)?,
+                ));
+            }
+            let mut hints = Vec::new();
+            v.json_hints(&json, &mut hints);
+            let (text, positions) = super::super::json::format_json_hinted(&json, &kwargs, &hints)
+                .map_err(Error::new)?;
+            Ok(Value::marked(text, positions))
         }
         "fromjson" => Ok(Value::owned(
             serde_json::from_str(
@@ -925,7 +934,7 @@ fn method<'a>(
 ) -> Result<Value<'a>> {
     if v.mapping() {
         return match name {
-            "items" => filter("items", v, args, kw),
+            "items" => filter("items", v, args, kw, false),
             "keys" => Ok(Value::list(v.iter()?)),
             "values" => Ok(Value::list(
                 v.pairs()?.into_iter().map(|(_, v)| v).collect(),
@@ -998,7 +1007,7 @@ fn method<'a>(
             };
             Ok(Value::list(parts))
         }
-        "replace" | "lower" | "upper" | "capitalize" => filter(name, v, args, kw),
+        "replace" | "lower" | "upper" | "capitalize" => filter(name, v, args, kw, false),
         _ => Err(Error::new(format!("unknown string method {name}"))),
     }
 }

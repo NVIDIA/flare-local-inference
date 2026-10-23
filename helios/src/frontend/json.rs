@@ -18,6 +18,14 @@ pub(super) fn format_json(
     value: &Json,
     kwargs: &serde_json::Map<String, Json>,
 ) -> Result<String, String> {
+    format_json_hinted(value, kwargs, &[]).map(|(text, _)| text)
+}
+
+pub(super) fn format_json_hinted(
+    value: &Json,
+    kwargs: &serde_json::Map<String, Json>,
+    hints: &[(&str, Vec<usize>)],
+) -> Result<(String, Vec<usize>), String> {
     let indent = match kwargs.get("indent") {
         None | Some(Json::Null) => None,
         Some(Json::String(s)) => Some(s.clone()),
@@ -65,8 +73,9 @@ pub(super) fn format_json(
             .unwrap_or(false),
     };
     let mut output = String::new();
-    formatting.write(value, 0, &mut output);
-    Ok(output)
+    let mut positions = Vec::new();
+    formatting.write(value, 0, &mut output, hints, &mut positions);
+    Ok((output, positions))
 }
 
 #[cfg(test)]
@@ -110,7 +119,7 @@ pub(super) fn tojson(
     };
     kwargs.assert_all_used()?;
     let mut output = String::new();
-    formatting.write(&value, 0, &mut output);
+    formatting.write(&value, 0, &mut output, &[], &mut Vec::new());
     Ok(output)
 }
 
@@ -141,7 +150,14 @@ impl Formatting {
         }
     }
 
-    fn write(&self, value: &Json, depth: usize, output: &mut String) {
+    fn write(
+        &self,
+        value: &Json,
+        depth: usize,
+        output: &mut String,
+        hints: &[(&str, Vec<usize>)],
+        positions: &mut Vec<usize>,
+    ) {
         match value {
             Json::Null => output.push_str("null"),
             Json::Bool(true) => output.push_str("true"),
@@ -152,7 +168,20 @@ impl Formatting {
             Json::Number(number) => {
                 write!(output, "{number}").expect("writing to a string succeeds")
             }
-            Json::String(value) => self.string(value, output),
+            Json::String(value) => {
+                let start = output.len();
+                self.string(value, output);
+                for (_, ends) in hints
+                    .iter()
+                    .filter(|(text, _)| std::ptr::eq(*text, value.as_str()))
+                {
+                    for &end in ends {
+                        let mut prefix = String::new();
+                        self.string(&value[..end], &mut prefix);
+                        positions.push(start + prefix.len() - 1);
+                    }
+                }
+            }
             Json::Array(values) => {
                 output.push('[');
                 for (index, value) in values.iter().enumerate() {
@@ -160,7 +189,7 @@ impl Formatting {
                         output.push_str(&self.item_separator);
                     }
                     self.newline(depth + 1, output);
-                    self.write(value, depth + 1, output);
+                    self.write(value, depth + 1, output, hints, positions);
                 }
                 if !values.is_empty() {
                     self.newline(depth, output);
@@ -180,7 +209,7 @@ impl Formatting {
                     self.newline(depth + 1, output);
                     self.string(key, output);
                     output.push_str(&self.key_separator);
-                    self.write(value, depth + 1, output);
+                    self.write(value, depth + 1, output, hints, positions);
                 }
                 if !values.is_empty() {
                     self.newline(depth, output);

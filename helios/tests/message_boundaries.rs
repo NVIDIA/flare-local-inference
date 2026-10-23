@@ -167,3 +167,41 @@ fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns()
     assert_eq!(boundaries[..3], other_boundaries[..3]);
     assert_eq!(tokens[..boundaries[2]], other[..other_boundaries[2]]);
 }
+
+#[test]
+fn segmented_xtml_preserves_block_hints_through_json_escaping() {
+    let frontend = frontend(
+        include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+        TemplateEncoding::TokenSegments,
+    );
+    let history = "Repeated \"history\"\\\n café 世界 😀 <|close|>";
+    let mut messages = json!([{"role":"user","content":[
+        {"type":"text","text":history},
+        {"type":"text","text":history},
+        {"type":"text","text":"Changing suffix"}]}]);
+    let options = json!({"add_generation_prompt":true});
+    let render = |messages: &Value| {
+        frontend
+            .render_chat(messages.as_array().unwrap(), options.as_object().unwrap())
+            .unwrap()
+    };
+    let plain = render(&messages);
+    messages[0]["_checkpoint_hints"] = json!([2]);
+    let marked = render(&messages);
+    assert_eq!(marked.text, plain.text);
+    assert_eq!(marked.token_ids, plain.token_ids);
+    let cut = marked.text.find("Changing suffix").unwrap();
+    // The fixture tokenizer emits one token per byte, except structural specials.
+    let suffix_tokens = frontend.encode(&marked.text[cut..], false).unwrap().len();
+    let cut = marked.token_ids.len() - suffix_tokens;
+    assert!(!plain.message_boundaries.contains(&cut));
+    assert!(marked.message_boundaries.contains(&cut));
+    assert_eq!(
+        marked.message_boundaries.len(),
+        plain.message_boundaries.len() + 1
+    );
+    messages[0]["content"][2]["text"] = json!("Different suffix");
+    let changed = render(&messages);
+    assert!(changed.token_ids.starts_with(&marked.token_ids[..cut]));
+    assert!(changed.message_boundaries.contains(&cut));
+}

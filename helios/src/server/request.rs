@@ -227,6 +227,7 @@ pub(super) fn prepare_inference_cached(
                 text: frontend.decode(&token_ids, false)?,
                 token_ids,
                 image_sources: Vec::new(),
+                image_checkpoint_hints: Vec::new(),
             },
             echo,
         )
@@ -280,6 +281,18 @@ pub(super) fn prepare_inference_cached(
             expansions.next();
         }
         *boundary += additional;
+    }
+    if !rendered.image_checkpoint_hints.is_empty() {
+        for &index in &rendered.image_checkpoint_hints {
+            let image = conditioned_inputs
+                .get(index)
+                .ok_or("image checkpoint hint has no prepared image")?;
+            if image.token_span.end < tokens.len() {
+                message_boundaries.push(image.token_span.end);
+            }
+        }
+        message_boundaries.sort_unstable();
+        message_boundaries.dedup();
     }
     let mut sampling = sampling_parameters(object, &config.sampling_defaults, &config.sampling_ranges)?;
     sampling.seed = sampling.seed.wrapping_add(index as u64);
