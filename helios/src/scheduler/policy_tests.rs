@@ -2648,3 +2648,226 @@ fn survival_feedback_is_transactional_and_replaces_binary_acceptance() {
     assert!(s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row])).is_err());
     assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 1);
 }
+
+fn feedback_window_engine(rows: Option<usize>, policy: PolicyConfig) -> RequestScheduler {
+    let mut s = RequestScheduler::new(
+        [7; 32],
+        SchedulerLimits {
+            max_active: 4,
+            request_slots: 4,
+            max_sequence_tokens: 8192,
+            prefill_chunk_size: 512,
+            pages: 1024,
+            snapshots: 256,
+        },
+        SchedulerCapabilities {
+            vocabulary: 1024,
+            page_tokens: 64,
+            vision: crate::model::VisionCapabilities::disabled(),
+            draft_pages_per_request: 0,
+            completion_inputs: vec![],
+            state_rows_per_request: rows,
+        },
+    )
+    .unwrap();
+    let mut graphs = super::tests::duration_graphs(4);
+    graphs.retain(|g| g.kind != GraphKind::Speculative);
+    s.measured_graph_durations(&graphs).unwrap();
+    s.configure_policy(policy).unwrap();
+    s
+}
+
+#[test]
+fn feedback_prefill_tails_progress_before_existing_generations_finish() {
+    for rows in [None, Some(1), Some(2)] {
+        for policy in [PolicyConfig::throughput(), PolicyConfig::default()] {
+            let mut s = feedback_window_engine(rows, policy);
+            for capacity in [64, 128, 256, 512] {
+                set_cost(&mut s, GraphKind::Prefill, 1, capacity, 31 * MS);
+            }
+            for batch in [1, 2, 4] {
+                set_cost(
+                    &mut s,
+                    GraphKind::Decode,
+                    batch,
+                    1,
+                    (22 + batch as u64 / 2) * MS,
+                );
+            }
+            let handles = (0..4)
+                .map(|id| {
+                    s.admit(RequestSpec {
+                        prompt: vec![id; 87],
+                        message_boundaries: vec![42, 82, 87],
+                        conditioning: vec![],
+                        max_new_tokens: 256,
+                        grammar_constrained: false,
+                        host_stops: false,
+                        prompt_logprobs: false,
+                        growable_output: true,
+                    })
+                    .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let mut running = std::collections::VecDeque::new();
+            let mut first_output = [false; 4];
+            let started = s.now_ns;
+            let mut launches = 0;
+            let mut drains = 0;
+            let mut draining = false;
+            while s.slots.iter().any(|slot| slot.request.is_some()) && launches < 4096 {
+                while running.len() < 2 {
+                    let Some(plan) = s.plan() else {
+                        if !first_output.iter().all(|v| *v)
+                            && !draining
+                            && !s.submissions.is_empty()
+                            && !s.submissions.values().any(|v| v.requires_feedback)
+                        {
+                            drains += 1;
+                            draining = true;
+                        }
+                        break;
+                    };
+                    draining = false;
+                    let fence = Fence(s.submitted.0 + 1);
+                    s.commit(&plan, fence).unwrap();
+                    running.push_back((plan, fence));
+                    launches += 1;
+                }
+                let (plan, fence) = running
+                    .pop_front()
+                    .expect("live requests must make progress");
+                let finish = s.submissions[&fence].expected_finish_ns.max(s.now_ns);
+                s.advance_to(finish).unwrap();
+                complete_timed(
+                    &mut s,
+                    &plan,
+                    fence,
+                    0,
+                    true,
+                    gpu_time(plan.estimated_duration_ns()),
+                );
+                if plan.kind == GraphKind::Prefill {
+                    for lane in &plan.lanes {
+                        if lane.start_position + lane.tokens as u64 == 87 {
+                            let index = handles.iter().position(|h| *h == lane.request).unwrap();
+                            first_output[index] = true;
+                            // Four three-chunk prompts cost 372ms of prefill.
+                            // Allow lifecycle work and drain latency, but never
+                            // a generation-sized wait for an eligible tail.
+                            assert!(s.now_ns - started <= 1_000 * MS);
+                        }
+                    }
+                }
+                if handles
+                    .iter()
+                    .any(|h| s.request(*h).map_or(true, |r| r.generated_tokens >= 256))
+                {
+                    assert!(
+                        first_output.iter().all(|v| *v),
+                        "a feedback-only prompt tail was hidden behind an entire generation"
+                    );
+                }
+            }
+            assert!(first_output.iter().all(|v| *v));
+            assert!(
+                drains <= 4,
+                "feedback drain/refill oscillated without serving the prompt tails"
+            );
+            assert!(!s.slots.iter().any(|slot| slot.request.is_some()));
+        }
+    }
+}
+
+#[test]
+fn higher_value_feedback_work_drains_but_never_crosses_an_inflight_barrier() {
+    let mut s = feedback_window_engine(None, PolicyConfig::throughput());
+    set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+    let existing = add(&mut s, 1, 64, 128);
+    ready(&mut s, &[existing]);
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.kind, GraphKind::Decode);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    for capacity in [64, 128, 256, 512] {
+        set_cost(&mut s, GraphKind::Prefill, 1, capacity, MS);
+    }
+    let waiting = add(&mut s, 2, 54, 128);
+    assert!(
+        s.plan().is_none(),
+        "refilling decode hides higher-value feedback work"
+    );
+    let finish = s.submissions[&fence].expected_finish_ns;
+    s.advance_to(finish).unwrap();
+    complete_timed(
+        &mut s,
+        &plan,
+        fence,
+        0,
+        true,
+        gpu_time(plan.estimated_duration_ns()),
+    );
+    let feedback = s.plan().unwrap();
+    // The arriving request first needs its feedback-only initialization.
+    assert_eq!(feedback.kind, GraphKind::Init);
+    assert!(feedback.requires_feedback && feedback.lanes.iter().any(|l| l.request == waiting));
+    let next = Fence(s.submitted.0 + 1);
+    s.commit(&feedback, next).unwrap();
+    assert!(s.plan().is_none(), "feedback still owns the entire window");
+}
+
+#[test]
+fn stale_feedback_winner_drains_once_then_rejoins_the_pipeline() {
+    let mut policy = PolicyConfig::throughput();
+    policy.estimate_ttl_ns = 3 * MS;
+    let mut s = feedback_window_engine(None, policy);
+    let handles = (0..2)
+        .map(|id| add(&mut s, id + 1, 64, 128))
+        .collect::<Vec<_>>();
+    ready(&mut s, &handles);
+    for batch in [1, 2] {
+        set_cost(&mut s, GraphKind::Decode, batch, 1, 10 * MS);
+    }
+    set_cost(&mut s, GraphKind::Decode, 4, 1, 100 * MS);
+    let first = s.phase_plan(GraphKind::Decode, Some(handles[0]));
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&first, fence).unwrap();
+    s.advance_to(s.now_ns + 4 * MS).unwrap();
+    set_cost(&mut s, GraphKind::Decode, 1, 1, 10 * MS);
+    assert!(
+        s.plan().is_none(),
+        "a stale higher-value cohort must drain rather than be hidden by a fresh alternative"
+    );
+    s.advance_to(s.submissions[&fence].expected_finish_ns)
+        .unwrap();
+    complete_timed(
+        &mut s,
+        &first,
+        fence,
+        0,
+        true,
+        gpu_time(first.estimated_duration_ns()),
+    );
+    let probe = s.plan().unwrap();
+    assert_eq!(probe.batch_capacity, 2);
+    assert!(s.plan_requires_feedback(&probe));
+    let next = Fence(s.submitted.0 + 1);
+    s.commit(&probe, next).unwrap();
+    s.advance_to(s.submissions[&next].expected_finish_ns)
+        .unwrap();
+    complete_timed(
+        &mut s,
+        &probe,
+        next,
+        0,
+        true,
+        gpu_time(probe.estimated_duration_ns()),
+    );
+    for _ in 0..2 {
+        let plan = s.plan().expect("refreshed work must not repeatedly drain");
+        assert!(!s.plan_requires_feedback(&plan));
+        let fence = Fence(s.submitted.0 + 1);
+        s.commit(&plan, fence).unwrap();
+    }
+    assert_eq!(s.submissions.len(), 2);
+}

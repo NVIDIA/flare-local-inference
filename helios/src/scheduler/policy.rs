@@ -846,9 +846,6 @@ impl RequestScheduler {
                                 &(r.consumed_tokens as usize + self.prefill_work(r, capacity)),
                             ).is_ok()))
             });
-        if feedback && !self.submissions.is_empty() {
-            return;
-        }
         let (selected, rate) = self
             .continuation_candidate(
                 kind,
@@ -956,9 +953,6 @@ impl RequestScheduler {
         age_price: f64,
         optimistic: bool,
     ) {
-        if !self.submissions.is_empty() {
-            return;
-        }
         let decode = if self.speculative_widths.is_empty() {
             GraphKind::Decode
         } else {
@@ -1088,11 +1082,10 @@ impl RequestScheduler {
             );
             let count = if episode.target.is_none() { self.prune_padding(&mut continuations) } else { continuations.len() };
             let candidate = *continuations[..count].iter().max_by(|a, b| compare(a, b))?;
-            return Some(self.materialize(candidate, log_scale,
-                episode.continuation()));
+            return self.available_plan(candidate, log_scale, episode.continuation());
         }
         if ordinary.rate.duration_ns == 0 {
-            return Some(self.materialize(ordinary, log_scale, PlanOrigin::Discovery));
+            return self.available_plan(ordinary, log_scale, PlanOrigin::Discovery);
         }
         if self.refresh_ready() && self.submissions.is_empty() {
             let mut targets: Vec<_> = self.costs.stale_keys().filter(|key| *key != ordinary.cost_key())
@@ -1115,15 +1108,30 @@ impl RequestScheduler {
                 }
             }
             if let Some((_, target, candidate)) = best {
-                return Some(self.materialize(candidate, log_scale, PlanOrigin::RefreshStart(target)));
+                return self.available_plan(candidate, log_scale, PlanOrigin::RefreshStart(target));
             }
         }
         if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() && self.submissions.is_empty() {
             if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
-                return Some(self.materialize(candidate, log_scale, PlanOrigin::AcceptanceStart));
+                return self.available_plan(candidate, log_scale, PlanOrigin::AcceptanceStart);
             }
         }
-        Some(self.materialize(ordinary, log_scale, PlanOrigin::Ordinary))
+        self.available_plan(ordinary, log_scale, PlanOrigin::Ordinary)
+    }
+
+    fn available_plan(
+        &self, candidate: Candidate, log_scale: f64, origin: PlanOrigin,
+    ) -> Option<ScheduledPlan> {
+        // Score feedback work before deciding whether to refill the pipeline.
+        // Gating the selected plan preserves refresh priority and lets a prompt
+        // tail or lifecycle operation drain deterministic decode's busy window.
+        let plan = self.materialize(candidate, log_scale, origin);
+        if self.plan_requires_feedback(&plan) && !self.submissions.is_empty() {
+            return None;
+        }
+        debug_assert!(!self.plan_requires_feedback(&plan) || self.submissions.is_empty());
+        debug_assert!(!self.submissions.values().any(|step| step.requires_feedback));
+        Some(plan)
     }
 
     fn materialize(&self, candidate: Candidate, log_scale: f64, origin: PlanOrigin) -> ScheduledPlan {
