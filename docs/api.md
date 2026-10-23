@@ -255,14 +255,28 @@ drains before its resources are reclaimed. Output queues remain bounded.
 HTTP 503 with an error object otherwise. Neither this route nor `/metrics`
 requires the serving key: both report aggregate state without request content.
 
-`GET /metrics` returns Prometheus text exposition format 0.0.4 by default.
-Counter and gauge names start with `flare_`, such as
-`flare_generated_tokens_total`, `flare_active_requests`, and
-`flare_free_kv_pages`; there are no histograms. Beyond the JSON fields below, the
-text includes speculative and proposal counters by batch, width, or depth, graph
-launches by kind, embedding row-cache counters, HTTP admission gauges, and
+`GET /metrics` returns Prometheus text exposition format 0.0.4 by default. All
+series names start with `flare_`, such as `flare_generated_tokens_total`,
+`flare_active_requests`, and `flare_free_kv_pages`. Beyond the JSON fields below,
+the text includes speculative and proposal counters by batch, width, or depth,
+graph launches by kind, embedding row-cache counters, HTTP admission gauges, and
 uptime. `flare_history_drafts_enabled` reports whether shared decoded history
 augments learned proposals in the serving process.
+
+The request series cover `flare_prompt_tokens_total`,
+`flare_prompt_tokens_cached_total`, `flare_request_success_total` for normal
+`stop` and `length` finishes, and histograms for prompt and generation size,
+group `n` and explicit `max_tokens`, first-token, inter-token, per-output-token,
+queue, prefill, decode, inference, end-to-end latency, prefill KV tokens, and
+preemptions per request. `flare_spec_decode_num_drafts_total`,
+`flare_spec_decode_num_draft_tokens_total`, and
+`flare_spec_decode_num_accepted_tokens_total` aggregate speculative work.
+`flare_request_success_total` excludes client cancellations and admission
+rejections, so its value equals `flare_e2e_request_latency_seconds_count`.
+Requests with only zero-token generations produce no request metrics. Running and
+waiting gauges, KV cache usage percentage, token-weighted prefix-cache counters,
+source splits, and per-position speculative counts are intentionally absent
+because Flare does not yet maintain matching accounting.
 
 The route returns one JSON object instead when the query contains `format=json`,
 or when the `Accept` header gives `application/json` a higher quality than

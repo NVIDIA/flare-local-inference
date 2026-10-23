@@ -802,7 +802,7 @@ mod tests {
     #[test]
     fn terminal_renders_braille_and_handles_resize_without_nonfinite_rates() {
         let start = Instant::now();
-        let metrics = Metrics::new(100, 128, 0);
+        let metrics = Metrics::new(100, 128, 0, 0);
         metrics.scheduler(crate::scheduler::SchedulerStats {
             cached_pages: 3,
             free_pages: 20,
