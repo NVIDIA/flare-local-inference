@@ -64,6 +64,26 @@ impl ToolDialect for ArgumentTags {
             })?,
         )])
     }
+    fn starts_call(text: &str) -> Option<bool> {
+        // Calls continue with the function name and an argument key or closing tag;
+        // quoted tags followed by prose remain text.
+        let text = text.strip_prefix(Self::OPEN).unwrap_or(text).trim_start();
+        if text.is_empty() {
+            return None;
+        }
+        let end = text.find(|c: char| c == '<' || c == '>' || c.is_whitespace())?;
+        if end == 0 {
+            return Some(false);
+        }
+        let next = text[end..].trim_start();
+        if ["<arg_key>", "</tool_call>"].iter().any(|tag| next.starts_with(tag)) {
+            Some(true)
+        } else if ["<arg_key>", "</tool_call>"].iter().any(|tag| tag.starts_with(next)) {
+            None
+        } else {
+            Some(false)
+        }
+    }
 }
 
 #[cfg(test)]
@@ -140,6 +160,48 @@ mod tests {
                 ArgumentTags::parse(body, &config().tools).is_err(),
                 "{body}"
             );
+        }
+    }
+
+    #[test]
+    fn prose_tool_tag_mentions_remain_answer_text() {
+        let call = "<tool_call>run<arg_key>text</arg_key><arg_value>x</arg_value></tool_call>";
+        for (text, content, calls) in [
+            (
+                "</think>The `<tool_call>` tag wraps calls. END".to_owned(),
+                "The `<tool_call>` tag wraps calls. END",
+                0,
+            ),
+            (
+                "</think>Write <tool_call> or `<tool_call>run` literally.".to_owned(),
+                "Write <tool_call> or `<tool_call>run` literally.",
+                0,
+            ),
+            (
+                format!("</think>Quote `<tool_call>` here.\n{call}"),
+                "Quote `<tool_call>` here.\n",
+                1,
+            ),
+        ] {
+            for split in text.char_indices().map(|(at, _)| at) {
+                let mut parser = ArgumentTagOutput::new(config());
+                let mut output = Accumulator::new("test".into());
+                for part in [&text[..split], &text[split..]] {
+                    output.apply(parser.push(Input::Text(part)).unwrap()).unwrap();
+                }
+                output
+                    .apply(parser.finish(Termination::Eos).unwrap())
+                    .unwrap();
+                output.finish().unwrap();
+                let message = output.message();
+                assert_eq!(message["content"], content, "{text:?} at {split}");
+                let tools = message["tool_calls"].as_array().map_or(&[][..], Vec::as_slice);
+                assert_eq!(tools.len(), calls, "{text:?} at {split}");
+                if let Some(tool) = tools.first() {
+                    assert_eq!(tool["function"]["name"], "run");
+                    assert_eq!(tool["function"]["arguments"], "{\"text\":\"x\"}");
+                }
+            }
         }
     }
 
