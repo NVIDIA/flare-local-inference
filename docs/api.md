@@ -309,8 +309,11 @@ Qwen treats `<tool_call>` as an implicit end to reasoning. Function-tag calls
 complete at `</function>` and accept omitted outer tool tags in answer content.
 A `<tool_call>` or `<function=` tag starts a call only when followed by a
 `<function=NAME>` header and a parameter or `</function>` tag; other mentions,
-such as a quoted tag in prose, remain reasoning or answer text. A tag still
-undecided when generation ends is parsed as an incomplete call.
+such as a quoted tag in prose, remain reasoning or answer text. A complete
+call written in prose, inline or on its own lines, still parses as a call and
+ends reasoning. A tag still undecided when generation ends is parsed as an
+incomplete call. GLM's `<tool_call>` likewise starts a call only when followed
+by a function name and an `<arg_key>` or `</tool_call>` tag.
 A missing `</parameter>` is closed by the next parameter or function boundary.
 Parameter schemas guide
 best-effort type conversion; non-strict schemas do not reject invalid values.
