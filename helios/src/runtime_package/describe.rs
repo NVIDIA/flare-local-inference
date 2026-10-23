@@ -276,6 +276,8 @@ fn vision_json(
             Profile::Moonvit(_) => json!({"profile": "moonvit"}),
             Profile::Step(_) => json!({"profile": "step"}),
             Profile::Radio(_) => json!({"profile": "radio"}),
+            Profile::PatchMerge(c) => json!({"profile": "patch_merge", "patch_size": c.patch_size,
+                "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
             Profile::Glm(_) => json!({"profile": "glm"}),
         }
     });

@@ -35,6 +35,7 @@ pub struct Prompt {
     /// Generate through end-of-sequence tokens until the output limit, as vLLM's `ignore_eos`.
     pub ignore_eos: bool,
     pub logprobs: bool,
+    pub logprob_token_ids: Vec<u32>,
     pub prompt_logprobs: bool,
 }
 
@@ -235,9 +236,10 @@ struct Active<'a> {
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
 }
 
-/// What earlier admissions of a preempted request already reported.
+/// Output accounting and decoded tail retained across admissions.
 #[derive(Clone, Copy, Default)]
 struct Carried {
+    decoded_sequence: crate::scheduler::decoded_history::DecodedSequence,
     prompt_tokens: Option<usize>,
     reused_prompt_tokens: Option<u64>,
     generated_tokens: u32,
@@ -371,7 +373,7 @@ impl ModelRuntime {
             .name("flare-model".into())
             .spawn(move || {
                 if matches!(peers, Some(crate::execution::RankPeers::Processes(_)))
-                    && manifest.offload.is_some()
+                    && manifest.offload.as_ref().is_some_and(|binding| !binding.sharded())
                 {
                     let error = Error::execution(
                         ExecutionError::Manifest,
@@ -421,6 +423,15 @@ impl ModelRuntime {
                     .and_then(|()| scheduler.enable_speculation(&worker_config.speculative_widths))
                     .and_then(|()| {
                         scheduler.proposal_source(worker_config.speculative_proposal_source)
+                    })
+                    .and_then(|()| {
+                        if worker_config.history_drafts
+                            || worker_config.speculative_proposal_source == crate::scheduler::speculation::ProposalSource::Copy
+                        {
+                            scheduler.enable_history_drafts()
+                        } else {
+                            Ok(())
+                        }
                     })
                     .and_then(|()| {
                         scheduler.fixed_speculative_width(worker_config.speculative_fixed_width)
@@ -1220,6 +1231,7 @@ impl<'a> Worker<'a> {
             if !incoming.readmitted {
                 self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
             }
+            self.scheduler.resume_decoded_sequence(handle, parked.carried.decoded_sequence)?;
             incoming.notify_admission(Ok(()));
             self.active[slot] = Some(Active {
                 request: handle,
@@ -1282,7 +1294,7 @@ impl<'a> Worker<'a> {
     fn complete(
         &mut self,
         kind: GraphKind,
-        completion: crate::execution::FrameCompletion,
+        mut completion: crate::execution::FrameCompletion,
     ) -> Result<()> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
@@ -1308,10 +1320,13 @@ impl<'a> Worker<'a> {
         let mut prefill = 0;
         let mut accepted = 0;
         let mut draft_rounds = 0;
+        let mut verification_drafts = 0;
+        let mut verification_rounds = 0;
         if matches!(
             kind,
             GraphKind::Prefill
                 | GraphKind::ScoredPrefill
+                | GraphKind::Decode
                 | GraphKind::Speculative
                 | GraphKind::Verification
                 | GraphKind::PackedSpeculative
@@ -1332,9 +1347,11 @@ impl<'a> Worker<'a> {
                         .saturating_sub(live.consumed_tokens)
                         .min(lane.tokens as u64);
                 } else if record.generated_tokens > live.generated_tokens as i64 {
+                    verification_rounds += 1;
                     if let Some(vector) = record.vector {
                         let offered =
                             (vector.offered_drafts as usize).min(lane.tokens.saturating_sub(1));
+                        verification_drafts += offered as u64;
                         if offered > 0 {
                             accepted += (vector.accepted_drafts as usize).min(offered) as u64;
                             draft_rounds += 1;
@@ -1366,7 +1383,8 @@ impl<'a> Worker<'a> {
                     completion.speculative_survival.as_ref().map(|rows| rows.as_slice()))?
         };
         self.metrics
-            .progress(prefill, generated.len(), accepted, draft_rounds);
+            .progress(prefill, generated.len(), accepted, draft_rounds,
+                verification_drafts, verification_rounds);
         self.metrics.replay_completed(completion.timing);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
@@ -1423,7 +1441,7 @@ impl<'a> Worker<'a> {
                     let value = payload.get(position - lane.start_position as usize - 1)
                         .and_then(Option::as_ref).ok_or("scored prefill omitted a prompt token")?;
                     if value.value.token != prompt.tokens[position] || value.rank as usize > self.config.contract.vocabulary
-                        || value.value.top[..value.value.top_count].iter().any(|(t, _)| *t as usize >= self.config.contract.vocabulary) {
+                        || value.value.top.iter().any(|(t, _)| *t as usize >= self.config.contract.vocabulary) {
                         return Err(crate::Error::from("scored prefill returned an invalid token or rank"));
                     }
                     Ok(Some(value.clone()))
@@ -1474,8 +1492,9 @@ impl<'a> Worker<'a> {
                 let terminating_eos = !request.incoming.prompt.ignore_eos
                     && self.config.eos_token_ids.contains(&token.token);
                 let logprob = if request.incoming.prompt.logprobs && !terminating_eos {
-                    match completion.logprobs.as_ref().and_then(|v| v[slot][position]) {
-                        Some(value) if value.token == token.token => Some(value),
+                    match completion.logprobs.as_mut().and_then(|v| v[slot][position].take()) {
+                        Some(value) if value.token == token.token
+                            && value.top.iter().all(|(id, _)| (*id as usize) < self.config.contract.vocabulary) => Some(value),
                         _ => {
                             request.incoming.fail(Error::execution(
                                 ExecutionError::Completion,
@@ -1688,6 +1707,7 @@ impl<'a> Worker<'a> {
             return Ok(false);
         }
         let tokens = live.tokens().to_vec();
+        let decoded_sequence = live.decoded_sequence;
         let (generated, prompt_tokens, reused) = (
             live.generated_tokens,
             live.prompt_tokens,
@@ -1711,6 +1731,7 @@ impl<'a> Worker<'a> {
             text_stops: active.text_stops,
             held_logprobs: active.held_logprobs,
             carried: Carried {
+                decoded_sequence,
                 prompt_tokens: Some(active.carried.prompt_tokens.unwrap_or(prompt_tokens)),
                 reused_prompt_tokens: Some(active.carried.reused_prompt_tokens.unwrap_or(reused)),
                 generated_tokens,
@@ -1747,14 +1768,9 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let proposal = prepare_copy_proposal(
-                    live.tokens(),
+                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { 7 }),
                     live.consumed_tokens,
                     request.incoming.prompt.grammar.as_ref(),
-                    if self.config.history_drafts && !live.host_stops() {
-                        7
-                    } else {
-                        0
-                    },
                     &self.config.eos_token_ids,
                 );
                 match proposal {
@@ -1877,15 +1893,53 @@ impl<'a> Worker<'a> {
             ));
         }
         let mut flags = [0u8; crate::execution::REQUEST_LANES * size_of::<i32>()];
+        let mut counts = [0u8; crate::execution::REQUEST_LANES * size_of::<i32>()];
+        let mut selections = Vec::new();
         for lane in &step.lanes {
             let slot = lane.request.slot as usize;
-            if self.active[slot].as_ref().is_some_and(|a| a.incoming.prompt.logprobs) {
-                flags[slot * size_of::<i32>()..(slot + 1) * size_of::<i32>()].copy_from_slice(&1i32.to_ne_bytes());
+            if let Some(active) = &self.active[slot] {
+                let start = slot * size_of::<i32>();
+                let end = start + size_of::<i32>();
+                if active.incoming.prompt.logprobs {
+                    flags[start..end].copy_from_slice(&1i32.to_ne_bytes());
+                }
+                let ids = &active.incoming.prompt.logprob_token_ids;
+                counts[start..end].copy_from_slice(&(ids.len() as i32).to_ne_bytes());
+                if !ids.is_empty() {
+                    selections.push((
+                        slot,
+                        ids.iter()
+                            .flat_map(|id| id.to_ne_bytes())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
             }
         }
-        let mut uploads = crate::model::Inputs::uploads(self.inputs.as_ref().expect("worker inputs initialized before submission"));
+        let mut uploads = crate::model::Inputs::uploads(
+            self.inputs
+                .as_ref()
+                .expect("worker inputs initialized before submission"),
+        );
         if self.config.max_top_logprobs != 0 {
-            uploads.push(crate::execution::Upload { buffer: "logprob_requested", offset: 0, bytes: &flags[..self.config.limits.request_capacity() * size_of::<i32>()] });
+            uploads.push(crate::execution::Upload {
+                buffer: "logprob_requested",
+                offset: 0,
+                bytes: &flags[..self.config.limits.request_capacity() * size_of::<i32>()],
+            });
+        }
+        if self.config.logprob_token_id_capacity != 0 {
+            uploads.push(crate::execution::Upload {
+                buffer: "logprob_token_id_counts",
+                offset: 0,
+                bytes: &counts[..self.config.limits.request_capacity() * size_of::<i32>()],
+            });
+            for (slot, bytes) in &selections {
+                uploads.push(crate::execution::Upload {
+                    buffer: "logprob_token_ids",
+                    offset: slot * crate::execution::MAX_LOGPROB_TOKEN_IDS * size_of::<i32>(),
+                    bytes,
+                });
+            }
         }
         if executor.submit(
             graph,
@@ -1922,7 +1976,7 @@ impl<'a> Worker<'a> {
             }
         }
         let mut events = Vec::new();
-        store.poll(&mut events);
+        store.poll(&mut events)?;
         let mut requeued = Vec::new();
         for event in events {
             progress = true;
@@ -2069,13 +2123,11 @@ fn cancel_stopped(
 }
 
 fn prepare_copy_proposal(
-    tokens: &[u32],
+    (mut ids, mut count): ([i64; 7], usize),
     consumed: u64,
     grammar: Option<&crate::grammar::RequestGrammar>,
-    maximum: usize,
     eos_ids: &[u32],
 ) -> Result<crate::scheduler::speculation::CopyProposal> {
-    let (mut ids, mut count) = crate::scheduler::speculation::copy_proposal(tokens, maximum);
     if let Some(end) = ids[..count]
         .iter()
         .position(|id| eos_ids.contains(&(*id as u32)))
@@ -2235,17 +2287,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_preparation_trims_eos_and_explicit_disable_has_no_proposals() {
-        let history = [1, 2, 3, 4, 11, 12, 13, 99, 1, 2, 3, 4];
-        let copy = prepare_copy_proposal(&history, 11, None, 7, &[12]).unwrap();
+    fn copy_preparation_trims_eos_and_preserves_empty_proposals() {
+        let copy = prepare_copy_proposal(([11, 12, 13, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
         assert_eq!(copy.count, 1);
         assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1]);
         assert_eq!(copy.consumed, 11);
         assert!(copy.grammar_masks.is_empty());
-        let disabled = prepare_copy_proposal(&history, 11, None, 0, &[12]).unwrap();
-        assert_eq!((disabled.count, disabled.tokens), (0, [-1; 7]));
-        let absent = prepare_copy_proposal(&[1, 2, 3, 4], 3, None, 7, &[]).unwrap();
-        assert_eq!(absent.count, 0);
+        let empty = prepare_copy_proposal(([-1; 7], 0), 11, None, &[12]).unwrap();
+        assert_eq!((empty.count, empty.tokens), (0, [-1; 7]));
     }
 
     #[test]
@@ -2424,6 +2473,7 @@ mod tests {
                 stop_sequences: vec![],
                 stop_strings: vec![],
                 logprobs: false,
+                logprob_token_ids: vec![],
                 prompt_logprobs: false,
                 ignore_eos: false,
                 grammar: None,

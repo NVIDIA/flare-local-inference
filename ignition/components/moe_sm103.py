@@ -678,7 +678,7 @@ class Sm103RoutedExperts:
 
     def __init__(self, source, experts: Sm103Experts, ids, weights, output, *, session, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None,
-                 router_plan=None, a4_prefill=False):
+                 router_plan=None, a4_prefill=False, router=None, route_output=None):
         from ignition.components.moe import RouterScratch
 
         if a4_prefill:
@@ -691,7 +691,9 @@ class Sm103RoutedExperts:
             tensor = getattr(experts, field, None)
             if tensor is not None:
                 record_numeric_tensor(tensor)
+        self.router = router
         self.source, self.output, self.scratch = source, output, None
+        self.output_source = output
         self.plan = plan_routed_experts(experts, tokens=source.shape[0], top_k=ids.shape[1])
         plan = self.plan
 
@@ -717,6 +719,9 @@ class Sm103RoutedExperts:
     def reduces_into_shared(self) -> bool:
         """Whether ``stage_rows``/``reduce`` can replace the finalized output plus a shared add."""
         return self.plan.contract is TRTLLM_CONTRACT
+
+    def route(self, logits: torch.Tensor) -> None:
+        self.router(logits)
 
     def __call__(self) -> torch.Tensor:
         return self.binding.run()

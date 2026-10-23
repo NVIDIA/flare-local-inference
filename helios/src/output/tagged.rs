@@ -32,6 +32,8 @@ pub trait ToolDialect {
 pub struct ThinkReasoning<D: ToolDialect> {
     dialect: std::marker::PhantomData<D>,
     buffer: String,
+    open: String,
+    close: String,
     trim_newlines: usize,
     tools: bool,
     trim_wrap: bool,
@@ -54,8 +56,8 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
         let mut progress = Progress::default();
         let mut boundary = self
             .buffer
-            .find("</think>")
-            .map(|at| (at, "</think>".len()));
+            .find(&self.close)
+            .map(|at| (at, self.close.len()));
         if self.tools && self.tool_ends_reasoning {
             if let Some(at) = self.buffer.find(D::OPEN) {
                 if boundary.is_none_or(|(end, _)| at < end) {
@@ -72,7 +74,7 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
             }
             .to_owned();
             let text = if self.tool_ends_reasoning {
-                text.replace("<think>", "")
+                text.replace(&self.open, "")
             } else {
                 text
             };
@@ -82,9 +84,10 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
             self.buffer.drain(..end + consumed);
             progress.remainder = Some(std::mem::take(&mut self.buffer));
         } else {
-            let mut hold = partial_marker(&self.buffer, &["</think>", "\n</think>"]);
+            let mut hold =
+                partial_marker(&self.buffer, &[&self.close, &format!("\n{}", self.close)]);
             if self.tool_ends_reasoning {
-                hold = hold.max(partial_marker(&self.buffer, &["<think>"]));
+                hold = hold.max(partial_marker(&self.buffer, &[&self.open]));
                 if self.tools {
                     hold = hold.max(partial_marker(&self.buffer, &[D::OPEN]));
                 }
@@ -92,7 +95,7 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
             let visible = self.buffer.len() - hold;
             let text: String = self.buffer.drain(..visible).collect();
             let text = if self.tool_ends_reasoning {
-                text.replace("<think>", "")
+                text.replace(&self.open, "")
             } else {
                 text
             };
@@ -197,6 +200,7 @@ pub struct TaggedOutput<D: ToolDialect> {
     received: usize,
     spans: Vec<Option<std::ops::Range<usize>>>,
     reasoning_enabled: bool,
+    initial_close: bool,
     mode: Mode,
     structured: bool,
     outer_tool_pending: bool,
@@ -213,6 +217,12 @@ impl<D: ToolDialect> TaggedOutput<D> {
         syntax: Option<&crate::model::contract::ReasoningParser>,
     ) -> Self {
         self.reasoning_enabled = syntax.is_some();
+        if let Some(syntax) = syntax {
+            self.reasoning.open.clone_from(&syntax.open);
+            self.reasoning.close.clone_from(&syntax.close);
+            self.initial_close = matches!(self.mode, Mode::Content)
+                && syntax.kind == crate::model::contract::ReasoningParserKind::MmThink;
+        }
         self.reasoning.trim_wrap = syntax.is_some_and(|s| s.wrapping_newlines > 0);
         self.reasoning.tool_ends_reasoning =
             syntax.is_some_and(|s| s.terminal_markers.iter().any(|m| m == D::OPEN));
@@ -228,6 +238,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             received: 0,
             spans: vec![],
             reasoning_enabled: true,
+            initial_close: false,
             mode: match config.start {
                 OutputStart::Content => Mode::Content,
                 OutputStart::Reasoning => Mode::Reasoning,
@@ -240,6 +251,8 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             tools: definitions.clone(),
             reasoning: ThinkReasoning {
                 buffer: String::new(),
+                open: "<think>".into(),
+                close: "</think>".into(),
                 trim_newlines: 0,
                 tools,
                 trim_wrap: D::TRIM_NEWLINES,
@@ -337,10 +350,25 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                     }
                 }
                 Mode::Content => {
+                    if self.initial_close {
+                        if self.reasoning.close.starts_with(&self.buffer)
+                            && self.buffer.len() < self.reasoning.close.len()
+                        {
+                            return Ok(output);
+                        }
+                        self.initial_close = false;
+                        if self.buffer.starts_with(self.reasoning.close.as_str()) {
+                            self.buffer.drain(..self.reasoning.close.len());
+                            continue;
+                        }
+                    }
                     if self.outer_tool_pending {
                         let text = self.buffer.trim_start();
                         if text.is_empty()
                             || (D::CLOSE.starts_with(text) && text.len() < D::CLOSE.len())
+                            || D::FUNCTION.is_some_and(|(open, _)| {
+                                open.starts_with(text) && text.len() < open.len()
+                            })
                         {
                             return Ok(output);
                         }
@@ -349,6 +377,10 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                             let at = self.buffer.find(D::CLOSE).unwrap();
                             self.buffer.drain(..at + D::CLOSE.len());
                             continue;
+                        }
+                        if D::FUNCTION.is_some_and(|(open, _)| text.starts_with(open)) {
+                            let whitespace = self.buffer.len() - text.len();
+                            self.buffer.drain(..whitespace);
                         }
                     }
                     if self.structured {
@@ -360,7 +392,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                             D::OPEN,
                             D::CLOSE,
                             D::FUNCTION.map_or(D::OPEN, |(open, _)| open),
-                            "</think>",
+                            self.reasoning.close.as_str(),
                         ];
                         let control = markers
                             .iter()
@@ -372,9 +404,9 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                         }
                     }
                     if self.reasoning.tool_ends_reasoning {
-                        if let Some(at) = self.buffer.find("</think>") {
+                        if let Some(at) = self.buffer.find(self.reasoning.close.as_str()) {
                             let earlier = [
-                                "<think>",
+                                self.reasoning.open.as_str(),
                                 D::OPEN,
                                 D::FUNCTION.map_or(D::OPEN, |(open, _)| open),
                             ]
@@ -383,7 +415,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                             if !earlier {
                                 let start = self.received - self.buffer.len();
                                 let prefix: String = self.buffer.drain(..at).collect();
-                                self.buffer.drain(.."</think>".len());
+                                self.buffer.drain(..self.reasoning.close.len());
                                 if !prefix.is_empty() {
                                     self.spans.push(Some(start..start + prefix.len()));
                                     output.push(Event::Content(prefix));
@@ -394,7 +426,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                     }
                     let mut marker = self
                         .reasoning_enabled
-                        .then(|| self.buffer.find("<think>"))
+                        .then(|| self.buffer.find(self.reasoning.open.as_str()))
                         .flatten()
                         .map(|at| (at, false));
                     let mut bare_function = false;
@@ -435,7 +467,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                             } else if tool {
                                 D::OPEN.len()
                             } else {
-                                "<think>".len()
+                                self.reasoning.open.len()
                             },
                         );
                         self.mode = if tool { Mode::Tool } else { Mode::Reasoning };
@@ -450,6 +482,8 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                             self.reasoning = ThinkReasoning {
                                 dialect: std::marker::PhantomData,
                                 buffer: String::new(),
+                                open: self.reasoning.open.clone(),
+                                close: self.reasoning.close.clone(),
                                 trim_newlines: u8::from(self.reasoning.trim_wrap) as usize,
                                 trim_wrap: self.reasoning.trim_wrap,
                                 tool_ends_reasoning: self.reasoning.tool_ends_reasoning,
@@ -461,14 +495,22 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                         let double_newline = format!("\n\n{}", D::OPEN);
                         let markers: &[&str] = match (self.reasoning_enabled, self.tools.is_empty())
                         {
-                            (true, true) => &["<think>"],
-                            (true, false) => &["<think>", D::OPEN, &double_newline, &newline],
+                            (true, true) => &[self.reasoning.open.as_str()],
+                            (true, false) => &[
+                                self.reasoning.open.as_str(),
+                                D::OPEN,
+                                &double_newline,
+                                &newline,
+                            ],
                             (false, false) => &[D::OPEN, &double_newline, &newline],
                             (false, true) => &[],
                         };
                         let mut hold = partial_marker(&self.buffer, markers);
                         if self.reasoning.tool_ends_reasoning {
-                            hold = hold.max(partial_marker(&self.buffer, &["</think>"]));
+                            hold = hold.max(partial_marker(
+                                &self.buffer,
+                                &[self.reasoning.close.as_str()],
+                            ));
                         }
                         if !self.tools.is_empty()
                             && let Some((open, _)) = D::FUNCTION

@@ -39,8 +39,8 @@ RECIPE = Recipe(
         revision="adea8e2c5373181e5a973fa1ecb343cb31af214b", architecture="MiMoV2ForCausalLM",
         stored_bytes=566_027_990_784, device_bytes=568_511_624_448, draft_bytes=5_536_632_576,
         expansion_bytes=14 << 30),),
-    context=1048576, page_tokens=128, concurrency=4, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
+    speculation=Speculation(draft_tokens=7, token_capacity=128), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,
     ranks=MappingProxyType({world: RankCosts(33_816_576 // world, 3_276_800 // world, 8 << 30)
                             for world in (2, 4, 8)}),

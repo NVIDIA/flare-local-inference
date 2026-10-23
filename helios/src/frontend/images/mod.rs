@@ -15,6 +15,7 @@ mod record;
 pub use conditioned::{ImageDescription, ImageEncoding, ImageInput, ImageSource, PreparedImageInput};
 pub(crate) mod packing;
 mod patches;
+mod patch_merge;
 mod qwen;
 mod radio;
 mod resize;
@@ -241,6 +242,7 @@ pub struct ImageProcessor {
 pub enum ImageSettings {
     Qwen(QwenImageSettings),
     Mimo(MimoImageSettings),
+    PatchMerge(PatchMergeImageSettings),
     Deepseek4 {},
     DeepseekRowMajor(DeepseekRowMajorImageSettings),
     Moonvit {},
@@ -255,6 +257,7 @@ impl ImageSettings {
         match self {
             Self::Qwen(_) => ImagePreparationKind::Qwen,
             Self::Mimo(_) => ImagePreparationKind::Mimo,
+            Self::PatchMerge(_) => ImagePreparationKind::PatchMerge,
             Self::Deepseek4 {} => ImagePreparationKind::Deepseek,
             Self::DeepseekRowMajor(_) => ImagePreparationKind::DeepseekRowMajor,
             Self::Moonvit {} => ImagePreparationKind::Moonvit,
@@ -292,10 +295,24 @@ pub struct MimoImageSettings {
     pub image_std: [f32; 3],
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PatchMergeImageSettings {
+    pub patch_size: usize,
+    pub min_pixels: usize,
+    pub max_pixels: usize,
+    pub image_mean: [f32; 3],
+    pub image_std: [f32; 3],
+    pub image_token: String,
+    pub start_token: String,
+    pub end_token: String,
+}
+
 #[derive(Clone)]
 enum Profile {
     Qwen(qwen::QwenProcessor),
     MiMo(patches::PatchProcessor),
+    PatchMerge(patch_merge::Processor),
     DeepSeek4,
     DeepseekRowMajor(DeepseekRowMajorImageSettings),
     Moonvit,
@@ -335,6 +352,7 @@ impl ImageProcessor {
             ImageSettings::Radio {} => Profile::Radio,
             ImageSettings::Glm {} => Profile::Glm,
             ImageSettings::Mimo(settings) => Profile::MiMo(mimo::load(&settings, limits)?),
+            ImageSettings::PatchMerge(settings) => Profile::PatchMerge(patch_merge::Processor::load(settings, limits)?),
             ImageSettings::Qwen(settings) => {
                 Profile::Qwen(qwen::QwenProcessor::load(&settings, limits)?)
             }
@@ -636,6 +654,7 @@ impl ImageProcessor {
         match &self.profile {
             Profile::Qwen(profile) => profile.patches.geometry(width, height),
             Profile::MiMo(profile) => profile.geometry(width, height),
+            Profile::PatchMerge(profile) => profile.patches.geometry(width, height),
             Profile::DeepSeek4 => deepseek4::geometry(self.limits, width, height),
             Profile::DeepseekRowMajor(settings) => deepseek_row_major::geometry(settings, self.limits, width, height),
             Profile::Moonvit => moonvit::geometry(self.limits, width, height),
@@ -648,6 +667,7 @@ impl ImageProcessor {
         match &self.profile {
             Profile::Qwen(profile) => profile.patches.resized_rgb(image),
             Profile::MiMo(profile) => profile.resized_rgb(image),
+            Profile::PatchMerge(profile) => profile.patches.resized_rgb(image),
             Profile::DeepSeek4 => deepseek4::resized_rgb(self.limits, image),
             Profile::DeepseekRowMajor(settings) => deepseek_row_major::resized_rgb(settings, self.limits, image),
             Profile::Moonvit => moonvit::resized_rgb(self.limits, image),
@@ -660,6 +680,7 @@ impl ImageProcessor {
         match &self.profile {
             Profile::Qwen(profile) => profile.process(images),
             Profile::MiMo(profile) => profile.process(images),
+            Profile::PatchMerge(profile) => profile.patches.process(images),
             Profile::DeepSeek4 => deepseek4::process(self.limits, images),
             Profile::DeepseekRowMajor(settings) => deepseek4::pack(
                 self.limits,
@@ -681,6 +702,7 @@ impl ImageProcessor {
     ) -> Result<ImagePrompt> {
         match &self.profile {
             Profile::Qwen(profile) => profile.expand_prompt(frontend, text, images),
+            Profile::PatchMerge(profile) => profile.expand_prompt(frontend, text, images),
             Profile::DeepSeek4 | Profile::DeepseekRowMajor(_) => Err("DeepSeek image spans require its model contract".into()),
             Profile::MiMo(_) => Err("MiMo image expansion requires its model contract".into()),
             Profile::Moonvit => Err("MoonViT image expansion requires its model contract".into()),

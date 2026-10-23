@@ -76,8 +76,10 @@ pub struct Snapshot {
     pub draft_steps: u64,
     /// Completed speculative or verification graphs, including terminal no-op rounds.
     pub verify_steps: u64,
-    /// Draft positions those graphs verified: verification width minus one per graph.
+    /// Draft positions allocated for progressing request rounds, including rejected drafts.
     pub verification_drafts: u64,
+    /// Progressing decode or verification request rounds, including zero-draft rounds.
+    pub verification_rounds: u64,
     /// Accepted draft tokens from progressing request rounds, excluding the bonus token.
     pub accepted_drafts: u64,
     /// Progressing request rounds that offered at least one draft.
@@ -203,6 +205,8 @@ pub(super) struct Metrics {
     generated_tokens: AtomicU64,
     accepted_drafts: AtomicU64,
     draft_rounds: AtomicU64,
+    verification_drafts: AtomicU64,
+    verification_rounds: AtomicU64,
     pub admitted: AtomicU64,
     pub http_requests: [AtomicU64; 5],
     pub completed: AtomicU64,
@@ -268,12 +272,15 @@ impl Metrics {
         }
     }
 
-    pub fn progress(&self, prefill: u64, generated: usize, accepted: u64, rounds: u64) {
+    pub fn progress(&self, prefill: u64, generated: usize, accepted: u64, rounds: u64,
+        verification_drafts: u64, verification_rounds: u64) {
         for (counter, value) in [
             (&self.prefill_tokens, prefill),
             (&self.generated_tokens, generated as u64),
             (&self.accepted_drafts, accepted),
             (&self.draft_rounds, rounds),
+            (&self.verification_drafts, verification_drafts),
+            (&self.verification_rounds, verification_rounds),
         ] {
             if value != 0 {
                 counter.fetch_add(value, Ordering::Relaxed);
@@ -288,6 +295,8 @@ impl Metrics {
             generated_tokens: self.generated_tokens.load(Ordering::Relaxed),
             accepted_drafts: self.accepted_drafts.load(Ordering::Relaxed),
             draft_rounds: self.draft_rounds.load(Ordering::Relaxed),
+            verification_drafts: self.verification_drafts.load(Ordering::Relaxed),
+            verification_rounds: self.verification_rounds.load(Ordering::Relaxed),
             active: self.active_requests.load(Ordering::Relaxed),
             pending: self.pending.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
@@ -310,10 +319,9 @@ impl Metrics {
             ..Snapshot::default()
         };
         for widths in &self.speculative {
-            for (drafts, counts) in widths.iter().enumerate() {
+            for counts in widths {
                 let rounds = counts.rounds.load(Ordering::Relaxed);
                 snapshot.verify_steps += rounds;
-                snapshot.verification_drafts += rounds * drafts as u64;
             }
         }
         snapshot
@@ -624,6 +632,16 @@ impl Metrics {
                 "draft_request_rounds_total",
                 "Progressing live request rounds offering at least one draft; denominator for mean acceptance length.",
                 &self.draft_rounds,
+            ),
+            (
+                "verification_draft_tokens_total",
+                "Draft positions allocated for progressing live request rounds, including rejected drafts and excluding padding.",
+                &self.verification_drafts,
+            ),
+            (
+                "verification_request_rounds_total",
+                "Progressing live decode or verification request rounds, including zero-draft rounds; denominator for mean planned verification depth.",
+                &self.verification_rounds,
             ),
             (
                 "requests_admitted_total",
@@ -998,7 +1016,6 @@ mod tests {
         for learned in [false, true] {
             let snapshot = metrics.snapshot(learned);
             assert_eq!(snapshot.verify_steps, 1);
-            assert_eq!(snapshot.verification_drafts, 7);
         }
         let text = metrics.render();
         for line in [
@@ -1024,7 +1041,6 @@ mod tests {
         let snapshot = metrics.snapshot(true);
         assert_eq!(snapshot.draft_steps, 7);
         assert_eq!(snapshot.verify_steps, 2);
-        assert_eq!(snapshot.verification_drafts, 2);
         let text = metrics.render();
         assert!(text.contains("flare_proposal_rounds_total{batch=\"4\",depth=\"7\"} 1"));
         assert!(text.contains("flare_proposal_gpu_nanoseconds_total{batch=\"4\",depth=\"7\"} 700"));
@@ -1034,7 +1050,7 @@ mod tests {
     #[test]
     fn snapshot_json_round_trips_beside_the_prometheus_counters() {
         let metrics = Metrics::new(100, 128, 0);
-        metrics.progress(40, 3, 2, 1);
+        metrics.progress(40, 3, 2, 1, 5, 2);
         metrics.scheduler(SchedulerStats {
             active_requests: 2,
             free_pages: 10,
@@ -1044,6 +1060,8 @@ mod tests {
         let snapshot = metrics.snapshot(true);
         let json = snapshot.json(true);
         assert_eq!(json["generated_tokens"], 3);
+        assert_eq!(json["verification_drafts"], 5);
+        assert_eq!(json["verification_rounds"], 2);
         assert_eq!(json["free_pages"], 10);
         assert_eq!(json["learned_drafter"], true);
         assert_eq!(serde_json::from_value::<Snapshot>(json).unwrap(), snapshot);
@@ -1057,6 +1075,8 @@ mod tests {
         let text = metrics.render();
         for line in [
             "flare_generated_tokens_total 3",
+            "flare_verification_draft_tokens_total 5",
+            "flare_verification_request_rounds_total 2",
             "flare_prefill_tokens_total 40",
             "flare_active_requests 2",
             "flare_free_kv_pages 10",

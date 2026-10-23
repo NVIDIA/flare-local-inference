@@ -51,6 +51,7 @@ needs only Flare, the driver, and the package.
 | Agent control and package transfer | Every agent, reachable from the controller and source/peer nodes | TCP 29900 by default |
 | Serving package payloads | Serving ranks' CX7 interfaces | Dynamically allocated TCP listener per rank |
 | Serving rendezvous | Rank zero, reachable from every peer | TCP 29800 for Orbit launches |
+| Host prefix record service | Rank zero, reachable from every peer | Dynamically allocated TCP listener per launch; peers connect during startup when a disk prefix cache is configured |
 | HTTP API | Rank zero, reachable from clients | TCP 8000 in this guide |
 | Ignition preparation rendezvous | Preparation rank zero | The selected port; examples use TCP 29630 |
 | Ignition preparation coordination | Preparation hosts | Additional dynamically allocated TCPStore and Gloo ports |
@@ -357,6 +358,31 @@ The example binds all interfaces on Maxwell:
 ```sh
 curl -fsS http://maxwell:8000/health
 ```
+
+`--prefix-cache-disk DIR --prefix-cache-disk-limit SIZE --prefix-cache-memory 0`
+keep published prefix checkpoints on every host's disk. Each rank writes its
+own share of a record under `DIR` on its host; rank zero indexes, sizes, and
+evicts every record and drives each peer's copies. Give every rank the same
+settings: startup fails when one rank has a store and another does not. A
+memory tier cannot span hosts, so a nonzero `--prefix-cache-memory` is
+rejected.
+
+The effective limit is the smallest limit among the ranks, because every host
+must hold the same records. When the limit is omitted, each host derives one
+tenth of its own free space and the ranks use the smallest of those values; the
+startup line reports the limit each rank uses.
+
+A rank's record connection carries every store, fetch, truncate, and unlink. If
+it fails while a job is outstanding, the ranks stop serving rather than
+continue with a cache they can no longer account for, and the waiting request
+fails. Restart the group after a record-connection failure.
+
+The startup phase `Join host prefix stores` reports how many records every rank
+holds. In `/metrics`, `flare_host_cache_stored_total` counts copy-outs,
+`flare_host_cache_hits_total` counts restores, and
+`flare_host_cache_reused_tokens_total` counts the tokens those restores
+covered. See
+[prefix cache offload](prefix-cache-offload.md#214-ranks-on-separate-hosts).
 
 A printed URL or successful `--detach` means rank processes started; wait for
 a successful health response before sending inference requests. The default

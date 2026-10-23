@@ -693,8 +693,12 @@ then rebased onto the live addresses and validated, and the server starts
 from this reconstructed contract. `flare run PACKAGE` in
 `flare/src/main.rs` starts the shared server directly from the typed contract.
 
-Before any CUDA initialization or worker threads, Flare restricts
+Before CUDA initialization or serving worker threads, Flare restricts
 `CUDA_VISIBLE_DEVICES` to `--gpus`, resolving indices within an inherited mask.
+When omitted, the list contains the first N visible GPUs for the package's N
+local ranks, or one GPU per host for a multi-host package. Package loading finishes
+its progress threads before setting visibility. Hub revision detection queries
+NVML in a separate process without initializing CUDA.
 Rank order follows the selected list; Helios receives contiguous device ordinals
 starting at zero, while loading progress retains the CLI's GPU labels. Flare
 sets `CUDA_FORCE_PRELOAD_LIBRARIES=0` and `CUDA_DISABLE_JIT=1`. The loader requires

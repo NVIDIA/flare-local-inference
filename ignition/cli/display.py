@@ -32,6 +32,6 @@ def speculation(settings, *, brief: bool = False) -> str:
     if brief:
         source = " from history" if not settings.learned else " with history drafts" if settings.history_drafts else ""
         return depth + source + selection
-    source = ("request history" if not settings.learned
-              else "MTP module and request history" if settings.history_drafts else "MTP module")
+    source = ("shared decoded history" if not settings.learned
+              else "MTP module and shared decoded history" if settings.history_drafts else "MTP module")
     return f"{depth} per round · {source}" + selection

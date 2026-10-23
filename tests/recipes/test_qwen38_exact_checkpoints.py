@@ -237,7 +237,6 @@ def test_admission_failure_does_not_reset_other_speculative_state():
 
     previous = torch.tensor([8, 7, 6, 5], dtype=torch.int32)
     generations = torch.tensor([11, 12, 13, 14], dtype=torch.int64)
-    accepted_generation = torch.tensor([21, 22, 23, 24], dtype=torch.int64)
     operation = PreparedMaintenance.__new__(PreparedMaintenance)
     operation._prepared = True
     operation.admission = SimpleNamespace(validate=lambda: None, apply=lambda: None)
@@ -250,12 +249,11 @@ def test_admission_failure_does_not_reset_other_speculative_state():
     operation.stage_errors = torch.zeros(4, dtype=torch.int32)
     operation.mode, operation.history = "init", lambda: None
     operation.requests = SimpleNamespace(generation=generations)
-    operation.speculation = SimpleNamespace(previous_accepted=previous, accepted_generation=accepted_generation)
+    operation.speculation = SimpleNamespace(previous_accepted=previous)
     operation.slots = 4
     operation._rows = torch.arange(4)
     operation()
     assert previous.tolist() == [8, 7, 1, 5]
-    assert accepted_generation.tolist() == [21, 22, 13, 24]
     previous[2] = 6
     operation.metadata.errors[1] = 8
     operation()

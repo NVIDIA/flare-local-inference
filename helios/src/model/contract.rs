@@ -54,10 +54,10 @@ contract_enum!(ValueSource {
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2 });
-contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8 });
-contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3 });
+contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
+contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
 contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, Proposal = 10, Verification = 11, ScoredPrefill = 12, PackedSpeculative = 13 });
 
 impl TryFrom<GraphKind> for GraphOperation {
@@ -587,6 +587,7 @@ impl FrontendContract {
             let (open, close) = match reasoning.kind {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
                 ReasoningParserKind::XtmlThink => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+                ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
             };
             if reasoning.open != open
                 || reasoning.close != close

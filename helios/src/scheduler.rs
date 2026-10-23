@@ -11,6 +11,7 @@ pub(crate) use cost::observed_duration_ns;
 pub use policy::{PolicyConfig, RequestAccounting};
 use refresh::PlanOrigin;
 pub mod speculation;
+pub(crate) mod decoded_history;
 pub mod split;
 #[cfg(test)]
 mod valuation;
@@ -226,6 +227,7 @@ pub struct LiveRequest {
     vision_patches: VecDeque<usize>,
     prefill_spans: Vec<std::ops::Range<usize>>,
     copy_proposal: Option<speculation::CopyProposal>,
+    pub(crate) decoded_sequence: decoded_history::DecodedSequence,
     growable_output: bool,
     /// Finishing to free its pages; the runtime readmits its history instead of completing it.
     preempted: bool,
@@ -617,6 +619,7 @@ pub struct RequestScheduler {
     scored_prefill_catalog: Vec<usize>,
     mixed_catalog: Vec<(usize, usize, usize)>,
     proposal_source: speculation::ProposalSource,
+    decoded_history: Option<decoded_history::DecodedHistory>,
     split: Option<split::SplitSpeculation>,
     costs: cost::ActionCosts,
     refresh: refresh::RefreshState,
@@ -689,6 +692,7 @@ impl RequestScheduler {
             scored_prefill_catalog: Vec::new(),
             mixed_catalog: Vec::new(),
             proposal_source: speculation::ProposalSource::Mtp,
+            decoded_history: None,
             split: None,
             costs: cost::ActionCosts::default(),
             refresh: refresh::RefreshState::default(),
@@ -895,6 +899,30 @@ impl RequestScheduler {
             return Err("invalid copy proposal for committed request state".into());
         }
         request.copy_proposal = Some(proposal);
+        Ok(())
+    }
+    pub fn enable_history_drafts(&mut self) -> Result<()> {
+        if self.submitted != Fence(0) || self.admissions != 0 {
+            return Err("decoded history must be enabled before admission".into());
+        }
+        self.decoded_history.get_or_insert_with(decoded_history::DecodedHistory::new);
+        Ok(())
+    }
+
+    pub fn history_proposal(&self, context: &[u32], maximum: usize) -> ([i64; 7], usize) {
+        self.decoded_history.as_ref().map_or(([-1; 7], 0), |history| history.lookup(context, maximum))
+    }
+
+    pub(crate) fn resume_decoded_sequence(
+        &mut self,
+        handle: RequestHandle,
+        sequence: decoded_history::DecodedSequence,
+    ) -> Result<()> {
+        let request = self.request_mut(handle)?;
+        if request.generated_tokens != 0 || request.pending != 0 {
+            return Err("decoded sequence must be restored before execution".into());
+        }
+        request.decoded_sequence = sequence;
         Ok(())
     }
     pub fn graph_durations(&mut self, graphs: &[crate::execution::GraphDescriptor]) -> Result<()> {
@@ -1465,6 +1493,7 @@ impl RequestScheduler {
             execution_limit: execution_limit as u64,
             error_code: None,
             copy_proposal: None,
+            decoded_sequence: Default::default(),
             history,
             tokens: spec.prompt,
             prefix,
@@ -2451,6 +2480,15 @@ impl RequestScheduler {
             }
             if request.pending == 0 {
                 request.scheduled_consumed = request.consumed_tokens;
+            }
+        }
+        if let Some(history) = &mut self.decoded_history {
+            for event in &generated {
+                let slot = event.request.slot as usize;
+                if records[slot].status != 3 {
+                    let request = self.slots[slot].request.as_mut().unwrap();
+                    history.append(&mut request.decoded_sequence, event.token);
+                }
             }
         }
         self.advance_retirement(fence)?;

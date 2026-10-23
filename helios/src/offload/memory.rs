@@ -1005,7 +1005,7 @@ impl PrefixStore for MemoryStore {
         self.fetch_chain(&hit.chain, ticket)
     }
 
-    fn poll(&mut self, events: &mut Vec<StoreEvent>) {
+    fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
         events.append(&mut self.events);
         self.transfers
             .lock()
@@ -1017,6 +1017,7 @@ impl PrefixStore for MemoryStore {
         self.core.settle(events);
         self.pump();
         events.append(&mut self.events);
+        Ok(())
     }
 
     fn stats(&self) -> StoreStats {
@@ -1033,7 +1034,7 @@ impl PrefixStore for MemoryStore {
         while !(self.core.outbound.is_empty() && self.core.inbound.is_empty())
             && Instant::now() < deadline
         {
-            self.poll(&mut events);
+            let _ = self.poll(&mut events);
             events.clear();
             if !(self.core.outbound.is_empty() && self.core.inbound.is_empty()) {
                 std::thread::sleep(Duration::from_millis(1));

@@ -409,7 +409,8 @@ class DirectWeightLoader:
                     paths(),
                     index_path=self.manifest.index_path,
                     skip=lambda name: name not in selected,
-                    needs_values=lambda entry: entry.name.endswith((".weight_scale_2", ".input_scale")),
+                    needs_values=lambda entry: entry.name.endswith((
+                        ".weight_scale_2", ".input_scale", ".weight_global_scale", ".input_global_scale")),
                 ))
             if self._sources.keys() != selected:
                 raise ValueError("direct loader tensor coverage differs from the inspected checkpoint")
@@ -481,7 +482,7 @@ class DirectWeightLoader:
         self._copy(target, source)
         return target
 
-    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None):
+    def load_linear_group(self, prefixes, *, row_ranges=None, column_range=None, scale_name="weight_scale"):
         """Pack compatible projection rows without changing their quantization."""
         self._require_open()
         prefixes = tuple(prefixes)
@@ -560,7 +561,7 @@ class DirectWeightLoader:
         weights, block_scales = [], []
         for prefix, row_range in zip(prefixes, row_ranges, strict=True):
             weight = self._sources[f"{prefix}.weight"]
-            scale = self._sources[f"{prefix}.weight_scale"]
+            scale = self._sources[f"{prefix}.{scale_name}"]
             if weight.ndim != 2 or weight.dtype != dtype:
                 raise ValueError(f"{prefix}: {fmt.upper()} weight must be a {dtype} matrix")
             rows, stored_columns = weight.shape
@@ -718,7 +719,10 @@ class DirectWeightLoader:
                          swiglu_clamp_after_silu=False,
                          scale_compression=None, scale_scratch=None,
                          projection_names=("up_proj", "gate_proj", "down_proj"), scale_name="weight_scale",
-                         weight_name="weight", activation="silu", w13_layout="w13", shared_columns=None):
+                         weight_name="weight", activation="silu", w13_layout="w13", shared_columns=None,
+                         global_scale_name="weight_scale_2", global_scale_kind="multiplier",
+                         input_scale_name=None, activation_outer_scale="expert",
+                         swiglu_alpha=None, swiglu_beta=None):
         """Prepare NVFP4 or MXFP4 experts, optionally compressing their block scales.
 
         The first two projection names fill the first and second w13 halves in that
@@ -737,6 +741,12 @@ class DirectWeightLoader:
         self._require_open()
         prefixes = tuple(prefixes)
         sm103 = is_sm103(self.device)
+        if global_scale_kind not in ("multiplier", "reciprocal"):
+            raise ValueError("expert global scale kind must be multiplier or reciprocal")
+        if activation_outer_scale not in ("expert", "token"):
+            raise ValueError("expert activation outer scale must be expert or token")
+        if activation_outer_scale == "token" and (format != "nvfp4" or activation_mode != "a4" or sm103):
+            raise ValueError("per-token activation outer scales require SM120 NVFP4 A4 experts")
         if sm103 and (scale_compression is not None or scale_scratch is not None):
             raise ValueError("SM103 FP4 experts do not support load-time scale compression")
         up_name, gate_name, down_name = projection_names
@@ -791,10 +801,17 @@ class DirectWeightLoader:
                                else scale[first:last])
                 if format == "mxfp4":
                     continue
-                value = self._sources[f"{prefix}.{projection}.weight_scale_2"]
+                value = self._sources[f"{prefix}.{projection}.{global_scale_name}"]
                 if value.dtype != torch.float32 or value.numel() != 1 or not bool(torch.isfinite(value) & (value > 0)):
                     raise ValueError(f"{prefix}.{projection}: expected a positive FP32 global weight scale")
-                scales[projection] = value.item()
+                scales[projection] = value.item() if global_scale_kind == "multiplier" else 1. / value.item()
+                if input_scale_name is not None:
+                    input_scale = self._sources[f"{prefix}.{projection}.{input_scale_name}"]
+                    if (input_scale.dtype != torch.float32 or input_scale.numel() != 1
+                            or not bool(torch.isfinite(input_scale) & (input_scale > 0))):
+                        raise ValueError(f"{prefix}.{projection}: expected a positive FP32 input scale")
+                    if activation_outer_scale == "token" and input_scale.item() != 1.:
+                        raise ValueError(f"{prefix}.{projection}: per-token activation placeholder must be one")
             if format == "mxfp4":
                 continue
             if scales[gate_name] != scales[up_name]:
@@ -815,7 +832,7 @@ class DirectWeightLoader:
             record_numeric_tensor(w2)
             record_numeric_tensor(s2)
             shared.exchange()
-        if activation_mode == "a4":
+        if activation_mode == "a4" and activation_outer_scale == "expert":
             if scale_vectors is None or len(scale_vectors) != 4:
                 raise ValueError("NVFP4 A4 experts require weight and activation scale vectors")
             vectors = scale_vectors
@@ -837,16 +854,24 @@ class DirectWeightLoader:
                 raise ValueError("SM103 FP4 experts do not support post-SiLU clamping")
             return _sm103_fp4_experts(w13, s13, w2, s2, vectors, format=format,
                                       activation_mode=activation_mode, swiglu_limit=swiglu_limit)
+        activation_options = {}
+        if swiglu_alpha is not None:
+            activation_options["swiglu_alpha"] = swiglu_alpha
+        if swiglu_beta is not None:
+            activation_options["swiglu_beta"] = swiglu_beta
+        if activation_outer_scale != "expert":
+            activation_options["outer_scale"] = activation_outer_scale
         plan = moe.plan_weights(
             source=moe.PackedSource(format="modelopt_nvfp4" if format == "nvfp4" else "fp4_e8m0_k32",
                                     w13_layout=w13_layout),
             activation=moe.ActivationSpec(mode=activation_mode, nonlinearity=activation, io_dtype=torch.bfloat16,
                                           swiglu_limit=swiglu_limit,
-                                          swiglu_clamp_after_silu=swiglu_clamp_after_silu),
+                                          swiglu_clamp_after_silu=swiglu_clamp_after_silu,
+                                          **activation_options),
             geometry=moe.MoEGeometry(num_experts=count, hidden_size=hidden_size, intermediate_size=local),
             constraints=moe.WeightPlanConstraints(scale_compression=scale_compression))
         gains = {} if not device_scales else dict(w13_global_scales=device_scales[0], w2_global_scales=device_scales[1])
-        if activation_mode == "a4":
+        if activation_mode == "a4" and activation_outer_scale == "expert":
             gains.update(input_scale=device_scales[2], intermediate_scale=device_scales[3], immutable_input_scales=True)
         packed = moe.PackedWeights(
             w13=w13, w2=w2,

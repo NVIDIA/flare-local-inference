@@ -6,7 +6,7 @@ use super::{
 };
 use crate::{
     Result,
-    model::contract::{FrontendContract, ToolParserKind},
+    model::contract::{FrontendContract, ReasoningParserKind, ToolParserKind},
 };
 
 #[derive(Clone)]
@@ -23,6 +23,7 @@ pub enum OutputPipeline {
     Dsml(super::dsml::DsmlOutput<false>),
     SpacedDsml(super::dsml::DsmlOutput<true>),
     Xtml(super::xtml::XtmlOutput),
+    MiniMaxXml(TaggedOutput<super::minimax_xml::MiniMaxXml>),
     Text(TaggedOutput<PlainText>),
 }
 
@@ -46,6 +47,7 @@ macro_rules! dispatch {
             OutputPipeline::Dsml($parser) => $body,
             OutputPipeline::SpacedDsml($parser) => $body,
             OutputPipeline::Xtml($parser) => $body,
+            OutputPipeline::MiniMaxXml($parser) => $body,
             OutputPipeline::Text($parser) => $body,
         }
     };
@@ -79,6 +81,9 @@ impl OutputPipeline {
                 config.content,
                 config.control_tokens,
             )),
+            Some((ToolParserKind::MiniMaxXml, _, _)) => {
+                Self::MiniMaxXml(TaggedOutput::new(config.content).with_reasoning(reasoning))
+            }
             None => Self::Text(TaggedOutput::new(config.content).with_reasoning(reasoning)),
         }
     }
@@ -122,6 +127,9 @@ impl OutputPipeline {
                 response: Some(("", super::xtml::RESPONSE_CLOSE)),
                 tool_body_start: false,
             }),
+            Some((ToolParserKind::MiniMaxXml, _, _)) => {
+                TaggedOutput::<super::minimax_xml::MiniMaxXml>::grammar_envelope(&config.content)
+            }
             None => Some(crate::grammar::OutputEnvelope {
                 reasoning_end: (config.content.start == super::tagged::OutputStart::Reasoning)
                     .then_some("</think>"),
@@ -132,6 +140,15 @@ impl OutputPipeline {
                 tool_body_start: false,
             }),
         }?;
+        if config.content.start == super::tagged::OutputStart::Reasoning
+            && config
+                .syntax
+                .reasoning
+                .as_ref()
+                .is_some_and(|r| r.kind == ReasoningParserKind::MmThink)
+        {
+            envelope.reasoning_end = Some("</mm:think>");
+        }
         envelope.tool_ends_reasoning = config.syntax.reasoning.as_ref().is_some_and(|r| {
             envelope
                 .tool
@@ -250,5 +267,89 @@ mod tests {
         let result = run(syntax, "<think>plan</think>answer", vec![], false);
         assert_eq!(result["reasoning_content"], "plan");
         assert_eq!(result["content"], "answer");
+    }
+    #[test]
+    fn mm_think_and_namespace_tools_stream_at_every_utf8_boundary() {
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::MiniMaxXml,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::MmThink,
+            open: "<mm:think>".into(),
+            close: "</mm:think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        let tools = vec![
+            json!({"function":{"name":"lookup","parameters":{"properties":{"n":{"type":"integer"}}}}}),
+        ];
+        let text = "</mm:think><mm:think>café 世界</mm:think>Searching. ]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name='lookup'>]<]minimax[>[<n>3]<]minimax[>[</n>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=lookup>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let config = OutputConfig {
+                syntax: syntax.clone(),
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    start: crate::output::tagged::OutputStart::Content,
+                    structured: false,
+                    tools: tools.clone(),
+                },
+            };
+            let mut parser = OutputPipeline::new(config);
+            let mut output = Accumulator::new("xml".into());
+            for part in [&text[..split], &text[split..]] {
+                output
+                    .apply(parser.push(Input::Text(part)).unwrap())
+                    .unwrap();
+            }
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            let result = output.message();
+            assert_eq!(result["reasoning_content"], "café 世界", "split {split}");
+            assert_eq!(result["content"], "Searching. ", "split {split}");
+            assert_eq!(
+                result["tool_calls"][0]["function"]["arguments"],
+                "{\"n\":3}"
+            );
+            assert_eq!(result["tool_calls"][1]["function"]["arguments"], "{}");
+        }
+        assert_eq!(
+            run(
+                syntax.clone(),
+                "</mm:think>answer</mm:think>",
+                vec![],
+                false
+            )["content"],
+            "answer</mm:think>"
+        );
+        let config = OutputConfig {
+            syntax,
+            control_tokens: vec![],
+            content: TaggedConfig {
+                start: crate::output::tagged::OutputStart::Reasoning,
+                structured: true,
+                tools: vec![],
+            },
+        };
+        assert_eq!(
+            OutputPipeline::grammar_envelope(&config)
+                .unwrap()
+                .reasoning_end,
+            Some("</mm:think>")
+        );
+        let mut parser = OutputPipeline::new(config.clone());
+        assert_eq!(
+            parser
+                .push(Input::Text("plan</mm:think>{\"ok\":true}"))
+                .unwrap(),
+            vec![
+                Event::Reasoning("plan".into()),
+                Event::Content("{\"ok\":true}".into())
+            ]
+        );
     }
 }

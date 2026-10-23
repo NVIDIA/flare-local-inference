@@ -55,6 +55,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Ok(());
         }
         cli::Command::Inspect(args) => return inspect::run(args),
+        cli::Command::HardwareRevision { gpu_count } => {
+            let devices: Vec<_> = (0..gpu_count).collect();
+            environment::configure(&devices)?;
+            println!("{}", hardware::detect(gpu_count as usize)?);
+            return Ok(());
+        }
         #[cfg(unix)]
         cli::Command::CheckpointTransport { socket } => {
             return fabric_transport::run(&socket).map_err(|e| e.to_string().into());
@@ -118,7 +124,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let bind = args.bind_address();
-    environment::configure(&args.gpus)?;
+    if args.rank.is_some_and(|rank| rank != 0) {
+        args.serving.select_gpus(1);
+    }
+    if !args.gpus.is_empty() {
+        environment::configure(&args.gpus)?;
+    }
     let key = args
         .api_key_file
         .as_ref()
@@ -128,7 +139,6 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .map_err(|error| format!("cannot read API key file {}: {error}", path.display()))
         })
         .transpose()?;
-    let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let mut progress = StartupProgress::stderr();
     #[cfg(unix)]
     let mut launched = None;
@@ -144,6 +154,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (received.authorized, Some(received.membership))
     } else {
         let (root, authorized, publisher) = load_package(&args, &mut progress)?;
+        configure_package_devices(&mut args, &authorized, &mut progress)?;
         _lease = None;
         if !args.hosts.is_empty() {
             launched = Some(
@@ -180,7 +191,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (authorized, membership)
     };
     #[cfg(windows)]
-    let (_, authorized, _) = load_package(&args, &mut progress)?;
+    let authorized = {
+        let (_, authorized, _) = load_package(&args, &mut progress)?;
+        configure_package_devices(&mut args, &authorized, &mut progress)?;
+        authorized
+    };
     #[cfg(windows)]
     let mut membership: Option<cluster::Membership> = None;
     if args.stage_only {
@@ -191,6 +206,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let options = args.load_options();
+    let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();
     let roce_ring = args.roce_ring;
     let rendezvous = args.rendezvous;
     // SAFETY: The trusted package owners remain live until every rank drains.
@@ -238,6 +254,24 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+fn configure_package_devices(
+    args: &mut cli::Run,
+    package: &flare_helios::runtime_package::AuthorizedPackage,
+    progress: &mut StartupProgress,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.gpus.is_empty() {
+        let local_ranks = if flare_helios::runtime_package::package_cluster(package).is_some() {
+            1
+        } else {
+            flare_helios::runtime_package::rank_needs(package).len()
+        };
+        args.serving.select_gpus(local_ranks);
+        progress.finish_animation();
+        environment::configure(&args.gpus)?;
+    }
+    Ok(())
+}
+
 fn load_package(
     args: &cli::Run,
     progress: &mut StartupProgress,
@@ -257,7 +291,7 @@ fn load_package(
     let path = if hub::is_repository(package) {
         let text = package.to_str().ok_or("repository must be UTF-8")?;
         origin = Some(hub::repository(text)?.0.to_owned());
-        hub::download(text, &args.hub, args.gpus.len())?
+        hub::download(text, &args.hub, args.gpus.len().max(1))?
     } else {
         if args.hub.revision.is_some()
             || args.hub.filename.is_some()
@@ -352,7 +386,8 @@ fn serve_peer(
     roce_ring: bool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut manifest = owner.manifests()?.remove(0);
-    let joined = cluster::peer(&owner, cluster, stream, &progress, roce_ring)?;
+    let mut joined = cluster::peer(&owner, cluster, stream, &progress, roce_ring)?;
+    let records = joined.records.take();
     manifest.collectives = Some(cluster::health(&joined.transport));
     progress.finish_animation();
     eprintln!(
@@ -365,6 +400,7 @@ fn serve_peer(
         flare_helios::execution::serve_rank(manifest, joined.streams, cluster.rank, cluster.world)
     };
     if !shutdown.drained {
+        std::mem::forget(records);
         std::mem::forget(joined.transport);
         std::mem::forget(owner);
         return Err(match shutdown.error {
@@ -372,6 +408,17 @@ fn serve_peer(
             None => "native replay did not drain".into(),
         }
         .into());
+    }
+    // Rank zero closes its store after every rank drained; the service's transfers use this
+    // rank's context and registered staging, which the package owner releases.
+    if let Some(records) = records
+        && let Err(error) = records.join()
+    {
+        // The service could not confirm its drain, so its transfers may still
+        // use this rank's context and registered staging.
+        std::mem::forget(joined.transport);
+        std::mem::forget(owner);
+        return Err(format!("host prefix record service did not drain: {error}").into());
     }
     // The proxy stops before the package releases the region it posts from.
     drop(joined.transport);

@@ -13,8 +13,8 @@ pub struct LoadOptions {
     pub memory_limit: Option<super::MemoryLimit>,
     /// Auxiliary embedding-table storage; defaults to disk when absent.
     pub embedding_table_storage: Option<crate::engram::Storage>,
-    /// Per-host bytes for disk-backed embedding row caches; zero disables.
-    pub embedding_table_cache_bytes: u64,
+    /// Per-host RAM bytes for disk-backed embedding rows; zero disables, absent selects by memory topology.
+    pub embedding_table_cache_bytes: Option<u64>,
     /// Keep original scale-plane bytes in host RAM while embedding weights remain on disk.
     pub embedding_table_resident_scales: bool,
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
@@ -40,6 +40,18 @@ impl LoadOptions {
             .unwrap_or(if cfg!(windows) { 4 } else { 1 })
     }
 
+    pub(super) fn embedding_cache_bytes(&self, has_tables: bool, integrated: bool) -> u64 {
+        self.embedding_table_cache_bytes.unwrap_or_else(|| {
+            if has_tables
+                && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
+            {
+                if integrated { 1 << 30 } else { 4 << 30 }
+            } else {
+                0
+            }
+        })
+    }
+
     pub(super) fn select(&self, packages: &mut [Package], config: &mut Value) -> Result<usize> {
         if self.mtp_verification_token_budget.is_some() && self.mtp_max_verification_token_budget.is_some() {
             return Err(invalid("exact and maximum verification token budgets are mutually exclusive"));
@@ -59,7 +71,7 @@ impl LoadOptions {
                 return Err(invalid("parallel embedding disk workers require Windows"));
             }
         }
-        if self.embedding_table_cache_bytes != 0
+        if self.embedding_table_cache_bytes.is_some_and(|bytes| bytes != 0)
             && self.embedding_table_storage == Some(crate::engram::Storage::Ram)
         {
             return Err(invalid("embedding row cache requires disk table storage"));
@@ -656,10 +668,39 @@ mod tests {
     }
 
     #[test]
+    fn embedding_cache_defaults_follow_storage_and_memory_topology() {
+        use crate::engram::Storage;
+        for storage in [None, Some(Storage::Disk)] {
+            let mut options = LoadOptions { embedding_table_storage: storage, ..Default::default() };
+            options.select(&mut [package()], &mut config()).unwrap();
+            assert_eq!(options.embedding_cache_bytes(true, false), 4 << 30);
+            assert_eq!(options.embedding_cache_bytes(true, true), 1 << 30);
+            assert_eq!(options.embedding_cache_bytes(false, false), 0);
+            assert_eq!(options.embedding_cache_bytes(false, true), 0);
+            for bytes in [0, 2 << 30, 8 << 30] {
+                options.embedding_table_cache_bytes = Some(bytes);
+                options.select(&mut [package()], &mut config()).unwrap();
+                assert_eq!(options.embedding_cache_bytes(true, false), bytes);
+                assert_eq!(options.embedding_cache_bytes(true, true), bytes);
+            }
+        }
+        for bytes in [None, Some(0)] {
+            let options = LoadOptions {
+                embedding_table_storage: Some(Storage::Ram),
+                embedding_table_cache_bytes: bytes,
+                ..Default::default()
+            };
+            options.select(&mut [package()], &mut config()).unwrap();
+            assert_eq!(options.embedding_cache_bytes(true, false), 0);
+            assert_eq!(options.embedding_cache_bytes(true, true), 0);
+        }
+    }
+
+    #[test]
     fn cached_disk_rows_reject_resident_table_storage_before_cuda() {
         let options = LoadOptions {
             embedding_table_storage: Some(crate::engram::Storage::Ram),
-            embedding_table_cache_bytes: 1 << 30,
+            embedding_table_cache_bytes: Some(1 << 30),
             ..Default::default()
         };
         assert!(
@@ -675,11 +716,11 @@ mod tests {
     fn resident_scales_allow_cached_disk_rows_and_reject_whole_table_ram() {
         let mut options = LoadOptions {
             embedding_table_resident_scales: true,
-            embedding_table_cache_bytes: 1 << 30,
+            embedding_table_cache_bytes: Some(1 << 30),
             ..Default::default()
         };
         options.select(&mut [package()], &mut config()).unwrap();
-        options.embedding_table_cache_bytes = 0;
+        options.embedding_table_cache_bytes = Some(0);
         options.embedding_table_storage = Some(crate::engram::Storage::Ram);
         assert!(options.select(&mut [package()], &mut config()).unwrap_err().to_string()
             .contains("resident embedding scales require disk table storage"));

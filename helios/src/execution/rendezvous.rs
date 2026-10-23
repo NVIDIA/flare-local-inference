@@ -268,6 +268,27 @@ pub fn share_records(peers: &mut [RankStream], local: Vec<u8>) -> Result<Vec<Vec
     Ok(records)
 }
 
+/// Rank zero: like [`share_records`], with a different rank-zero record for each peer.
+///
+/// `local` holds one entry per rank: entry zero is rank zero's own record, and
+/// entry `i + 1` is the record sent to peer `i`. A record that names an address
+/// can therefore name the address that peer reaches rank zero on.
+pub fn share_records_each(peers: &mut [RankStream], local: Vec<Vec<u8>>) -> Result<Vec<Vec<u8>>> {
+    if local.len() != peers.len() + 1 {
+        return Err(failure("rank zero prepared records for a different world"));
+    }
+    let mut records = vec![local[0].clone()];
+    for peer in peers.iter_mut() {
+        records.push(read_frame(peer)?);
+    }
+    for (index, peer) in peers.iter_mut().enumerate() {
+        let mut for_peer = records.clone();
+        for_peer[0] = local[index + 1].clone();
+        write_frame(peer, &encode(&for_peer))?;
+    }
+    Ok(records)
+}
+
 /// A peer: send this rank's transport record and receive every rank's.
 pub fn exchange_record(
     stream: &mut RankStream,

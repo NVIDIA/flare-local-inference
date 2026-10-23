@@ -965,9 +965,9 @@ impl PrefixStore for CompositeStore {
         Ok(())
     }
 
-    fn poll(&mut self, events: &mut Vec<StoreEvent>) {
+    fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()> {
         let mut memory_events = std::mem::take(&mut self.memory_events);
-        self.memory.poll(&mut memory_events);
+        self.memory.poll(&mut memory_events)?;
         for event in memory_events.drain(..) {
             match event {
                 StoreEvent::Stored {
@@ -980,7 +980,7 @@ impl PrefixStore for CompositeStore {
         }
         self.memory_events = memory_events;
         let mut transport_events = std::mem::take(&mut self.transport_events);
-        self.disk.poll_transport(&mut transport_events);
+        let polled = self.disk.poll_transport(&mut transport_events);
         for event in transport_events.drain(..) {
             match event {
                 TransportEvent::Stored { id, result } if self.jobs.contains_key(&id) => {
@@ -1012,6 +1012,7 @@ impl PrefixStore for CompositeStore {
         }
         self.drop_evicted_copies();
         self.retry_stale();
+        polled
     }
 
     fn stats(&self) -> StoreStats {
@@ -1039,7 +1040,7 @@ impl PrefixStore for CompositeStore {
             if stats.outbound_in_flight == 0 && stats.inbound_in_flight == 0 {
                 break;
             }
-            self.poll(&mut events);
+            let _ = self.poll(&mut events);
             events.clear();
             std::thread::sleep(Duration::from_millis(1));
         }

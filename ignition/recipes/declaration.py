@@ -100,7 +100,7 @@ class Speculation:
     widths from measured costs and conditional acceptance estimates when true, or use the fixed maximum when
     false. Flare can reduce both capacities when loading the package. Drafts
     come from the checkpoint's MTP module or, with the `copy` source, from
-    continuations of the request's own history; `history_drafts` adds those
+    continuations from shared decoded history; `history_drafts` adds those
     continuations to MTP drafts.
     """
 
@@ -177,7 +177,7 @@ class Recipe:
     unless a plan overrides them, and `plain_ranks` holds its costs with
     speculation disabled. Each active request has one execution state row per
     selected verification position unless `verification_rows` gives another count
-    of extra rows. `history_copy` states that drafts can be copied from request history.
+    of extra rows. `history_copy` states that drafts can be copied from shared decoded history.
     `stream_overlap` states that captured graphs run independent branches on an
     auxiliary stream, which a plan can serialize onto the main stream.
     `online_mxfp8` states that the recipe names BF16 projections a plan may store as

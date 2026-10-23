@@ -31,6 +31,8 @@ tempfile = "3"
 # DGX Spark and Grace hosts serve multi-host packages over RoCEnante, which links libibverbs.
 [target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
 flare-helios = { path = "../helios", features = ["runtime-package", "server", "roce"] }
+# sha2 0.10 gates ARM SHA-256 instructions behind its asm feature.
+sha2 = { version = "0.10.9", features = ["asm"] }
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Shell", "Win32_Security", "Win32_Security_Authorization"] }

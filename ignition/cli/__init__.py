@@ -159,9 +159,9 @@ def _preparation_arguments(running):
                                " learned speculation (default: see MODEL --help)")
     speculative.add_argument("--mtp-proposal-source", choices=("mtp", "copy"),
                           help="where drafts come from: the learned draft model, or copy for continuations"
-                               " of the request's own history, which loads no draft model (default: mtp)")
+                               " from shared decoded history, which loads no draft model (default: mtp)")
     speculative.add_argument("--history-drafts", action="store_true",
-                          help="also draft continuations copied from the request's own history")
+                          help="also draft continuations copied from shared decoded history")
     advanced = running.add_argument_group("advanced options")
     advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"), default="auto",
                           help="constrain MLA arithmetic while retaining packed KV storage and compatible"

@@ -35,6 +35,6 @@ RECIPE = Recipe(
     checkpoints=(Checkpoint(alias="qwen3.8-27b", repository="nvidia/Qwen3.8-27B-NVFP4",
         revision="482ca0f3832238542f8f5295dde86b5f22711d80", architecture="Qwen3_5ForConditionalGeneration",
         stored_bytes=21_921_428_072, device_bytes=20_150_569_096, expansion_bytes=307_871_744),),
-    context=262144, page_tokens=128, concurrency=4, max_concurrency=64, prefill_chunk=4096,
+    context=262144, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     max_draft_tokens=0, ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30)}),
 )

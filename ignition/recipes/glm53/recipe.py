@@ -75,8 +75,8 @@ RECIPE = Recipe(
         device_bytes=177_421_592_008,
         # Decoder layer 45, the MTP module.
         draft_bytes=4_301_658_112),),
-    context=1048576, page_tokens=256, concurrency=4, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5), max_draft_tokens=7, verification_rows=0,
+    context=1048576, page_tokens=256, concurrency=32, max_concurrency=64, prefill_chunk=4096,
+    speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0,
     # Shared experts, KDA gate projections, and decode query chains run on an auxiliary stream.
     stream_overlap=True, max_images=4, image_bytes=32 << 20, language_model_only=True,
     ranks=MappingProxyType({

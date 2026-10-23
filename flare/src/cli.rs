@@ -30,6 +30,11 @@ pub enum Command {
     Download(Download),
     /// Summarize a package's metadata, with optional memory, graph, and frontend details.
     Inspect(Inspect),
+    #[command(hide = true)]
+    HardwareRevision {
+        #[arg(value_parser = clap::value_parser!(i32).range(1..))]
+        gpu_count: i32,
+    },
     /// Run this host's agent, which pairs with controllers and supervises serving ranks.
     Agent(AgentArgs),
     /// Control an orbit of agents from this machine.
@@ -403,12 +408,6 @@ impl OrbitRun {
         {
             options.extend(["--kv-cache-limit".into(), "memory".into()]);
         }
-        if self.serving.embedding_table_cache_size == 0
-            && matches.value_source("embedding_table_cache_size")
-                == Some(clap::parser::ValueSource::CommandLine)
-        {
-            options.extend(["--embedding-table-cache-size".into(), "0".into()]);
-        }
         options
     }
 
@@ -595,8 +594,9 @@ pub struct ServingOptions {
     pub hub: HubOptions,
 
     /// GPUs in rank order, relative to CUDA_VISIBLE_DEVICES when set.
+    /// Omitted: the first N visible GPUs, where N is the package's local rank count.
     #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
-        default_value = "0", value_parser = clap::value_parser!(i32).range(0..),
+        value_parser = clap::value_parser!(i32).range(0..),
         help_heading = "Serving options")]
     pub gpus: Vec<i32>,
 
@@ -635,10 +635,10 @@ pub struct ServingOptions {
             .map(|value| if value == "disk" { Storage::Disk } else { Storage::Ram }))]
     pub embedding_table_storage: Option<Storage>,
 
-    /// Per-host budget for a disk-backed embedding row cache, e.g. 1G; includes the
-    /// index, usage counters and miss workspace. Selects disk storage; 0 disables [default: 0].
-    #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = "0", help_heading = "Serving options")]
-    pub embedding_table_cache_size: u64,
+    /// Per-host RAM budget for disk-backed embedding rows, including index, counters and miss
+    /// workspace; 0 disables [default: 4GiB on discrete GPUs, 1GiB on unified-memory GPUs].
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Serving options")]
+    pub embedding_table_cache_size: Option<u64>,
 
     /// Retain embedding scales in host RAM while weights remain on disk; adds to the row-cache budget.
     #[arg(long, help_heading = "Serving options")]
@@ -749,6 +749,12 @@ impl Run {
 }
 
 impl ServingOptions {
+    pub fn select_gpus(&mut self, local_ranks: usize) {
+        if self.gpus.is_empty() {
+            self.gpus = (0..local_ranks as i32).collect();
+        }
+    }
+
     /// Serving options every rank of a multi-host package must load with.
     pub fn rank_options(&self, roce_ring: bool) -> Vec<String> {
         let mut options = Vec::new();
@@ -799,14 +805,35 @@ impl ServingOptions {
         if let Some(workers) = self.embedding_table_workers {
             options.extend(["--embedding-table-workers".into(), workers.to_string()]);
         }
-        if self.embedding_table_cache_size != 0 {
+        if let Some(bytes) = self.embedding_table_cache_size {
             options.extend([
                 "--embedding-table-cache-size".into(),
-                self.embedding_table_cache_size.to_string(),
+                bytes.to_string(),
             ]);
         }
         if self.embedding_table_resident_scales {
             options.push("--embedding-table-resident-scales".into());
+        }
+        // Every rank keeps its own records under its host's directory; rank zero's store drives
+        // all of them, so every rank needs the same settings.
+        if let Some(bytes) = self.prefix_cache_memory {
+            options.extend(["--prefix-cache-memory".into(), bytes.to_string()]);
+        }
+        if let Some(directory) = &self.prefix_cache_disk {
+            options.extend(["--prefix-cache-disk".into(), directory.display().to_string()]);
+        }
+        if let Some(bytes) = self.prefix_cache_disk_limit {
+            options.extend(["--prefix-cache-disk-limit".into(), bytes.to_string()]);
+        }
+        if let Some(transport) = self.prefix_cache_disk_transport {
+            options.extend([
+                "--prefix-cache-disk-transport".into(),
+                match transport {
+                    Transport::Staged => "staged",
+                    Transport::Direct => "direct",
+                }
+                .into(),
+            ]);
         }
         options
     }
@@ -834,7 +861,7 @@ impl ServingOptions {
             } else {
                 None
             },
-            device_labels: Some(self.gpus.clone()),
+            device_labels: (!self.gpus.is_empty()).then(|| self.gpus.clone()),
             prefix_cache: PrefixCacheOffload {
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
@@ -929,7 +956,7 @@ mod tests {
             );
             assert_eq!(
                 effective.serving.embedding_table_cache_size,
-                if explicit { 0 } else { 1 << 30 }
+                Some(if explicit { 0 } else { 1 << 30 })
             );
             assert_eq!(
                 run_matches.value_source("gpus") == Some(clap::parser::ValueSource::CommandLine),
@@ -943,6 +970,30 @@ mod tests {
             panic!("expected run")
         };
         *args
+    }
+
+    #[test]
+    fn omitted_gpus_follow_package_ranks_and_explicit_selection_wins() {
+        for ranks in [1, 2, 4, 8, 16] {
+            let mut args = run(&["flare", "run", "model.safetensors"]);
+            assert!(args.gpus.is_empty());
+            args.serving.select_gpus(ranks);
+            let expected: Vec<_> = (0..ranks as i32).collect();
+            assert_eq!(args.gpus, expected);
+            assert_eq!(args.load_options().device_labels, Some(expected));
+        }
+        for (flag, expected) in [("0", vec![0]), ("3,1", vec![3, 1])] {
+            let mut args = run(&["flare", "run", "model.safetensors", "--gpus", flag]);
+            args.serving.select_gpus(4);
+            assert_eq!(args.gpus, expected);
+        }
+        let mut args = run(&["flare", "run", "model.safetensors"]);
+        args.serving.select_gpus(2);
+        assert_eq!(
+            crate::environment::visibility(&args.gpus, Some("4,7,5")).unwrap(),
+            "4,7"
+        );
+        assert!(crate::environment::visibility(&args.gpus, Some("4")).is_err());
     }
 
     #[test]
@@ -997,9 +1048,10 @@ mod tests {
         assert_eq!(args.scheduler_policy, "balanced");
         assert_eq!(args.mtp_adaptive_verification_alpha, None);
         let options = args.load_options();
-        assert_eq!(options.device_labels, Some(vec![0]));
+        assert_eq!(options.device_labels, None);
         assert_eq!(options.embedding_table_storage, None);
-        assert_eq!(options.embedding_table_cache_bytes, 0);
+        assert_eq!(options.embedding_table_cache_bytes, None);
+        assert!(!args.rank_options().contains(&"--embedding-table-cache-size".to_owned()));
         assert_eq!(options.max_concurrency, None);
         assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
         assert_eq!(options.memory_limit, None);
@@ -1367,20 +1419,55 @@ mod tests {
 
     #[test]
     fn embedding_row_cache_accepts_a_binary_memory_budget() {
+        for (size, bytes) in [("0", 0), ("1G", 1 << 30), ("4GiB", 4 << 30)] {
+            let args = run(&["flare", "run", "model.safetensors", "--embedding-table-cache-size", size]);
+            let options = args.load_options();
+            assert_eq!(options.embedding_table_cache_bytes, Some(bytes));
+            assert_eq!(options.embedding_table_storage, None);
+            assert_eq!(args.rank_options(), ["--embedding-table-cache-size".to_owned(), bytes.to_string()]);
+            let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
+            forwarded.extend(args.rank_options());
+            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
+            assert_eq!(peer.load_options().embedding_table_cache_bytes, Some(bytes));
+        }
+    }
+
+    #[test]
+    fn prefix_cache_settings_reach_every_rank() {
         let args = run(&[
             "flare",
             "run",
             "model.safetensors",
-            "--embedding-table-cache-size",
-            "1G",
+            "--prefix-cache-memory",
+            "0",
+            "--prefix-cache-disk",
+            "/var/cache/flare",
+            "--prefix-cache-disk-limit",
+            "100G",
+            "--prefix-cache-disk-transport",
+            "staged",
         ]);
-        let options = args.load_options();
-        assert_eq!(options.embedding_table_cache_bytes, 1 << 30);
-        assert_eq!(options.embedding_table_storage, None);
+        let options = args.rank_options();
         assert_eq!(
-            args.rank_options(),
-            ["--embedding-table-cache-size", "1073741824"]
+            options,
+            [
+                "--prefix-cache-memory",
+                "0",
+                "--prefix-cache-disk",
+                "/var/cache/flare",
+                "--prefix-cache-disk-limit",
+                "107374182400",
+                "--prefix-cache-disk-transport",
+                "staged",
+            ]
         );
+        let mut forwarded = vec!["flare", "run", "model.safetensors"];
+        forwarded.extend(options.iter().map(String::as_str));
+        assert_eq!(
+            run(&forwarded).load_options().prefix_cache,
+            args.load_options().prefix_cache
+        );
+        assert!(run(&["flare", "run", "model.safetensors"]).rank_options().is_empty());
     }
 
     #[test]
@@ -1388,7 +1475,7 @@ mod tests {
         let args = run(&["flare", "run", "model.safetensors", "--embedding-table-resident-scales",
                          "--embedding-table-cache-size", "1G"]);
         assert!(args.load_options().embedding_table_resident_scales);
-        assert_eq!(args.load_options().embedding_table_cache_bytes, 1 << 30);
+        assert_eq!(args.load_options().embedding_table_cache_bytes, Some(1 << 30));
         assert!(args.rank_options().contains(&"--embedding-table-resident-scales".to_owned()));
         assert!(!run(&["flare", "run", "model.safetensors"]).load_options().embedding_table_resident_scales);
     }

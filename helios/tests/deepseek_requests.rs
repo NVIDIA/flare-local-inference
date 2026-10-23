@@ -461,3 +461,33 @@ fn base64_images_follow_the_rendered_placeholder_order() {
     assert!(request.prompt.tokens.starts_with(&complete_message.tokens));
     assert!(request.prompt.message_boundaries.contains(&complete_message.tokens.len()));
 }
+
+#[test]
+fn decision_generation_prompt_prepares_a_nonthinking_first_assistant_token() {
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let mut fixture = Fixture::new(encoder);
+        fixture.config.max_top_logprobs = 1;
+        let prepared = fixture
+            .prepare(json!({
+                "messages":[
+                    {"role":"system","content":"Select one label."},
+                    {"role":"user","content":"State: charged twice"},
+                    {"role":"assistant","content":"State received."},
+                    {"role":"user","content":"Question: refund? A: false B: true\nAnswer:"}
+                ],
+                "chat_template_kwargs":{"enable_thinking":false,"add_generation_prompt":true},
+                "max_tokens":1,"ignore_eos":true,"logprobs":true
+            }))
+            .unwrap();
+        assert!(prepared.rendered_prompt.contains("Answer:"));
+        assert!(prepared.rendered_prompt.ends_with("</think>"));
+        assert_eq!(
+            prepared.prompt.tokens,
+            fixture
+                .frontend
+                .encode(&prepared.rendered_prompt, false)
+                .unwrap()
+        );
+        assert_eq!(prepared.output.content.start, OutputStart::Content);
+    }
+}

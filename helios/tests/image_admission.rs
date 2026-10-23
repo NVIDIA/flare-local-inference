@@ -47,6 +47,7 @@ fn jpeg_and_oriented_png_use_actual_checkpoint_request_preparation() {
     .unwrap();
     let config = ModelConfig {
         max_top_logprobs: 0,
+        logprob_token_id_capacity: 0,
         prepared_sequence_tokens: 262144,
         contract: support::contract("qwen38"),
         model_id: "local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD".into(),

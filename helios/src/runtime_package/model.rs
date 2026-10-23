@@ -356,7 +356,7 @@ impl NativeModel {
                 }
             }
         }
-        if options.embedding_table_cache_bytes != 0 && engram.is_empty() {
+        if options.embedding_table_cache_bytes.is_some_and(|bytes| bytes != 0) && engram.is_empty() {
             return Err(invalid(
                 "embedding row cache requires an embedding table catalog",
             ));
@@ -372,8 +372,6 @@ impl NativeModel {
                 bytes.checked_add(plane.resident_bytes()? as u64)
                     .ok_or_else(|| invalid("resident embedding tables exceed the memory budget"))
             })?;
-        let embedding_host_bytes = resident_bytes.checked_add(options.embedding_table_cache_bytes)
-            .ok_or_else(|| invalid("embedding tables and row cache exceed the memory budget"))?;
         let prepared: crate::model::PreparedContract =
             serde_json::from_value(server_config["model_contract"].clone())
                 .map_err(|error| invalid(format!("invalid prepared contract: {error}")))?;
@@ -569,6 +567,10 @@ impl NativeModel {
                     .collect::<Vec<_>>()
                     .join(" / "),
             );
+            let embedding_table_cache_bytes = options.embedding_cache_bytes(
+                !engram.is_empty(), model.ranks.iter().any(|rank| rank.integrated));
+            let embedding_host_bytes = resident_bytes.checked_add(embedding_table_cache_bytes)
+                .ok_or_else(|| invalid("embedding tables and row cache exceed the memory budget"))?;
             let initial = match before_contexts {
                 Some(initial) => initial,
                 None => model
@@ -631,7 +633,7 @@ impl NativeModel {
             if !engram.is_empty() {
                 let phase = progress.phase("Prepare embedding tables", None);
                 let storage = options.embedding_table_storage.unwrap_or_default();
-                let group_budget = options.embedding_table_cache_bytes / engram.len() as u64;
+                let group_budget = embedding_table_cache_bytes / engram.len() as u64;
                 let files = archive
                     .files
                     .values()
@@ -744,8 +746,9 @@ impl NativeModel {
             manifest.buffers.iter().find(|buffer| buffer.name == name)
                 .map(|buffer| buffer.nbytes as u64)
         })?;
+        let shard = self.cluster.as_ref().map(|cluster| (cluster.rank, cluster.world));
         let prepared = crate::offload::prepare_with_inputs(
-            &options.prefix_cache, root, identity, geometry, contexts, staging,
+            &options.prefix_cache, root, identity, geometry, contexts, staging, shard,
         )?;
         let summary = prepared.summary();
         self.offload = prepared.into_shared();
@@ -864,6 +867,11 @@ impl NativeModel {
     /// This file's rank of a multi-host model, or None when every rank is local.
     pub fn cluster(&self) -> Option<&ClusterRank> {
         self.cluster.as_ref()
+    }
+
+    /// The host prefix store this process prepared, before the model worker opens it.
+    pub fn offload(&self) -> Option<&crate::offload::Shared> {
+        self.offload.as_deref()
     }
 
     /// The RoCE transport local rank `rank` launches, if any.

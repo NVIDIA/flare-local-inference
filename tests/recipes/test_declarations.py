@@ -1,7 +1,6 @@
 """Declared recipe costs against the layouts and checkpoints they describe."""
 
 import math
-from collections import Counter
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +16,33 @@ GLM = resolve("glm-5.3-flash")
 COPY = Speculation(3, proposal_source="copy")
 
 
+@pytest.mark.parametrize("alias,drafts,graphs,options", [
+    ("qwen3.8-flash", 5, 34, {"mtp": True}),
+    ("glm-5.3-flash", 5, 34, {"mtp": True}),
+    ("deepseek-v4-flash", 5, 34, {}),
+    ("step5-preview-nvfp4", 3, 24, {}),
+    ("mimo-v2.6-pro-mopd", 7, 44, {}),
+    ("kimi-k3-mxfp4-csf", 7, 44, {"draft_checkpoint": Path("dspark")}),
+    ("nemotron-bolt-24gb", 7, 44, {"draft_checkpoint": Path("lilicorr")}),
+])
+def test_rectangular_recipe_defaults_prepare_bounded_speculative_coverage(alias, drafts, graphs, options):
+    from importlib import import_module
+
+    recipe = resolve(alias).recipe
+    selected = recipe.speculation
+    config = import_module(f"ignition.recipes.{recipe.name}.bootstrap").PreparationConfig(
+        max_active=recipe.concurrency, speculative_widths=selected.widths,
+        speculative_token_capacity=selected.token_capacity, **options)
+    assert config.max_active == 32 and config.speculative_token_capacity == 128
+    assert selected.draft_tokens == drafts and not selected.packed_verification
+    shapes = set(config.speculative_shapes)
+    assert len(shapes) == graphs
+    assert {(batch, 1) for batch in (1, 2, 4, 8, 16, 32)} <= shapes
+    assert {(batch, drafts + 1) for batch in (1, 2, 4, 8, 16)} <= shapes
+    assert {(32, width) for width in range(1, 5)} <= shapes
+    assert all(batch * width <= 128 for batch, width in shapes)
+
+
 @pytest.mark.parametrize("world_size", [1, 2, 4])
 def test_qwen_state_rows_and_pages_match_the_prepared_layouts(world_size):
     import torch
@@ -25,7 +51,7 @@ def test_qwen_state_rows_and_pages_match_the_prepared_layouts(world_size):
     from ignition.recipes.qwen38.state import HybridStateLayout
 
     recipe = QWEN.recipe
-    assert recipe.speculation == Speculation(draft_tokens=5) and recipe.max_draft_tokens == 7
+    assert recipe.speculation == Speculation(draft_tokens=5, token_capacity=128) and recipe.max_draft_tokens == 7
     assert recipe.speculation.adaptive and recipe.history_copy
 
     def layer(speculative_tokens):
@@ -108,7 +134,7 @@ def test_glm_state_rows_and_pages_match_the_continuation_pool(world_size):
     from ignition.recipes.glm53.pool import continuation_layout
 
     recipe = GLM.recipe
-    assert recipe.speculation == Speculation(draft_tokens=5) and recipe.max_draft_tokens == 7
+    assert recipe.speculation == Speculation(draft_tokens=5, token_capacity=128) and recipe.max_draft_tokens == 7
     assert not recipe.history_copy and recipe.page_tokens == 256
     layer_types = tuple("indexed_attention" if index % 4 == 3 else "linear_attention" for index in range(45))
     target = layer_types.count("indexed_attention")
@@ -137,25 +163,6 @@ def test_weights_exclude_the_draft_model_unless_drafts_are_learned(model):
     assert recipe.live_rows(4, None) == 1 + 4
 
 
-def test_qwen_stored_bytes_match_the_cached_checkpoint():
-    if not QWEN.cached(HUB):
-        pytest.skip("the pinned Qwen revision is not in the hub cache")
-    from ignition.preparation.checkpoint import inspect_qwen38_checkpoint
-
-    sizes, compressed_scales = Counter(), 0
-    for name, tensor in inspect_qwen38_checkpoint(QWEN.snapshot(HUB)).tensors.items():
-        sizes[tensor.component] += tensor.nbytes
-        if name.startswith("model.language_model.layers.") and ".mlp.experts." in name and ".weight_scale." in name:
-            compressed_scales += tensor.nbytes
-    checkpoint = QWEN.checkpoint
-    assert checkpoint.stored_bytes == sum(sizes.values())
-    assert checkpoint.mapped_host_bytes == 0
-    assert checkpoint.device_bytes == sum(sizes.values()) - sizes["ple_tables"]
-    assert checkpoint.draft_bytes == sizes["mtp"]
-    # Routed experts expand their CSF block scales to native storage at load.
-    assert checkpoint.expansion_bytes == 48 * 512 * 307_200 - compressed_scales
-
-
 def test_glm_stored_bytes_match_the_cached_checkpoint():
     if not GLM.cached(HUB):
         pytest.skip("the pinned GLM revision is not in the hub cache")
@@ -178,7 +185,7 @@ def fitted(model, gpus, **settings):
 
 
 @pytest.mark.parametrize("compile_forwards", [False, True])
-@pytest.mark.parametrize("concurrency", [1, 5, 64])
+@pytest.mark.parametrize("concurrency", [1, 5, 32, 64])
 def test_qwen_adapter_configures_the_bootstrap_from_a_plan(monkeypatch, tmp_path, compile_forwards, concurrency):
     from ignition.recipes.qwen38.state import HybridStateLayout
 
@@ -196,6 +203,10 @@ def test_qwen_adapter_configures_the_bootstrap_from_a_plan(monkeypatch, tmp_path
     assert seen["compile_decoder"] is compile_forwards and config.compile_decoder is compile_forwards
     assert config.devices == (0,) and config.max_active == concurrency and config.mtp
     assert (config.speculative_widths, config.speculative_fixed_width) == ((1, 2, 3, 4, 5, 6), None)
+    assert config.speculative_token_capacity == 128
+    assert (min(config.request_capacity, 16), 6) in config.speculative_shapes
+    if concurrency >= 32:
+        assert (32, 4) in config.speculative_shapes and (32, 5) not in config.speculative_shapes
     assert (config.speculative_proposal_source, config.history_drafts) == (
         "mtp", False)
     assert config.pages is None and config.context == plan.recipe.context

@@ -312,11 +312,13 @@ enum ToolParserKind {
   GLM_ARGUMENT_TAGS = 2;
   DSML = 3;
   XTML = 4;
+  MINIMAX_XML = 5;
 }
 enum ReasoningParserKind {
   REASONING_PARSER_UNSPECIFIED = 0;
   THINK_TAGS = 1;
   XTML_THINK = 2;
+  MM_THINK = 3;
 }
 enum ImagePreparationKind {
   IMAGE_PREPARATION_UNSPECIFIED = 0;
@@ -328,6 +330,7 @@ enum ImagePreparationKind {
   RADIO_IMAGE_PREPARATION = 6;
   DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION = 7;
   GLM_IMAGE_PREPARATION = 8;
+  PATCH_MERGE_IMAGE_PREPARATION = 9;
 }
 enum ImageLayoutKind {
   IMAGE_LAYOUT_UNSPECIFIED = 0;
@@ -339,6 +342,7 @@ enum ImageLayoutKind {
   RADIO_IMAGE_LAYOUT = 6;
   DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT = 7;
   GLM_IMAGE_LAYOUT = 8;
+  BRACKETED_IMAGE_LAYOUT = 9;
 }
 message ToolParser {
   ToolParserKind kind = 1;
@@ -457,7 +461,18 @@ message ImageSettings {
     Empty radio = 6;
     DeepseekRowMajorImageSettings deepseek_row_major = 7;
     Empty glm = 8;
+    PatchMergeImageSettings patch_merge = 9;
   }
+}
+message PatchMergeImageSettings {
+  uint32 patch_size = 1;
+  uint64 min_pixels = 2;
+  uint64 max_pixels = 3;
+  repeated float image_mean = 4;
+  repeated float image_std = 5;
+  string image_token = 6;
+  string start_token = 7;
+  string end_token = 8;
 }
 message DeepseekRowMajorImageSettings {
   uint64 min_pixels = 1;

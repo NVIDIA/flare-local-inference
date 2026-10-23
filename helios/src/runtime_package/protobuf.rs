@@ -142,6 +142,11 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                     "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
                     "image_mean": config.image_mean, "image_std": config.image_std,
                 }}),
+                Profile::PatchMerge(config) => serde_json::json!({"patch_merge": {
+                    "patch_size": config.patch_size, "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
+                    "image_mean": config.image_mean, "image_std": config.image_std,
+                    "image_token": config.image_token, "start_token": config.start_token, "end_token": config.end_token,
+                }}),
                 Profile::DeepseekRowMajor(config) => serde_json::json!({"deepseek_row_major": {
                     "min_pixels": config.min_pixels, "max_tokens": config.max_tokens,
                     "max_width_height_ratio": config.max_width_height_ratio,
@@ -697,4 +702,95 @@ mod tests {
             (Some(1), Some(6), 128));
     }
 
+    #[cfg(feature = "server")]
+    #[test]
+    fn serialized_tag_parsers_keep_existing_ids_defaults_and_serving_behavior() {
+        use crate::model::contract::{FrontendContract, ReasoningParserKind, ToolParserKind};
+        use crate::output::tagged::OutputConfig as TaggedConfig;
+        use crate::output::{Input, OutputConfig, OutputPipeline, Termination};
+        use crate::server::output::Accumulator;
+        for (kind, expected, payload) in [
+            (
+                1,
+                ToolParserKind::QwenCoder,
+                "<tool_call><function=lookup></function></tool_call>",
+            ),
+            (
+                2,
+                ToolParserKind::GlmArgumentTags,
+                "<tool_call>lookup</tool_call>",
+            ),
+            (
+                3,
+                ToolParserKind::Dsml,
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"></｜DSML｜invoke></｜DSML｜tool_calls>",
+            ),
+        ] {
+            let tool = wire::ToolParser::decode(&[0x08, kind][..]).unwrap();
+            let reason =
+                wire::ReasoningParser::decode(&b"\x08\x01\x12\x07<think>\x1a\x08</think>"[..])
+                    .unwrap();
+            let value = wire::FrontendContract {
+                tools: Some(tool),
+                reasoning: Some(reason),
+                assistant_marker: "assistant".into(),
+                ..Default::default()
+            };
+            let syntax: FrontendContract =
+                serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap();
+            assert_eq!(syntax.tools.as_ref().unwrap().kind, expected);
+            assert_eq!(syntax.tools.as_ref().unwrap().wrapping_newlines, 0);
+            assert_eq!(
+                syntax.reasoning.as_ref().unwrap().kind,
+                ReasoningParserKind::ThinkTags
+            );
+            let mut parser = OutputPipeline::new(OutputConfig {
+                syntax,
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    structured: false,
+                    start: crate::output::tagged::OutputStart::Reasoning,
+                    tools: vec![serde_json::json!({"function":{"name":"lookup"}})],
+                },
+            });
+            let mut output = Accumulator::new("package".into());
+            let text = format!("plan</think>{payload}");
+            for character in text.chars() {
+                output
+                    .apply(parser.push(Input::Text(&character.to_string())).unwrap())
+                    .unwrap();
+            }
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            assert_eq!(output.message()["reasoning_content"], "plan");
+            assert_eq!(
+                output.message()["tool_calls"][0]["function"]["name"],
+                "lookup"
+            );
+        }
+        assert_eq!(
+            ToolParserKind::try_from(wire::ToolParser::decode(&[0x08, 4][..]).unwrap().kind)
+                .unwrap(),
+            ToolParserKind::Xtml
+        );
+        assert_eq!(
+            ReasoningParserKind::try_from(
+                wire::ReasoningParser::decode(&[0x08, 2][..]).unwrap().kind
+            )
+            .unwrap(),
+            ReasoningParserKind::XtmlThink
+        );
+        assert!(ToolParserKind::try_from(wire::ToolParser::decode(&[][..]).unwrap().kind).is_err());
+        let syntax: FrontendContract = serde_json::from_value(
+            serde_json::to_value(wire::FrontendContract {
+                assistant_marker: "assistant".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(syntax.tools.is_none() && syntax.reasoning.is_none());
+    }
 }

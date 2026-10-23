@@ -215,16 +215,19 @@ Export Qwen with up to five MTP draft tokens per round:
 
 ```sh
 .venv/bin/ignition export qwen3.8-flash --gpus 2 \
-  --mtp-draft-tokens 5 --max-concurrency 4 \
+  --mtp-draft-tokens 5 --max-concurrency 32 \
   --output /data/flare-runtime/qwen38-tp1-mtp5.safetensors --verbose
 
 .venv/bin/ignition export qwen3.8-flash --gpus 0,1 \
-  --mtp-draft-tokens 5 --max-concurrency 4 \
+  --mtp-draft-tokens 5 --max-concurrency 32 \
   --output /data/flare-runtime/qwen38-tp2-mtp5.safetensors --verbose
 ```
 
-Qwen defaults to five MTP draft tokens, with explicit flags taking precedence.
-Changing this default does not change an already exported package.
+Qwen defaults to 32 concurrent requests, five MTP draft tokens, and 128 target-token
+rows, with explicit flags and configuration taking precedence. Verification is
+rectangular: the default catalog covers five drafts per request through batch 16
+and three drafts at batch 32. Already exported packages retain their captured
+capacities.
 
 Vision recipes accept `--image-concurrency N`, independently of
 `--max-concurrency`. It defaults to `min(4, max_concurrency)` and can also be set
@@ -526,9 +529,11 @@ through the shared cache and speculative execution contracts. The perception enc
 prepares 504-pixel local crops and a 728-pixel overview. Serving defaults follow
 the model card: temperature 1, top-p 0.95, no top-k filter, and neutral penalties.
 
-One-shot TP reductions with up to 36 rows fuse the residual update and
-zero-centered RMSNorm into the collective, preserving FP32 residual storage and
-BF16 normalized outputs. Attention and dense MLP projections enter the fused
+One-shot TP reductions within the channel's byte capacity fuse the residual
+update and zero-centered RMSNorm into the collective. A bounded resident grid
+retains row ownership across ranks while processing multiple rows per block.
+The collective preserves FP32 residual storage and BF16 normalized outputs.
+Attention and dense MLP projections enter the fused
 collective directly as BF16; routed MLP updates enter as FP32. Attention and dense
 MLP reductions round to BF16 before residual addition; routed MLP reductions retain
 FP32. MLP reductions consume the following layer's input-normalization weight.
@@ -603,7 +608,60 @@ always enabled; requests to disable thinking are ignored without an error.
 Effort defaults to `max`; requests can select `low`, `high`, or `max` and
 override sampling defaults. Preserve assistant reasoning in conversation history.
 
+## MiniMax M3.1 Flash
+
+The `minimax-m3-1-flash` alias selects
+[`MiniMaxAI/MiniMax-M3.1-Flash`](https://huggingface.co/MiniMaxAI/MiniMax-M3.1-Flash)
+at revision `9e7ebacac350497ad4a1272a2e817639bf11561c`. Preparation uses four
+SM120/SM121 GPUs, MXFP8 projections, NVFP4 routed experts, and FP8 target,
+indexer, and DSpark caches. Sampling defaults are temperature 1.0 and top-p
+0.95, following the model card.
+
+DSpark defaults match DeepSeek V4.1: 32 concurrent requests, five draft tokens,
+a 128-row physical target capacity, a 64-graph packed budget, and GPU causal
+prefix allocation. Each packed graph generates proposals, allocates prefixes,
+verifies the admitted tokens, and commits accepted state. Width-one graphs
+preserve draft context. `--speculative-token-capacity` and
+`--speculative-graph-budget` control the same shared catalog geometry described
+under DeepSeek V4.1.
+
+The annotated template in `ignition/recipes/minimax_m3/assets/chat_template.jinja`
+preserves the pinned upstream template byte for byte after removing message
+marks. It retains the upstream adaptive-thinking behavior and XML tool syntax.
+Vision preparation includes temporal patch duplication and spatial patch
+merging; `--language-model-only` omits the vision encoder. Optional
+`--expert-scale-compression csf` losslessly compresses expert scales and shares
+their expansion scratch across routed layers. Planning retains the native
+weight budget for this encoding; loading reports its actual allocation.
+
+```sh
+ignition export minimax-m3-1-flash --gpus 0-3 --language-model-only \
+  --expert-scale-compression csf --output /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors
+flare/target/release/flare run /data/flare-runtime/minimax-m3.1-flash-tp4.safetensors --gpus 0-3
+```
+
 ## Storage and graph capacities
+
+Every recipe defaults to 32 concurrent requests. Speculative recipes default to
+128 target-token rows, independently of the selected concurrency. Explicit flags
+and configuration override these defaults; existing packages retain their
+captured capacities. Memory planning rejects capacities that do not fit the
+selected GPUs.
+
+| Recipe | Draft tokens | Verification layout | Speculative graphs at default concurrency | Maximum drafts at batch 32 |
+|---|---:|---|---:|---:|
+| Qwen3.8 Flash, GLM 5.3, DeepSeek V4 | 5 | Rectangular | 34 | 3 |
+| Step-5 | 3 | Rectangular | 24 | 3 |
+| MiMo V2.6 Pro, Kimi K3, Nemotron Bolt | 7 | Rectangular | 44 | 3 |
+| DeepSeek V4.1 | 5 | Packed | 64 packed + 6 width-one | Up to 5, sharing 128 rows across requests |
+| Qwen3.8 27B | None | Ordinary decode | None | None |
+
+Rectangular catalogs cover full draft depth through batch 16. The counts include
+width-one speculative graphs and exclude ordinary decode, prefill, maintenance,
+and vision graphs. Capturing full rectangular depth at batch 32 requires 192 rows
+for five drafts or 256 rows for seven drafts, set with
+`--speculative-token-capacity`. DeepSeek V4.1's packed graph count is bounded
+independently by `--speculative-graph-budget`.
 
 Every model export prints a VRAM inventory for each rank after final publication,
 including exports without `--verbose`. Heliopause measures device usage and package
@@ -656,10 +714,9 @@ Ignition captures power-of-two
 batch capacities through the concurrency limit
 and width one at every bucket. Rectangular speculative and verification shapes
 require `batch * width <= speculative_token_capacity`; the preparation flag
-`--speculative-token-capacity` defaults to the larger of padded concurrency and
-maximum verification width, except DeepSeek V4.1, whose packed catalog defaults
-to 128 physical target rows. Its packed capacities follow the table above rather
-than rectangular `batch * width` shapes. Previously exported separate-proposal
+`--speculative-token-capacity` defaults to 128 physical target rows for every
+speculative recipe. DeepSeek V4.1's packed capacities follow its packed catalog table
+above rather than rectangular `batch * width` shapes. Previously exported separate-proposal
 catalogs cover every bucket and load-time draft depth independently of that limit.
 Flare can reduce concurrency at load time. Rectangular catalogs permit smaller
 positive draft limits; packed catalogs require their captured positive depth or
@@ -724,7 +781,8 @@ outside the model's cache budget. RAM embedding tables load before cache
 sizing. Disk embedding tables use bounded staging and can retain their scale
 planes in RAM with `--embedding-table-resident-scales`. The loader accounts for
 resident scales and the optional row cache before sizing KV, for both PLE and
-Engram packages.
+Engram packages. Disk tables default to a 1 GiB host-RAM row cache per Spark;
+`--embedding-table-cache-size` overrides it, and `0` disables it.
 
 Spark's NVML interface does not report VRAM capacity. Ignition identifies an
 integrated device through CUDA and uses Linux `MemAvailable`, capped by CUDA's

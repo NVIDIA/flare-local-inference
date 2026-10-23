@@ -17,6 +17,7 @@ type HostAlloc = unsafe extern "C" fn(*mut Handle, usize, c_uint) -> c_int;
 type HostFree = unsafe extern "C" fn(Handle) -> c_int;
 type Upload = unsafe extern "C" fn(u64, *const c_void, usize, Handle) -> c_int;
 type Download = unsafe extern "C" fn(Handle, u64, usize, Handle) -> c_int;
+type Download2D = unsafe extern "C" fn(*const Copy2D, Handle) -> c_int;
 type EventCreate = unsafe extern "C" fn(*mut Handle, c_uint) -> c_int;
 type EventRecord = unsafe extern "C" fn(Handle, Handle) -> c_int;
 type EventElapsed = unsafe extern "C" fn(*mut f32, Handle, Handle) -> c_int;
@@ -57,6 +58,27 @@ struct CopyAttributes {
     source_location: [c_int; 2],
     destination_location: [c_int; 2],
     flags: c_uint,
+}
+
+/// `CUDA_MEMCPY2D`.
+#[repr(C)]
+struct Copy2D {
+    source_x: usize,
+    source_y: usize,
+    source_type: c_uint,
+    source_host: *const c_void,
+    source_device: u64,
+    source_array: Handle,
+    source_pitch: usize,
+    destination_x: usize,
+    destination_y: usize,
+    destination_type: c_uint,
+    destination_host: Handle,
+    destination_device: u64,
+    destination_array: Handle,
+    destination_pitch: usize,
+    width: usize,
+    height: usize,
 }
 
 /// `CUmemLocation`: a location type and, for devices and host NUMA nodes, its id.
@@ -129,6 +151,7 @@ struct Driver {
     host_free: HostFree,
     upload: Upload,
     download: Download,
+    download_2d: Download2D,
     event_create: EventCreate,
     event_record: EventRecord,
     event_elapsed: EventElapsed,
@@ -190,6 +213,7 @@ impl Driver {
                 host_free: symbol!("cuMemFreeHost"),
                 upload: symbol!("cuMemcpyHtoDAsync_v2"),
                 download: symbol!("cuMemcpyDtoHAsync_v2"),
+                download_2d: symbol!("cuMemcpy2DAsync_v2"),
                 event_create: symbol!("cuEventCreate"),
                 event_record: symbol!("cuEventRecord"),
                 event_elapsed: symbol!("cuEventElapsedTime"),
@@ -841,6 +865,38 @@ impl Stream {
                 nbytes,
                 self.handle as Handle,
             )
+        })
+    }
+
+    /// The source and pinned destination remain owned until this stream completes.
+    pub(crate) unsafe fn download_2d(
+        &self,
+        host: &PinnedHost,
+        device: usize,
+        source_pitch: usize,
+        width: usize,
+        rows: usize,
+    ) -> Result<()> {
+        let copy = Copy2D {
+            source_x: 0,
+            source_y: 0,
+            source_type: 2,
+            source_host: std::ptr::null(),
+            source_device: device as u64,
+            source_array: std::ptr::null_mut(),
+            source_pitch,
+            destination_x: 0,
+            destination_y: 0,
+            destination_type: 1,
+            destination_host: host.handle as Handle,
+            destination_device: 0,
+            destination_array: std::ptr::null_mut(),
+            destination_pitch: width,
+            width,
+            height: rows,
+        };
+        self.driver.check("cuMemcpy2DAsync_v2", unsafe {
+            (self.driver.download_2d)(&copy, self.handle as Handle)
         })
     }
 

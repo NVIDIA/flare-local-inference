@@ -69,10 +69,10 @@ RECIPE = Recipe(
     ),
     context=1048576,
     page_tokens=256,
-    concurrency=4,
+    concurrency=32,
     max_concurrency=64,
     prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5),
+    speculation=Speculation(draft_tokens=5, token_capacity=128),
     max_draft_tokens=5,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,

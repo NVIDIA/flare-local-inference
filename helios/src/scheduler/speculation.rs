@@ -1,4 +1,4 @@
-//! Request-local speculative acceptance and observed copy proposals.
+//! Request-local speculative acceptance and copy proposal metadata.
 
 use crate::{Result, execution::BATCH_CAPACITIES};
 
@@ -152,32 +152,6 @@ impl AcceptanceProfile {
         }
         self.rounds = self.rounds.saturating_add(1);
     }
-}
-
-/// Copies only observed continuation tokens; the device guards its consumed-position epoch.
-pub fn copy_proposal(history: &[u32], maximum: usize) -> ([i64; 7], usize) {
-    let mut output = [-1; 7];
-    let maximum = maximum.min(7);
-    for length in [8, 4] {
-        if history.len() <= length || maximum == 0 {
-            continue;
-        }
-        let suffix = history.len() - length;
-        for position in (suffix.saturating_sub(4096)..suffix).rev() {
-            if history[position..position + length] != history[suffix..] {
-                continue;
-            }
-            let continuation = &history[position + length..];
-            let count = maximum.min(continuation.len());
-            for (target, token) in output.iter_mut().zip(continuation.iter()).take(count) {
-                *target = i64::from(*token);
-            }
-            if count > 0 {
-                return (output, count);
-            }
-        }
-    }
-    (output, 0)
 }
 
 #[cfg(test)]

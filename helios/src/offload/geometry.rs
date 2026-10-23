@@ -180,6 +180,18 @@ pub fn fingerprint(geometry: &[CacheGeometry]) -> [u8; 16] {
     hash.finalize().into()
 }
 
+/// The fingerprint of one rank's records when every rank runs in its own process and keeps
+/// its own record files: [`fingerprint`] of that rank's geometry, bound to the rank and the
+/// world size, so a host never restores records another rank wrote.
+pub fn shard_fingerprint(geometry: &CacheGeometry, rank: usize, world: usize) -> [u8; 16] {
+    let mut hash = Blake2b::<U16>::new();
+    hash.update(b"flare-cache-shard-v1\0");
+    hash.update((rank as u64).to_le_bytes());
+    hash.update((world as u64).to_le_bytes());
+    hash.update(fingerprint(std::slice::from_ref(geometry)));
+    hash.finalize().into()
+}
+
 pub(crate) fn invalid(message: impl Into<String>) -> Error {
     Error::execution(ExecutionError::State, message)
 }

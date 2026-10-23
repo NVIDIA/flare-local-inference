@@ -72,11 +72,11 @@ RECIPE = Recipe(
         # Routed-expert block scales expand at load from 4,156,604,564 CSF bytes to
         # 48 layers x 512 experts x 307,200 bytes.
         expansion_bytes=3_393_142_636),),
-    context=262144, page_tokens=64, concurrency=4, max_concurrency=64, prefill_chunk=4096,
+    context=262144, page_tokens=64, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     # Rounds adapt among zero through five drafts, up to seven. Verification records
     # corrections and commits accepted tokens into the live state row, so it keeps
     # no extra rows.
-    speculation=Speculation(draft_tokens=5), max_draft_tokens=7, verification_rows=0, history_copy=True,
+    speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0, history_copy=True,
     # Shared experts, small-batch attention projections and selection, and GDN input projections run
     # on an auxiliary stream.
     stream_overlap=True,

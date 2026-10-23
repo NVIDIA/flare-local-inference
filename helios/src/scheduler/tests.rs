@@ -1413,17 +1413,56 @@ fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
     }
 }
 #[test]
-fn copied_continuations_are_observed_tokens_and_width_catalog_is_validated() {
-    use super::speculation::{copy_proposal, validate_widths};
-    let tokens = [1, 2, 3, 4, 90, 91, 92, 8, 1, 2, 3, 4];
-    let (ids, count) = copy_proposal(&tokens, 3);
-    assert_eq!(count, 3);
-    assert_eq!(&ids[..3], &[90, 91, 92]);
-    assert_eq!(copy_proposal(&[1, 2, 3, 4], 7).1, 0);
-    assert_eq!(copy_proposal(&tokens, 0).1, 0);
+fn speculative_width_catalog_is_validated() {
+    use super::speculation::validate_widths;
     for bad in [vec![2], vec![1, 9], vec![1, 4, 2]] {
         assert!(validate_widths(&bad).is_err());
     }
+}
+
+#[test]
+fn shared_drafts_learn_committed_outputs_without_prompt_backfill_or_slot_joining() {
+    let mut s = scheduler(1, 64, 4);
+    s.enable_history_drafts().unwrap();
+    s.enable_speculation(&[1, 2, 4, 8]).unwrap();
+    s.fixed_speculative_width(Some(8)).unwrap();
+    let h = s.admit(spec(65, 32)).unwrap();
+    assert_eq!(s.history_proposal(&[0, 1, 2, 3], 7).1, 0);
+    init(&mut s, 1);
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(2)).unwrap();
+    s.complete(Fence(2), &records(h, 2, 65, 1, 10, 1), Default::default()).unwrap();
+    retain_prompt(&mut s, 3);
+    let step = s.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Speculative);
+    s.commit(&step, Fence(4)).unwrap();
+    let mut completion = vector_records(h, 4, 70, 6, &[11, 12, 13, 90, 91], 8, 1);
+    completion[0].vector.as_mut().unwrap().accepted_drafts = 4;
+    let mut invalid = completion;
+    invalid[0].generation += 1;
+    assert!(s.complete(Fence(4), &invalid, Default::default()).is_err());
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7).1, 0);
+    s.complete(Fence(4), &completion, Default::default()).unwrap();
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), ([90, 91, -1, -1, -1, -1, -1], 2));
+    assert_eq!(s.history_proposal(&[0, 1, 2, 3], 7).1, 0);
+    assert_eq!(s.history_proposal(&[12, 13, 90, 91], 7).1, 0);
+    s.cancel(h).unwrap();
+    let next = s.admit(spec(66, 16)).unwrap();
+    assert_eq!(next.slot, h.slot);
+    assert_ne!(next.generation, h.generation);
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7).0[0], 90);
+    init(&mut s, 5);
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(6)).unwrap();
+    s.complete(Fence(6), &records(next, 6, 66, 1, 92, 1), Default::default()).unwrap();
+    retain_prompt(&mut s, 7);
+    assert_eq!(s.history_proposal(&[12, 13, 90, 91], 7).1, 0);
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(8)).unwrap();
+    let mut failed = vector_records(next, 8, 66, 1, &[], 8, 3);
+    failed[0].error_code = 1;
+    s.complete(Fence(8), &failed, Default::default()).unwrap();
+    assert_eq!(s.history_proposal(&[1, 2, 3, 4], 7).1, 0);
 }
 
 #[test]

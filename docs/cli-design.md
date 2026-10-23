@@ -209,11 +209,11 @@ explicit flags take precedence.
 | `--expert-scale-compression [MODE]` | Losslessly compress routed-expert scales: DeepSeek V4.1 backbone and DSpark MXFP4 scales, or Step-5 NVFP4 scales including BF16 experts converted to W4A16. `csf` is a compressed scale encoding expanded during execution. Estimated resident GPU weight savings are 3% for DeepSeek V4.1 and 6% for Step-5; actual savings depend on encoded scales. A bare flag selects `csf`; `--expert-scale-compression csf` also works. Retain compressed scales and share expansion scratch across serial layers. | Native scales |
 | `--no-mtp` | Disable multi-token speculation: load no draft model, keep no verification rows, and decode one token per step. | Speculation on |
 | `--mtp-draft-tokens N` | Most draft tokens verified in one round; see `MODEL --help` for its limit. Verification capacities cover counts from 0 through `N` within the speculative token capacity. Retained and packed proposal producers execute the full configured block; verification adapts using measured cost and historical acceptance or native proposal confidence. Zero retains draft state with width-one execution; `--no-mtp` excludes draft weights and state. | Recipe declaration |
-| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 for DeepSeek V4.1; otherwise larger of padded concurrency and maximum verification width |
+| `--speculative-token-capacity N` | Maximum physical target-token rows in wider speculative graphs; width one covers every request bucket. Applies to every speculative recipe. | 128 |
 | `--speculative-graph-budget N` | Maximum packed round graphs to capture, independently of physical target-token rows. Excludes mandatory width-one and ordinary graphs; requires packed adaptive learned speculation at positive draft depth. Must cover both physical-row endpoints for every eligible request bucket. | 64 for DeepSeek V4.1 |
 | `--no-mtp-adaptive-verification` | Default to fixed-width serving. Capture includes every smaller width within the speculative token capacity. Positive-depth DeepSeek V4.1 DSpark requires adaptive verification. | Adaptive |
-| `--mtp-proposal-source {mtp,copy}` | Where drafts come from: the checkpoint's MTP module, or `copy` for continuations of the request's own history, which loads no draft model. Qwen only. | `mtp` |
-| `--history-drafts` | Also draft continuations copied from the request's own history. Qwen only. | off |
+| `--mtp-proposal-source {mtp,copy}` | Where drafts come from: the checkpoint's MTP module, or `copy` for continuations from shared decoded history, which loads no draft model. Qwen only. | `mtp` |
+| `--history-drafts` | Also draft continuations copied from shared decoded history. Qwen only. | off |
 | `--mla-compute-mode {auto,bf16}` | Constrain DeepSeek V4.1 MLA arithmetic while preserving packed KV storage and autotuning among compatible kernels. | `auto` |
 | `--no-stream-overlap` | Run every concurrent branch (shared experts, projection chains, query chains) serially on the main stream with the same kernels, to diagnose scheduling-dependent faults. Slower. Recipes that run no branches concurrently reject it. | Overlap |
 | `--autotune-effort off\|low\|medium\|high\|max` | Kernel search effort. Off uses heuristics; low applies broad exclusions; medium balances search cost; high retains only conservative exclusions; max enumerates every declared legal candidate. Overrides `[preparation] autotune_effort`. | Medium |
@@ -232,7 +232,11 @@ fixed, and `branches serialized` under `--no-stream-overlap`. That flag is also
 recorded in the plan and the exported graph catalog; it changes graph scheduling,
 not kernel selection, so its packages share tuned kernels with overlapped ones.
 
-Each recipe selects its proposal and prefix-allocation mode.
+Every recipe defaults to 32 concurrent requests. Speculative recipes declare
+128 target-token rows. Rectangular catalogs cover the recipe's full draft depth
+through batch 16 and up to three drafts at batch 32; Step-5's three-draft catalog
+covers its full depth at batch 32. Each recipe selects its proposal and
+prefix-allocation mode.
 DeepSeek V4.1 defaults to five draft tokens, concurrency 32, a 4096-token
 prefill chunk, 128 physical target rows, and at most 64 packed round graphs,
 with packed GPU prefix selection.
@@ -443,7 +447,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--dangerously-accept-publisher NAMESPACE` | Accept this exact publisher namespace; requires the matching key flag | Interactive first use or remembered trust |
 | `--trust-store PATH` | Persistent key/namespace acceptance file | `~/.config/flare/trust.toml` |
 | `--verify-weights` | Verify the stored allocation and table ranges of the ranks served before loading model GPU resources | off |
-| `--gpus N[,N...]` | Selected GPUs in rank order; indices follow an inherited `CUDA_VISIBLE_DEVICES` list when present | `0` |
+| `--gpus N[,N...]` | Selected GPUs in rank order; indices follow an inherited `CUDA_VISIBLE_DEVICES` list when present | First N visible GPUs for the package's N local ranks; one GPU per host for multi-host packages |
 | `--host ADDR` | Listener IP address, IPv4 or IPv6 | `127.0.0.1` |
 | `--port N` | Listener port | `8000` |
 | `--served-model-name ALIAS` | Replace the package's serving aliases with this nonblank alias | Package aliases |
@@ -457,7 +461,7 @@ Help exits with status 0; usage errors go to stderr with status 2. Its options a
 | `--mtp-verification-token-budget N` | Select one exact captured packed verification capacity per batch | All captured capacities |
 | `--mtp-max-verification-token-budget N` | Retain all captured packed verification capacities at or below a total-row ceiling | All captured capacities |
 | `--embedding-table-storage disk\|ram` | PLE and Engram table storage; both modes deliver compact GPU rows | `disk` |
-| `--embedding-table-cache-size SIZE` | Per-host budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB` | `0` (disabled) |
+| `--embedding-table-cache-size SIZE` | Per-host RAM budget for cached disk-backed PLE/Engram rows, including the index, usage counters and miss workspace; accepts sizes such as `1G` or `2GiB`; `0` disables | `4GiB` on discrete GPUs; `1GiB` on unified-memory GPUs such as DGX Spark |
 | `--embedding-table-resident-scales` | Keep original embedding scale bytes in host RAM while weights remain on disk; adds to the row-cache budget | Disabled |
 
 `--mtp-adaptive-verification-alpha 0.5` scores each joint prefix-survival
@@ -475,9 +479,13 @@ cost is included in gather latency. Small gathers stay on the delivery thread.
 Worker phase counters sum overlapping worker intervals and must not be subtracted
 from elapsed gather time. RAM storage rejects this disk-only option.
 
-An embedding row cache selects disk storage and cannot be combined with
-`--embedding-table-storage ram`. Each host shares its budget across embedding
-tables and local tensor-parallel ranks. The loader commits cache memory before
+Disk-backed embedding tables default to a 4 GiB host-RAM row cache per host,
+or 1 GiB when any selected GPU shares host memory, as on DGX Spark. Explicit
+cache sizes, including `0` to disable caching, override the hardware default.
+RAM table storage and packages without embedding tables allocate no row cache
+by default. An explicit nonzero cache requires disk storage and an embedding
+table catalog. Each host shares its budget across embedding tables and local
+tensor-parallel ranks. The loader commits cache memory before
 sizing KV and continuation pools, so the cache uses part of the integrated GPU's
 existing memory budget. The cache remains fixed in size while serving and warms
 from requests each time the server starts.
@@ -578,11 +586,16 @@ flare run ORG/MODEL@gb202 --filename model.safetensors --gpus 0,1,2,3
 These examples use `ORG/MODEL` as a repository placeholder. Repositories contain
 prepared Flare packages, not source Transformers checkpoints. Hardware variants
 are separate Hugging Face revisions named `gb10` and `gb202`. Automatic selection
-queries the selected GPUs' PCI device identifiers through the CUDA driver without
-creating a context. GB10 selects `gb10`; known GB202 devices, including RTX PRO
+queries the selected GPUs' PCI device identifiers through NVML without initializing
+CUDA. GB10 selects `gb10`; known GB202 devices, including RTX PRO
 6000 Blackwell, select `gb202`. All selected GPUs must belong to the same family.
 An unknown identifier or a driver unable to report it requires an explicit
 revision. GPU selection follows `CUDA_VISIBLE_DEVICES` for both commands.
+Revision detection runs in a short-lived process so NVML's worker threads cannot
+overlap CUDA visibility changes. Without `--gpus`, it uses the first visible GPU.
+After reading the package, `flare run` selects its required number of
+local GPUs and narrows CUDA visibility before initializing the serving driver.
+An explicit GPU list must match the package's local rank count.
 
 An explicit `--revision` overrides `@revision` and hardware detection. It accepts
 a branch, tag, or commit, and permits downloading on a machine without NVIDIA
@@ -832,8 +845,7 @@ cuda = "/opt/cuda"                # Used when installed packages provide no tool
 `[models.<alias>]` overrides `[defaults]`; flags override both.
 Both sections accept `speculative_token_capacity`, overridden during preparation
 by `--speculative-token-capacity`. Omitting it uses the recipe declaration when
-supplied: DeepSeek V4.1 declares 128 target rows. Other recipes derive the
-capacity from prepared concurrency and draft depth.
+supplied: every speculative recipe declares 128 target rows.
 Both sections also accept positive integer `speculative_graph_budget`, overridden
 by `--speculative-graph-budget`. DeepSeek V4.1 declares 64 packed round graphs.
 The `[defaults]` graph budget applies only to active packed adaptive learned
@@ -1131,7 +1143,7 @@ For the command line to stay this small, every recipe declares:
   live state per active request, and a graph-and-scratch estimate for a cold
   host;
 - a prefill chunk and the decode capacities;
-- its speculation settings, whether drafts can be copied from request history,
+- its speculation settings, whether drafts can be copied from shared decoded history,
   the draft model's share of weights and pages, and its costs with speculation
   disabled;
 - image limits;

@@ -105,7 +105,7 @@ fn parameter_end(text: &str) -> Option<&str> {
         .strip_prefix('>')
 }
 
-fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
+pub(super) fn scalar_parameter_value(raw: &str, schema: Option<&Value>) -> Value {
     let mut kinds = Vec::new();
     parameter_types(schema, &mut kinds);
     let parsed = serde_json::from_str::<Value>(raw);
@@ -146,9 +146,13 @@ fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
         }
     }
     // Tool schemas guide tag-to-JSON conversion; non-strict calls retain invalid values.
-    let mut value = value
+    value
         .or_else(|| parsed.ok())
-        .unwrap_or_else(|| Value::String(raw.into()));
+        .unwrap_or_else(|| Value::String(raw.into()))
+}
+
+fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
+    let mut value = scalar_parameter_value(raw, schema);
     if let Some(schema) = schema {
         match &mut value {
             Value::Object(fields) => {
@@ -187,7 +191,7 @@ fn integer_value(raw: &str) -> Option<Value> {
         .or_else(|| raw.parse::<u64>().ok().map(Value::from))
 }
 
-fn parameter_types<'a>(schema: Option<&'a Value>, kinds: &mut Vec<&'a str>) {
+pub(super) fn parameter_types<'a>(schema: Option<&'a Value>, kinds: &mut Vec<&'a str>) {
     let start = kinds.len();
     if let Some(schema) = schema {
         match schema.get("type") {

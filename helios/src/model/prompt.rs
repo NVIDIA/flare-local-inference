@@ -43,6 +43,9 @@ pub fn prepare_image_inputs(
         return Err("prompt contains an input token outside the prepared frontend contract".into());
     }
     let mut prepared = match config.contract.frontend.image_layout {
+        Some(ImageLayoutKind::Bracketed) => crate::frontend::images::layouts::bracketed::prepare_input(
+            frontend, processor, rendered, &images,
+        )?,
         Some(ImageLayoutKind::Glm) => crate::frontend::images::layouts::glm::prepare_input(
             frontend, processor, rendered, &images,
         )?,

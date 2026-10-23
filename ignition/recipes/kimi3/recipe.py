@@ -61,8 +61,8 @@ RECIPE = Recipe(
         Checkpoint(alias="kimi-k3-dspark", repository="/data/kimi-k3-dspark", revision="local",
         architecture="KimiK3ForConditionalGeneration", stored_bytes=1_500_516_228_062,
         device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000)),
-    context=1048576, page_tokens=128, concurrency=4, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
+    speculation=Speculation(draft_tokens=7, token_capacity=128), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.

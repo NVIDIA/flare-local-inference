@@ -123,6 +123,16 @@ def _fake_sigmoid(source):
     return torch.sigmoid(source)
 
 
+@torch.library.custom_op('flare::gelu', mutates_args=())
+def _gelu(source: torch.Tensor, approximate: str = 'none') -> torch.Tensor:
+    return torch.nn.functional.gelu(source, approximate=approximate)
+
+
+@_gelu.register_fake
+def _fake_gelu(source, approximate='none'):
+    return torch.empty_like(source)
+
+
 @torch.library.custom_op('flare::native_layer_norm', mutates_args=())
 def _native_layer_norm(source: torch.Tensor, shape: list[int], weight: torch.Tensor | None,
                        bias: torch.Tensor | None, eps: float) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -300,7 +310,7 @@ def compile_forward(fn, *, tracer=None):
     Their typed views are reconstructed inside each opaque invocation so
     Inductor can preserve mutations without cloning strided state regions.
     Pointwise tensor operations remain visible to ordinary Inductor compilation.
-    Mean reductions, FP32 sigmoid, LayerNorm and RMSNorm retain ATen's rounding.
+    Mean reductions, FP32 sigmoid, exact GELU, LayerNorm and RMSNorm retain ATen's rounding.
     Both compilation and cache restoration execute one warmup on caller-owned state.
     Compiled artifacts take persistent tensors as inputs and are cached without
     weight payloads or process-local kernel handles. Each callable retains its
@@ -330,6 +340,9 @@ def _lower_storage(module):
         elif (node.op == 'call_function' and node.target is torch.ops.aten.sigmoid.default
                 and node.meta['val'].dtype == torch.float32):
             node.target = torch.ops.flare.sigmoid.default
+        elif (node.op == 'call_function' and node.target is torch.ops.aten.gelu.default
+                and node.kwargs.get('approximate', 'none') == 'none'):
+            node.target = torch.ops.flare.gelu.default
         elif node.op == 'call_function' and node.target is torch.ops.aten.native_layer_norm.default:
             node.target = torch.ops.flare.native_layer_norm.default
         elif node.op == 'call_function' and node.target is torch.ops.aten._fused_rms_norm.default:

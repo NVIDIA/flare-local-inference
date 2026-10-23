@@ -17,7 +17,7 @@ HUB = Path.home() / ".cache/huggingface/hub"
 def test_declarations_import_without_model_dependencies():
     result = subprocess.run(
         [sys.executable, "-c", "import sys; from ignition.recipes import aliases; from ignition import planning;"
-         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'step5-preview-nvfp4', 'nemotron-bolt-24gb');"
+         " import ignition.cli.preparation; assert aliases() == ('qwen3.8-flash', 'qwen3.8-27b', 'glm-5.3-flash', 'deepseek-v4.1-flash', 'deepseek-v4-flash', 'mimo-v2.6-pro-mopd', 'kimi-k3-mxfp4-csf', 'kimi-k3', 'kimi-k3-dspark', 'step5-preview-nvfp4', 'nemotron-bolt-24gb', 'minimax-m3-1-flash');"
          " assert not {'torch', 'transformers', 'flare_heliopause'} & set(sys.modules)"],
         cwd=ROOT, check=False, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr

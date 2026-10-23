@@ -239,7 +239,5 @@ class PreparedMaintenance:
                         & (self.filtered.request_slots == slot) & (self.metadata.errors == 0)).any()
                     self.speculation.previous_accepted[slot].copy_(torch.where(selected, 1,
                         self.speculation.previous_accepted[slot]))
-                    self.speculation.accepted_generation[slot].copy_(torch.where(selected,
-                        self.requests.generation[slot], self.speculation.accepted_generation[slot]))
         else:
             self._complete()

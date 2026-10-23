@@ -85,6 +85,8 @@ def backend(monkeypatch):
             if request.name not in controls.skip_prime:
                 call = request.prepare_call(request.plan)
                 if call is not None:
+                    if call.produce is not None:
+                        call.produce()
                     call.invoke()
                 # b12x PreparationJob._publish retains this tuple until plan release.
                 self._published_owners[request.name] = () if call is None else tuple(call.owners)
@@ -278,6 +280,45 @@ def test_benchmark_resource_shared_across_requests_and_released_before_capture(b
     assert report["allocated_after_trial_release"] == report["allocated_before_tuning"] == 4096
     with pytest.raises(RuntimeError, match="only during"):
         benchmark_resource(session, "late", create)
+
+
+def test_indexed_normalization_releases_private_priming_operands(backend, monkeypatch):
+    from ignition.components import rms_norm
+
+    session = make_session(device=0, checkpoint="indexed-normalization")
+    monkeypatch.setattr(PreparationSession, "_allocated", lambda self: 0)
+    plan = declaration("indexed").plan
+    plan.request = lambda **kwargs: Request(plan=plan, **kwargs)
+    monkeypatch.setattr(rms_norm.hyperconnection, "Caps", lambda **kwargs: None)
+    monkeypatch.setattr(rms_norm.hyperconnection, "plan", lambda *args, **kwargs: plan)
+    references = []
+    original = rms_norm.HyperconnectionBenchmarkInputs
+
+    def operands(*args):
+        value = original(*args)
+        references.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(rms_norm, "HyperconnectionBenchmarkInputs", operands)
+
+    def launch(source, weight, output, *, eps, indices):
+        assert torch.isfinite(source).all()
+        assert ((indices >= 0) & (indices < source.shape[0])).all()
+        output.copy_(source[indices])
+
+    plan.launch = launch
+    source = torch.full((257, 128), torch.nan, dtype=torch.bfloat16)
+    indices = torch.full((8,), 1 << 20, dtype=torch.int32)
+    weight = torch.ones(128, dtype=torch.bfloat16)
+    output = torch.full((8, 128), torch.nan, dtype=torch.bfloat16)
+    rms_norm.PreparedIndexedRMSNorm(source, indices, weight, output,
+        eps=1e-6, session=session, name="indexed")
+    session.tune()
+    assert references and all(reference() is None for reference in references)
+    assert not session._published_owners["indexed"]
+    assert torch.isnan(source).all() and torch.isnan(output).all()
+    assert (indices == 1 << 20).all()
+    session.close()
 
 
 

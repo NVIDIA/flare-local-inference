@@ -274,6 +274,33 @@ def test_fp32_sigmoid_preserves_bf16_gate_rounding():
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("approximate", ["none", "tanh"])
+@torch.no_grad()
+def test_gelu_preserves_aten_rounding(approximate):
+    source = torch.linspace(-6, 6, 32768, device="cuda", dtype=torch.bfloat16)
+    output = torch.empty_like(source)
+
+    def forward():
+        output.copy_(torch.nn.functional.gelu(source, approximate=approximate))
+
+    compiled = compile_forward(forward)
+    compiled()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        compiled()
+    for shift in (0., 0.125, -0.25):
+        source.add_(shift)
+        expected = torch.nn.functional.gelu(source, approximate=approximate)
+        output.fill_(float("nan"))
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        torch.testing.assert_close(output, expected, rtol=0, atol=0)
+    graph.reset()
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
 @pytest.mark.parametrize("rows", [1, 4096])
 @torch.no_grad()
 def test_layer_norm_preserves_aten_rounding(rows):

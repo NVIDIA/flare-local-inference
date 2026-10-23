@@ -63,6 +63,10 @@ forwards inside completed speculative graphs; verification steps count completed
 speculative graphs. Copy-only proposals contribute no drafter steps. Mean draft
 acceptance length is accepted draft tokens per progressing request round with
 at least one offered draft, excluding the bonus token and width-one rounds.
+DEPTH is allocated draft positions per progressing decode or verification request
+round, including zero-draft rounds. Packed rounds contribute their allocated
+per-request prefixes; the graph's maximum width and padded batch size do not
+determine this average. Rejected drafts count toward depth.
 The display also shows active/queued requests, completed/failed requests, reused
 tokens, and cached/free KV pages. Token counters are available through `/metrics`.
 
@@ -461,9 +465,11 @@ and concurrent comparisons against MiniJinja.
 
 ## Embedding row cache
 
-Disk-backed embedding tables can use a separate bounded row cache through
-`flare run --embedding-table-cache-size 1G`. The loader accounts for its host
-storage before sizing KV pages and continuation snapshots. Entries hold immutable
+Disk-backed embedding tables use a bounded host-RAM row cache, defaulting to
+4 GiB per host on discrete GPUs or 1 GiB when any selected GPU shares host memory.
+`flare run --embedding-table-cache-size SIZE` overrides the budget; `0` disables
+caching. RAM table storage allocates no separate row cache. The loader accounts
+for its host storage before sizing KV pages and continuation snapshots. Entries hold immutable
 table rows shared across requests; they copy into existing pinned row staging,
 whose consumer fences remain unchanged. Approximate usage counts protect frequently
 requested rows; recency breaks ties, and periodic count decay adapts to workload
