@@ -570,13 +570,43 @@ fn generation_logprobs(protocol: Protocol, body: &Value) -> Result<Option<Logpro
             (enabled, top)
         }
         Protocol::Messages => {
-            if ["logprobs", "top_logprobs", "return_tokens_as_token_ids"].iter().any(|key| present(body, key)) {
+            if body.get("logprob_token_ids").is_some()
+                || ["logprobs", "top_logprobs", "return_tokens_as_token_ids"]
+                    .iter()
+                    .any(|key| present(body, key))
+            {
                 return Err(unsupported("/v1/messages does not support logprob fields"));
             }
             (false, 0)
         }
     };
-    Ok(enabled.then_some(LogprobOptions { top, token_ids }))
+    let mut ids = Vec::new();
+    if let Some(value) = body.get("logprob_token_ids").filter(|v| !v.is_null()) {
+        let values = value
+            .as_array()
+            .ok_or("logprob_token_ids must be an array of integers")?;
+        if values.len() > crate::execution::MAX_LOGPROB_TOKEN_IDS {
+            return Err("logprob_token_ids accepts at most 128 elements".into());
+        }
+        for value in values {
+            let id = value
+                .as_u64()
+                .and_then(|id| i32::try_from(id).ok())
+                .ok_or("logprob_token_ids must contain nonnegative int32 integers")?
+                as u32;
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    if !ids.is_empty() && !enabled {
+        return Err("logprob_token_ids requires generation logprobs to be enabled".into());
+    }
+    Ok(enabled.then_some(LogprobOptions {
+        top,
+        token_ids,
+        ids,
+    }))
 }
 
 pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Decoded> {
@@ -620,7 +650,7 @@ pub(crate) fn decode(protocol: Protocol, body: Value, count: bool) -> Result<Dec
             .filter(|n| *n <= crate::execution::MAX_TOP_LOGPROBS as u64)
             .ok_or("prompt_logprobs must be an integer from 0 through 20")? as usize)
     } else if protocol == Protocol::Completions && flag(&body, "echo", false)? {
-        logprobs.map(|v| v.top)
+        logprobs.as_ref().map(|v| v.top)
     } else { None };
     let choices = body
         .get("n")

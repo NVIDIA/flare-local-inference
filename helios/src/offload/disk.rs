@@ -737,9 +737,14 @@ fn truncate(path: &Path, length: u64) -> Result<u64> {
 }
 
 fn unlink(path: &Path) -> Result<u64> {
-    fs::remove_file(path)
-        .map(|()| 0)
-        .map_err(|error| io_failure(format!("unlink record file {}", path.display()), error))
+    match fs::remove_file(path) {
+        Ok(()) => Ok(0),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(io_failure(
+            format!("unlink record file {}", path.display()),
+            error,
+        )),
+    }
 }
 
 /// One contiguous direct-I/O transfer between a buffer and a file offset.
@@ -1503,7 +1508,7 @@ mod tests {
         assert!(thread.submit(Job::Close { id: JobId(6) }).is_err());
         let replies = wait(&thread, 1);
         assert_eq!(replies[0].operation, Operation::Unlink);
-        failed(&replies[0]);
+        succeeded(&replies[0]);
         fs::remove_dir_all(&directory).unwrap();
     }
 
@@ -2116,7 +2121,7 @@ mod tests {
         assert_eq!(replies.len(), accepted);
         for reply in &replies {
             assert_eq!(reply.operation, Operation::Unlink);
-            failed(reply);
+            succeeded(reply);
         }
         assert!(live.submit(Job::Close { id: JobId(0) }).is_err());
     }

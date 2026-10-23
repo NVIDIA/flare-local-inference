@@ -106,8 +106,9 @@ pub enum Effort {
     Max,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct LogprobOptions {
+    pub ids: Vec<u32>,
     pub top: usize,
     pub token_ids: bool,
 }

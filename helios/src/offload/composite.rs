@@ -284,7 +284,8 @@ impl CompositeStore {
     fn streamed_event(&mut self, event: TransportEvent, events: &mut Vec<StoreEvent>) {
         if let TransportEvent::Stored {
             id, result: Err(_), ..
-        } = &event
+        }
+        | TransportEvent::StoreInvalidated { id, .. } = &event
         {
             if let Some(key) = self.disk.pending_store_key(*id) {
                 self.fail_children(key);

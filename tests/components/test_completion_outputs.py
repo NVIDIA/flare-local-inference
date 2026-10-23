@@ -1,5 +1,7 @@
 """Completion storage remains shared across serial mixed graph variants."""
 
+import os
+
 import pytest
 import torch
 
@@ -9,8 +11,9 @@ from ignition.components.completion import (
 )
 
 
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='CUDA opt-in')
 def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool():
-    outputs = CompletionOutputs.allocate((2, 4, 24), device='cpu')
+    outputs = CompletionOutputs.allocate((2, 4, 24), device='cuda')
     cursor = outputs.private_storage.cursor()
     prompt, decode = outputs.private(cursor), outputs.private(cursor)
     assert prompt.requested is decode.requested is outputs.requested
@@ -22,13 +25,14 @@ def test_mixed_roles_merge_only_the_active_frame_and_reuse_the_catalog_pool():
     outputs.logprobs.fill_(-8)
     prompt.speculative_survival.fill_(.9)
     decode.speculative_survival.fill_(.5)
-    outputs.merge(prompt, decode, torch.tensor(2), torch.tensor([1], dtype=torch.int32))
+    outputs.merge(prompt, decode, torch.tensor(2, device='cuda'), torch.tensor([1], dtype=torch.int32, device='cuda'))
     assert torch.all(outputs.records[0] == -7)
     assert torch.all(outputs.logprobs[0] == -8)
     assert torch.all(outputs.records[1, 2] == 11)
-    assert torch.all(outputs.logprobs[1, 2] == 12)
+    assert torch.all(outputs.logprobs[1, 2, :, :42] == 12)
     assert torch.all(outputs.records[1, [0, 1, 3]] == 21)
-    assert torch.all(outputs.logprobs[1, [0, 1, 3]] == 22)
+    assert torch.all(outputs.logprobs[1, [0, 1, 3], :, :42] == 22)
+    assert torch.all(outputs.logprobs[1, :, :, 42:] == -8)
     assert torch.all(outputs.speculative_survival[0] == -1)
     assert torch.all(outputs.speculative_survival[1, 2] == -1)
     assert torch.all(outputs.speculative_survival[1, [0, 1, 3]] == .5)

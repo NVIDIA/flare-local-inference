@@ -1096,7 +1096,7 @@ mod logprob_retention_tests {
         let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
         decoder.track_logprobs(&frontend, true);
         for token in [vec![0,1],vec![2;1024]].concat() {
-            decoder.push_logprob(TokenLogprobs { token, logprob: -1., top: [(0,0.); crate::execution::MAX_TOP_LOGPROBS], top_count: 0 }).unwrap();
+            decoder.push_logprob(TokenLogprobs { token, logprob: -1., top: vec![] }).unwrap();
             assert!(decoder.pending_entries.is_empty());
         }
         assert!(decoder.finish(Termination::OutputLimit).unwrap().is_empty());

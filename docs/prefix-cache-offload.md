@@ -713,6 +713,14 @@ failed, rank zero unlinks the file from the ranks that wrote it before
 reporting the failure, so no host keeps a record the index lacks. A cleanup
 unlink that fails is reported with that failure rather than discarded.
 
+A partially successful replacement invalidates the previous record: successful
+ranks have overwritten it, even when cleanup fails. Its index entry becomes
+unreadable, so descendants can restore only when a GPU-resident prefix already
+covers that entry. Parent links remain until the descendants are evicted, and
+the full replacement size stays charged until reclamation. Removing a file
+already deleted by partial-write cleanup succeeds. When every rank fails before
+replacing its file, the previous record remains readable.
+
 Sends are queued to a writer thread per connection, so the model worker never
 waits for a peer. A peer that stops reading fills a bounded queue and fails the
 job instead of stalling the worker. A connection that fails while a job is

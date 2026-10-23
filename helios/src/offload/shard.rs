@@ -79,6 +79,7 @@ enum Kind {
     Fetched,
     Truncated,
     Unlinked,
+    StoreInvalidated,
 }
 
 impl Kind {
@@ -92,6 +93,7 @@ impl Kind {
             1 => Self::Fetched,
             2 => Self::Truncated,
             3 => Self::Unlinked,
+            4 => Self::StoreInvalidated,
             _ => return Err(invalid("unknown prefix record event kind")),
         })
     }
@@ -99,6 +101,9 @@ impl Kind {
     fn of(event: &TransportEvent) -> (Self, JobId, Result<u64>) {
         match event {
             TransportEvent::Stored { id, result } => (Self::Stored, *id, copy(result)),
+            TransportEvent::StoreInvalidated { id, error } => {
+                (Self::StoreInvalidated, *id, Err(error.clone()))
+            }
             TransportEvent::Fetched { id, result } => (Self::Fetched, *id, copy(result)),
             TransportEvent::Truncated { id, result } => {
                 (Self::Truncated, *id, copy(result).map(|()| 0))
@@ -112,6 +117,12 @@ impl Kind {
     fn event(self, id: JobId, result: Result<u64>) -> TransportEvent {
         match self {
             Self::Stored => TransportEvent::Stored { id, result },
+            Self::StoreInvalidated => TransportEvent::StoreInvalidated {
+                id,
+                error: result
+                    .err()
+                    .unwrap_or_else(|| invalid("invalidated store lacks a failure")),
+            },
             Self::Fetched => TransportEvent::Fetched { id, result },
             Self::Truncated => TransportEvent::Truncated {
                 id,
@@ -605,8 +616,7 @@ impl Sharded {
                 _ => None,
             });
         if let Some((store, error)) = pending.cleanup {
-            // A cleanup unlink that also failed leaves a file no index charges
-            // for; report it with the failure rather than discarding it.
+            // Preserve cleanup failures alongside the write failure.
             let leftover =
                 pending
                     .results
@@ -620,10 +630,8 @@ impl Sharded {
                 Some(failure) => invalid(format!("{error}; cleanup unlink failed on {failure}")),
                 None => error,
             };
-            self.events.push(TransportEvent::Stored {
-                id: store,
-                result: Err(error),
-            });
+            self.events
+                .push(TransportEvent::StoreInvalidated { id: store, error });
             return;
         }
         let Some(error) = failure else {
@@ -653,10 +661,8 @@ impl Sharded {
                 writer.finish()
             }
             Err(_) => {
-                self.events.push(TransportEvent::Stored {
-                    id: store,
-                    result: Err(error),
-                });
+                self.events
+                    .push(TransportEvent::StoreInvalidated { id: store, error });
                 return;
             }
         };
@@ -1793,9 +1799,9 @@ mod tests {
         transport.record(Kind::Stored, JobId(3), 1, Err(invalid("no space")));
         match events(&mut transport, 1).as_slice() {
             [
-                TransportEvent::Stored {
+                TransportEvent::StoreInvalidated {
                     id: JobId(3),
-                    result: Err(error),
+                    error,
                 },
             ] => {
                 assert!(error.to_string().contains("no space"), "{error}");
@@ -1829,9 +1835,9 @@ mod tests {
             .unwrap();
         match events(&mut transport, 1).as_slice() {
             [
-                TransportEvent::Stored {
+                TransportEvent::StoreInvalidated {
                     id: JobId(4),
-                    result: Err(error),
+                    error,
                 },
             ] => {
                 assert!(error.to_string().contains("short write"), "{error}");
@@ -1865,9 +1871,9 @@ mod tests {
         .unwrap();
         match events(&mut transport, 1).as_slice() {
             [
-                TransportEvent::Stored {
+                TransportEvent::StoreInvalidated {
                     id: JobId(6),
-                    result: Err(error),
+                    error,
                 },
             ] => {
                 let error = error.to_string();
@@ -1877,6 +1883,28 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+
+        // When every write fails, the previous files remain usable.
+        let seventh = record_file(&directory, 608);
+        transport.pending.insert(
+            (Kind::Stored, JobId(7)),
+            Pending {
+                kind: Kind::Stored,
+                results: vec![Some(Err(invalid("write failed"))), None],
+                path: Some(seventh.clone()),
+                cleanup: None,
+                started: Instant::now(),
+            },
+        );
+        transport.record(Kind::Stored, JobId(7), 1, Err(invalid("disk full")));
+        assert!(matches!(
+            events(&mut transport, 1).as_slice(),
+            [TransportEvent::Stored {
+                id: JobId(7),
+                result: Err(_)
+            }]
+        ));
+        assert!(seventh.exists());
 
         // A broken connection fails every job still waiting on that rank.
         let fifth = record_file(&directory, 640);
@@ -2162,6 +2190,17 @@ mod tests {
 
     #[test]
     fn events_and_peer_file_names_round_trip_and_reject_paths() {
+        let event = TransportEvent::StoreInvalidated {
+            id: JobId(11),
+            error: invalid("partial store"),
+        };
+        let (kind, id, result) = Kind::of(&event);
+        let frame = encode_event(kind, id, &result);
+        let (kind, id, result) = decode_event(&frame[5..]).unwrap();
+        assert!(matches!(
+            kind.event(id, result),
+            TransportEvent::StoreInvalidated { id: JobId(11), .. }
+        ));
         for result in [Ok(42u64), Err(invalid("disk full"))] {
             let frame = encode_event(Kind::Fetched, JobId(9), &result);
             let (kind, id, decoded) = decode_event(&frame[5..]).unwrap();

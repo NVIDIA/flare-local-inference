@@ -77,7 +77,8 @@ class GraphSignature:
         if len(set(self.inputs)) != len(self.inputs):
             raise ValueError("graph input names must be unique")
         if any(name in self.inputs for name in ("frame_index", "submission_sequence", "completion_records",
-                                               "completion_logprobs", "logprob_requested", "readiness_timestamps",
+                                               "completion_logprobs", "logprob_requested", "logprob_token_ids",
+                                               "logprob_token_id_counts", "readiness_timestamps",
                                                "completion_speculative_survival")):
             raise ValueError("reserved execution buffers are bound automatically")
 
@@ -126,7 +127,8 @@ class PreparedExecution(PreparedGraphBundle):
         cursor = 0
         reserved = ("frame_index", "submission_sequence")
         if "logprob_requested" in self.buffers:
-            reserved += ("logprob_requested",)
+            reserved += tuple(name for name in ("logprob_requested", "logprob_token_ids",
+                                                "logprob_token_id_counts") if name in self.buffers)
         input_names = set(reserved)
         for signature in self.signatures.values():
             input_names.update(signature.inputs)

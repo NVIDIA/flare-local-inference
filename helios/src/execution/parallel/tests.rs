@@ -521,3 +521,47 @@ fn packed_combined_process_schema_rejects_a_different_proposal_depth() {
     peer.graphs[0].draft_tokens = 3;
     assert_ne!(layout(&root), layout(&peer), "different proposal contracts must fail before any rank launch");
 }
+
+#[test]
+fn logprob_uploads_budget_count_and_prefix_wire_bytes_separately() {
+    let manifest = super::super::tests::with_logprobs(crate::execution::MAX_LOGPROB_TOKEN_IDS);
+    let measure = |uploads: &[Upload<'_>]| {
+        let mut size = 0;
+        wire::prepare(&manifest, Fence(1), 0, false, uploads, |_, bytes| {
+            size += bytes.len();
+            Ok(())
+        })
+        .unwrap();
+        size
+    };
+    let empty = measure(&[]);
+    let counts = [0u8; 16];
+    assert_eq!(
+        measure(&[Upload {
+            buffer: "logprob_token_id_counts",
+            offset: 0,
+            bytes: &counts
+        }]) - empty,
+        16 + 24
+    );
+    for count in [1, 20, 21, 127, 128] {
+        let ids: Vec<_> = (0..count as i32).flat_map(i32::to_ne_bytes).collect();
+        let additional = measure(&[
+            Upload {
+                buffer: "logprob_token_id_counts",
+                offset: 0,
+                bytes: &counts,
+            },
+            Upload {
+                buffer: "logprob_token_ids",
+                offset: 0,
+                bytes: &ids,
+            },
+        ]) - empty;
+        assert_eq!(additional, 16 + 24 + 4 * count + 24);
+        eprintln!(
+            "C=4 N={count}: H2D={} remote_peer={additional}",
+            16 + 4 * count
+        );
+    }
+}

@@ -63,6 +63,8 @@ pub enum TransportEvent {
         id: super::JobId,
         result: Result<u64>,
     },
+    /// A failed store changed the destination on some ranks; its prior file is unusable.
+    StoreInvalidated { id: super::JobId, error: Error },
     Fetched {
         id: super::JobId,
         result: Result<u64>,
@@ -1773,6 +1775,15 @@ impl DiskStore {
     /// Finish a reserved record: a successful write makes it ready; a failed
     /// one returns its bytes to the budget and drops it from the index.
     pub(crate) fn commit_record(&mut self, key: PrefixKey, result: Result<u64>) -> Result<()> {
+        self.finish_record(key, result, true)
+    }
+
+    fn finish_record(
+        &mut self,
+        key: PrefixKey,
+        result: Result<u64>,
+        prior_readable: bool,
+    ) -> Result<()> {
         if let Some(old) = self.replacements.remove(&key) {
             let node = self.index.node_mut(&key).unwrap();
             if result.is_ok() {
@@ -1784,12 +1795,27 @@ impl DiskStore {
                 self.stats.bytes_out += result.as_ref().copied().unwrap();
                 self.evicted.push(key);
             } else {
-                self.used -= node.location.bytes;
-                node.location = old;
-                node.ready = true;
+                if prior_readable {
+                    self.used -= node.location.bytes;
+                    node.location = old;
+                    node.ready = true;
+                } else {
+                    // A failed cleanup can leave a complete replacement on one rank.
+                    self.used -= old.bytes;
+                    node.ready = false;
+                    node.row = false;
+                }
                 self.stats.store_failed += 1;
             }
             self.index.unpin(&key)?;
+            if !prior_readable {
+                self.evicted.push(key);
+                if self.index.node(&key).unwrap().children() == 0 {
+                    for removed in self.index.remove(&key)? {
+                        self.unlink(removed)?;
+                    }
+                }
+            }
             self.sync_budget();
             return Ok(());
         }
@@ -1987,21 +2013,10 @@ impl DiskStore {
         self.stats.progress += 1;
         match event {
             TransportEvent::Stored { id, result } => {
-                let Some(job) = self.outbound.remove(&id) else {
-                    return;
-                };
-                if let Ok(bytes) = &result {
-                    self.outbound_rate.observe(*bytes, job.started.elapsed());
-                }
-                let result = match self.commit_record(job.key, result.clone()) {
-                    Ok(()) => result,
-                    Err(error) => Err(error),
-                };
-                events.push(StoreEvent::Stored {
-                    checkpoint: job.checkpoint,
-                    key: job.key,
-                    result,
-                });
+                self.finish_outbound(id, result, true, events);
+            }
+            TransportEvent::StoreInvalidated { id, error } => {
+                self.finish_outbound(id, Err(error), false, events);
             }
             TransportEvent::Fetched { id, result } => {
                 let Some(job) = self.inbound.remove(&id) else {
@@ -2059,6 +2074,30 @@ impl DiskStore {
                 self.sync_budget();
             }
         }
+    }
+
+    fn finish_outbound(
+        &mut self,
+        id: JobId,
+        result: Result<u64>,
+        prior_readable: bool,
+        events: &mut Vec<StoreEvent>,
+    ) {
+        let Some(job) = self.outbound.remove(&id) else {
+            return;
+        };
+        if let Ok(bytes) = &result {
+            self.outbound_rate.observe(*bytes, job.started.elapsed());
+        }
+        let result = match self.finish_record(job.key, result.clone(), prior_readable) {
+            Ok(()) => result,
+            Err(error) => Err(error),
+        };
+        events.push(StoreEvent::Stored {
+            checkpoint: job.checkpoint,
+            key: job.key,
+            result,
+        });
     }
 }
 
@@ -2459,6 +2498,72 @@ mod tests {
         )
         .unwrap();
         (store, log)
+    }
+
+    #[test]
+    fn partial_row_replacement_failure_invalidates_ancestry_until_reclaimed() {
+        for has_child in [false, true] {
+            let full = history(1000);
+            let root = header(&geometry(), &full, 128, None);
+            let child = header(&geometry(), &full, 256, Some(128));
+            let mut records = vec![scanned(&directory(), root.clone(), 0, false)];
+            if has_child {
+                records.push(scanned(&directory(), child.clone(), 1, true));
+            }
+            let (mut store, log) = store_with(records, 1 << 30);
+            let original = store.used();
+            let mut ids = Ids::new();
+            let publication =
+                checkpoint(&mut ids, &full, 128, None, pages(0..2), 2, StateSlotId(1));
+            assert_eq!(store.store(&publication).unwrap(), StoreOutcome::Queued);
+            let events = complete(
+                &log,
+                TransportEvent::StoreInvalidated {
+                    id: JobId(1),
+                    error: invalid("rank 1: disk full"),
+                },
+                &mut store,
+            );
+            assert!(matches!(
+                &events[..],
+                [StoreEvent::Stored { result: Err(_), .. }]
+            ));
+            assert!(store.lookup(&full, 0, u64::MAX).is_none());
+            assert_eq!(store.stats().store_failed, 1);
+            assert_eq!(store.stats().row_refills, 0);
+            assert_eq!(store.stats().outbound_in_flight, 0);
+            if has_child {
+                let node = store.index.node(&root.key).unwrap();
+                assert!(!node.ready && !node.row && !node.pinned());
+                assert_eq!(node.children(), 1);
+                assert_eq!(store.used(), original + ROW_RECORD);
+                assert_eq!(store.index.node(&child.key).unwrap().parent, Some(root.key));
+                // A GPU-resident ancestor still supplies a valid prefix for the child's tail.
+                assert_eq!(store.lookup(&full, 128, u64::MAX).unwrap().key, child.key);
+                assert!(store.make_room(store.limit()).unwrap());
+            }
+            assert!(store.index.is_empty());
+            assert_eq!(store.used(), 0);
+            let unlinks: Vec<_> = log
+                .borrow()
+                .calls
+                .iter()
+                .filter_map(|call| match call {
+                    Call::Unlink { id, path } => Some((*id, path.clone())),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(unlinks.len(), if has_child { 2 } else { 1 });
+            for (id, _) in unlinks {
+                complete(
+                    &log,
+                    TransportEvent::Unlinked { id, result: Ok(()) },
+                    &mut store,
+                );
+            }
+            assert!(store.maintenance.is_empty());
+            assert_eq!(store.used(), 0);
+        }
     }
 
     #[test]
@@ -4237,7 +4342,7 @@ mod tests {
                 },
                 TransportEvent::Unlinked {
                     id: second,
-                    result: Err(_),
+                    result: Ok(()),
                 },
             ] => assert_eq!((*first, *second), (JobId(8), JobId(9))),
             other => panic!("unexpected events {other:?}"),

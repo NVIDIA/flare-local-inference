@@ -96,6 +96,41 @@ device inputs before handoff. The native executor always uploads the reserved
 frame index and positive, monotonic submission sequence. Command callers
 cannot override those two values.
 
+Generation reporting uses `logprob_requested: int32[C]` as a boolean gate,
+where C is padded request capacity. New packages also bind
+`logprob_token_ids: int32[C,128]` and `logprob_token_id_counts: int32[C]`.
+Counts are cleared every submission: zero selects natural top-20; 1..128 selects
+the uploaded ID prefix. Sampling graphs require the complete input group.
+`completion_logprobs: int32[2,C,8,258]` contains a chosen pair followed by up to
+128 alternative pairs, each storing a token ID and FP32 logprob bits. Reporting
+uses raw target logits before sampling transforms, gated by slot epoch and
+committed output positions. The host retains each pending frame's selections
+and appends its chosen pair only when absent from explicit alternatives.
+
+For a reporting frame, one pitched D2H copy transfers `8C * 4(2+2W)` bytes,
+with W the larger of 20 and the frame's largest explicit count. Source pitch
+follows package storage; compact pinned decoding uses the copied pitch, while
+mapped-host decoding uses package pitch. Frames without reporting copy no
+generation payload. Natural width-20 readback remains 1,344C bytes; explicit
+width 128 uses 8,256C. Legacy packages with natural capacity k in 1..20 retain
+that capacity, request limit, source pitch, and `64C(1+k)` readback bytes.
+Prompt output geometry and readback are independent of generation width.
+
+Relative to width-20 packages, persistent generation output adds 13,824C bytes
+per rank and inputs add 516C. Each private output adds another 13,824C; two
+pinned generation frames add 13,824C on discrete GPUs. Two input staging frames
+add 1,032C before alignment. Allocator rounding and resulting KV capacity must
+be measured for the complete package.
+
+Each submission adds 4C H2D count bytes per rank and one upload descriptor even
+without explicit IDs. Explicit prefixes add `4ΣN` H2D bytes. The existing remote
+TP wire format adds `4C+24` bytes per peer for counts, plus `4ΣN` payload bytes
+and 24 bytes per uploaded prefix per peer. Same-process rank threads share
+uploads instead of using that wire format. Natural finishing adds a count load
+and branch; candidate and normalization work remain unchanged. Wider output
+strides and width-masked mixed merges require measurement. Equal readback bytes
+do not imply equal total work or efficiency.
+
 An optional `readiness_timestamps` output has dtype int64 and contiguous shape
 `[2,3*N]`, with `1 <= N <= 64`. Each frame holds one triple per embedding table:
 GPU timestamps before its external readiness wait, after readiness, and after a

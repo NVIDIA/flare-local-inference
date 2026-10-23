@@ -9,7 +9,7 @@ pub(super) struct Formatted {
 
 pub(super) fn format(
     entry: &super::token_spans::ReturnedLogprob,
-    options: super::inference::LogprobOptions,
+    options: &super::inference::LogprobOptions,
     frontend: &Frontend,
 ) -> Result<Formatted> {
     let token = |id: u32, logprob: f32| -> Result<Value> {
@@ -18,8 +18,20 @@ pub(super) fn format(
             else { String::from_utf8_lossy(bytes).into_owned() }, "logprob":logprob, "bytes":bytes}))
     };
     let mut value = token(entry.value.token, entry.value.logprob)?;
-    value["top_logprobs"] = Value::Array(entry.value.top[..entry.value.top_count.min(options.top)]
-        .iter().map(|&(id, lp)| token(id, lp)).collect::<Result<_>>()?);
+    let top = if options.ids.is_empty() {
+        options.top
+    } else {
+        entry.value.top.len()
+    };
+    value["top_logprobs"] = Value::Array(
+        entry
+            .value
+            .top
+            .iter()
+            .take(top)
+            .map(|&(id, lp)| token(id, lp))
+            .collect::<Result<_>>()?,
+    );
     Ok(Formatted {
         entry: value,
         offset: entry.text_offset,
@@ -74,7 +86,7 @@ pub(super) fn prompt(
         let mut dictionary = serde_json::Map::new();
         let mut legacy = serde_json::Map::new();
         let mut rank = 1;
-        for (index, &(id, lp)) in value.value.top[..value.value.top_count.min(top)].iter().enumerate() {
+        for (index, &(id, lp)) in value.value.top.iter().take(top).enumerate() {
             if index > 0 && lp < value.value.top[index - 1].1 {
                 rank = index + 1;
             }
@@ -110,7 +122,11 @@ mod tests {
     use std::sync::Arc;
 
     fn value(token: u32) -> TokenLogprobs {
-        TokenLogprobs { token, logprob: -2., top: [(0, -1.); crate::execution::MAX_TOP_LOGPROBS], top_count: 1 }
+        TokenLogprobs {
+            token,
+            logprob: -2.,
+            top: vec![(0, -1.)],
+        }
     }
     fn entries(events: &[Event]) -> Vec<super::super::token_spans::ReturnedLogprob> {
         events.iter().filter_map(|e| if let Event::TokenLogprobs(v) = e { Some(v.clone()) } else { None }).flatten().collect()
@@ -128,7 +144,15 @@ mod tests {
         let mut encoder = Encoder::new(protocol, "lp".into(), "model".into(), 1, 1,
             vec![PromptUsage { tokens: 1, image_tokens: 0 }], vec![], crate::server::inference::ToolChoice::Auto,
             true, false, json!({}));
-        encoder.set_logprobs(Some(LogprobOptions { top: 1, token_ids: true }), frontend, streaming);
+        encoder.set_logprobs(
+            Some(LogprobOptions {
+                top: 1,
+                token_ids: true,
+                ids: vec![],
+            }),
+            frontend,
+            streaming,
+        );
         encoder
     }
 
@@ -158,7 +182,16 @@ mod tests {
             events.extend(decoder.finish(Termination::OutputLimit).unwrap());
             let entries = entries(&events);
             assert_eq!(entries.iter().map(|e| e.text_offset).collect::<Vec<_>>(), [0, 1]);
-            let formatted = format(&entries[0], LogprobOptions { top: 1, token_ids: false }, &frontend).unwrap();
+            let formatted = format(
+                &entries[0],
+                &LogprobOptions {
+                    top: 1,
+                    token_ids: false,
+                    ids: vec![],
+                },
+                &frontend,
+            )
+            .unwrap();
             assert_eq!(formatted.entry["bytes"], json!([228]));
             assert_eq!(formatted.entry["token"], "�");
             let mut encoder = encoder(Protocol::Completions, frontend.clone(), false);
@@ -300,7 +333,11 @@ mod tests {
 mod stop_entry_tests {
     use crate::{execution::TokenLogprobs, output::Piece, server::stops::TextStops};
     fn value(token: u32) -> TokenLogprobs {
-        TokenLogprobs { token, logprob: -2., top: [(0,-1.); crate::execution::MAX_TOP_LOGPROBS], top_count: 1 }
+        TokenLogprobs {
+            token,
+            logprob: -2.,
+            top: vec![(0, -1.)],
+        }
     }
     fn tokens(pieces: &[Piece]) -> Vec<u32> {
         pieces.iter().filter_map(|p| if let Piece::Logprob(e) = p { Some(e.value.token) } else { None }).collect()
@@ -348,7 +385,13 @@ mod silent_stream_tests {
         let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[10], None);
         decoder.track_logprobs(&frontend, false);
         for _ in 0..1024 {
-            let events = decoder.push_logprob(TokenLogprobs { token: 10, logprob: -1., top: [(0,0.); crate::execution::MAX_TOP_LOGPROBS], top_count: 0 }).unwrap();
+            let events = decoder
+                .push_logprob(TokenLogprobs {
+                    token: 10,
+                    logprob: -1.,
+                    top: vec![],
+                })
+                .unwrap();
             assert!(matches!(&events[..], [Event::TokenLogprobs(entries)] if entries.len() == 1 && entries[0].value.token == 10));
         }
         assert!(decoder.finish(Termination::OutputLimit).unwrap().is_empty());
@@ -367,7 +410,14 @@ mod utf8_entry_tests {
             let mut offsets = Vec::new();
             let mut attributed = 0;
             for token in &tokens {
-                for event in decoder.push_logprob(TokenLogprobs { token: *token, logprob: -1., top: [(0,0.); crate::execution::MAX_TOP_LOGPROBS], top_count: 0 }).unwrap() {
+                for event in decoder
+                    .push_logprob(TokenLogprobs {
+                        token: *token,
+                        logprob: -1.,
+                        top: vec![],
+                    })
+                    .unwrap()
+                {
                     match event {
                         Event::TokenLogprobs(entries) => offsets.extend(entries.iter().map(|e| e.text_offset)),
                         Event::ContentLogprobs(entries) => attributed += entries.len(),
@@ -392,10 +442,10 @@ mod prompt_tests {
     fn tied_prompt_tokens_have_the_same_competition_rank() {
         let frontend = crate::server::output::tests::frontend(&["A", "B", "C", "D"]);
         for token in [1, 2, 3] {
-            let mut top = [(0, 0.); crate::execution::MAX_TOP_LOGPROBS];
+            let mut top = vec![(0, 0.); 4];
             top[..4].copy_from_slice(&[(0, -1.), (1, -2.), (2, -2.), (3, -2.)]);
             let values = [Some(PromptLogprobs { value: TokenLogprobs {
-                token, logprob: -2., top, top_count: 4,
+                token, logprob: -2., top,
             }, rank: 2 })];
             let (dictionary, _) = prompt(&[token], &values, 4, false, &frontend, &mut 0, true).unwrap();
             assert_eq!(dictionary[0]["0"]["rank"], 1);
@@ -409,7 +459,7 @@ mod prompt_tests {
     fn prompt_formats_nulls_actual_rank_echo_streams_and_chat_placement() {
         let frontend = Arc::new(crate::server::output::tests::frontend(&["A", " B", " C"]));
         let values = [None, Some(PromptLogprobs { value: TokenLogprobs { token: 1, logprob: -3.,
-            top: [(2, -1.); crate::execution::MAX_TOP_LOGPROBS], top_count: 1 }, rank: 8 })];
+            top: vec![(2, -1.)] }, rank: 8 })];
         let (dictionary, legacy) = prompt(&[0, 1], &values, 1, true, &frontend, &mut 0, true).unwrap();
         assert_eq!(dictionary[1]["1"]["decoded_token"], " B");
         assert_eq!(dictionary[1]["2"]["decoded_token"], " C");
@@ -417,7 +467,7 @@ mod prompt_tests {
         for protocol in [Protocol::Completions, Protocol::Chat] {
             let mut encoder = Encoder::new(protocol, "id".into(), "model".into(), 0, 1,
                 vec![PromptUsage { tokens: 2, image_tokens: 0 }], vec![], ToolChoice::Auto, true, false, json!({}));
-            encoder.set_logprobs(Some(crate::server::inference::LogprobOptions { top: 1, token_ids: false }), frontend.clone(), false);
+            encoder.set_logprobs(Some(crate::server::inference::LogprobOptions { top: 1, token_ids: false, ids: vec![] }), frontend.clone(), false);
             encoder.set_prompt_logprobs(Some(1), frontend.clone(), protocol == Protocol::Completions, vec![3]);
             encoder.prompt_logprobs(0, 0, &[0, 1], &values).unwrap();
             let response = encoder.response();
@@ -435,7 +485,7 @@ mod prompt_tests {
         }
         let mut encoder = Encoder::new(Protocol::Completions, "id".into(), "model".into(), 0, 1,
             vec![PromptUsage { tokens: 2, image_tokens: 0 }], vec![], ToolChoice::Auto, true, false, json!({}));
-        encoder.set_logprobs(Some(crate::server::inference::LogprobOptions { top: 1, token_ids: false }), frontend.clone(), true);
+        encoder.set_logprobs(Some(crate::server::inference::LogprobOptions { top: 1, token_ids: false, ids: vec![] }), frontend.clone(), true);
         encoder.set_prompt_logprobs(Some(1), frontend, true, vec![3]);
         let frames = encoder.prompt_logprobs(0, 0, &[0, 1], &values).unwrap();
         assert_eq!(frames[0].data["choices"][0]["logprobs"]["token_logprobs"], json!([null, -3.]));

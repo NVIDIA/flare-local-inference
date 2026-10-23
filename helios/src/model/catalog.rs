@@ -19,7 +19,9 @@ pub fn validate(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<()
 
 fn validate_inner(config: &ModelConfig, manifest: &ExecutionManifest) -> Result<()> {
     manifest.validate()?;
-    if config.max_top_logprobs != manifest.max_top_logprobs()? {
+    if config.max_top_logprobs != manifest.max_top_logprobs()?
+        || config.logprob_token_id_capacity != manifest.logprob_token_id_capacity()
+    {
         return Err("model logprob capacity differs from its declared output buffers".into());
     }
     config.contract.validate(manifest)?;

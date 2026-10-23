@@ -59,13 +59,13 @@ Logprobs describe the raw next-token distribution over the complete vocabulary:
 `logit(token) - logsumexp(logits)`, with FP32 accumulation, before temperature,
 penalties, grammar masks, and top-k, top-p, or min-p filtering. Speculative output
 uses the target model's distribution at each committed position. The chosen token
-is always included, even when outside the alternatives. Alternatives are ordered
-by decreasing logprob, with increasing token ID for ties.
+is always included, even when outside the alternatives. Natural alternatives are
+ordered by decreasing logprob, with increasing token ID for ties.
 
-Every newly exported package provides up to 20 alternatives. Older packages serve
-unchanged, advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0`, and
-reject logprob requests with HTTP 400: `logprobs are not available in this model
-package`. Re-export to enable the feature.
+Every newly exported package provides up to 20 natural alternatives and supports
+explicit token IDs. Older packages retain their natural request limit (1..20),
+or advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0` when they have
+no generation logprob outputs. Unsupported requests return HTTP 400.
 
 For Chat Completions, set `logprobs: true` and optionally `top_logprobs: 0..20`.
 A positive `top_logprobs` requires `logprobs: true`; zero alone is accepted and
@@ -109,6 +109,22 @@ explicitly rejects logprob fields. Temperature zero remains rejected. Single-tok
 continuations work with `max_tokens: 1`, `continue_final_message: true`,
 `add_generation_prompt: false`, `logprobs: true`, and `top_logprobs: 20`, omitting
 temperature to use the model's prepared default.
+
+On Chat, Completions, and Responses, `logprob_token_ids: [id, ...]` replaces
+natural generation alternatives with those IDs in caller order. Existing generation
+logprob enablement is required. Supply at most 128 elements before deduplication;
+IDs must be nonnegative integers within the model vocabulary. Duplicates are
+removed in first-occurrence order. Null and empty arrays behave as omission.
+The sampled token is appended only when absent, so explicit results contain at
+most 129 entries. Values retain full-vocabulary normalization. Numeric top-k
+options still accept only 0..20 and do not truncate explicit results.
+
+Prompt scores and echoed prompt entries remain natural. Completions accepts
+validated IDs with `echo: true, max_tokens: 0`, which returns no generation
+positions. Completions maps retain their existing decoded-string collision
+behavior; use `return_tokens_as_token_ids: true` to distinguish IDs. Messages
+rejects `logprob_token_ids`. Older packages reject nonempty selections before
+admission with an explanation to re-export.
 
 ### Prompt log probabilities
 
@@ -577,3 +593,59 @@ tests use temporary repositories and check a real read/edit/test task. Scheduler
 regressions in `tests/server/test_scheduler.py` run against ordinary, fixed-width,
 and adaptive speculative execution. These environment variables configure tests,
 not the native server.
+
+## System One decisions
+
+`POST /v1/systemone` accepts the [TypeSafe System One schema](https://api.typesafe.ai/openapi.json)
+for `noul`, `choice`, and `score` questions:
+
+```json
+{"model":"local","state":{"message":"Charged twice"},"questions":{
+  "refund":{"type":"noul","instructions":"Is a refund requested?"},
+  "team":{"type":"choice","criteria":{"billing":null,"support":"Other help"}},
+  "urgency":{"type":"score","criteria":["Routine","Urgent"]}}}
+```
+
+The response contains the loaded `model`, a named `answers` map, and
+`usage: {input_tokens, output_tokens}`. Noul returns `noul: P(true)`; Choice
+returns `choice`, named `probabilities`, and `confidence`; Score returns the
+probability-weighted zero-based `score`, original levels in `legend`, indexed
+`probabilities`, and `confidence`. Confidence follows the
+[Jev formulas](https://docs.typesafe.ai/confidence), with first-option tie breaking
+and singleton confidence one. Normalizing label probabilities does not provide
+empirical calibration for the loaded model.
+
+Requests require a model string, a string/object/array state and 1–64 named
+questions. Instructions and descriptions preserve structured JSON. Choice has
+1–128 criteria; Score has 1–10 nonnull levels. Available single-token labels and
+prepared context/output capacities may lower these limits. Schema failures return
+Jev-style HTTP 422 `detail` entries. Malformed JSON, incompatible templates and
+unsupported packages return 400; authentication and operational errors use the
+existing generation error format.
+
+The native scorer compiles independent questions after a common state message,
+verifies distinct single-token synthetic labels after the complete rendered
+prompt, and reads raw `logprob_token_ids` with one generated token per question.
+Questions execute sequentially, allowing ordinary prefix reuse after the first
+question. Usage sums actual logical prompt counts, including cached input, and
+actual generated read tokens. No prose or streaming is returned. Dropping a
+request cancels its current child through the ordinary generation lifetime.
+
+The scorer uses the normal assistant generation prompt with thinking disabled
+where supported and an `Answer:` cue in the final user turn. Labels are verified
+as the first assistant token against the actual rendered prompt, including with
+the native DeepSeek encoders. Older packages without requested-ID outputs require
+re-export.
+
+PNG/JPEG [image assets](https://docs.typesafe.ai/images) require
+`TypeSafe-Danger-Zone-Images: true` and a vision package. Supply base64 assets or
+uncompressed multipart/form-data with an application/json `request` part first,
+followed by uniquely named image parts. An asset's `part` takes precedence over
+`data_base64`; every part must belong to exactly one asset. References replace
+string values, including nested state/instructions/criteria, with whole-value
+matches first and then nonoverlapping left-to-right matches. Keys remain text;
+legends retain original references. Unused assets are rejected. Existing body,
+context and image limits apply, including to expanded prompts. Multipart content
+encoding must be identity (or absent); compressed multipart returns HTTP 415.
+JSON supports the usual compressed encodings. Box,
+audio/video and custom question types are unsupported.

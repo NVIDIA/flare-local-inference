@@ -66,6 +66,7 @@ impl Fixture {
         Self {
             config: ModelConfig {
                 max_top_logprobs: 0,
+                logprob_token_id_capacity: 0,
                 prepared_sequence_tokens: 128,
                 contract: crate::model::testing::metadata(),
                 identity: [23; 32],
@@ -199,6 +200,7 @@ impl Fixture {
                     stop_sequences: vec![],
                     stop_strings: vec![],
                     logprobs: false,
+                    logprob_token_ids: vec![],
                     prompt_logprobs: false,
                     ignore_eos: false,
                     grammar: None,
@@ -3045,4 +3047,34 @@ fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
     assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
     assert!(worker.pending.is_empty());
     assert_eq!(worker.scheduler.stats().active_requests, 1);
+}
+
+#[test]
+fn native_prompt_rejects_invalid_requested_logprob_ids() {
+    let mut fixture = Fixture::new();
+    let (mut incoming, _generation) = fixture.incoming(vec![0, 1], 1);
+    incoming.prompt.logprobs = true;
+    incoming.prompt.logprob_token_ids = vec![0, 1];
+    let validate = |config: &ModelConfig, prompt: &Prompt| {
+        crate::model::admission::validate_prompt(config, prompt)
+    };
+    assert!(
+        validate(&fixture.config, &incoming.prompt)
+            .unwrap_err()
+            .to_string()
+            .contains("re-export")
+    );
+    fixture.config.logprob_token_id_capacity = crate::execution::MAX_LOGPROB_TOKEN_IDS;
+    validate(&fixture.config, &incoming.prompt).unwrap();
+    for ids in [
+        vec![0, 0],
+        vec![fixture.config.contract.vocabulary as u32],
+        vec![0; 129],
+    ] {
+        incoming.prompt.logprob_token_ids = ids;
+        assert!(validate(&fixture.config, &incoming.prompt).is_err());
+    }
+    incoming.prompt.logprob_token_ids = vec![0];
+    incoming.prompt.logprobs = false;
+    assert!(validate(&fixture.config, &incoming.prompt).is_err());
 }
