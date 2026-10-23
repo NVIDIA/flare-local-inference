@@ -1082,8 +1082,10 @@ and MiniJinja with Python-method compatibility for chat templates. Dependency
 versions and features are specified in [Cargo.toml](../helios/Cargo.toml).
 The [template renderer](../helios/src/frontend/mod.rs) supplies Python-compatible
 JSON formatting, whitespace handling, and template exceptions. Rendering must
-match the checkpoint template's bytes and token IDs, including tool schemas and
-image content.
+match the recipe's canonical template bytes and token IDs, including tool schemas
+and image content. Recipes normally use the checkpoint template; Gemma 4 uses
+Google's canonical templates across quantization publishers as specified in
+[frontend metadata](model-development.md#sampling-and-frontend-metadata).
 
 The [native image processor](../helios/src/frontend/images/mod.rs) is checked
 against the checkpoint's Transformers processor. Compare resized and normalized

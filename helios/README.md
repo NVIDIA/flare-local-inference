@@ -393,7 +393,7 @@ Each asset is hashed and parsed from the same bytes. No model lookup, downloadin
 Python import, or Python callback occurs in this API.
 
 `Frontend::render_chat` preserves JSON message content and tool argument order,
-applies the verified checkpoint's template, and returns prompt bytes, token IDs,
+applies the prepared recipe's template, and returns prompt bytes, token IDs,
 and complete-message token endpoints. Template defaults fill missing options;
 explicit request options win. `frontend::jinja` compiles Jinja statements and
 expressions to compact bytecode at asset load. Constants, names, call arguments,
@@ -415,8 +415,11 @@ remain outside completed messages. Annotations follow Jinja whitespace controls.
 
 The exact deployed Qwen3.8 and inference-transformed Step templates are replaced
 in memory with their annotated recipe assets. Other unannotated templates fail
-to load. Preparation verifies that removing annotations reproduces the checkpoint
-template bytes. Package files and metadata formats remain unchanged.
+to load. Checkpoint-derived annotations must reproduce the source bytes when
+removed. Gemma 4 selects one of two annotated Google canonical templates by model
+size across all supported quantization publishers; see
+[recipe frontend metadata](../docs/model-development.md#sampling-and-frontend-metadata).
+Package files and metadata formats remain unchanged.
 
 DeepSeek V4 and V4.1 use the canonical native encoder, patched to record byte
 positions in its normalized-message append loop. Adjacent users share a merged

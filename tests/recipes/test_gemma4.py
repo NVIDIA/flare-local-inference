@@ -501,21 +501,49 @@ def test_frontend_contract_and_cache_regions():
     assert len(contract["cache"]["regions"]) == 1 + len(pool.pages)
 
 
-@pytest.mark.parametrize("checkpoint", RECIPE.checkpoints, ids=lambda checkpoint: checkpoint.alias)
-def test_pinned_chat_templates_have_annotated_copies(checkpoint):
+@pytest.mark.parametrize(
+    "alias,raw_fn,filename",
+    [
+        ("gemma-4-e2b", _e2b_raw, "chat_template.google-e2b-e4b.jinja"),
+        ("gemma-4-e4b", _e4b_raw, "chat_template.google-e2b-e4b.jinja"),
+        ("gemma-4-e4b-nvfp4", _e4b_raw, "chat_template.google-e2b-e4b.jinja"),
+        ("gemma-4-12b", _gemma4_12b_raw, "chat_template.google.jinja"),
+        ("gemma-4-12b-nvfp4", _gemma4_12b_raw, "chat_template.google.jinja"),
+        ("gemma-4-26b-a4b", _moe_26b_raw, "chat_template.google.jinja"),
+        ("gemma-4-26b-a4b-nvfp4", _moe_26b_raw, "chat_template.google.jinja"),
+        ("gemma-4-31b", _dense_31b_raw, "chat_template.google.jinja"),
+        ("gemma-4-31b-nvfp4", _dense_31b_raw, "chat_template.google.jinja"),
+    ],
+)
+def test_model_sizes_select_canonical_chat_templates(alias, raw_fn, filename):
+    assert resolve(alias).recipe is RECIPE
+    config = ModelConfig.from_dict(raw_fn())
+    asset = chat_template_asset(config.hidden)
+    path = Path(asset["path"])
+    assert path.name == filename
+    assert path.read_bytes().count(b"{%- mark -%}") == 2
+
+
+@pytest.mark.parametrize(
+    "checkpoint",
+    [checkpoint for checkpoint in RECIPE.checkpoints if checkpoint.repository.startswith("google/")],
+    ids=lambda checkpoint: checkpoint.alias,
+)
+def test_canonical_chat_templates_match_pinned_google_sources(checkpoint):
     snapshot = (Path.home() / ".cache/huggingface/hub" / ("models--" + checkpoint.repository.replace("/", "--"))
                 / "snapshots" / checkpoint.revision)
-    if not (snapshot / "chat_template.jinja").exists():
-        pytest.skip("checkpoint chat template is not cached")
+    if not all((snapshot / name).exists() for name in ("config.json", "chat_template.jinja")):
+        pytest.skip("Google checkpoint configuration and chat template are not cached")
     source = (snapshot / "chat_template.jinja").read_bytes()
-    annotated = Path(chat_template_asset(source)["path"]).read_bytes()
+    config = ModelConfig.load(snapshot)
+    annotated = Path(chat_template_asset(config.hidden)["path"]).read_bytes()
     assert annotated.replace(b"{%- mark -%}", b"") == source
     assert annotated.count(b"{%- mark -%}") == 2
 
 
-def test_unannotated_chat_template_is_rejected():
-    with pytest.raises(ValueError, match="matches no annotated Gemma 4 template"):
-        chat_template_asset(b"{{ messages }}")
+def test_unknown_model_size_has_no_chat_template():
+    with pytest.raises(ValueError, match="unsupported Gemma 4 chat template hidden size"):
+        chat_template_asset(4096)
 
 
 @pytest.mark.parametrize(

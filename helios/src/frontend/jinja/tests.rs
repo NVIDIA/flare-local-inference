@@ -264,22 +264,6 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
                 "../../../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"
             ),
         ),
-        (
-            "gemma-nvidia",
-            include_str!("../../../../ignition/recipes/gemma4/assets/chat_template.nvidia.jinja"),
-        ),
-        (
-            "gemma-unsloth-12b",
-            include_str!(
-                "../../../../ignition/recipes/gemma4/assets/chat_template.unsloth-12b.jinja"
-            ),
-        ),
-        (
-            "gemma-unsloth-e4b",
-            include_str!(
-                "../../../../ignition/recipes/gemma4/assets/chat_template.unsloth-e4b.jinja"
-            ),
-        ),
     ];
     let user = json!({"role":"user","content":"  café 世界 👋 a\u{301}\r\n<|im_end|>  "});
     let tools = json!([{"type":"function","function":{"name":"lookup","description":" Find <items> & café. ","parameters":{"type":"object","properties":{"query":{"type":"string","description":"A query"},"count":{"type":"integer","enum":[1,2]}},"required":["query"],"additionalProperties":false}}}]);
@@ -314,6 +298,8 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
         json!({}),
         json!({"tools":tools}),
         json!({"enable_thinking":false}),
+        json!({"enable_thinking":true}),
+        json!({"preserve_thinking":true}),
         json!({"preserve_thinking":false,"truncate_history_thinking":true,"clear_thinking":true}),
         json!({"reasoning_effort":"low"}),
         json!({"reasoning_effort":"max"}),
