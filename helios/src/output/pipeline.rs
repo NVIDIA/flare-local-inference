@@ -24,6 +24,7 @@ pub enum OutputPipeline {
     SpacedDsml(super::dsml::DsmlOutput<true>),
     Xtml(super::xtml::XtmlOutput),
     MiniMaxXml(TaggedOutput<super::minimax_xml::MiniMaxXml>),
+    GemmaCall(TaggedOutput<super::gemma_call::GemmaCall>),
     Text(TaggedOutput<PlainText>),
 }
 
@@ -48,6 +49,7 @@ macro_rules! dispatch {
             OutputPipeline::SpacedDsml($parser) => $body,
             OutputPipeline::Xtml($parser) => $body,
             OutputPipeline::MiniMaxXml($parser) => $body,
+            OutputPipeline::GemmaCall($parser) => $body,
             OutputPipeline::Text($parser) => $body,
         }
     };
@@ -83,6 +85,9 @@ impl OutputPipeline {
             )),
             Some((ToolParserKind::MiniMaxXml, _, _)) => {
                 Self::MiniMaxXml(TaggedOutput::new(config.content).with_reasoning(reasoning))
+            }
+            Some((ToolParserKind::GemmaCall, _, _)) => {
+                Self::GemmaCall(TaggedOutput::new(config.content).with_reasoning(reasoning))
             }
             None => Self::Text(TaggedOutput::new(config.content).with_reasoning(reasoning)),
         }
@@ -130,6 +135,9 @@ impl OutputPipeline {
             Some((ToolParserKind::MiniMaxXml, _, _)) => {
                 TaggedOutput::<super::minimax_xml::MiniMaxXml>::grammar_envelope(&config.content)
             }
+            Some((ToolParserKind::GemmaCall, _, _)) => {
+                TaggedOutput::<super::gemma_call::GemmaCall>::grammar_envelope(&config.content)
+            }
             None => Some(crate::grammar::OutputEnvelope {
                 reasoning_end: (config.content.start == super::tagged::OutputStart::Reasoning)
                     .then_some("</think>"),
@@ -140,14 +148,14 @@ impl OutputPipeline {
                 tool_body_start: false,
             }),
         }?;
-        if config.content.start == super::tagged::OutputStart::Reasoning
-            && config
-                .syntax
-                .reasoning
-                .as_ref()
-                .is_some_and(|r| r.kind == ReasoningParserKind::MmThink)
-        {
-            envelope.reasoning_end = Some("</mm:think>");
+        if config.content.start == super::tagged::OutputStart::Reasoning {
+            match config.syntax.reasoning.as_ref().map(|r| r.kind) {
+                Some(ReasoningParserKind::MmThink) => envelope.reasoning_end = Some("</mm:think>"),
+                Some(ReasoningParserKind::ChannelThought) => {
+                    envelope.reasoning_end = Some("<channel|>")
+                }
+                _ => {}
+            }
         }
         envelope.tool_ends_reasoning = config.syntax.reasoning.as_ref().is_some_and(|r| {
             envelope
@@ -351,5 +359,89 @@ mod tests {
                 Event::Content("{\"ok\":true}".into())
             ]
         );
+    }
+
+    #[test]
+    fn channel_thought_and_gemma_calls_stream_at_every_utf8_boundary() {
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::GemmaCall,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::ChannelThought,
+            open: "<|channel>thought".into(),
+            close: "<channel|>".into(),
+            wrapping_newlines: 1,
+            terminal_markers: vec!["<|tool_call>".into()],
+        });
+        let tools = vec![
+            json!({"function":{"name":"lookup","parameters":{"properties":{"n":{"type":"integer"}}}}}),
+        ];
+        let stream = |text: &str, split: usize, start| {
+            let mut parser = OutputPipeline::new(OutputConfig {
+                syntax: syntax.clone(),
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    start,
+                    structured: false,
+                    tools: tools.clone(),
+                },
+            });
+            let mut output = Accumulator::new("gemma".into());
+            for part in [&text[..split], &text[split..]] {
+                output
+                    .apply(parser.push(Input::Text(part)).unwrap())
+                    .unwrap();
+            }
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            output.message()
+        };
+        let content = crate::output::tagged::OutputStart::Content;
+        let text = "<|channel>thought\ncafé 世界\n<channel|>Checking. <|tool_call>call:lookup{n:3,q:<|\"|>a,b<|\"|>}<tool_call|><|tool_call>call:other{}<tool_call|>";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let result = stream(text, split, content);
+            assert_eq!(result["reasoning_content"], "café 世界", "split {split}");
+            assert_eq!(result["content"], "Checking. ", "split {split}");
+            assert_eq!(
+                result["tool_calls"][0]["function"]["arguments"],
+                "{\"n\":3,\"q\":\"a,b\"}"
+            );
+            assert_eq!(result["tool_calls"][1]["function"]["name"], "other");
+            assert_eq!(result["tool_calls"][1]["function"]["arguments"], "{}");
+        }
+        let text = "<|channel>thought\nplan<|tool_call>call:lookup{n:1}<tool_call|>";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let result = stream(text, split, content);
+            assert_eq!(result["reasoning_content"], "plan", "split {split}");
+            assert_eq!(result["tool_calls"][0]["function"]["arguments"], "{\"n\":1}");
+        }
+        let result = stream("<channel|>answer", 0, content);
+        assert_eq!(result["content"], "answer");
+        assert!(result.get("reasoning_content").is_none());
+        let reasoning = crate::output::tagged::OutputStart::Reasoning;
+        let text = "resume\n<channel|>Done.";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let result = stream(text, split, reasoning);
+            assert_eq!(result["reasoning_content"], "resume", "split {split}");
+            assert_eq!(result["content"], "Done.", "split {split}");
+        }
+        let envelope = OutputPipeline::grammar_envelope(&OutputConfig {
+            syntax: syntax.clone(),
+            control_tokens: vec![],
+            content: TaggedConfig {
+                start: reasoning,
+                structured: true,
+                tools: tools.clone(),
+            },
+        })
+        .unwrap();
+        assert_eq!(envelope.reasoning_end, Some("<channel|>"));
+        assert_eq!(envelope.tool, Some(("<|tool_call>", "<tool_call|>")));
+        assert!(envelope.tool_ends_reasoning);
     }
 }

@@ -186,10 +186,13 @@ an independent enum selector. Implementations are reusable syntax or image
 algorithms, not model identities. Qwen Coder function tags, GLM argument tags,
 and DSML tool syntax may be paired independently with think-tag reasoning.
 Wrapping newlines, tag separators, assistant boundaries, and reasoning terminal
-markers are explicit syntax data.
+markers are explicit syntax data. A reasoning terminal marker must be the
+declared tool syntax's opener.
 
 The shared prompt path determines initial reasoning state from an open assistant
-envelope, excluding completed user, tool, and assistant messages. Prefix-boundary
+envelope, excluding completed user, tool, and assistant messages. When a template
+resumes the assistant turn after an embedded tool response, only text after the
+last message end marker can open reasoning. Prefix-boundary
 rules declare message roles and rendering constraints. Image token layout data
 declares feature IDs and atomic spans; custom image layout code produces token
 positions, feature mappings, and vision tensors. The generic graph packer binds

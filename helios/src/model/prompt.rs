@@ -186,18 +186,27 @@ pub fn prepare_output(
         .is_some_and(|v| v == &Value::Bool(true) || v.as_str().is_some_and(|s| !s.is_empty()));
     let open_assistant = effective("add_generation_prompt") == Some(&Value::Bool(true))
         || (continuation && messages.last().is_some_and(|m| m["role"] == "assistant"));
-    let prefix = open_assistant
+    let turn = open_assistant
         .then(|| rendered.text.rsplit_once(&syntax.assistant_marker))
         .flatten()
-        .map(|(_, suffix)| suffix)
-        .filter(|suffix| {
-            !syntax
-                .message_end_markers
-                .iter()
-                .any(|end| suffix.contains(end))
-        });
+        .map(|(_, suffix)| suffix);
+    let prefix = turn.filter(|suffix| {
+        !syntax
+            .message_end_markers
+            .iter()
+            .any(|end| suffix.contains(end))
+    });
+    // A template may resume the assistant turn after an embedded tool response.
+    let resumed = turn.map(|suffix| {
+        let end = syntax
+            .message_end_markers
+            .iter()
+            .filter_map(|end| suffix.rfind(end.as_str()).map(|at| at + end.len()))
+            .max();
+        &suffix[end.unwrap_or(0)..]
+    });
     let mut reasoning = syntax.reasoning.as_ref().is_some_and(|r| {
-        prefix.is_some_and(|prefix| {
+        resumed.is_some_and(|prefix| {
             prefix
                 .rfind(&r.open)
                 .is_some_and(|open| prefix.rfind(&r.close).is_none_or(|close| open > close))
@@ -650,6 +659,61 @@ mod tests {
                 let envelope = crate::output::OutputPipeline::grammar_envelope(&output).unwrap();
                 assert_eq!(envelope.tool_body_start, expected == OutputStart::ToolBody);
             }
+        }
+    }
+
+    #[test]
+    fn reasoning_resumes_after_an_embedded_tool_response() {
+        use crate::model::contract::{ReasoningParser, ReasoningParserKind, ToolParserKind};
+        use crate::output::tagged::OutputStart;
+        let frontend = crate::server::output::tests::frontend(&["x"]);
+        let mut config = super::super::tests::config();
+        let mut syntax = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/qwen38.json"
+        ))
+        .unwrap()
+        .frontend;
+        syntax.assistant_marker = "<|turn>model\n".into();
+        syntax.message_end_markers = vec!["<turn|>".into(), "<|tool_response>".into()];
+        syntax.tools.as_mut().unwrap().kind = ToolParserKind::GemmaCall;
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::ChannelThought,
+            open: "<|channel>thought".into(),
+            close: "<channel|>".into(),
+            wrapping_newlines: 1,
+            terminal_markers: vec![],
+        });
+        config.contract.frontend = syntax;
+        let call = "<|turn>user\nHi<turn|>\n<|turn>model\n<|tool_call>call:f{}<tool_call|>\
+                    <|tool_response>response:f{value:<|\"|>ok<|\"|>}<tool_response|>";
+        for (text, expected) in [
+            (format!("{call}<|channel>thought\n"), OutputStart::Reasoning),
+            (call.into(), OutputStart::Content),
+            (
+                "<|turn>user\n<|channel>thought<turn|>\n<|turn>model\n".into(),
+                OutputStart::Content,
+            ),
+            (
+                "<|turn>user\nHi<turn|>\n<|turn>model\n<|channel>thought\n<channel|>".into(),
+                OutputStart::Content,
+            ),
+        ] {
+            let rendered = RenderedPrompt {
+                message_boundaries: Vec::new(),
+                image_sources: vec![],
+                text: text.clone(),
+                token_ids: vec![],
+            };
+            let output = prepare_output(
+                &config,
+                &frontend,
+                &rendered,
+                &[json!({"role":"user","content":"Hi"})],
+                json!({"add_generation_prompt":true}).as_object().unwrap(),
+                false,
+            )
+            .unwrap();
+            assert_eq!(output.content.start, expected, "{text}");
         }
     }
 }

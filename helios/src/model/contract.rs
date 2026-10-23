@@ -54,8 +54,8 @@ contract_enum!(ValueSource {
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5, GemmaCall = 6 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3, ChannelThought = 4 });
 contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
 contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
 contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, Proposal = 10, Verification = 11, ScoredPrefill = 12, PackedSpeculative = 13 });
@@ -588,7 +588,13 @@ impl FrontendContract {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
                 ReasoningParserKind::XtmlThink => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
                 ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
+                ReasoningParserKind::ChannelThought => ("<|channel>thought", "<channel|>"),
             };
+            let tool_open = self.tools.as_ref().and_then(|tool| match tool.kind {
+                ToolParserKind::QwenCoder | ToolParserKind::GlmArgumentTags => Some("<tool_call>"),
+                ToolParserKind::GemmaCall => Some("<|tool_call>"),
+                _ => None,
+            });
             if reasoning.open != open
                 || reasoning.close != close
                 || (reasoning.kind == ReasoningParserKind::XtmlThink
@@ -602,14 +608,7 @@ impl FrontendContract {
                 || reasoning
                     .terminal_markers
                     .iter()
-                    .any(|marker| marker != "<tool_call>")
-                || (!reasoning.terminal_markers.is_empty()
-                    && self.tools.as_ref().is_none_or(|tool| {
-                        !matches!(
-                            tool.kind,
-                            ToolParserKind::QwenCoder | ToolParserKind::GlmArgumentTags
-                        )
-                    }))
+                    .any(|marker| Some(marker.as_str()) != tool_open)
             {
                 return Err("unsupported think-tag reasoning parameters".into());
             }
@@ -622,5 +621,43 @@ impl FrontendContract {
             return Err("prefix boundary requires nonempty message roles".into());
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reasoning_terminal_markers_follow_the_declared_tool_opener() {
+        let think = (ReasoningParserKind::ThinkTags, "<think>", "</think>");
+        let channel = (ReasoningParserKind::ChannelThought, "<|channel>thought", "<channel|>");
+        let bare = (ReasoningParserKind::ChannelThought, "<|channel>", "<channel|>");
+        for (tool, (kind, open, close), marker, valid) in [
+            (ToolParserKind::QwenCoder, think, "<tool_call>", true),
+            (ToolParserKind::GlmArgumentTags, think, "<tool_call>", true),
+            (ToolParserKind::GemmaCall, channel, "<|tool_call>", true),
+            (ToolParserKind::GemmaCall, think, "<|tool_call>", true),
+            (ToolParserKind::GemmaCall, channel, "<tool_call>", false),
+            (ToolParserKind::QwenCoder, think, "<|tool_call>", false),
+            (ToolParserKind::MiniMaxXml, think, "<tool_call>", false),
+            (ToolParserKind::GemmaCall, bare, "<|tool_call>", false),
+        ] {
+            let mut syntax = crate::model::testing::metadata().frontend;
+            syntax.tools = Some(ToolParser {
+                kind: tool,
+                wrapping_newlines: 0,
+                tag_separator: String::new(),
+            });
+            syntax.reasoning = Some(ReasoningParser {
+                kind,
+                open: open.into(),
+                close: close.into(),
+                wrapping_newlines: 1,
+                terminal_markers: vec![marker.into()],
+            });
+            let result = syntax.validate();
+            assert_eq!(result.is_ok(), valid, "{tool:?} {open} {marker} {result:?}");
+        }
     }
 }

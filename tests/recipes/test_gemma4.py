@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from ignition import planning
+from ignition.preparation import runtime_package_pb2 as p
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.recipes import resolve
 from ignition.recipes.gemma4.attention import (
@@ -482,8 +483,11 @@ def test_gemma4_recipe_adapter_configures_bootstrap(monkeypatch, tmp_path):
 
 def test_frontend_contract_and_cache_regions():
     assert FRONTEND["assistant_marker"] == "<|turn>model\n"
-    assert FRONTEND["reasoning"]["open"] == "<think>"
-    assert FRONTEND["reasoning"]["close"] == "</think>"
+    assert FRONTEND["tools"]["kind"] == p.GEMMA_CALL
+    assert FRONTEND["reasoning"]["kind"] == p.CHANNEL_THOUGHT
+    assert FRONTEND["reasoning"]["open"] == "<|channel>thought"
+    assert FRONTEND["reasoning"]["close"] == "<channel|>"
+    assert FRONTEND["reasoning"]["terminal_markers"] == ["<|tool_call>"]
     assert "<turn|>" in FRONTEND["message_end_markers"]
 
     raw = _moe_26b_raw()

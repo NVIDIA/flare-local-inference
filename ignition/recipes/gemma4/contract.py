@@ -7,8 +7,7 @@ from .config import PAGE_TOKENS
 
 
 FRONTEND = c.frontend(
-    tools=p.QWEN_CODER,
-    terminal_markers=["<tool_call>"],
+    tools=p.GEMMA_CALL,
     assistant_marker="<|turn>model\n",
     message_end_markers=["<turn|>", "<|tool_response>", "<eos>"],
     prefix_boundary=c.prefix_boundary(
@@ -18,6 +17,13 @@ FRONTEND = c.frontend(
         required_start="<bos><|turn>system\n",
         required_marker="<turn|>",
     ),
+)
+FRONTEND["reasoning"] = dict(
+    kind=p.CHANNEL_THOUGHT,
+    open="<|channel>thought",
+    close="<channel|>",
+    wrapping_newlines=1,
+    terminal_markers=["<|tool_call>"],
 )
 
 

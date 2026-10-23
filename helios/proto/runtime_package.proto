@@ -315,12 +315,14 @@ enum ToolParserKind {
   DSML = 3;
   XTML = 4;
   MINIMAX_XML = 5;
+  GEMMA_CALL = 6;
 }
 enum ReasoningParserKind {
   REASONING_PARSER_UNSPECIFIED = 0;
   THINK_TAGS = 1;
   XTML_THINK = 2;
   MM_THINK = 3;
+  CHANNEL_THOUGHT = 4;
 }
 enum ImagePreparationKind {
   IMAGE_PREPARATION_UNSPECIFIED = 0;
