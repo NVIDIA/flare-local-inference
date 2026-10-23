@@ -302,6 +302,8 @@ class Plan:
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 "packed_verification": self.speculation.packed_verification,
                 "draft_prefix_selection": self.speculation.draft_prefix_selection,
+                "draft_head_quantization": self.speculation.draft_head_quantization,
+                "markov_head_quantization": self.speculation.markov_head_quantization,
                 **({"graph_budget": self.speculation.graph_budget}
                    if self.speculation.graph_budget is not None else {})},
             "context": self.context, "checkpoint_context": self.recipe.context,
@@ -341,6 +343,12 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     if mla_compute_mode not in recipe.mla_compute_modes:
         raise UsageError(f"--mla-compute-mode {mla_compute_mode}: supported values for this recipe are "
                          + ", ".join(recipe.mla_compute_modes))
+    if speculation is not None:
+        for head in ("draft", "markov"):
+            value = getattr(speculation, f"{head}_head_quantization")
+            if value is not None and value not in getattr(recipe, f"{head}_head_quantizations"):
+                raise UsageError(f"--{head}-head-quantization {value}: {checkpoint.alias}"
+                                 " does not prepare this proposal head format")
     if expert_scale_compression is not None and expert_scale_compression not in checkpoint.scale_compressed_device_bytes:
         raise UsageError(f"--expert-scale-compression {expert_scale_compression}: {checkpoint.alias}"
                          " does not prepare this scale encoding")

@@ -16,7 +16,9 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
         "speculative_graph_budget": speculation.graph_budget,
         "speculative_fixed_width": speculation.fixed_width, "packed_verification": speculation.packed_verification,
-        "draft_prefix_selection": speculation.draft_prefix_selection}
+        "draft_prefix_selection": speculation.draft_prefix_selection,
+        "draft_head_quantization": speculation.draft_head_quantization,
+        "markov_head_quantization": speculation.markov_head_quantization}
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         image_concurrency=plan.image_concurrency,
@@ -40,6 +42,7 @@ def usage(prepared):
 RECIPE = Recipe(
     name="deepseek41", served_model_name="DeepSeek-V4.1-Flash", prepare=prepare, usage=usage,
     mla_compute_modes=("auto", "bf16"), mla_compute_mode="bf16", expert_scale_compression="csf",
+    draft_head_quantizations=("nvfp4",), markov_head_quantizations=("nvfp4",),
     # Recommended sampling: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017#minimal-inference.
     sampling_defaults=SamplingDefaults(temperature=1., top_p=1., top_k=-1),
     checkpoints=(Checkpoint(alias="deepseek-v4.1-flash", repository="deepseek-ai/DeepSeek-V4.1-Flash-1017",

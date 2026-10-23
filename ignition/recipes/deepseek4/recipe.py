@@ -23,7 +23,10 @@ def prepare(
     drafting = (
         {}
         if speculation is None
-        else {"speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width}
+        else {"speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
+              "speculative_fixed_width": speculation.fixed_width,
+              "draft_head_quantization": speculation.draft_head_quantization,
+              "markov_head_quantization": speculation.markov_head_quantization}
     )
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
@@ -51,6 +54,7 @@ def usage(prepared):
 
 RECIPE = Recipe(
     name="deepseek4",
+    draft_head_quantizations=("nvfp4",), markov_head_quantizations=("nvfp4",),
     served_model_name="DeepSeek-V4-Flash-Vision-Exp",
     # Agent evaluation sampling: https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp#introduction.
     sampling_defaults=SamplingDefaults(temperature=1., top_p=.95, top_k=-1),

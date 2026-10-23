@@ -108,8 +108,15 @@ class Speculation:
     packed_verification: bool = False
     draft_prefix_selection: str = "cpu"
     graph_budget: int | None = None
+    draft_head_quantization: str | None = None
+    markov_head_quantization: str | None = None
 
     def __post_init__(self):
+        for value in (self.draft_head_quantization, self.markov_head_quantization):
+            if value not in (None, "nvfp4"):
+                raise ValueError("draft head quantization must be omitted or nvfp4")
+            if value is not None and self.draft_tokens < 1:
+                raise ValueError("draft head quantization requires positive learned draft depth")
         if self.graph_budget is not None:
             if type(self.graph_budget) is not int or self.graph_budget < 1:
                 raise ValueError("speculative graph budget must be a positive integer")
@@ -209,6 +216,9 @@ class Recipe:
     mla_compute_mode: str = "auto"
     expert_scale_compression: str | None = None
     export_repository: str = ""
+    # Preparation overrides for vocabulary and transition projections used only by proposals.
+    draft_head_quantizations: tuple[str, ...] = ()
+    markov_head_quantizations: tuple[str, ...] = ()
 
     def mixed_shapes(self, concurrency, chunk, speculation):
         from ignition.components.capacity import mixed_shapes

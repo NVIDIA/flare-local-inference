@@ -107,6 +107,8 @@ message RebuildSpeculation {
   uint64 token_capacity = 5;
   bool packed_verification = 6;
   string draft_prefix_selection = 7;
+  optional string draft_head_quantization = 8;
+  optional string markov_head_quantization = 9;
 }
 // Views of retained prepared weight storage, with no additional payload copies.
 // Names are paths in the recipe's weight objects, not original checkpoint keys.

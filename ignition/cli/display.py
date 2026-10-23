@@ -29,6 +29,9 @@ def speculation(settings, *, brief: bool = False) -> str:
     drafts = settings.draft_tokens
     depth = f"{'up to' if settings.adaptive else 'exactly'} {drafts} draft token{'' if drafts == 1 else 's'}"
     selection = " · GPU prefix selection" if settings.draft_prefix_selection == "gpu" else ""
+    heads = [f"{head} head {getattr(settings, head + '_head_quantization').upper()}"
+             for head in ("draft", "markov") if getattr(settings, head + '_head_quantization') is not None]
+    precision = " · " + ", ".join(heads) if heads else ""
     if brief:
-        return depth + selection
-    return f"{depth} per round · MTP module" + selection
+        return depth + selection + precision
+    return f"{depth} per round · MTP module" + selection + precision

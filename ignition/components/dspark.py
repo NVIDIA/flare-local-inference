@@ -225,6 +225,7 @@ class PreparedMarkov:
 
     A replicated head runs independently on each rank without a collective.
     A sharded head uses the supplied runtime to gather its FP32 bits unchanged.
+    Quantized A16 projections produce BF16 logits, widened before bias addition.
     """
 
     def __init__(self, weights, tokens, *, runtime, coordinator, session, name):
@@ -232,18 +233,22 @@ class PreparedMarkov:
         self.embedding = torch.zeros(
             (rows, weights.config.draft.markov_rank), dtype=torch.bfloat16, device=device
         )
-        columns = weights.draft.markov_head.shape[0]
+        head = weights.draft.markov_head
+        columns = head.shape[0] if isinstance(head, torch.Tensor) else head.out_features
         expected_columns = 129280 if runtime is None else 129280 // weights.shard.world_size
         if columns != expected_columns:
             raise ValueError("Markov head vocabulary partition must match its gather runtime")
         self.local = torch.zeros((rows, columns), dtype=torch.float32, device=device)
+        self.projected = self.local if isinstance(head, torch.Tensor) else torch.empty(
+            (rows, columns), dtype=torch.bfloat16, device=device)
         self.logits = self.local if runtime is None else torch.zeros((rows, 129280), dtype=torch.float32, device=device)
         self.embed = PreparedEmbedding(
             weights.draft.markov_embedding, tokens, self.embedding, session=session, name=name + ".embed"
         )
-        self.projection = UnquantizedProjection(
-            self.embedding, weights.draft.markov_head, self.local, session=session, name=name + ".head"
-        )
+        projection = UnquantizedProjection if isinstance(head, torch.Tensor) else QuantizedProjection
+        options = {} if isinstance(head, torch.Tensor) else {"activation_mode": "a16"}
+        self.projection = projection(self.embedding, head, self.projected,
+                                     session=session, name=name + ".head", **options)
         self.gather = None if runtime is None else PreparedAllGather(
             self.local.view(torch.bfloat16),
             self.logits.view(torch.bfloat16),
@@ -255,6 +260,8 @@ class PreparedMarkov:
 
     def __call__(self):
         self.projection(self.embed())
+        if self.projected is not self.local:
+            self.local.copy_(self.projected)
         if self.gather is not None:
             self.gather(self.local.view(torch.bfloat16))
         return self.logits

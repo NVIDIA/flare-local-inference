@@ -73,6 +73,8 @@ class PreparationConfig:
     retain_graphs: bool = False
     kernel_cache: Path | None = None
     dspark: bool = True
+    draft_head_quantization: str | None = None
+    markov_head_quantization: str | None = None
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = None
@@ -81,6 +83,10 @@ class PreparationConfig:
 
     def __post_init__(self):
         from ignition.components.capacity import image_capacity
+        from ignition.recipes.declaration import Speculation
+
+        Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
+                    markov_head_quantization=self.markov_head_quantization)
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if type(self.stream_overlap) is not bool:
@@ -146,7 +152,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     metadata_path = manifest.metadata_path
     transient = contextlib.ExitStack()
     transient.enter_context(package_storage.transient())
-    weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark)
+    weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
+                                draft_head_quantization=config.draft_head_quantization,
+                                markov_head_quantization=config.markov_head_quantization)
     release_unused()
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     with phase(progress, "Allocate model state and collectives"):
@@ -507,6 +515,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "world_size": shard.world_size,
         "device": config.devices[rank],
         "weights_bytes": weights.allocated_bytes,
+        "draft_head_quantization": config.draft_head_quantization,
+        "markov_head_quantization": config.markov_head_quantization,
         "mapped_host_bytes": 0,
         "offloaded_bytes": 0,
         "continuation_bytes": pool.backing.nbytes,

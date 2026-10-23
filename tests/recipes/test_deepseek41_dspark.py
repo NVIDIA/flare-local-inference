@@ -23,6 +23,21 @@ def test_dspark_preparation_and_recipe_draft_defaults():
         PreparationConfig(speculative_widths=(1, 9))
 
 
+@pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"), ("nvfp4", "nvfp4")])
+def test_draft_precision_preserves_graph_capacities(draft, markov):
+    from ignition.recipes.deepseek4.bootstrap import PreparationConfig as V4Config
+
+    for configuration in (PreparationConfig, V4Config):
+        control = configuration(max_active=16)
+        candidate = configuration(max_active=16, draft_head_quantization=draft,
+                                  markov_head_quantization=markov)
+        assert candidate.speculative_shapes == control.speculative_shapes
+        assert candidate.prefill_capacities == control.prefill_capacities
+        if draft or markov:
+            with pytest.raises(ValueError, match="positive learned"):
+                configuration(dspark=False, draft_head_quantization=draft, markov_head_quantization=markov)
+
+
 @pytest.mark.parametrize("width", range(1, 9))
 def test_explicit_draft_limit_sizes_the_parallel_block(width):
     config = PreparationConfig(max_active=4, speculative_widths=tuple(range(1, width + 1)))

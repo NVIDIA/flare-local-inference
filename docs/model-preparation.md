@@ -452,6 +452,16 @@ The three preceding tokens live in continuation state, including reused prefixes
 DSpark proposals, target verification, and accepted-state commit use the shared
 native speculative contract; Helios contains no DSpark model implementation.
 
+The optional preparation flags `--draft-head-quantization nvfp4` and
+`--markov-head-quantization nvfp4` select independent NVFP4 copies of the draft
+vocabulary head and Markov output projection. Both use BF16 activations; the
+Markov kernel's BF16 output is widened to FP32 before bias addition. Target
+verification retains the checkpoint head. Omitting these flags preserves the
+checkpoint precision. Each selection requires tuning, capture, and package export;
+it cannot change an existing package at serving time. The same options apply to
+the DeepSeek V4 Flash recipe. Quantization changes proposal probabilities and can
+change acceptance and throughput; measure both separately and together.
+
 ## DeepSeek V4 Flash
 
 DeepSeek V4 Flash uses `local-inference-lab/DeepSeek-V4-Flash-Vision-Exp-lossless-CSF`, including its

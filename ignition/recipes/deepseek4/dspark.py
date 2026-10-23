@@ -82,7 +82,7 @@ class PreparedDraft:
         )
         self.head = PreparedVocabularyProjection(
             scratch.hidden,
-            weights.head,
+            weights.head if weights.draft.draft_head is None else weights.draft.draft_head,
             scratch.local_logits,
             scratch.logits,
             runtime=vocabulary_runtime,

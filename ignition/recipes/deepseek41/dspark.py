@@ -25,7 +25,8 @@ class PreparedDraft:
             window_metadata=self.window_metadata)
             for i, layer in enumerate(weights.draft.layers))
         self.head_hidden = scratch.buffers.zeros(scratch.hidden.shape, scratch.hidden.dtype)
-        self.head = PreparedVocabularyProjection(scratch.hidden, weights.head, scratch.local_logits, scratch.logits,
+        head = weights.head if weights.draft.draft_head is None else weights.draft.draft_head
+        self.head = PreparedVocabularyProjection(scratch.hidden, head, scratch.local_logits, scratch.logits,
             runtime=vocabulary_runtime, coordinator=coordinator, session=session, name=name + ".head")
 
     def __call__(self):

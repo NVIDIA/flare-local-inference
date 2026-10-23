@@ -1,11 +1,12 @@
 """Native FP8/MXFP4 checkpoint transfers and tensor-parallel partitions."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
 from ignition.components.weights import MLPWeights
 from ignition.components.block_fp8_weights import BlockFP8WeightLoader
+from ignition.components.vocabulary import nvfp4_draft_head
 
 from .config import ModelConfig
 
@@ -35,8 +36,9 @@ class DSparkWeights:
     main_norm: torch.Tensor
     norm: torch.Tensor
     markov_embedding: torch.Tensor
-    markov_head: torch.Tensor
+    markov_head: object
     confidence_head: torch.Tensor | None = None
+    draft_head: object | None = None
 
     @classmethod
     def load(cls, loader, *, confidence=False):
@@ -65,7 +67,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, dspark=False, confidence=False,
-             expert_scale_compression=None):
+             expert_scale_compression=None, draft_head_quantization=None, markov_head_quantization=None):
         config = ModelConfig.load(manifest.metadata_path)
         before = torch.cuda.memory_allocated(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark,
@@ -74,6 +76,11 @@ class ModelWeights:
             head = loader.load_padded_tensor("head.weight", rows=shard.padded_partition(129280, alignment=64))
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
             draft = DSparkWeights.load(loader, confidence=confidence) if dspark else None
+            if draft is not None:
+                if draft_head_quantization == "nvfp4":
+                    draft = replace(draft, draft_head=nvfp4_draft_head(head))
+                if markov_head_quantization == "nvfp4":
+                    draft = replace(draft, markov_head=nvfp4_draft_head(draft.markov_head))
             vision = ({name: loader.load_tensor(name) for name in loader._sources
                        if name.startswith(("vision.", "aligner.", "image_"))}
                       if config.vision is not None else None)

@@ -31,6 +31,11 @@ def from_plan(model, plan, *, compiled_forwards):
             adaptive=s.adaptive,
             token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
             draft_prefix_selection=s.draft_prefix_selection)
+        # Record proposal-head precision only when it differs from the checkpoint
+        # default, so existing BF16 manifests stay byte-identical.
+        for field in ('draft_head_quantization', 'markov_head_quantization'):
+            if (value := getattr(s, field)) is not None:
+                result['speculation'][field] = value
     return result
 
 

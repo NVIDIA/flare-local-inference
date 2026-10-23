@@ -27,6 +27,26 @@ def test_mla_arithmetic_flag_defaults_and_override(command):
     assert explicit.mla_compute_mode == "bf16"
 
 
+@pytest.mark.parametrize("model", ["deepseek-v4.1-flash", "deepseek-v4-flash"])
+@pytest.mark.parametrize("flags", [["--draft-head-quantization", "nvfp4"],
+                                   ["--markov-head-quantization", "nvfp4"],
+                                   ["--draft-head-quantization", "nvfp4", "--markov-head-quantization", "nvfp4"]])
+def test_independent_draft_precision_flags_require_learned_proposals(model, flags):
+    from ignition.cli.preparation import speculation
+
+    args = _parser().parse_args(["export", model, "--output", "model.safetensors", *flags])
+    result = speculation(args, resolve(model))
+    assert bool(result.draft_head_quantization) == ("--draft-head-quantization" in flags)
+    assert bool(result.markov_head_quantization) == ("--markov-head-quantization" in flags)
+    args.no_mtp = True
+    with pytest.raises(UsageError, match="disables speculation"):
+        speculation(args, resolve(model))
+    args.no_mtp = False
+    args.mtp_draft_tokens = 0
+    with pytest.raises(UsageError, match="positive learned draft depth"):
+        speculation(args, resolve(model))
+
+
 @pytest.mark.parametrize("command", [[], ["export"], ["serve"]])
 def test_help_lists_every_recipe(command, capsys):
     with pytest.raises(SystemExit) as error:

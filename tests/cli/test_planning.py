@@ -85,6 +85,56 @@ def test_pages_take_all_remaining_supply():
     assert whole.supply_bytes - whole.page_bytes - whole.fixed_bytes < 2 * MIB
 
 
+@pytest.mark.parametrize("draft,markov", [(None, None), ("nvfp4", None), (None, "nvfp4"), ("nvfp4", "nvfp4")])
+def test_proposal_precision_is_independent_plan_metadata(draft, markov, monkeypatch):
+    from types import SimpleNamespace
+    from ignition.cli import display
+    from ignition.preparation import rebuild_manifest
+
+    # Source identity needs the native export extension; the record's precision keys do not.
+    monkeypatch.setattr("ignition.preparation.source_identity.source_identity", lambda: "test-source")
+
+    model = replace(SOLO, draft_head_quantizations=("nvfp4",), markov_head_quantizations=("nvfp4",))
+    spec = replace(DRAFTING, draft_head_quantization=draft, markov_head_quantization=markov)
+    result = derive(model=model, speculation=spec)
+    assert result.to_dict()["speculation"]["draft_head_quantization"] == draft
+    assert result.to_dict()["speculation"]["markov_head_quantization"] == markov
+    summary = display.speculation(spec)
+    assert ("draft head NVFP4" in summary) == bool(draft)
+    assert ("markov head NVFP4" in summary) == bool(markov)
+    # The rebuild record must distinguish the precision, or a rebuild would silently
+    # produce checkpoint-default heads; an unset field stays absent so BF16 records
+    # remain byte-identical. Encode through the schema the export actually uses, so a
+    # key without a protobuf field fails here rather than at package export.
+    from google.protobuf import json_format
+    from ignition.preparation import runtime_package_pb2 as proto
+
+    manifest = rebuild_manifest.from_plan(SimpleNamespace(directory=None), result, compiled_forwards=True)
+    encoded = proto.RebuildManifest()
+    json_format.ParseDict(manifest, encoded)
+    assert encoded.speculation.HasField("draft_head_quantization") == bool(draft)
+    assert encoded.speculation.HasField("markov_head_quantization") == bool(markov)
+    assert encoded.speculation.draft_head_quantization == (draft or "")
+    assert encoded.speculation.markov_head_quantization == (markov or "")
+    if draft or markov:
+        with pytest.raises(UsageError, match="head-quantization"):
+            derive(speculation=spec)
+        with pytest.raises(ValueError, match="positive learned"):
+            replace(spec, draft_tokens=0)
+
+
+def test_legacy_rebuild_speculation_without_head_precision_still_loads():
+    from ignition.preparation import runtime_package_pb2 as proto
+
+    # A record written before fields 8 and 9 existed must still load and report the
+    # checkpoint-default precision, so packages prepared earlier keep their meaning.
+    legacy = proto.RebuildSpeculation.FromString(b"\x08\x05\x10\x01\x1a\x03mtp\x30\x01")
+    assert legacy.draft_tokens == 5 and legacy.packed_verification
+    assert not legacy.HasField("draft_head_quantization")
+    assert not legacy.HasField("markov_head_quantization")
+    assert legacy.draft_head_quantization == "" and legacy.markov_head_quantization == ""
+
+
 def test_mla_arithmetic_is_explicit_plan_metadata_without_changing_capacity():
     model = replace(SOLO, mla_compute_modes=("auto", "bf16"))
     options = dict(concurrency=4, reserve_bytes=0, speculation=model.speculation)
@@ -174,7 +224,8 @@ def test_speculation_settings_are_validated_and_described():
     assert Speculation(0).widths == (1,) and Speculation(0, adaptive=False).fixed_width == 1
     record = derive(speculation=Speculation(5)).to_dict()["speculation"]
     assert record == {"draft_tokens": 5, "adaptive": True,
-                      "packed_verification": False, "draft_prefix_selection": "cpu"}
+                      "packed_verification": False, "draft_prefix_selection": "cpu",
+                      "draft_head_quantization": None, "markov_head_quantization": None}
     assert derive(speculation=Speculation(5, packed_verification=True)).to_dict()["speculation"]["packed_verification"]
     assert display.speculation(None) == "off"
     assert display.speculation(DRAFTING) == "up to 3 draft tokens per round · MTP module"

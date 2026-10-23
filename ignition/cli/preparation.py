@@ -140,7 +140,9 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     given = [flag for flag, value in (
         ("--mtp-draft-tokens", args.mtp_draft_tokens),
         ("--speculative-token-capacity", args.speculative_token_capacity),
-        ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None)) if value is not None]
+        ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
+        ("--draft-head-quantization", getattr(args, "draft_head_quantization", None)),
+        ("--markov-head-quantization", getattr(args, "markov_head_quantization", None))) if value is not None]
     if explicit_graph_budget:
         given.append("--speculative-graph-budget")
     if default is None:
@@ -172,8 +174,13 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     budget = graph_budget.value if packed else None
     if budget is not None and (type(budget) is not int or budget < 1):
         raise UsageError("--speculative-graph-budget must be a positive integer")
+    draft_head = getattr(args, "draft_head_quantization", None)
+    markov_head = getattr(args, "markov_head_quantization", None)
+    if (draft_head or markov_head) and drafts < 1:
+        raise UsageError("draft head quantization requires positive learned draft depth")
     return Speculation(drafts, adaptive, token_capacity=capacity, packed_verification=packed,
-                       draft_prefix_selection=prefix_selection, graph_budget=budget)
+                       draft_prefix_selection=prefix_selection, graph_budget=budget,
+                       draft_head_quantization=draft_head, markov_head_quantization=markov_head)
 
 
 def fetch(model: ResolvedModel, hub_cache, *, progress_bars: bool = True) -> str:

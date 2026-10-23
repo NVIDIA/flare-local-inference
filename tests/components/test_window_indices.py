@@ -269,7 +269,7 @@ def test_draft_window_group_survives_layer_buffers(monkeypatch):
     scratch = SimpleNamespace(buffers=buffers, embedding=torch.zeros((15, 5120)),
         hidden=torch.zeros((3, 5120)), local_logits=torch.zeros((3, 1)), logits=torch.zeros((3, 1)))
     weights = SimpleNamespace(config=None, embedding=None, head=None, shard=None,
-        draft=SimpleNamespace(layers=(None, None)))
+        draft=SimpleNamespace(layers=(None, None), draft_head=None))
     private = []
 
     def prepare_layer(*args, window_metadata, **kwargs):

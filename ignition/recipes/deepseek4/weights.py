@@ -1,6 +1,6 @@
 """Block-128 FP8, native MXFP4 experts, vision, and checkpoint-integrated DSpark."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 
@@ -36,7 +36,8 @@ class DSparkWeights:
     norm: torch.Tensor
     head_mix: dict
     markov_embedding: torch.Tensor
-    markov_head: torch.Tensor
+    markov_head: object
+    draft_head: object | None = None
 
     @classmethod
     def load(cls, loader):
@@ -70,7 +71,9 @@ class ModelWeights:
     allocated_bytes: int
 
     @classmethod
-    def load(cls, manifest, device, *, shard, progress=None, dspark=True):
+    def load(cls, manifest, device, *, shard, progress=None, dspark=True,
+             draft_head_quantization=None, markov_head_quantization=None):
+        from ignition.components.vocabulary import nvfp4_draft_head
         config = ModelConfig.load(manifest.metadata_path)
         before = torch.cuda.memory_allocated(device)
         with DeepSeekWeightLoader(manifest, device, shard=shard, progress=progress, dspark=dspark) as loader:
@@ -79,6 +82,11 @@ class ModelWeights:
             head_mix = loader.load_head_mix("")
             layers = tuple(loader.load_layer(i) for i in range(config.layers))
             draft = DSparkWeights.load(loader) if dspark else None
+            if draft is not None:
+                if draft_head_quantization == "nvfp4":
+                    draft = replace(draft, draft_head=nvfp4_draft_head(head))
+                if markov_head_quantization == "nvfp4":
+                    draft = replace(draft, markov_head=nvfp4_draft_head(draft.markov_head))
             vision = {
                 name: loader.load_tensor(name)
                 for name in loader._sources

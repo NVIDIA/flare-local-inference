@@ -83,6 +83,8 @@ class PreparationConfig:
     retain_graphs: bool = False
     kernel_cache: Path | None = None
     dspark: bool = True
+    draft_head_quantization: str | None = None
+    markov_head_quantization: str | None = None
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
     speculative_token_capacity: int | None = 128
@@ -101,6 +103,9 @@ class PreparationConfig:
         from ignition.components.compressed_mla import validate_mla_compute_mode
 
         validate_mla_compute_mode(self.mla_compute_mode)
+        from ignition.recipes.declaration import Speculation
+        Speculation(self.draft_tokens, draft_head_quantization=self.draft_head_quantization,
+                    markov_head_quantization=self.markov_head_quantization)
         self.speculative_shapes
         self.packed_speculative_shapes
         drafting = self.dspark and self.draft_tokens > 0
@@ -297,7 +302,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     with package_storage.transient():
         weights = ModelWeights.load(manifest, device, shard=shard, progress=progress, dspark=config.dspark,
                                     confidence=config.split_speculation,
-                                    expert_scale_compression=config.expert_scale_compression)
+                                    expert_scale_compression=config.expert_scale_compression,
+                                    draft_head_quantization=config.draft_head_quantization,
+                                    markov_head_quantization=config.markov_head_quantization)
         release_unused()
     transient = contextlib.ExitStack()
     transient.enter_context(package_storage.transient())
@@ -548,6 +555,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         "weights_bytes": weights.allocated_bytes, "mapped_host_bytes": 0,
         "expert_scale_compression": config.expert_scale_compression,
         "mla_compute_mode": config.mla_compute_mode,
+        "draft_head_quantization": config.draft_head_quantization,
+        "markov_head_quantization": config.markov_head_quantization,
         "offloaded_bytes": sum(tables.partition(ordinal, shard.rank).rows * 264
                                for ordinal in range(len(tables.sources))),
         "continuation_bytes": pool.backing.nbytes, "state_rows": state_rows,
