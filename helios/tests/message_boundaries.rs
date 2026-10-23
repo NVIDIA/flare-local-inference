@@ -147,6 +147,49 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
 }
 
 #[test]
+fn gemma_templates_checkpoint_preamble_messages_and_tool_rounds() {
+    let messages = json!([
+        {"role":"system","content":"Instructions"},
+        {"role":"user","content":"Question"},
+        {"role":"assistant","content":"","tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"lookup","arguments":{"q":"x"}}}
+        ]},
+        {"role":"tool","tool_call_id":"call_1","content":"Result"},
+        {"role":"assistant","content":"Answer"},
+        {"role":"user","content":"Follow-up"}
+    ]);
+    let messages = messages.as_array().unwrap();
+    let options = |generation: bool| {
+        json!({
+            "bos_token": "<bos>",
+            "add_generation_prompt": generation,
+            "tools": [{"type":"function","function":{"name":"lookup","description":"Look up a value",
+                "parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    };
+    for template in [
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google.jinja"),
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"),
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.nvidia.jinja"),
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.unsloth-12b.jinja"),
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.unsloth-e4b.jinja"),
+    ] {
+        let frontend = frontend(template, TemplateEncoding::Text);
+        let full = frontend.render_chat(messages, &options(true)).unwrap();
+        // An assistant tool call is complete only after the tool responses inlined into its turn.
+        for count in [1, 2, 4, 5, 6] {
+            let prefix = frontend.render_chat(&messages[..count], &options(false)).unwrap();
+            assert!(full.text.starts_with(&prefix.text), "{count}");
+            assert!(full.message_boundaries.contains(&prefix.token_ids.len()), "{count}");
+        }
+        assert_eq!(full.message_boundaries.len(), 5);
+    }
+}
+
+#[test]
 fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns() {
     let frontend = frontend(
         include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja"),

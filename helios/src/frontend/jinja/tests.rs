@@ -10,6 +10,20 @@ fn oracle(source: &str, context: &Json) -> std::result::Result<String, minijinja
     environment.add_test("iterable", |v: &minijinja::Value| {
         !v.is_none() && v.try_iter().is_ok()
     });
+    environment.add_test("sequence", |v: &minijinja::Value| {
+        use minijinja::value::ValueKind;
+        matches!(v.kind(), ValueKind::Seq | ValueKind::Map | ValueKind::String)
+    });
+    environment.set_formatter(|out, state, value| {
+        if value.kind() == minijinja::value::ValueKind::Number && !value.is_integer() {
+            if let Some(v) = f64::try_from(value.clone()).ok().filter(|v| v.is_finite()) {
+                return out
+                    .write_str(&super::super::json::python_float(v))
+                    .map_err(|_| minijinja::Error::from(minijinja::ErrorKind::WriteFailure));
+            }
+        }
+        minijinja::escape_formatter(out, state, value)
+    });
     environment.add_function(
         "raise_exception",
         |v: minijinja::Value| -> std::result::Result<(), minijinja::Error> {
@@ -37,7 +51,7 @@ fn compare(source: &str, context: Json) {
 
 #[test]
 fn expressions_and_python_methods_match_minijinja() {
-    let context = json!({"s":"  café 👋  ","a":[1,2,3,4],"m":{"z":true,"a":null},"none":null});
+    let context = json!({"s":"  café 👋  ","a":[1,2,3,4],"m":{"z":true,"a":null},"d":{"b":2,"B":3,"a":1},"f":[1e-6,-0.0,1e16,2.5,3.0],"none":null});
     for expr in [
         "1+2*3",
         "(1+2)*3",
@@ -81,9 +95,32 @@ fn expressions_and_python_methods_match_minijinja() {
         "18446744073709551615|tojson",
         "18446744073709551615",
         "9007199254740993 == 9007199254740992",
+        "f[0]",
+        "f[1]",
+        "f[2]",
+        "f[3]",
+        "f[4]",
+        "m is sequence",
+        "s is sequence",
+        "none is sequence",
+        "d|dictsort",
+        "d|dictsort(case_sensitive=true)",
+        "d|dictsort(by='value',reverse=true)",
+        "'a' \"b\" 'c'|upper",
+        "['a' 'b', 'c']",
     ] {
         compare(&format!("{{{{ {expr} }}}}"), context.clone());
     }
+}
+
+#[test]
+fn float_text_conversions_use_python_spelling() {
+    let template = CompiledTemplate::compile("{{ f|join(' ') }}|{{ f[2]|string }}").unwrap();
+    let context = json!({"f":[1e-6,-0.0,1e16,2.5,3.0]});
+    assert_eq!(
+        template.render(context.as_object().unwrap()).unwrap().text,
+        "1e-06 -0.0 1e+16 2.5 3.0|1e+16"
+    );
 }
 
 #[test]
@@ -216,6 +253,32 @@ fn recipe_templates_match_on_messages_tools_images_and_options() {
         (
             "kimi",
             include_str!("../../../../ignition/recipes/kimi3/assets/chat_template.jinja"),
+        ),
+        (
+            "gemma",
+            include_str!("../../../../ignition/recipes/gemma4/assets/chat_template.google.jinja"),
+        ),
+        (
+            "gemma-e2b-e4b",
+            include_str!(
+                "../../../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"
+            ),
+        ),
+        (
+            "gemma-nvidia",
+            include_str!("../../../../ignition/recipes/gemma4/assets/chat_template.nvidia.jinja"),
+        ),
+        (
+            "gemma-unsloth-12b",
+            include_str!(
+                "../../../../ignition/recipes/gemma4/assets/chat_template.unsloth-12b.jinja"
+            ),
+        ),
+        (
+            "gemma-unsloth-e4b",
+            include_str!(
+                "../../../../ignition/recipes/gemma4/assets/chat_template.unsloth-e4b.jinja"
+            ),
         ),
     ];
     let user = json!({"role":"user","content":"  café 世界 👋 a\u{301}\r\n<|im_end|>  "});

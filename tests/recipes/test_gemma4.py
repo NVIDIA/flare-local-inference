@@ -1,6 +1,7 @@
 """Unit tests for the Gemma 4 recipe, configuration, pool layout, and numerical kernels."""
 
 import json
+from pathlib import Path
 import struct
 
 import pytest
@@ -15,6 +16,7 @@ from ignition.recipes.gemma4.attention import (
     rms_norm,
     rms_norm_no_scale,
 )
+from ignition.recipes.gemma4.bootstrap import chat_template_asset
 from ignition.recipes.gemma4.config import PAGE_TOKENS, ModelConfig
 from ignition.recipes.gemma4.contract import FRONTEND, prepare as prepare_contract
 from ignition.recipes.gemma4.decoder import softcap_logits
@@ -497,6 +499,23 @@ def test_frontend_contract_and_cache_regions():
     assert contract["vocabulary"] == config.vocabulary
     assert contract["cache"]["page_tokens"] == PAGE_TOKENS
     assert len(contract["cache"]["regions"]) == 1 + len(pool.pages)
+
+
+@pytest.mark.parametrize("checkpoint", RECIPE.checkpoints, ids=lambda checkpoint: checkpoint.alias)
+def test_pinned_chat_templates_have_annotated_copies(checkpoint):
+    snapshot = (Path.home() / ".cache/huggingface/hub" / ("models--" + checkpoint.repository.replace("/", "--"))
+                / "snapshots" / checkpoint.revision)
+    if not (snapshot / "chat_template.jinja").exists():
+        pytest.skip("checkpoint chat template is not cached")
+    source = (snapshot / "chat_template.jinja").read_bytes()
+    annotated = Path(chat_template_asset(source)["path"]).read_bytes()
+    assert annotated.replace(b"{%- mark -%}", b"") == source
+    assert annotated.count(b"{%- mark -%}") == 2
+
+
+def test_unannotated_chat_template_is_rejected():
+    with pytest.raises(ValueError, match="matches no annotated Gemma 4 template"):
+        chat_template_asset(b"{{ messages }}")
 
 
 @pytest.mark.parametrize(

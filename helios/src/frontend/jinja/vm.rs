@@ -824,6 +824,50 @@ fn filter<'a>(
             });
             Ok(Value::list(items))
         }
+        "dictsort" => {
+            if !args.is_empty() {
+                return Err(Error::new("dictsort accepts only keyword arguments"));
+            }
+            let option = |name: &str| kw.iter().find(|(k, _)| *k == name).map(|(_, v)| v.clone());
+            let case_sensitive = option("case_sensitive").is_some_and(|v| v.truthy());
+            let by_value = match option("by") {
+                None => false,
+                Some(by) => match by.as_str() {
+                    Some("key") => false,
+                    Some("value") => true,
+                    _ => return Err(Error::new("dictsort by must be 'key' or 'value'")),
+                },
+            };
+            let reverse = option("reverse").is_some_and(|v| v.truthy());
+            let text = |v: &Value| {
+                if case_sensitive {
+                    v.text()
+                } else {
+                    v.text().to_lowercase()
+                }
+            };
+            let mut pairs = v.pairs()?;
+            pairs.sort_by(|(ak, av), (bk, bv)| {
+                let order = if by_value {
+                    if let (Some(a), Some(b)) = (av.number(), bv.number()) {
+                        a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal)
+                    } else {
+                        text(av).cmp(&text(bv))
+                    }
+                } else if case_sensitive {
+                    ak.cmp(bk)
+                } else {
+                    ak.to_lowercase().cmp(&bk.to_lowercase())
+                };
+                if reverse { order.reverse() } else { order }
+            });
+            Ok(Value::list(
+                pairs
+                    .into_iter()
+                    .map(|(k, v)| Value::list(vec![Value::string(k), v]))
+                    .collect(),
+            ))
+        }
         "join" => {
             let sep = args.first().map(Value::text).unwrap_or_default();
             let mut text = String::new();

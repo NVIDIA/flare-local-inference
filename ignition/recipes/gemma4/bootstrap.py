@@ -42,7 +42,7 @@ from ignition.preparation.collectives import (
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
-from ignition.preparation.frontend import prepare_frontend
+from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
@@ -57,6 +57,14 @@ from .decoder import PreparedDecoder, Scratch, SoftcappedResume
 from .pool import ContinuationPool, continuation_layout, page_bytes
 from .speculative import PreparedContext, PreparedRound
 from .weights import ModelWeights
+
+
+def chat_template_asset(source: bytes):
+    """Select the annotated copy of the checkpoint's chat template; supported checkpoints ship different templates."""
+    for path in sorted(Path(__file__).with_name("assets").glob("chat_template.*.jinja")):
+        if path.read_bytes().replace(b"{%- mark -%}", b"") == source:
+            return annotated_template_asset(source, path)
+    raise ValueError("checkpoint chat template matches no annotated Gemma 4 template")
 
 
 @dataclass(frozen=True)
@@ -496,8 +504,11 @@ def prepare_rank(snapshot, config, *, rank=0, group=None, progress=None, package
     if group is not None:
         torch.distributed.barrier(group=group)
     assets = {
-        role: {"path": str(snapshot / file), "sha256": hashlib.sha256((snapshot / file).read_bytes()).hexdigest()}
-        for role, file in (("tokenizer", "tokenizer.json"), ("chat_template", "chat_template.jinja"))
+        "tokenizer": {
+            "path": str(snapshot / "tokenizer.json"),
+            "sha256": hashlib.sha256((snapshot / "tokenizer.json").read_bytes()).hexdigest(),
+        },
+        "chat_template": chat_template_asset((snapshot / "chat_template.jinja").read_bytes()),
     }
     raw_eos = []
     gen_path = snapshot / "generation_config.json"

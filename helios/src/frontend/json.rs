@@ -191,7 +191,7 @@ impl Formatting {
     }
 }
 
-fn python_float(value: f64) -> String {
+pub(super) fn python_float(value: f64) -> String {
     let negative = value.is_sign_negative();
     if value == 0.0 {
         return if negative { "-0.0" } else { "0.0" }.into();
