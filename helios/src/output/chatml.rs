@@ -15,6 +15,7 @@ impl<const WRAPPING_NEWLINES: bool> ToolDialect for FunctionTags<WRAPPING_NEWLIN
     const CLOSE: &'static str = "</tool_call>";
     const FUNCTION: Option<(&'static str, &'static str)> = Some(("<function=", "</function>"));
     const TOOL_ENDS_REASONING: bool = true;
+    const OPEN_STARTS_LINE: bool = WRAPPING_NEWLINES;
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>> {
         Ok(vec![parse_tool(body, tools, WRAPPING_NEWLINES)?])
     }
@@ -364,9 +365,63 @@ mod tests {
     }
 
     #[test]
+    fn qwen_tool_tag_mentions_within_reasoning_lines_remain_reasoning() {
+        let reasoning = "The parser fails when the model emits `<tool_call>` verbatim. My request sent `<tool_call><function=lookup>` and returned valid output.\nWriting about <tool_call> mid-sentence.";
+        let text = format!(
+            "{reasoning}\n</think>\n\nChecking.\n\n<tool_call>\n<function=lookup>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>"
+        );
+        for split in text.char_indices().map(|(at, _)| at) {
+            let mut parser = Harness::new(config(), "mention".into());
+            parser.push(&text[..split]).unwrap();
+            parser.push(&text[split..]).unwrap();
+            parser.finish().unwrap();
+            let message = parser.message();
+            assert_eq!(message["reasoning_content"], reasoning, "split {split}");
+            assert_eq!(message["content"], "Checking.", "split {split}");
+            assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
+            assert_eq!(message["tool_calls"][0]["function"]["name"], "lookup");
+        }
+        let text = "<tool_call>\n<function=lookup>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let mut parser = Harness::new(config(), "immediate".into());
+            parser.push(&text[..split]).unwrap();
+            parser.push(&text[split..]).unwrap();
+            parser.finish().unwrap();
+            let message = parser.message();
+            assert!(message.get("reasoning_content").is_none(), "split {split}");
+            assert_eq!(message["tool_calls"][0]["function"]["name"], "lookup");
+        }
+    }
+
+    #[test]
+    fn compact_tool_tags_end_reasoning_within_a_line() {
+        let text = "Look up Paris.<tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let mut parser = CompactChatMlOutput::new(config());
+            let mut output = Accumulator::new("compact".into());
+            for part in [&text[..split], &text[split..]] {
+                output
+                    .apply(parser.push(Input::Text(part)).unwrap())
+                    .unwrap();
+            }
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            let message = output.message();
+            assert_eq!(
+                message["reasoning_content"], "Look up Paris.",
+                "split {split}"
+            );
+            assert_eq!(message["tool_calls"].as_array().unwrap().len(), 1);
+        }
+    }
+
+    #[test]
     fn qwen_tools_end_reasoning_and_duplicate_think_markers_do_not_leak() {
         for text in [
-            "<think>Look up Paris.<tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>",
+            "<think>Look up Paris.\n<tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>",
+            "Look up Paris.\n<tool_call>\n<function=lookup>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>",
             "Look up Paris.</think></think><tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>",
         ] {
             for split in text.char_indices().map(|(index, _)| index) {

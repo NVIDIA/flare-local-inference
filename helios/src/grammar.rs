@@ -20,6 +20,7 @@ pub struct OutputEnvelope {
     pub tool: Option<(&'static str, &'static str)>,
     pub function: Option<(&'static str, &'static str)>,
     pub tool_ends_reasoning: bool,
+    pub tool_starts_line: bool,
     pub tool_body_start: bool,
     pub response: Option<(&'static str, &'static str)>,
 }
@@ -242,8 +243,46 @@ impl GrammarCompiler {
             rules.push_str("start: tool_after_open tools_suffix ws\n");
         } else if let Some(end) = envelope.reasoning_end {
             if let Some((open, _)) = envelope.tool.filter(|_| envelope.tool_ends_reasoning) {
-                rules.push_str(&self.delimited_region("reasoning_done", end, &[end, open]));
-                rules.push_str(&self.delimited_region("reasoning_tool", open, &[end, open]));
+                if envelope.tool_starts_line {
+                    let trie = self.factory.tok_env().tok_trie();
+                    if trie.get_special_token(open).is_some() {
+                        return Err(Error::admission(
+                            AdmissionError::Grammar,
+                            "line-start tool openers must be text",
+                        ));
+                    }
+                    let line_open = format!("\n{open}");
+                    let ends = [end, line_open.as_str()];
+                    rules.push_str(&self.delimited_region(
+                        "reasoning_done",
+                        end,
+                        &ends,
+                        Some(open),
+                    ));
+                    rules.push_str(&self.delimited_region(
+                        "reasoning_line_tool",
+                        &line_open,
+                        &ends,
+                        Some(open),
+                    ));
+                    rules.push_str(&format!(
+                        "reasoning_tool: reasoning_line_tool | {}\n",
+                        self.marker(open)
+                    ));
+                } else {
+                    rules.push_str(&self.delimited_region(
+                        "reasoning_done",
+                        end,
+                        &[end, open],
+                        None,
+                    ));
+                    rules.push_str(&self.delimited_region(
+                        "reasoning_tool",
+                        open,
+                        &[end, open],
+                        None,
+                    ));
+                }
                 // Only the outer tool opener implicitly ends reasoning.
                 rules.push_str(&format!(
                     "start: (reasoning_done ws {branches} | reasoning_tool tool_after_open tools_suffix) ws\n",
@@ -296,14 +335,20 @@ impl GrammarCompiler {
         }
     }
 
-    fn delimited_region(&self, name: &str, close: &str, ends: &[&str]) -> String {
+    fn delimited_region(
+        &self,
+        name: &str,
+        close: &str,
+        ends: &[&str],
+        excluded_start: Option<&str>,
+    ) -> String {
         let trie = self.factory.tok_env().tok_trie();
         let literals: Vec<_> = ends
             .iter()
             .filter(|end| trie.get_special_token(end).is_none())
             .map(|end| serde_json::to_string(end).unwrap())
             .collect();
-        let text = if literals.is_empty() {
+        let mut text = if literals.is_empty() {
             "/(?s:.*)/".to_owned()
         } else {
             format!(
@@ -311,6 +356,12 @@ impl GrammarCompiler {
                 literals.join(" | ")
             )
         };
+        if let Some(start) = excluded_start {
+            text = format!(
+                "({text} & ~({} /(?s:.*)/))",
+                serde_json::to_string(start).unwrap()
+            );
+        }
         let excluded: Vec<_> = ends
             .iter()
             .filter_map(|end| trie.get_special_token(end))
@@ -830,6 +881,7 @@ mod tests {
                 tool: Some(("<tool_call>", "</tool_call>")),
                 function: None,
                 tool_ends_reasoning: false,
+                tool_starts_line: false,
                 response: None,
                 tool_body_start: false,
             };
@@ -875,6 +927,7 @@ mod tests {
                 tool: Some(("<|open|>tools<|sep|>", "<|close|>tools<|sep|>")),
                 function: None,
                 tool_ends_reasoning: false,
+                tool_starts_line: false,
                 response: Some(("", "<|close|>response<|sep|>")),
                 tool_body_start: false,
             };
@@ -909,45 +962,74 @@ mod tests {
     #[test]
     fn qwen_envelope_preserves_implicit_reasoning_and_function_boundaries() {
         let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
-        let envelope = OutputEnvelope {
-            reasoning_end: Some("</think>"),
-            tool: Some(("<tool_call>", "</tool_call>")),
-            function: Some(("<function=", "</function>")),
-            tool_ends_reasoning: true,
-            response: None,
-            tool_body_start: false,
-        };
-        for (text, accepted) in [
-            ("thought</think>{\"ok\":true}", true),
-            ("thought<tool_call><function=f></function>", true),
+        // (text, accepted anywhere, accepted only at line start)
+        for (text, anywhere, line_start) in [
+            ("thought</think>{\"ok\":true}", true, true),
+            ("thought<tool_call><function=f></function>", true, false),
+            ("thought\n<tool_call><function=f></function>", true, true),
+            ("<tool_call><function=f></function>", true, true),
             (
                 "thought<tool_call><function=f></function></tool_call>",
                 true,
+                false,
             ),
-            ("thought</think><function=f></function>{\"ok\":true}", true),
+            (
+                "thought\n\n<tool_call>\n<function=f>\n</function>\n</tool_call>",
+                true,
+                true,
+            ),
+            (
+                "thought</think><function=f></function>{\"ok\":true}",
+                true,
+                true,
+            ),
             (
                 "thought<tool_call><function=f></function><function=f></function>",
                 true,
+                false,
             ),
             (
                 "thought<tool_call>literal</tool_call></think>{\"ok\":true}",
                 false,
+                true,
             ),
-            ("thought</think>{\"ok\":false}", false),
+            (
+                "Mention `<tool_call>` here.\n<tool_call><function=f></function>",
+                false,
+                true,
+            ),
+            (
+                "thought\n<tool_call>literal</tool_call></think>{\"ok\":true}",
+                false,
+                false,
+            ),
+            ("thought</think>{\"ok\":false}", false, false),
             (
                 "thought<tool_call><function=f></function>junk</tool_call>",
                 false,
+                false,
             ),
         ] {
-            let mut grammar = compiler
-                .compile_json_schema_in(&json!({"const":{"ok":true}}), Some(&envelope))
-                .unwrap();
-            let result = text
-                .bytes()
-                .map(u32::from)
-                .chain([256])
-                .all(|id| grammar.advance(id).is_ok());
-            assert_eq!(result, accepted, "{text}");
+            for (tool_starts_line, accepted) in [(false, anywhere), (true, line_start)] {
+                let envelope = OutputEnvelope {
+                    reasoning_end: Some("</think>"),
+                    tool: Some(("<tool_call>", "</tool_call>")),
+                    function: Some(("<function=", "</function>")),
+                    tool_ends_reasoning: true,
+                    tool_starts_line,
+                    response: None,
+                    tool_body_start: false,
+                };
+                let mut grammar = compiler
+                    .compile_json_schema_in(&json!({"const":{"ok":true}}), Some(&envelope))
+                    .unwrap();
+                let result = text
+                    .bytes()
+                    .map(u32::from)
+                    .chain([256])
+                    .all(|id| grammar.advance(id).is_ok());
+                assert_eq!(result, accepted, "{text} line start {tool_starts_line}");
+            }
         }
     }
 
@@ -959,6 +1041,7 @@ mod tests {
             tool: Some(("<tool_call>", "</tool_call>")),
             function: Some(("<function=", "</function>")),
             tool_ends_reasoning: true,
+            tool_starts_line: false,
             response: None,
             tool_body_start: false,
         };
@@ -994,18 +1077,27 @@ mod tests {
                 tool: Some(("<tool_call>", "</tool_call>")),
                 function: Some(("<function=", "</function>")),
                 tool_ends_reasoning: true,
+                tool_starts_line: true,
                 response: None,
                 tool_body_start: false,
             };
-            for text in [
+            let mut texts: Vec<String> = [
                 r#"{"literal":"<think>東京</think><tool_call>literal</tool_call>"}"#,
                 "<tool_call><function=lookup><parameter=query>東京</parameter></function></tool_call>",
-            ] {
-                let text = if reasoning {
+            ]
+            .iter()
+            .map(|text| {
+                if reasoning {
                     format!("Consider the request.</think>\n\n{text}")
                 } else {
-                    text.into()
-                };
+                    (*text).into()
+                }
+            })
+            .collect();
+            if reasoning {
+                texts.push("Mention `<tool_call>` first.\n<tool_call>\n<function=lookup>\n<parameter=query>\n東京\n</parameter>\n</function>\n</tool_call>".into());
+            }
+            for text in texts {
                 let schema = json!({"type":"object","properties":{"literal":{"type":"string"}},"required":["literal"],"additionalProperties":false});
                 let canonical = tokenizer
                     .encode(text.as_str(), false)
@@ -1469,6 +1561,7 @@ mod tests {
                 tool: Some((open, close)),
                 function: None,
                 tool_ends_reasoning: false,
+                tool_starts_line: false,
                 tool_body_start: true,
                 response: None,
             };

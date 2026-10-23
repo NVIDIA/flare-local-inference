@@ -26,6 +26,9 @@ pub trait ToolDialect {
     const CLOSE: &'static str;
     const FUNCTION: Option<(&'static str, &'static str)> = None;
     const TOOL_ENDS_REASONING: bool = false;
+    /// Templates place `OPEN` on its own line, so a mention within a reasoning line
+    /// is text rather than an implicit end of reasoning.
+    const OPEN_STARTS_LINE: bool = false;
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>>;
 }
 
@@ -38,6 +41,7 @@ pub struct ThinkReasoning<D: ToolDialect> {
     tools: bool,
     trim_wrap: bool,
     tool_ends_reasoning: bool,
+    line_start: bool,
 }
 impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
     fn push(&mut self, input: Input<'_>) -> Result<Progress> {
@@ -59,7 +63,19 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
             .find(&self.close)
             .map(|at| (at, self.close.len()));
         if self.tools && self.tool_ends_reasoning {
-            if let Some(at) = self.buffer.find(D::OPEN) {
+            let opener = self
+                .buffer
+                .match_indices(D::OPEN)
+                .map(|(at, _)| at)
+                .find(|&at| {
+                    !D::OPEN_STARTS_LINE
+                        || if at == 0 {
+                            self.line_start
+                        } else {
+                            self.buffer[..at].ends_with('\n')
+                        }
+                });
+            if let Some(at) = opener {
                 if boundary.is_none_or(|(end, _)| at < end) {
                     boundary = Some((at, 0));
                 }
@@ -89,11 +105,17 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
             if self.tool_ends_reasoning {
                 hold = hold.max(partial_marker(&self.buffer, &[&self.open]));
                 if self.tools {
-                    hold = hold.max(partial_marker(&self.buffer, &[D::OPEN]));
+                    hold = hold.max(partial_marker(
+                        &self.buffer,
+                        &[D::OPEN, &format!("\n{}", D::OPEN)],
+                    ));
                 }
             }
             let visible = self.buffer.len() - hold;
             let text: String = self.buffer.drain(..visible).collect();
+            if let Some(last) = text.chars().last() {
+                self.line_start = last == '\n';
+            }
             let text = if self.tool_ends_reasoning {
                 text.replace(&self.open, "")
             } else {
@@ -257,6 +279,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 tools,
                 trim_wrap: D::TRIM_NEWLINES,
                 tool_ends_reasoning: D::TOOL_ENDS_REASONING,
+                line_start: true,
                 dialect: std::marker::PhantomData,
             },
             tool: (config.start == OutputStart::ToolBody).then(|| TaggedTools {
@@ -275,6 +298,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             tool: (!config.tools.is_empty()).then_some((D::OPEN, D::CLOSE)),
             function: D::FUNCTION,
             tool_ends_reasoning: D::TOOL_ENDS_REASONING,
+            tool_starts_line: D::OPEN_STARTS_LINE,
             response: None,
             tool_body_start: config.start == OutputStart::ToolBody,
         })
@@ -487,6 +511,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                                 trim_newlines: u8::from(self.reasoning.trim_wrap) as usize,
                                 trim_wrap: self.reasoning.trim_wrap,
                                 tool_ends_reasoning: self.reasoning.tool_ends_reasoning,
+                                line_start: true,
                                 tools: !self.tools.is_empty(),
                             };
                         }

@@ -129,6 +129,7 @@ impl OutputPipeline {
                     .then_some((super::xtml::TOOLS_OPEN, super::xtml::TOOLS_CLOSE)),
                 function: None,
                 tool_ends_reasoning: false,
+                tool_starts_line: false,
                 response: Some(("", super::xtml::RESPONSE_CLOSE)),
                 tool_body_start: false,
             }),
@@ -144,6 +145,7 @@ impl OutputPipeline {
                 tool: None,
                 function: None,
                 tool_ends_reasoning: false,
+                tool_starts_line: false,
                 response: None,
                 tool_body_start: false,
             }),
@@ -443,5 +445,65 @@ mod tests {
         assert_eq!(envelope.reasoning_end, Some("<channel|>"));
         assert_eq!(envelope.tool, Some(("<|tool_call>", "<tool_call|>")));
         assert!(envelope.tool_ends_reasoning);
+        assert!(!envelope.tool_starts_line);
+    }
+
+    #[test]
+    fn wrapped_function_tags_end_reasoning_only_at_line_start() {
+        let tools = vec![json!({"function":{"name":"lookup"}})];
+        for (wrapping_newlines, text, reasoning) in [
+            (
+                1,
+                "Emit `<tool_call>` verbatim.\n<tool_call>\n<function=lookup>\n</function>\n</tool_call>",
+                "Emit `<tool_call>` verbatim.",
+            ),
+            (
+                0,
+                "Plan.<tool_call><function=lookup></function></tool_call>",
+                "Plan.",
+            ),
+        ] {
+            let mut syntax = crate::model::testing::metadata().frontend;
+            syntax.tools = Some(ToolParser {
+                kind: ToolParserKind::QwenCoder,
+                wrapping_newlines,
+                tag_separator: String::new(),
+            });
+            syntax.reasoning = Some(ReasoningParser {
+                kind: ReasoningParserKind::ThinkTags,
+                open: "<think>".into(),
+                close: "</think>".into(),
+                wrapping_newlines,
+                terminal_markers: vec!["<tool_call>".into()],
+            });
+            let config = OutputConfig {
+                syntax,
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    start: crate::output::tagged::OutputStart::Reasoning,
+                    structured: false,
+                    tools: tools.clone(),
+                },
+            };
+            let envelope = OutputPipeline::grammar_envelope(&config).unwrap();
+            assert!(envelope.tool_ends_reasoning);
+            assert_eq!(envelope.tool_starts_line, wrapping_newlines > 0);
+            for split in text.char_indices().map(|(at, _)| at) {
+                let mut parser = OutputPipeline::new(config.clone());
+                let mut output = Accumulator::new("qwen".into());
+                for part in [&text[..split], &text[split..]] {
+                    output
+                        .apply(parser.push(Input::Text(part)).unwrap())
+                        .unwrap();
+                }
+                output
+                    .apply(parser.finish(Termination::Eos).unwrap())
+                    .unwrap();
+                output.finish().unwrap();
+                let message = output.message();
+                assert_eq!(message["reasoning_content"], reasoning, "split {split}");
+                assert_eq!(message["tool_calls"][0]["function"]["name"], "lookup");
+            }
+        }
     }
 }

@@ -304,7 +304,10 @@ or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
 Shared runtime handling owns token accounting, stop filtering, and termination.
 
-Qwen treats `<tool_call>` as an implicit end to reasoning. Function-tag calls
+Qwen treats `<tool_call>` as an implicit end to reasoning. Its templates place
+wrapped function tags on their own lines, so with wrapped tags only a
+`<tool_call>` that begins a reasoning line ends reasoning; mentions within a
+line remain reasoning text. Compact tags end reasoning anywhere. Function-tag calls
 complete at `</function>` and accept omitted outer tool tags in answer content.
 A missing `</parameter>` is closed by the next parameter or function boundary.
 Parameter schemas guide

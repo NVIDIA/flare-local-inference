@@ -200,6 +200,7 @@ impl<const SPACED: bool> ModelOutput for DsmlOutput<SPACED> {
             }),
             function: None,
             tool_ends_reasoning: false,
+            tool_starts_line: false,
             response: None,
             tool_body_start: config.start == OutputStart::ToolBody,
         })

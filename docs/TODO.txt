@@ -108,6 +108,11 @@
     routes: compare inline reconstruction and separate expansion in complete
     graphs before adding a preparation override. See performance-work.md.
 
+[ ] Check Step 5, MiMo, and Nemotron reasoning for prose `<tool_call>` mentions.
+    Their compact function tags still end reasoning anywhere because their
+    templates place calls after text; content-side mentions are also unhandled.
+    See helios/src/output/tagged.rs and NVIDIA/flare-local-inference#30.
+
 [ ] Run DeepSeek V4 packed-context native replay with its checkpoint and measure
     exported V4/V4.1 packages with packed context projections. Compare GLM's
     shared-expert launch order when the configured checkpoint shards are available.
