@@ -1,16 +1,18 @@
 //! Native tokenization and rendering over verified Hugging Face assets.
 
 mod deepseek;
+mod boundaries;
+mod templates;
 #[cfg(feature = "images")]
 pub mod images;
 mod json;
+mod jinja;
 
 mod vocabulary;
 
 use std::fs;
 use std::path::PathBuf;
 
-use minijinja::{Environment, Error as TemplateError, ErrorKind, Value};
 use serde_json::{Map, Value as Json};
 use sha2::{Digest, Sha256};
 use tokenizers::Tokenizer;
@@ -184,6 +186,7 @@ pub struct RenderedPrompt {
     pub image_sources: Vec<String>,
     pub text: String,
     pub token_ids: Vec<u32>,
+    pub message_boundaries: Vec<usize>,
 }
 
 pub struct Frontend {
@@ -191,7 +194,7 @@ pub struct Frontend {
     image_placeholder_token_id: Option<u32>,
     tokenizer: Tokenizer,
     ordinary_tokenizer: Option<Tokenizer>,
-    environment: Environment<'static>,
+    template: Option<jinja::CompiledTemplate>,
     template_source: String,
     bos_token_id: Option<u32>,
     effort_levels: std::sync::OnceLock<Vec<String>>,
@@ -242,9 +245,7 @@ impl Frontend {
                 .into_iter()
                 .filter(|effort| {
                     context.insert("reasoning_effort".into(), (*effort).into());
-                    self.environment
-                        .get_template("chat")
-                        .and_then(|template| template.render(&context))
+                    self.template.as_ref().unwrap().render(&context)
                         .is_ok()
                 })
                 .map(str::to_owned)
@@ -290,10 +291,8 @@ impl Frontend {
             );
             context.insert("add_generation_prompt".into(), false.into());
             context.insert("continue_final_message".into(), false.into());
-            self.environment
-                .get_template("chat")
-                .and_then(|template| template.render(&context))
-                .is_ok_and(|text| text.contains(marker))
+            self.template.as_ref().unwrap().render(&context)
+                .is_ok_and(|rendered| rendered.text.contains(marker))
         });
         if *supported {
             return Ok(());
@@ -376,6 +375,7 @@ impl Frontend {
             )))
         })?;
         tokenizer.with_padding(None);
+        boundaries::preserve_offsets(&mut tokenizer);
         if prompt_encoder != PromptEncoder::Jinja
             && image_placeholder_token_id.is_some_and(|id| tokenizer.id_to_token(id).is_none())
         {
@@ -398,34 +398,11 @@ impl Frontend {
                 error,
             )))
         })?;
-        let mut environment = Environment::new();
-        environment.set_trim_blocks(true);
-        environment.set_lstrip_blocks(true);
-        environment
-            .set_unknown_method_callback(minijinja_contrib::pycompat::unknown_method_callback);
-        // Function pointers keep internal function-item names out of template diagnostics.
-        environment.add_filter("tojson", json::tojson as fn(_, _) -> _);
-        environment.add_test(
-            "iterable",
-            (|value: &Value| !value.is_none() && value.try_iter().is_ok()) as fn(&Value) -> bool,
-        );
-        environment.add_function(
-            "raise_exception",
-            (|message: Value| -> std::result::Result<Value, TemplateError> {
-                Err(TemplateError::new(
-                    ErrorKind::InvalidOperation,
-                    message.to_string(),
-                ))
-            }) as fn(Value) -> std::result::Result<Value, TemplateError>,
-        );
-        environment
-            .add_template_owned("chat", template_source.clone())
-            .map_err(|error| {
-                Error::frontend(FrontendError::Template(Failure::caused_by(
-                    error.to_string(),
-                    error,
-                )))
-            })?;
+        let template = if prompt_encoder == PromptEncoder::Jinja {
+            Some(templates::compile(&template_source).map_err(|error| {
+                Error::frontend(FrontendError::Template(Failure::caused_by(error.to_string(), error)))
+            })?)
+        } else { None };
         let bos_token_id = assets
             .tokens
             .bos_token
@@ -467,7 +444,7 @@ impl Frontend {
             inline_system_messages: Default::default(),
             tokenizer,
             ordinary_tokenizer: None,
-            environment,
+            template,
             template_source,
             defaults,
         };
@@ -513,14 +490,13 @@ impl Frontend {
                 "Cannot apply chat template to an empty conversation. Provide at least one message.",
             ))));
         }
-        self.render_jinja(messages, options, false)
+        self.render_jinja(messages, options)
     }
 
     fn render_jinja(
         &self,
         messages: &[Json],
         options: &Map<String, Json>,
-        boundary: bool,
     ) -> Result<RenderedPrompt> {
         let mut context = self.defaults.clone();
         context.extend(options.clone());
@@ -590,28 +566,11 @@ impl Frontend {
             .map(|field| self.mark_continuation(&mut messages, &field))
             .transpose()?;
         context.insert("messages".into(), Json::Array(messages));
-        let mut rendered = Vec::new();
-        let template = self
-            .environment
-            .get_template("chat")
-            .map_err(|error| {
-                Error::frontend(FrontendError::Template(Failure::caused_by(
-                    error.to_string(),
-                    error,
-                )))
-            })?;
-        let result = template.render_captured_to(context, &mut rendered);
-        // A complete request may require later turns that a prefix does not contain.
-        if !boundary || rendered.is_empty() {
-            result.map_err(|error| {
-                Error::frontend(FrontendError::Template(Failure::caused_by(
-                    error.detail().unwrap_or("chat template rendering failed").to_owned(),
-                    error,
-                )))
-            })?;
-        }
-        let rendered = String::from_utf8(rendered)
-            .map_err(|error| deepseek::invalid(error.to_string()))?;
+        let rendered = self.template.as_ref().unwrap().render(&context).map_err(|error| {
+            Error::frontend(FrontendError::Template(Failure::caused_by(error.message.clone(), error)))
+        })?;
+        let marks = rendered.marks;
+        let rendered = rendered.text;
         let mut segments: Vec<TokenSegment> = if self.ordinary_tokenizer.is_some() {
             serde_json::from_str(&rendered).map_err(|error| {
                 Error::frontend(FrontendError::Template(Failure::caused_by(
@@ -625,6 +584,15 @@ impl Frontend {
                 allow_special: true,
             }]
         };
+        let mut segment_ends = Vec::with_capacity(segments.len() + 1);
+        segment_ends.push(0usize);
+        for segment in &segments { segment_ends.push(segment_ends.last().unwrap() + segment.text.len()); }
+        let byte_boundaries = marks.into_iter().map(|mark| match mark {
+            jinja::Mark::Byte(byte) if self.ordinary_tokenizer.is_none() && byte <= *segment_ends.last().unwrap() => Ok(byte),
+            jinja::Mark::Position(count) if self.ordinary_tokenizer.is_some() => segment_ends.get(count).copied()
+                .ok_or_else(|| deepseek::invalid("mark position exceeds the rendered segment count")),
+            _ => Err(deepseek::invalid("text templates require byte marks; segmented templates require segment-count marks")),
+        }).collect::<Result<Vec<_>>>()?;
         let mut text: String = segments
             .iter()
             .map(|segment| segment.text.as_str())
@@ -640,6 +608,8 @@ impl Frontend {
         }
         let mut remaining = text.len();
         let mut token_ids = Vec::new();
+        let mut offsets = Vec::new();
+        let mut byte_start = 0;
         for segment in &mut segments {
             segment.text.truncate(remaining.min(segment.text.len()));
             remaining -= segment.text.len();
@@ -657,11 +627,15 @@ impl Frontend {
                     )))
                 })?;
             token_ids.extend_from_slice(encoding.get_ids());
+            offsets.extend(encoding.get_offsets().iter().map(|&(start,end)| (byte_start+start,byte_start+end)));
+            byte_start += segment.text.len();
             if remaining == 0 {
                 break;
             }
         }
+        let message_boundaries = boundaries::token_ends(&byte_boundaries, &offsets, text.len())?;
         Ok(RenderedPrompt {
+            message_boundaries,
             text,
             token_ids,
             image_sources,
@@ -809,22 +783,13 @@ mod tests {
         let source = format!(
             "{{% for message in messages %}}{guard}{{{{ message.role }}}}:{{{{ message.content }}}}\n{{% endfor %}}"
         );
-        let mut environment = Environment::new();
-        environment.add_function(
-            "raise_exception",
-            |message: String| -> std::result::Result<(), TemplateError> {
-                Err(TemplateError::new(ErrorKind::InvalidOperation, message))
-            },
-        );
-        environment
-            .add_template_owned("chat", source.clone())
-            .unwrap();
+        let template = Some(jinja::CompiledTemplate::compile(&source).unwrap());
         Frontend {
             prompt_encoder: PromptEncoder::Jinja,
             image_placeholder_token_id: None,
             ordinary_tokenizer: None,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
-            environment,
+            template,
             template_source: source,
             bos_token_id: None,
             vocabulary_bytes: Default::default(),
@@ -915,27 +880,15 @@ mod tests {
             ("['low','high','max']", ["low", "high", "max"]),
         ] {
             let source = format!(
-                "{{% if reasoning_effort not in {levels} %}}{{{{ raise_exception() }}}}{{% endif %}}"
+                "{{% if reasoning_effort not in {levels} %}}{{{{ raise_exception('unsupported effort') }}}}{{% endif %}}"
             );
-            let mut environment = Environment::new();
-            environment.add_function(
-                "raise_exception",
-                || -> std::result::Result<(), TemplateError> {
-                    Err(TemplateError::new(
-                        ErrorKind::InvalidOperation,
-                        "unsupported effort",
-                    ))
-                },
-            );
-            environment
-                .add_template_owned("chat", source.clone())
-                .unwrap();
+            let template = Some(jinja::CompiledTemplate::compile(&source).unwrap());
             let frontend = Frontend {
                 prompt_encoder: PromptEncoder::Jinja,
                 image_placeholder_token_id: None,
                 ordinary_tokenizer: None,
                 tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
-                environment,
+                template,
                 template_source: source,
                 bos_token_id: None,
                 vocabulary_bytes: Default::default(),
@@ -985,19 +938,8 @@ mod tests {
     fn render_failure_retains_template_cause_and_detail() {
         use std::error::Error as _;
 
-        let mut environment = Environment::new();
-        environment.add_function(
-            "raise_exception",
-            || -> std::result::Result<(), TemplateError> {
-                Err(TemplateError::new(
-                    ErrorKind::InvalidOperation,
-                    "fixture rejection",
-                ))
-            },
-        );
-        environment
-            .add_template_owned("chat", "{{ raise_exception() }}".to_owned())
-            .unwrap();
+        let source = "{{ raise_exception('fixture rejection') }}";
+        let template = Some(jinja::CompiledTemplate::compile(source).unwrap());
         let frontend = Frontend {
             prompt_encoder: PromptEncoder::Jinja,
             image_placeholder_token_id: None,
@@ -1007,8 +949,8 @@ mod tests {
             inline_system_messages: Default::default(),
             ordinary_tokenizer: None,
             tokenizer: Tokenizer::new(tokenizers::models::bpe::BPE::default()),
-            environment,
-            template_source: "{{ raise_exception() }}".to_owned(),
+            template,
+            template_source: source.to_owned(),
             defaults: Map::new(),
         };
         let error = frontend
@@ -1023,9 +965,9 @@ mod tests {
         let cause = error
             .source()
             .unwrap()
-            .downcast_ref::<TemplateError>()
+            .downcast_ref::<jinja::Error>()
             .unwrap();
-        assert_eq!(cause.kind(), ErrorKind::InvalidOperation);
+        assert_eq!(cause.message, "fixture rejection");
         let input = frontend.render_chat(&[], &Map::new()).err().unwrap();
         assert!(matches!(input, Error::Frontend(FrontendError::Input(_))));
         assert!(input.source().is_none());

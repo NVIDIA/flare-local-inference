@@ -6,12 +6,22 @@ import json
 from google.protobuf.json_format import MessageToDict, ParseError
 import pytest
 
-from ignition.preparation.frontend import image_settings, prepare_frontend, tokenizer_settings
+from ignition.preparation.frontend import annotated_template_asset, image_settings, prepare_frontend, tokenizer_settings
 from ignition.preparation.package_file import combine, read_index, write_sources
 from ignition.preparation.package_proto import serving
 from ignition.preparation.runtime_package_pb2 import BundleIndex, ModelIndex
 from ignition.recipes import recipes
 from ignition.recipes.declaration import SamplingDefaults, SamplingRange
+
+
+def test_template_annotations_require_exact_checkpoint_source(tmp_path):
+    source = b"{{ messages[0].content }}"
+    path = tmp_path / "chat_template.jinja"
+    path.write_bytes(source + b"{%- mark -%}")
+    asset = annotated_template_asset(source, path)
+    assert Path(asset["path"]).read_bytes() == source + b"{%- mark -%}"
+    with pytest.raises(ValueError, match="checkpoint chat template does not match"):
+        annotated_template_asset(source + b" ", path)
 
 
 @pytest.mark.parametrize("recipe", recipes(), ids=lambda recipe: recipe.name)
@@ -80,6 +90,17 @@ def test_image_metadata_is_a_tight_consumed_contract():
         changed = {**processor, key: value}
         with pytest.raises(ValueError, match="unsupported"):
             image_settings(changed, model, "qwen")
+
+
+def test_glm_image_profile_validates_checkpoint_structure():
+    fixture = json.loads((Path(__file__).parents[1] / "frontend/glm53_images.json").read_text())
+    processor, model = fixture["processor"], fixture["model"]
+    model["model_type"] = "glm5_next"
+    assert image_settings(processor, model, "glm") == {"glm": {}}
+    for key, value in (("patch_size", 16), ("max_image_tokens", 4096), ("do_rescale", False)):
+        changed = {**processor, "image_processor": {**processor["image_processor"], key: value}}
+        with pytest.raises(ValueError, match="unsupported GLM"):
+            image_settings(changed, model, "glm")
 
 
 def server():
@@ -156,11 +177,11 @@ def test_runtime_config_blobs_and_partial_sampling_defaults_are_rejected():
             serving(ModelIndex(), source)
     source = server()
     del source["sampling_defaults"]["top_k"]
-    with pytest.raises(ValueError, match="every parameter"):
+    with pytest.raises(ValueError, match="sampling defaults"):
         serving(ModelIndex(), source)
     source = server()
     source["frontend"]["tokenizer"]["unused"] = True
-    with pytest.raises(ParseError, match="has no field"):
+    with pytest.raises(ValueError, match="unused"):
         serving(ModelIndex(), source)
 
 

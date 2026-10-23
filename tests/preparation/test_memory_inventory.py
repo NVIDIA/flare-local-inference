@@ -136,7 +136,8 @@ def test_inventory_separates_physical_cache_host_peers_and_package_alignment(mon
     package = SimpleNamespace(allocations=[Allocation('fixed', 100, 300),
         Allocation('external', 500, 100), Allocation('cache', 1000, 1 << 40, sizing={'capacity': 'KV'}),
         Allocation('peer', 9000, 500, memory='peer'), Allocation('host', 10000, 4000, memory='mapped_host')],
-        module_globals=[(700, 10, 'kernel.constant')], kernels={1: None}, modules={'kernel': b'ELF'})
+        module_globals=[(700, 10, 'kernel.constant')],
+        export_counts={'kernels': 1, 'modules': 1, 'cubin_bytes': 3})
     report = collect_inventory(prepared, storage, package, external=[(520, 20)])
     assert report['fixed_package_bytes'] == 400
     assert report['cache_backing_bytes'] == 200
@@ -196,7 +197,8 @@ with PackageStorage() as storage:
         buffers={'cache': cache}, device=0, export_zero_ranges=(), graphs={'prefill': None, 'decode': None})
     allocations = [Allocation(str(i), a.address, a.nbytes) for i, a in enumerate(storage.mappings.values())]
     allocations.append(Allocation('KV', region.address, region.extent, sizing={'capacity': 'kv_pages'}))
-    package = SimpleNamespace(allocations=allocations, module_globals=[], kernels={}, modules={})
+    package = SimpleNamespace(allocations=allocations, module_globals=[],
+        export_counts={'kernels': 0, 'modules': 0, 'cubin_bytes': 0})
     report = collect_inventory(prepared, storage, package)
     def size(category, field='entries'):
         return sum(row['nbytes'] for row in report[field] if row['category'] == category)

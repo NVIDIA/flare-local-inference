@@ -377,7 +377,8 @@ def test_native_flashinfer_chain_accept_reject_rng_and_budget(width, compiled):
     verify = PreparedStochasticVerification(draft_probs, drafts, target_probs, state, slots, epochs, live, rng=rng)
     verify.prepare()
     logits = torch.zeros((*inputs.shape, state.vocab_size), device=inputs.device)
-    commit = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live, completion_outputs(records), frame, sequence, rng=rng, logits=logits)
+    outputs = completion_outputs(records)
+    commit = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live, outputs, frame, sequence, rng=rng, logits=logits)
     commit.prepare()
     restore_state = snapshot(state)
     def restore():
@@ -394,18 +395,22 @@ def test_native_flashinfer_chain_accept_reject_rng_and_budget(width, compiled):
         assert rng.target_offset.cpu().tolist() == [verify.draw_reservation] * 4
         expected_seed = state.seed.view(torch.int64)[slots.long()] ^ TARGET_RNG_DOMAIN
         assert torch.equal(verify.seed_bits, expected_seed)
+        assert outputs.speculative_survival[0, :, :width - 1].eq(1).all()
+        assert outputs.speculative_survival[0, :, width - 1:].eq(-1).all()
         restore()
         target_probs[:, 0].zero_(); target_probs[:, 0, 101] = 1
         replay()
         assert commit.emitted_count.cpu().tolist() == [1] * 4
         assert state.pending_token.cpu().tolist() == [101] * 4
         assert verify.emitted_drafts.eq(0).all()
+        assert outputs.speculative_survival[0, :, :width - 1].eq(0).all()
         restore()
         target_probs[:, 0].fill_(float("nan"))
         replay()
         assert commit.emitted_count.eq(0).all()
         assert rng.target_offset.eq(0).all()
         assert state.generated_tokens.eq(1).all()
+        assert outputs.speculative_survival.eq(-1).all()
 
 
 @pytest.mark.parametrize("compiled", [False, True])
@@ -462,8 +467,9 @@ def test_fixed_graph_commits_bounded_prefixes_at_batch_four(compiled, bonus):
         target_valid=target_valid, token_limits=limits)
     verify.prepare()
     logits = torch.zeros((*inputs.shape, state.vocab_size), device=inputs.device)
+    outputs = completion_outputs(records)
     commit = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live,
-        completion_outputs(records), frame, sequence, rng=rng, token_limits=limits, logits=logits)
+        outputs, frame, sequence, rng=rng, token_limits=limits, logits=logits)
     commit.prepare()
     restore = snapshot(state)
 
@@ -485,3 +491,117 @@ def test_fixed_graph_commits_bounded_prefixes_at_batch_four(compiled, bonus):
         assert state.consumed_tokens.tolist() == [4, 3, 5, 6]
         assert state.pending_token.tolist() == [bonus] * 4
         assert records[0, :, 15].tolist() == [4] * 4
+        for row, slot in enumerate(slots.tolist()):
+            extent = int(limits[row]) - 1
+            assert outputs.speculative_survival[0, slot, :extent].eq(1).all()
+            assert outputs.speculative_survival[0, slot, extent:].eq(-1).all()
+
+
+@torch.no_grad()
+def test_compiled_survival_prefixes_remain_monotone_at_unit_ratios():
+    from ignition.preparation.compilation import compile_forward
+
+    args = tensors(4, 8)
+    state, slots, epochs, live, inputs, records, frame, sequence = args
+    drafts = inputs[:, 1:].contiguous()
+    draft_probs = torch.zeros((4, 7, VOCAB), device="cuda")
+    target_probs = torch.zeros((4, 8, VOCAB), device="cuda")
+    for column in range(7):
+        draft_probs[:, column, 4 + column] = .5
+        draft_probs[:, column, 100] = .5
+        target_probs[:, column, 4 + column] = .5
+        target_probs[:, column, 101] = .5
+    target_probs[:, -1, 102] = 1
+    rng = SpeculativeRngState.allocate("cuda")
+    verify = PreparedStochasticVerification(draft_probs, drafts, target_probs,
+        state, slots, epochs, live, rng=rng)
+    verify.prepare()
+    ratios = torch.rand((32, 4, 7), generator=torch.Generator().manual_seed(13))
+    ratios[:, :, 3:] = 1
+    def run():
+        verify()
+    compiled = compile_forward(run)
+    with captured(compiled, (*args, verify, rng), {"survival": verify.output.survival}) as replay:
+        for values in ratios:
+            for column in range(7):
+                probability = values[:, column].to("cuda") * .5
+                target_probs[:, column, 4 + column] = probability
+                target_probs[:, column, 101] = 1 - probability
+            replay()
+            actual = verify.output.survival.cpu()
+            assert verify.output.valid.all()
+            assert torch.isfinite(actual).all() and ((actual >= 0) & (actual <= 1)).all()
+            assert (actual[:, 1:] <= actual[:, :-1]).all(), actual
+            prefixes = [values[:, 0]]
+            for column in range(1, 7):
+                prefixes.append(prefixes[-1] * values[:, column])
+            torch.testing.assert_close(actual, torch.stack(prefixes, -1), rtol=0, atol=0)
+
+
+@torch.no_grad()
+def test_compiled_survival_feedback_censors_logical_tails_and_preserves_sampling():
+    from ignition.preparation.compilation import compile_forward
+
+    args = tensors(4, 4)
+    state, slots, epochs, live, inputs, records, frame, sequence = args
+    draft_probs = torch.zeros((4, 3, VOCAB), device='cuda')
+    target_probs = torch.zeros((4, 4, VOCAB), device='cuda')
+    drafts = inputs[:, 1:].contiguous()
+    for column in range(3):
+        draft_probs[:, column, 4 + column] = .5
+        draft_probs[:, column, 100] = .5
+        target_probs[:, column, 4 + column] = [.25, .375, .125][column]
+        target_probs[:, column, 101] = 1 - [.25, .375, .125][column]
+    target_probs[:, -1, 102] = 1
+    limits = torch.tensor([4, 2, 3, 4], device='cuda', dtype=torch.int32)
+    rng = SpeculativeRngState.allocate('cuda')
+    verify = PreparedStochasticVerification(draft_probs, drafts, target_probs,
+        state, slots, epochs, live, rng=rng, token_limits=limits)
+    verify.prepare()
+    outputs = completion_outputs(records)
+    logits = torch.zeros((*inputs.shape, state.vocab_size), device='cuda')
+    commit = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live,
+        outputs, frame, sequence, rng=rng, token_limits=limits, logits=logits)
+    legacy = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live,
+        replace(outputs, speculative_survival=None), frame, sequence, rng=rng,
+        token_limits=limits, logits=logits)
+    commit.prepare(); legacy.prepare()
+    restore_state = snapshot(state)
+    def restore():
+        restore_state()
+        rng.generation.zero_(); rng.target_offset.zero_()
+    def run():
+        verify(); commit()
+    def run_legacy():
+        verify(); legacy()
+    compiled, baseline = compile_forward(run), compile_forward(run_legacy)
+    expected = torch.tensor([.5, .375, .09375], device='cuda')
+    with captured(compiled, (*args, verify, commit, rng), {'records': records}, restore) as replay:
+        for case in ('ordinary', 'inactive', 'terminal', 'reused_slot'):
+            restore()
+            if case == 'inactive': live[0] = 2
+            else: live[0] = 4
+            if case == 'terminal':
+                state.eos_count.fill_(1)
+                state.eos_token_ids[:, 0] = 4
+            if case == 'reused_slot': state.generation[slots[0]] += 1
+            before = snapshot(state)
+            replay()
+            actual_records = records.clone()
+            actual_state = {name: getattr(state, name).clone() for name in state.__dataclass_fields__}
+            actual_rng = rng.target_offset.clone()
+            feedback = outputs.speculative_survival[0].clone()
+            for row, slot in enumerate(slots.tolist()):
+                record = records[0, slot].tolist()
+                active = row < int(live[0]) and (case != 'reused_slot' or row != 0)
+                extent = min(int(limits[row]) - 1, record[9] if record[8] > record[10] else record[10]) if active else 0
+                torch.testing.assert_close(feedback[slot, :extent], expected[:extent], rtol=0, atol=0)
+                assert feedback[slot, extent:].eq(-1).all()
+            before()
+            rng.generation.zero_(); rng.target_offset.zero_()
+            baseline()
+            torch.cuda.synchronize()
+            assert torch.equal(records, actual_records)
+            assert torch.equal(rng.target_offset, actual_rng)
+            for name, value in actual_state.items():
+                assert torch.equal(getattr(state, name), value), name

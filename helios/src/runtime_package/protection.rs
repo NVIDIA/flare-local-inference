@@ -210,6 +210,36 @@ pub struct AuthorizedPackage {
     pub(super) archive: Archive,
     pub(super) index: wire::ModelIndex,
 }
+fn publisher_profiles(publishers: &[Publisher]) -> Result<Vec<Publisher>> {
+    let mut profiles = super::publishers::embedded()?;
+    for publisher in publishers {
+        publisher.validate()?;
+        if let Some(previous) = profiles
+            .iter()
+            .find(|p| p.public_key == publisher.public_key)
+        {
+            if previous != publisher {
+                return Err(invalid("conflicting identities for the same publisher key"));
+            }
+        } else {
+            profiles.push(publisher.clone());
+        }
+    }
+    Ok(profiles)
+}
+
+/// Authenticate exact envelope bytes against publisher profiles without opening payload files.
+/// The payload length is the signed logical primary-file extent.
+pub fn verify_package_metadata(
+    bytes: &[u8],
+    publishers: &[Publisher],
+    payload_length: u64,
+) -> Result<(wire::ModelIndex, Publisher)> {
+    let profiles = publisher_profiles(publishers)?;
+    let (protection, index) = Protection::verify(bytes, &profiles, payload_length, None)?;
+    Ok((index, protection.publisher))
+}
+
 impl VerifiedPackage {
     pub(super) fn verified_rank(&self) -> Option<usize> {
         self.archive.protection.rank
@@ -218,20 +248,7 @@ impl VerifiedPackage {
     /// Authenticate the package's index and publisher binding, for every rank or only `rank` of
     /// a multi-host package, which a copy holding that rank's bytes alone verifies completely.
     pub fn open(path: &Path, publishers: &[Publisher], rank: Option<usize>) -> Result<Self> {
-        let mut profiles = super::publishers::embedded()?;
-        for publisher in publishers {
-            publisher.validate()?;
-            if let Some(previous) = profiles
-                .iter()
-                .find(|p| p.public_key == publisher.public_key)
-            {
-                if previous != publisher {
-                    return Err(invalid("conflicting identities for the same publisher key"));
-                }
-            } else {
-                profiles.push(publisher.clone());
-            }
-        }
+        let profiles = publisher_profiles(publishers)?;
         let (archive, index) = Archive::open(path, &profiles, rank)?;
         let publisher = archive.protection.publisher.clone();
         let official_source = archive.protection.official_source.clone();

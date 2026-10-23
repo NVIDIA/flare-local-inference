@@ -94,7 +94,6 @@ def _peer(parent, snapshot, config, rank, rendezvous, connection, control, prepa
             _, path, options, cache = command
             dist.barrier()
             storage.peer_storage.reset()
-            torch.cuda.synchronize()
             dist.barrier()
             with export_options(cache.cache, no_weights=cache.no_weights) if cache else nullcontext():
                 package = export_model(model, recorder, storage, path, options=options, sources=True)

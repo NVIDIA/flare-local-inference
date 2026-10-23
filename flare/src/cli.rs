@@ -1,3 +1,4 @@
+use flare_helios::execution::roce_fabric::Shape;
 use std::{
     net::{IpAddr, SocketAddr},
     num::NonZeroUsize,
@@ -30,21 +31,20 @@ pub enum Command {
     Download(Download),
     /// Summarize a package's metadata, with optional memory, graph, and frontend details.
     Inspect(Inspect),
+    #[command(hide = true)]
+    HardwareRevision {
+        #[arg(value_parser = clap::value_parser!(i32).range(1..))]
+        gpu_count: i32,
+    },
     /// Run this host's agent, which pairs with controllers and supervises serving ranks.
     Agent(AgentArgs),
     /// Control an orbit of agents from this machine.
     Orbit(OrbitArgs),
     #[cfg(unix)]
     #[command(hide = true)]
-    CheckpointConnect {
+    CheckpointTransport {
         #[arg(long)]
-        grant: PathBuf,
-        #[arg(long)]
-        rank: usize,
-        #[arg(long)]
-        stream: usize,
-        #[arg(long)]
-        fd: i32,
+        socket: PathBuf,
     },
     /// Manage remembered publisher trust.
     Trust {
@@ -152,6 +152,17 @@ pub struct AgentArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum AgentCommand {
+    /// Pair this machine with resident agents for --hosts or Orbit launches.
+    Pair {
+        #[arg(required = true, value_name = "HOST")]
+        hosts: Vec<String>,
+        #[arg(long, value_name = "CODE")]
+        code: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        agents_file: Option<PathBuf>,
+        #[arg(long, value_name = "PATH")]
+        controller_key: Option<PathBuf>,
+    },
     /// Install and restart this host's agent service, and prepare controller pairing.
     Install {
         /// One-time code a controller presents to pair.
@@ -184,12 +195,6 @@ pub struct OrbitArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum OrbitCommand {
-    /// Internal Ignition request: sign a fabric route for an admitted checkpoint source.
-    #[command(hide = true)]
-    CheckpointRoute {
-        #[arg(long)]
-        cluster: Option<String>,
-    },
     /// Pair this controller with the agents on HOSTS.
     Pair {
         #[arg(required = true, value_name = "HOST")]
@@ -274,8 +279,12 @@ pub struct OrbitPush {
     #[arg(long)]
     pub roce_ring: bool,
 
-    /// Parallel TCP streams per destination file over the ring fabric [default: 8].
-    #[arg(long, value_name = "N", requires = "roce_ring", value_parser = clap::value_parser!(u8).range(1..=64))]
+    /// Stream package data through fabric interfaces along the target nodes' chain order.
+    #[arg(long, conflicts_with = "roce_ring")]
+    pub roce_chain: bool,
+
+    /// Parallel TCP streams per destination file over the fabric [default: 8].
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=64))]
     pub transfer_streams: Option<u8>,
 
     #[command(flatten)]
@@ -286,13 +295,20 @@ impl OrbitPush {
     /// What package verification and publisher acceptance need, as `flare run` takes them.
     pub fn run_args(&self) -> Run {
         Run {
-            package: PathBuf::from(&self.package),
+            package: Some(PathBuf::from(&self.package)),
             host: "127.0.0.1".parse().unwrap(),
             port: 8000,
             served_model_name: None,
             roce_ring: self.roce_ring,
+            roce_chain: self.roce_chain,
             rendezvous: None,
             rank: None,
+            hosts: Vec::new(),
+            agents_file: None,
+            controller_key: None,
+            transfer_streams: self.transfer_streams,
+            package_cache: None,
+            stage_only: false,
             api_key_file: None,
             scheduler_policy: "balanced".into(),
             serving: self.serving.clone(),
@@ -358,9 +374,14 @@ pub struct OrbitRun {
     #[arg(long, help_heading = "Multi-host options")]
     pub roce_ring: bool,
 
-    /// Parallel TCP streams per destination file over the ring fabric [default: saved group or 8].
+    /// Parallel TCP streams per destination file over the fabric [default: saved group or 8].
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=64), help_heading = "Multi-host options")]
     pub transfer_streams: Option<u8>,
+
+    /// Experimental chain in rank order: like --roce-ring, with no link between the first and
+    /// last rank; hosts cabled directly as a chain.
+    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    pub roce_chain: bool,
 
     /// IP address for rank zero's HTTP server [default: saved group or 127.0.0.1].
     #[arg(long, value_name = "ADDR", help_heading = "Serving options")]
@@ -390,19 +411,13 @@ pub struct OrbitRun {
 impl OrbitRun {
     /// Serving options every rank loads with.
     pub fn rank_options(&self, matches: &clap::ArgMatches) -> Vec<String> {
-        let mut options = self.serving.rank_options(self.roce_ring);
+        let mut options = self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain));
         // Explicit defaults must override saved values, while omitted defaults must not.
         if self.serving.kv_cache_limit == KvCacheLimit::Memory
             && matches.value_source("kv_cache_limit")
                 == Some(clap::parser::ValueSource::CommandLine)
         {
             options.extend(["--kv-cache-limit".into(), "memory".into()]);
-        }
-        if self.serving.embedding_table_cache_size == 0
-            && matches.value_source("embedding_table_cache_size")
-                == Some(clap::parser::ValueSource::CommandLine)
-        {
-            options.extend(["--embedding-table-cache-size".into(), "0".into()]);
         }
         options
     }
@@ -431,13 +446,20 @@ impl OrbitRun {
     /// The equivalent single-host arguments, for publisher trust resolution of the package.
     pub fn run_args(&self) -> Run {
         Run {
-            package: PathBuf::from(self.package.as_deref().unwrap_or_default()),
+            package: Some(PathBuf::from(self.package.as_deref().unwrap_or_default())),
             host: self.host.unwrap_or_else(|| "127.0.0.1".parse().unwrap()),
             port: self.port.unwrap_or(8000),
             served_model_name: self.served_model_name.clone(),
             roce_ring: self.roce_ring,
+            roce_chain: self.roce_chain,
             rendezvous: None,
             rank: None,
+            hosts: Vec::new(),
+            agents_file: None,
+            controller_key: None,
+            transfer_streams: self.transfer_streams,
+            package_cache: None,
+            stage_only: false,
             api_key_file: self.api_key_file.clone(),
             scheduler_policy: self
                 .scheduler_policy
@@ -465,8 +487,8 @@ pub enum TrustCommand {
 )]
 pub struct Run {
     /// Local prepared .safetensors package or Hugging Face ORG/NAME[@REVISION].
-    #[arg(value_name = "PACKAGE")]
-    pub package: PathBuf,
+    #[arg(value_name = "PACKAGE", required_unless_present = "rank")]
+    pub package: Option<PathBuf>,
 
     /// IP address for the HTTP server.
     #[arg(
@@ -495,6 +517,11 @@ pub struct Run {
     #[arg(long, help_heading = "Multi-host options")]
     pub roce_ring: bool,
 
+    /// Experimental chain in rank order: like --roce-ring, with no link between the first and
+    /// last rank; hosts cabled directly as a chain.
+    #[arg(long, conflicts_with = "roce_ring", help_heading = "Multi-host options")]
+    pub roce_chain: bool,
+
     /// Rank zero's rendezvous address: where rank zero listens, or on a peer, where it joins rank zero.
     #[arg(long, value_name = "HOST:PORT", help_heading = "Multi-host options")]
     pub rendezvous: Option<String>,
@@ -502,6 +529,45 @@ pub struct Run {
     /// This host's rank of a multi-host package.
     #[arg(long, value_name = "N", help_heading = "Multi-host options")]
     pub rank: Option<usize>,
+
+    /// Start peer ranks through paired agents, in rank order; rank zero runs locally.
+    #[arg(
+        long,
+        value_name = "HOST[,HOST...]",
+        value_delimiter = ',',
+        help_heading = "Multi-host options"
+    )]
+    pub hosts: Vec<String>,
+
+    /// Paired agent registry [default: ~/.config/flare/orbit.toml].
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "hosts",
+        help_heading = "Multi-host options"
+    )]
+    pub agents_file: Option<PathBuf>,
+
+    /// Paired controller key [default: ~/.config/flare/orbit/controller.key].
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "hosts",
+        help_heading = "Multi-host options"
+    )]
+    pub controller_key: Option<PathBuf>,
+
+    /// Parallel CX7 TCP streams per peer for package distribution [default: 8].
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(1..=64), help_heading = "Multi-host options")]
+    pub transfer_streams: Option<u8>,
+
+    /// Cache root for received rank packages [default: ~/.cache/flare].
+    #[arg(long, value_name = "PATH", help_heading = "Multi-host options")]
+    pub package_cache: Option<PathBuf>,
+
+    /// Distribute and verify rank packages, then exit before GPU initialization.
+    #[arg(long, help_heading = "Multi-host options")]
+    pub stage_only: bool,
 
     /// File containing the serving API key; omit to disable authentication.
     #[arg(long, value_name = "PATH", help_heading = "Serving options")]
@@ -545,8 +611,9 @@ pub struct ServingOptions {
     pub hub: HubOptions,
 
     /// GPUs in rank order, relative to CUDA_VISIBLE_DEVICES when set.
+    /// Omitted: the first N visible GPUs, where N is the package's local rank count.
     #[arg(long, value_name = "N[,N...]", value_delimiter = ',', action = clap::ArgAction::Set,
-        default_value = "0", value_parser = clap::value_parser!(i32).range(0..),
+        value_parser = clap::value_parser!(i32).range(0..),
         help_heading = "Serving options")]
     pub gpus: Vec<i32>,
 
@@ -585,10 +652,10 @@ pub struct ServingOptions {
             .map(|value| if value == "disk" { Storage::Disk } else { Storage::Ram }))]
     pub embedding_table_storage: Option<Storage>,
 
-    /// Per-host budget for a disk-backed embedding row cache, e.g. 1G; includes the
-    /// index, usage counters and miss workspace. Selects disk storage; 0 disables [default: 0].
-    #[arg(long, value_name = "SIZE", value_parser = parse_size, default_value = "0", help_heading = "Serving options")]
-    pub embedding_table_cache_size: u64,
+    /// Per-host RAM budget for disk-backed embedding rows, including index, counters and miss
+    /// workspace; 0 disables [default: 4GiB on discrete GPUs, 1GiB on unified-memory GPUs].
+    #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Serving options")]
+    pub embedding_table_cache_size: Option<u64>,
 
     /// Retain embedding scales in host RAM while weights remain on disk; adds to the row-cache budget.
     #[arg(long, help_heading = "Serving options")]
@@ -636,6 +703,11 @@ pub struct ServingOptions {
     )]
     pub no_mtp_adaptive_verification: bool,
 
+    /// Exponent on split-proposal prefix-survival scores; below 1 favors longer verification [default: 1.0].
+    #[arg(long, value_name = "ALPHA", value_parser = verification_alpha,
+        help_heading = "Advanced speculation options")]
+    pub mtp_adaptive_verification_alpha: Option<f64>,
+
     /// Host memory for prefix checkpoints and prepared inputs, e.g. 16G; 0 disables [default: disabled].
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_memory: Option<u64>,
@@ -663,6 +735,11 @@ fn served_model_name(value: &str) -> Result<String, String> {
     }
 }
 
+fn verification_alpha(value: &str) -> Result<f64, String> {
+    value.parse::<f64>().ok().filter(|v| v.is_finite() && *v > 0.0)
+        .ok_or_else(|| "adaptive verification alpha must be finite and greater than zero".into())
+}
+
 impl std::ops::Deref for Run {
     type Target = ServingOptions;
 
@@ -680,7 +757,7 @@ impl Run {
     /// graphs and capacities on every host.
     #[cfg(test)]
     pub fn rank_options(&self) -> Vec<String> {
-        self.serving.rank_options(self.roce_ring)
+        self.serving.rank_options(Shape::from_flags(self.roce_ring, self.roce_chain))
     }
 
     pub fn load_options(&self) -> LoadOptions {
@@ -689,8 +766,14 @@ impl Run {
 }
 
 impl ServingOptions {
+    pub fn select_gpus(&mut self, local_ranks: usize) {
+        if self.gpus.is_empty() {
+            self.gpus = (0..local_ranks as i32).collect();
+        }
+    }
+
     /// Serving options every rank of a multi-host package must load with.
-    pub fn rank_options(&self, roce_ring: bool) -> Vec<String> {
+    pub fn rank_options(&self, shape: Shape) -> Vec<String> {
         let mut options = Vec::new();
         if self.kv_cache_limit != KvCacheLimit::Memory {
             options.extend(["--kv-cache-limit".into(), self.kv_cache_limit.to_string()]);
@@ -698,8 +781,10 @@ impl ServingOptions {
         if let Some(limit) = self.memory_limit {
             options.push(format!("--memory-limit={limit}"));
         }
-        if roce_ring {
-            options.push("--roce-ring".into());
+        match shape {
+            Shape::Mesh => {}
+            Shape::Ring => options.push("--roce-ring".into()),
+            Shape::Chain => options.push("--roce-chain".into()),
         }
         if self.verify_weights {
             options.push("--verify-weights".into());
@@ -722,6 +807,9 @@ impl ServingOptions {
         if self.no_mtp_adaptive_verification {
             options.push("--no-mtp-adaptive-verification".into());
         }
+        if let Some(alpha) = self.mtp_adaptive_verification_alpha {
+            options.extend(["--mtp-adaptive-verification-alpha".into(), alpha.to_string()]);
+        }
         if let Some(storage) = self.embedding_table_storage {
             options.extend([
                 "--embedding-table-storage".into(),
@@ -736,14 +824,35 @@ impl ServingOptions {
         if let Some(workers) = self.embedding_table_workers {
             options.extend(["--embedding-table-workers".into(), workers.to_string()]);
         }
-        if self.embedding_table_cache_size != 0 {
+        if let Some(bytes) = self.embedding_table_cache_size {
             options.extend([
                 "--embedding-table-cache-size".into(),
-                self.embedding_table_cache_size.to_string(),
+                bytes.to_string(),
             ]);
         }
         if self.embedding_table_resident_scales {
             options.push("--embedding-table-resident-scales".into());
+        }
+        // Every rank keeps its own records under its host's directory; rank zero's store drives
+        // all of them, so every rank needs the same settings.
+        if let Some(bytes) = self.prefix_cache_memory {
+            options.extend(["--prefix-cache-memory".into(), bytes.to_string()]);
+        }
+        if let Some(directory) = &self.prefix_cache_disk {
+            options.extend(["--prefix-cache-disk".into(), directory.display().to_string()]);
+        }
+        if let Some(bytes) = self.prefix_cache_disk_limit {
+            options.extend(["--prefix-cache-disk-limit".into(), bytes.to_string()]);
+        }
+        if let Some(transport) = self.prefix_cache_disk_transport {
+            options.extend([
+                "--prefix-cache-disk-transport".into(),
+                match transport {
+                    Transport::Staged => "staged",
+                    Transport::Direct => "direct",
+                }
+                .into(),
+            ]);
         }
         options
     }
@@ -771,7 +880,7 @@ impl ServingOptions {
             } else {
                 None
             },
-            device_labels: Some(self.gpus.clone()),
+            device_labels: (!self.gpus.is_empty()).then(|| self.gpus.clone()),
             prefix_cache: PrefixCacheOffload {
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
@@ -801,6 +910,8 @@ mod tests {
                     "8000",
                     "--scheduler-policy",
                     "balanced",
+                    "--mtp-adaptive-verification-alpha",
+                    "1.0",
                     "--kv-cache-limit",
                     "memory",
                     "--embedding-table-cache-size",
@@ -832,6 +943,8 @@ mod tests {
                 "8001".into(),
                 "--scheduler-policy".into(),
                 "throughput".into(),
+                "--mtp-adaptive-verification-alpha".into(),
+                "0.5".into(),
                 "--kv-cache-limit".into(),
                 "context".into(),
                 "--embedding-table-cache-size".into(),
@@ -843,6 +956,7 @@ mod tests {
                 panic!()
             };
             assert_eq!(effective.port, if explicit { 8000 } else { 8001 });
+            assert_eq!(effective.mtp_adaptive_verification_alpha, Some(if explicit { 1.0 } else { 0.5 }));
             assert_eq!(
                 effective.host.to_string(),
                 if explicit { "127.0.0.1" } else { "0.0.0.0" }
@@ -861,7 +975,7 @@ mod tests {
             );
             assert_eq!(
                 effective.serving.embedding_table_cache_size,
-                if explicit { 0 } else { 1 << 30 }
+                Some(if explicit { 0 } else { 1 << 30 })
             );
             assert_eq!(
                 run_matches.value_source("gpus") == Some(clap::parser::ValueSource::CommandLine),
@@ -875,6 +989,30 @@ mod tests {
             panic!("expected run")
         };
         *args
+    }
+
+    #[test]
+    fn omitted_gpus_follow_package_ranks_and_explicit_selection_wins() {
+        for ranks in [1, 2, 4, 8, 16] {
+            let mut args = run(&["flare", "run", "model.safetensors"]);
+            assert!(args.gpus.is_empty());
+            args.serving.select_gpus(ranks);
+            let expected: Vec<_> = (0..ranks as i32).collect();
+            assert_eq!(args.gpus, expected);
+            assert_eq!(args.load_options().device_labels, Some(expected));
+        }
+        for (flag, expected) in [("0", vec![0]), ("3,1", vec![3, 1])] {
+            let mut args = run(&["flare", "run", "model.safetensors", "--gpus", flag]);
+            args.serving.select_gpus(4);
+            assert_eq!(args.gpus, expected);
+        }
+        let mut args = run(&["flare", "run", "model.safetensors"]);
+        args.serving.select_gpus(2);
+        assert_eq!(
+            crate::environment::visibility(&args.gpus, Some("4,7,5")).unwrap(),
+            "4,7"
+        );
+        assert!(crate::environment::visibility(&args.gpus, Some("4")).is_err());
     }
 
     #[test]
@@ -927,10 +1065,12 @@ mod tests {
         assert_eq!(args.bind_address().to_string(), "127.0.0.1:8000");
         assert_eq!(args.served_model_name, None);
         assert_eq!(args.scheduler_policy, "balanced");
+        assert_eq!(args.mtp_adaptive_verification_alpha, None);
         let options = args.load_options();
-        assert_eq!(options.device_labels, Some(vec![0]));
+        assert_eq!(options.device_labels, None);
         assert_eq!(options.embedding_table_storage, None);
-        assert_eq!(options.embedding_table_cache_bytes, 0);
+        assert_eq!(options.embedding_table_cache_bytes, None);
+        assert!(!args.rank_options().contains(&"--embedding-table-cache-size".to_owned()));
         assert_eq!(options.max_concurrency, None);
         assert_eq!(options.kv_cache_limit, KvCacheLimit::Memory);
         assert_eq!(options.memory_limit, None);
@@ -967,6 +1107,44 @@ mod tests {
     }
 
     #[test]
+    fn manual_peers_and_agent_launches_parse_without_orbit_configuration() {
+        let peer = run(&["flare", "run", "--rank", "2", "--rendezvous", "head:29800"]);
+        assert!(peer.package.is_none());
+        assert_eq!(peer.rank, Some(2));
+        let head = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--hosts",
+            "peer1,peer2,peer3",
+            "--transfer-streams",
+            "16",
+            "--stage-only",
+        ]);
+        assert_eq!(head.hosts, ["peer1", "peer2", "peer3"]);
+        assert_eq!(head.transfer_streams, Some(16));
+        assert!(head.stage_only);
+        assert!(Cli::try_parse_from(["flare", "run"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "flare",
+                "run",
+                "model.safetensors",
+                "--transfer-streams",
+                "0"
+            ])
+            .is_err()
+        );
+        assert!(matches!(
+            Cli::parse_from(["flare", "agent", "pair", "peer1", "--code", "join-code"]).command,
+            Command::Agent(AgentArgs {
+                command: Some(AgentCommand::Pair { .. }),
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn explicit_options_reach_the_loader() {
         let args = run(&[
             "flare",
@@ -994,7 +1172,7 @@ mod tests {
             "--prefix-cache-disk-transport",
             "direct",
         ]);
-        assert_eq!(args.package, PathBuf::from("model.safetensors"));
+        assert_eq!(args.package, Some(PathBuf::from("model.safetensors")));
         assert_eq!(args.bind_address().to_string(), "[::1]:8001");
         assert_eq!(args.api_key_file, Some(PathBuf::from("key.txt")));
         let options = args.load_options();
@@ -1037,6 +1215,20 @@ mod tests {
         assert_eq!(push.to, ["zero", "one", "two", "three"]);
         assert_eq!(push.transfer_streams, Some(8));
         assert!(push.run_args().roce_ring);
+        let arguments = ["flare", "orbit", "push", "model.safetensors", "--to", "zero,one,two"];
+        let parsed = Cli::try_parse_from([&arguments[..], &["--roce-chain"]].concat()).unwrap();
+        let Command::Orbit(OrbitArgs {
+            command: OrbitCommand::Push(push),
+            ..
+        }) = parsed.command
+        else {
+            panic!("expected prestaging command");
+        };
+        let run = push.run_args();
+        assert!(run.roce_chain && !run.roce_ring);
+        assert!(
+            Cli::try_parse_from([&arguments[..], &["--roce-chain", "--roce-ring"]].concat()).is_err()
+        );
     }
 
     #[test]
@@ -1095,7 +1287,7 @@ mod tests {
                 "--transfer-streams",
                 "4"
             ])
-            .is_err()
+            .is_ok()
         );
     }
 
@@ -1185,6 +1377,22 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_verification_alpha_is_validated_and_forwarded() {
+        for value in ["0.5", "1.0", "2.0"] {
+            let args = run(&["flare", "run", "model.safetensors", "--mtp-adaptive-verification-alpha", value]);
+            assert_eq!(args.mtp_adaptive_verification_alpha, Some(value.parse().unwrap()));
+            let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
+            forwarded.extend(args.rank_options());
+            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
+            assert_eq!(peer.mtp_adaptive_verification_alpha, args.mtp_adaptive_verification_alpha);
+        }
+        for value in ["0", "-0.5", "NaN", "inf", "-inf", "invalid"] {
+            assert!(Cli::try_parse_from(["flare", "run", "model.safetensors",
+                &format!("--mtp-adaptive-verification-alpha={value}")]).is_err());
+        }
+    }
+
+    #[test]
     fn last_verification_flag_wins() {
         let enable = "--mtp-adaptive-verification";
         let disable = "--no-mtp-adaptive-verification";
@@ -1244,20 +1452,55 @@ mod tests {
 
     #[test]
     fn embedding_row_cache_accepts_a_binary_memory_budget() {
+        for (size, bytes) in [("0", 0), ("1G", 1 << 30), ("4GiB", 4 << 30)] {
+            let args = run(&["flare", "run", "model.safetensors", "--embedding-table-cache-size", size]);
+            let options = args.load_options();
+            assert_eq!(options.embedding_table_cache_bytes, Some(bytes));
+            assert_eq!(options.embedding_table_storage, None);
+            assert_eq!(args.rank_options(), ["--embedding-table-cache-size".to_owned(), bytes.to_string()]);
+            let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
+            forwarded.extend(args.rank_options());
+            let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else { panic!() };
+            assert_eq!(peer.load_options().embedding_table_cache_bytes, Some(bytes));
+        }
+    }
+
+    #[test]
+    fn prefix_cache_settings_reach_every_rank() {
         let args = run(&[
             "flare",
             "run",
             "model.safetensors",
-            "--embedding-table-cache-size",
-            "1G",
+            "--prefix-cache-memory",
+            "0",
+            "--prefix-cache-disk",
+            "/var/cache/flare",
+            "--prefix-cache-disk-limit",
+            "100G",
+            "--prefix-cache-disk-transport",
+            "staged",
         ]);
-        let options = args.load_options();
-        assert_eq!(options.embedding_table_cache_bytes, 1 << 30);
-        assert_eq!(options.embedding_table_storage, None);
+        let options = args.rank_options();
         assert_eq!(
-            args.rank_options(),
-            ["--embedding-table-cache-size", "1073741824"]
+            options,
+            [
+                "--prefix-cache-memory",
+                "0",
+                "--prefix-cache-disk",
+                "/var/cache/flare",
+                "--prefix-cache-disk-limit",
+                "107374182400",
+                "--prefix-cache-disk-transport",
+                "staged",
+            ]
         );
+        let mut forwarded = vec!["flare", "run", "model.safetensors"];
+        forwarded.extend(options.iter().map(String::as_str));
+        assert_eq!(
+            run(&forwarded).load_options().prefix_cache,
+            args.load_options().prefix_cache
+        );
+        assert!(run(&["flare", "run", "model.safetensors"]).rank_options().is_empty());
     }
 
     #[test]
@@ -1265,7 +1508,7 @@ mod tests {
         let args = run(&["flare", "run", "model.safetensors", "--embedding-table-resident-scales",
                          "--embedding-table-cache-size", "1G"]);
         assert!(args.load_options().embedding_table_resident_scales);
-        assert_eq!(args.load_options().embedding_table_cache_bytes, 1 << 30);
+        assert_eq!(args.load_options().embedding_table_cache_bytes, Some(1 << 30));
         assert!(args.rank_options().contains(&"--embedding-table-resident-scales".to_owned()));
         assert!(!run(&["flare", "run", "model.safetensors"]).load_options().embedding_table_resident_scales);
     }

@@ -6,7 +6,6 @@ import json
 from dataclasses import dataclass, replace
 from functools import partial
 from pathlib import Path
-from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 
 import torch
@@ -47,7 +46,7 @@ from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
-from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
@@ -74,6 +73,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = tuple(range(8))
     context: int = 1048576
@@ -120,6 +120,7 @@ class PreparationConfig:
 
 
 @torch.no_grad()
+@with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage):
     from .recipe import RECIPE
 
@@ -174,7 +175,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "quantization": weights.config.quantization, "headers": headers, "world_size": shard.world_size,
             "contract": "step5.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             device=device, checkpoint=identity, workload_schema="step5",
             numerical_policy="default", coordinator=coordinator, headroom_bytes=config.headroom_bytes,
             benchmark_storage=package_storage)
@@ -302,12 +303,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
     release_unused()
-    from .frontend import inference_template
-    frontend_assets = TemporaryDirectory(prefix="flare-step5-frontend-")
-    template = Path(frontend_assets.name) / "chat_template.jinja"
-    template.write_text(inference_template(snapshot))
-    assets = {role: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-              for role, path in (("tokenizer", snapshot / "tokenizer.json"), ("chat_template", template))}
+    from .frontend import runtime_assets
+    assets = runtime_assets(snapshot)
     frontend = prepare_frontend(snapshot, eos_token_ids=weights.config.text["eos_token_id"])
     frontend["image"] = {"step": {}}
     server_config = {"identity": identity, "model_id": snapshot.name, "max_sequence_tokens": config.context,
@@ -359,5 +356,5 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                            *storage_ranges(disposable), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, *channels,
-                   vision_inputs, vision_prefill, vision_state, vision_storage, scratch_pool, graph_buffers, private_buffers, speculation, frontend_assets),
+                   vision_inputs, vision_prefill, vision_state, vision_storage, scratch_pool, graph_buffers, private_buffers, speculation),
         close_resources=(*channels, *((scoring,) if scoring is not None else ())))

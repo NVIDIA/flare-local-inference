@@ -62,7 +62,7 @@ def test_verification_keeps_prefix_width_separate_from_total_rows(monkeypatch):
         GraphSignature('decode',4,1,packed_token_capacity=4)
 
 
-def test_diagnostic_manifest_preserves_selectable_proposal_depths(monkeypatch):
+def test_execution_manifest_preserves_declared_legacy_producer_geometry(monkeypatch):
     signatures = {f"proposal{width}": GraphSignature("proposal", 4, width, ("tokens",),
                   speculation_enabled=True) for width in (2, 4, 6)}
     execution = _execution(graphs={name: object() for name in signatures}, signatures=signatures)

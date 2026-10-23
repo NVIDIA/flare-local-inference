@@ -1,14 +1,29 @@
-# Multi-host serving with Orbit
+# Multi-host serving
 
 Flare can serve one prepared model across several DGX Sparks. Each host runs
 one tensor-parallel rank; rank zero serves the HTTP API and coordinates its
 peers. The package fixes the rank count and GPU architecture.
 
-Orbit starts and manages those ranks. Every serving host runs `flare agent`,
-including rank zero's host. A controller runs `flare orbit` to pair hosts,
-select GPUs, distribute package data, and manage groups. It needs no model GPU
-and can have a different CPU architecture from the nodes. Orbit commands are
-implemented in Unix builds; Windows builds reject them.
+Serving ranks own package distribution and collective rendezvous. Choose how to
+launch them:
+
+| Mode | Command | Process ownership |
+| --- | --- | --- |
+| Manual | `flare run PACKAGE --rank 0 --rendezvous ZERO:PORT`, then `flare run --rank R --rendezvous ZERO:PORT` on each peer | Operator starts every rank |
+| Agent-assisted | `flare run PACKAGE --hosts PEER1,PEER2,...` on rank zero | Local rank zero starts ordered peers through paired agents |
+| Orbit | `flare orbit run PACKAGE` | Orbit places and supervises every rank through agents |
+
+All three modes use the same native package receiver and CX7 transport. Orbit
+adds placement, saved groups, detached operation, and monitoring. Its controller
+needs no model GPU and can have a different CPU architecture from the nodes.
+
+Graph input uploads use rank-control packets of at most 64 MiB. Larger input
+sets are split on tensor-element boundaries, with the total bytes bounded by
+the prepared input-frame extent. Each peer validates the complete upload set
+before acknowledging readiness; graph replay begins only after every rank is
+ready. Small input sets use one packet. Serving builds must agree on the rank
+control protocol version; changing packet framing does not require package
+re-export.
 
 This guide covers setup and operation. The [Orbit reference](orbit.md) defines
 placement, persistent groups, caching, and the protocol. To create a package,
@@ -34,22 +49,76 @@ needs only Flare, the driver, and the package.
 | Connection | Destination | Port |
 | --- | --- | --- |
 | Agent control and package transfer | Every agent, reachable from the controller and source/peer nodes | TCP 29900 by default |
+| Serving package payloads | Serving ranks' CX7 interfaces | Dynamically allocated TCP listener per rank |
 | Serving rendezvous | Rank zero, reachable from every peer | TCP 29800 for Orbit launches |
+| Host prefix record service | Rank zero, reachable from every peer | Dynamically allocated TCP listener per launch; peers connect during startup when a disk prefix cache is configured |
 | HTTP API | Rank zero, reachable from clients | TCP 8000 in this guide |
 | Ignition preparation rendezvous | Preparation rank zero | The selected port; examples use TCP 29630 |
 | Ignition preparation coordination | Preparation hosts | Additional dynamically allocated TCPStore and Gloo ports |
+| Ignition checkpoint and export payloads | Preparation hosts' CX7 interfaces | Dynamically allocated TCP listener per rank |
 
-Agent control uses encrypted TCP to the addresses recorded at pairing.
-With `orbit run --roce-ring` or `orbit push --roce-ring`, package transfers use
-TCP on the discovered RoCE interfaces, with agents relaying non-neighbor data
-through the ring. Each agent must listen on its fabric addresses as well as its
-management address. Other package transfers use the paired addresses. Model
-collectives use RDMA. Flare does not configure interfaces, addresses, host routes,
-switches, or firewalls. See [fabric TCP transfers](orbit.md#package-transfers-through-ring-interfaces).
+Agent control uses encrypted TCP to the addresses recorded at pairing. Serving
+ranks distribute package payloads through dynamically allocated TCP listeners on
+the discovered CX7 interfaces. Direct mode connects to each peer; `--roce-ring`
+relays non-neighbor data through the ring, and `--roce-chain` along a chain. Serving distribution uses plain TCP
+on the dedicated cluster fabric, with package signature verification and
+publisher acceptance before GPU loading. It requires no route keys or agents.
+Model collectives use RDMA. Agent-based prestaging with `orbit push` uses the
+agents' existing authenticated sessions and signed grants; those agents must
+also listen on their fabric addresses. Flare does not configure interfaces,
+addresses, routes, switches, or firewalls.
 
 The serving ranks select up to two rails per peer from active devices. The
 package does not pin the physical fabric used during preparation. For direct
 cabling and neighbor forwarding, see [experimental rings](#experimental-rings).
+
+## Manual serving
+
+Rank zero holds the complete primary and companion files. Start a two-host
+package as follows, using the same serving options on both hosts:
+
+```sh
+# Rank zero on maxwell
+flare run /data/model.safetensors --rank 0 --rendezvous maxwell:29800
+
+# Rank one on hertz; the package is fetched from rank zero
+flare run --rank 1 --rendezvous maxwell:29800
+```
+
+For a ring, add `--roce-ring` on rank zero and start every peer with its physical
+rank number. Rank zero sends the routing mode to peers. `--transfer-streams N`
+on rank zero selects 1..64 TCP streams per peer, default 8, across available CX7
+rails. A peer with a complete local rank copy can supply its package path;
+Flare verifies that its export matches rank zero's.
+
+Received files contain only the rank's required ranges. Flare verifies their
+stored data, reuses verified cache entries, and keeps relays alive until every
+rank has finished receiving. `--package-cache PATH` selects a receiver's cache
+root, default `~/.cache/flare`. `--stage-only` on rank zero distributes and
+verifies packages, then exits all ranks before GPU loading. Manual ranks apply
+normal publisher trust independently; unattended first use requires the exact
+publisher key and namespace acceptance flags described in the CLI reference.
+
+## Launch peers through agents
+
+Install an agent on each peer and pair it from the head node:
+
+```sh
+flare agent pair hertz --code CODE_FROM_HERTZ
+flare run /data/model.safetensors --hosts hertz
+```
+
+`--hosts` lists peers only, in rank order; the local process is rank zero.
+Names or addresses must match paired agent records. The head node needs no
+agent, cluster definition, or saved group. Peer processes use the executable
+running their agents. The default rendezvous is the head node's address toward
+the first peer on port 29800; `--rendezvous HOST:PORT` overrides it.
+
+Pairing shares the node registry and controller key with Orbit, so existing
+pairings work in both modes. `--agents-file PATH` and `--controller-key PATH`
+select those files when their default paths are unsuitable. The local process
+forwards peer output and owns the launch lifetime; after local serving drains,
+it waits for peer exits. Use Orbit for detached groups.
 
 ## One-time setup: the Flare agent
 
@@ -129,8 +198,8 @@ or a key filename. See [controller-set management](orbit.md#controller-set).
 Orbit accepts a Hugging Face repository `ORG/NAME[@REVISION]`, a local primary
 path, or `NODE:/absolute/path`, where NODE is a paired node's name. Repository
 packages download on a candidate node, keeping the full package off the
-controller. A source node reads its package in place; other hosts receive
-their required data through the agents.
+controller. The source node reads its package in place. Orbit stages the complete package
+on rank zero when needed; serving ranks then distribute peer shards.
 
 For a package published on Hugging Face, launch from its repository:
 
@@ -185,9 +254,9 @@ Provision the same preparation token on every host before starting. Set
 `[preparation] checkpoint_token_file` in `~/.config/flare/config.toml`, or use
 its default `~/.config/flare/agent.token`. The file needs identical contents of
 at least 32 random bytes and mode `600` on each host. This token is separate
-from Orbit identities. The default rendezvous checkpoint transfer authenticates
-its bytes without encryption. With `--roce-ring`, checkpoint tensor ranges use
-encrypted TCP through the paired Flare agents on the RoCE interfaces.
+from Orbit identities. Checkpoint and export frames use that token for
+authentication without encryption. Payloads travel through rank-owned helpers on the CX7 interfaces,
+using direct peer connections or ring relays selected by `--roce-ring`.
 
 The example prepares GLM-5.3 Flash on two Sparks. Run from each checkout root.
 On `maxwell`, whose preparation address is `10.200.0.12`, select an unused output:
@@ -209,26 +278,27 @@ admits each peer once, serves checkpoint metadata and selected byte ranges,
 and coordinates preparation. Peers do not create full checkpoint shards.
 Keep checkpoint source files unchanged during loading.
 
-For a physical ring, add `--roce-ring --cluster NAME` to rank zero's export or
-serve command. The Orbit cluster must list exactly the participating hosts in
-preparation rank order, including rank zero; admission checks each rank's GPU
-UUID against its paired agent. `--orbit-file PATH` selects the controller
-configuration, and `--key-file PATH` selects its signing key.
-All hosts need Flare executables and paired agents from the same revision.
-Ignition finds Flare on `PATH` or at `flare/target/release/flare`;
-the agents must listen on their fabric interfaces. Peers connect using
-`ignition join`; rank zero supplies their signed fabric route during admission.
+For a physical ring, add `--roce-ring` to rank zero's export or serve command;
+for hosts cabled as a chain with no link between the first and last rank, add
+`--roce-chain` instead. The peers' `--rank` values define physical order. Preparation does not
+require Orbit agents, pairing, a cluster file, or controller keys. Every rank
+starts one native helper, exchanges its discovered fabric endpoints through
+the rendezvous, and keeps the helper alive while dependent transfers run.
+All hosts need matching Flare executables and preparation sources. Ignition
+finds Flare on `PATH` or at `flare/target/release/flare`; check for stale installed
+executables. Direct connections between two Sparks and switched fabrics use
+peer-to-peer CX7 TCP without `--roce-ring`.
 
 Checkpoint loading uses eight TCP streams per peer by default. Select 1 through
-64 with `--transfer-streams N`. Streams alternate between the neighbor rails.
-Each peer receives its requested ranges along the shortest path from rank zero;
-equal-length paths follow increasing rank numbers, wrapping at the rank count.
-Each hop binds and checks the signed fabric IPs. A failed fabric channel ends
+64 with `--transfer-streams N`. Streams alternate between available rails.
+Direct topology sends each peer its requested ranges directly. Ring topology uses the shortest path from rank
+zero; equal-length paths follow increasing rank numbers, wrapping at the rank count.
+Each hop binds and checks the exchanged fabric IPs. A failed fabric channel ends
 preparation instead of retrying through management.
 Admission metadata and coordination use the rendezvous connection.
 Export retains the authenticated fabric channels after checkpoint reads drain:
-peers send missing prepared payload files back through the same ring hops and
-rails. Rank zero receives from all peers concurrently, with one file per stream
+peers send missing prepared payload files back through the same direct connections
+or ring hops and rails. Rank zero receives from all peers concurrently, with one file per stream
 and bounded 4 MiB frames. Each received file is hashed and published atomically.
 On failure, sibling connections are aborted and workers are joined; incomplete
 files are never published. Export manifests and cache requests use the
@@ -290,6 +360,31 @@ The example binds all interfaces on Maxwell:
 curl -fsS http://maxwell:8000/health
 ```
 
+`--prefix-cache-disk DIR --prefix-cache-disk-limit SIZE --prefix-cache-memory 0`
+keep published prefix checkpoints on every host's disk. Each rank writes its
+own share of a record under `DIR` on its host; rank zero indexes, sizes, and
+evicts every record and drives each peer's copies. Give every rank the same
+settings: startup fails when one rank has a store and another does not. A
+memory tier cannot span hosts, so a nonzero `--prefix-cache-memory` is
+rejected.
+
+The effective limit is the smallest limit among the ranks, because every host
+must hold the same records. When the limit is omitted, each host derives one
+tenth of its own free space and the ranks use the smallest of those values; the
+startup line reports the limit each rank uses.
+
+A rank's record connection carries every store, fetch, truncate, and unlink. If
+it fails while a job is outstanding, the ranks stop serving rather than
+continue with a cache they can no longer account for, and the waiting request
+fails. Restart the group after a record-connection failure.
+
+The startup phase `Join host prefix stores` reports how many records every rank
+holds. In `/metrics`, `flare_host_cache_stored_total` counts copy-outs,
+`flare_host_cache_hits_total` counts restores, and
+`flare_host_cache_reused_tokens_total` counts the tokens those restores
+covered. See
+[prefix cache offload](prefix-cache-offload.md#214-ranks-on-separate-hosts).
+
 A printed URL or successful `--detach` means rank processes started; wait for
 a successful health response before sending inference requests. The default
 HTTP bind is `127.0.0.1` on rank zero, so remote clients need an appropriate
@@ -349,20 +444,6 @@ its service. The systemd service may restart a failed agent, but agents do not
 restore the rank processes it previously supervised. After updating all nodes,
 check `orbit status` and restart saved groups explicitly.
 
-### Start ranks manually
-
-Manual startup requires the executable, each rank's package data, and publisher
-trust on each host. Start rank zero with `--rank 0 --rendezvous 0.0.0.0:29800`.
-Start a peer with its rank and rank zero's reachable address:
-
-```sh
-flare run /data/flare-runtime/glm53-spark-tp2.safetensors \
-  --rank 1 --rendezvous 10.200.0.12:29800 --gpus 0
-```
-
-Use matching serving options on every rank. Processes started this way are not
-Orbit groups; file distribution and process management belong to the operator.
-
 ## Failures
 
 | Error or symptom | Check |
@@ -390,4 +471,5 @@ not retry it automatically.
 `--roce-ring` connects neighbors in selected rank order and uses native CPU relays
 for other destinations. Transport supports 2 through 16 ranks, subject to each
 recipe's supported sizes. Four-Spark transport checks pass; physical ring cabling
-and full-model ring serving remain unqualified. See [RoCE ring transport](roce-ring.md).
+and full-model ring serving remain unqualified. `--roce-chain` uses the same relays
+over a chain with open ends. See [RoCE ring transport](roce-ring.md).

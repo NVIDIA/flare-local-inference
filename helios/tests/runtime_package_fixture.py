@@ -83,11 +83,6 @@ def _prepare(root, images, shard_size):
     function = int(params.func)
     status, symbol = cuda.cuFuncGetName(params.func)
     assert not status
-    assert len({image.cubin for image in images.images if symbol + b"\0" in image.cubin}) >= 2
-    def module_image(function):
-        from ignition.preparation.runtime_package import _Cuda
-        return images.image_for(_Cuda(), int(function))
-    modules = {"dense": module_image(params.func), "fill": module_image(fill.func)}
     pointers = C.cast(params.kernelParams, C.POINTER(C.c_void_p))
     sizes = []
     for index in range(64):
@@ -126,7 +121,7 @@ def _prepare(root, images, shard_size):
                              relocations=storage_relocations.get(name, ()))
                    for name, tensor in tensors.items()]
     fill_arguments = (Argument(4), Argument(2), Argument(8, (Relocation(0, reference("scratch")),)))
-    package = RuntimePackage(allocations=allocations, modules=modules,
+    package = RuntimePackage(allocations=allocations, modules={}, recorder=images.native,
                              kernels=[Kernel(function, "dense", tuple(arguments)),
                                       Kernel(int(fill.func), "fill", fill_arguments)],
                              owners=(gemm, tensors))
@@ -144,8 +139,7 @@ def _prepare(root, images, shard_size):
         "modified_outputs": {f"rows_{rows}": f"modified-{rows}.bin" for rows in (32, 64)},
         "pointers": [{"allocation": ref.allocation, "offset": ref.offset} for ref in table_targets],
     }))
-    print(f"exported {len(graphs)} b12x graphs and {len(allocations)} allocations; "
-          f"cubins={sum(map(len, modules.values()))} bytes", flush=True)
+    print(f"exported {len(graphs)} b12x graphs and {len(allocations)} allocations", flush=True)
 
 
 if __name__ == "__main__":

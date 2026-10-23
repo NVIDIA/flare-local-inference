@@ -1,7 +1,8 @@
 # Orbit
 
 Orbit pairs a controller with Flare agents, places prepared models on their
-GPUs, distributes package data, and starts and supervises serving groups.
+GPUs, places source packages, and starts and supervises serving groups.
+Native serving ranks distribute peer shards through the shared CX7 transport.
 The controller runs `flare orbit`; each serving host runs `flare agent`.
 The controller needs no model GPU and may use a different CPU architecture
 from the serving hosts. Orbit is implemented in Unix builds; Windows builds
@@ -23,6 +24,7 @@ processes to hosts and authenticates control and file-transfer requests.
 | Command | Where | Effect |
 | --- | --- | --- |
 | `flare agent install [--join-code CODE] [--accept-first] [--listen ADDR]` | Node | Installs the executable copy and user unit, restarts the service, requests linger, and prints pairing details |
+| `flare agent pair HOST... [--code CODE]` | Head or controller | Pairs the shared agent identities without a cluster definition |
 | `flare agent reset` | Node | Removes authorized controllers; the node becomes unpaired |
 | `flare agent --listen ADDR` | Node | Runs the service (the unit's command) |
 | `flare orbit pair HOST... [--code CODE]` | Controller | Pairs and records nodes |
@@ -38,8 +40,10 @@ processes to hosts and authenticates control and file-transfer requests.
 | `flare orbit push PACKAGE --to NODE,...` | Controller | Stages package data without starting ranks |
 | `flare orbit packages [--cluster NAME]` | Controller | Every node's cache directories with their verification state |
 
-`flare run --rank R --rendezvous ADDR` starts an operator-managed rank on a
-host that already holds its executable and package. Preparation uses
+`flare run --rank R --rendezvous ADDR` starts an operator-managed peer and
+receives its package from rank zero. `flare run PACKAGE --hosts PEER,...` starts
+ordered peer agents while rank zero runs locally. Neither form needs Orbit
+placement, cluster definitions, or saved groups. Preparation uses
 `ignition export` and `ignition join` with its separate
 `[preparation] checkpoint_token_file`; see [multi-host preparation](multi-host.md#prepare-the-package).
 
@@ -198,12 +202,11 @@ sequenceDiagram
         C->>P: PUT executable (if not cached)
     end
     C->>Z: PUT package (if the controller holds it)
-    C->>P: TRANSFER grant, source = rank zero, rank ranges
-    P->>Z: FETCH grant, ranges
-    Z-->>P: bytes
-    P-->>C: OK
-    C->>Z: RUN grant, rank 0
+    C->>Z: RUN grant, rank 0, complete package
     C->>P: RUN grant, rank 1
+    P->>Z: Serving rendezvous and fabric endpoints
+    Z-->>P: Required shard ranges over CX7
+    P->>Z: Package verified, ready for capacity agreement
     Z-->>C: LOG …
     P-->>C: LOG …
 ```
@@ -246,15 +249,17 @@ sequenceDiagram
    it on subsequent launches. If a node does not advertise an installed
    executable, the controller refuses the default launch before transferring
    package data and asks for an agent update or an explicit override.
-5. The source is the node named by `NODE:PATH`, or rank zero after the controller
-   uploads a local package. Rank zero needs a complete package. Other nodes
-   fetch their rank's required files and ranges from the source in parallel.
-   Fetched data is verified against the signed index and marked in the cache;
-   later launches reuse verified entries. See [package caching](#package-caching).
+5. Rank zero needs the complete package. It reads a source already on its host
+   in place; otherwise the agents stage the complete source there. The controller
+   uploads a controller-local package to rank zero. Peer shards are received by
+   serving bootstrap after rank processes start.
 6. The controller sends RUN to every node, rank zero first. Rank zero's agent
    starts `flare run PACKAGE --rank 0 --rendezvous 0.0.0.0:PORT` with the
    grant's serving options and HTTP bind; peers start with `--rank R
-   --rendezvous ZERO:PORT`.
+   --rendezvous ZERO:PORT` without a package argument. Serving ranks exchange CX7
+   endpoints, then receive missing files and ranges through parallel streams.
+   They verify stored data and publisher trust before capacity agreement and GPU
+   loading. Verified cache entries are shared with `orbit push` and manual runs.
 7. The controller prints rank zero's HTTP address and, unless `--detach` was
    given, follows output with `[rank R name]` prefixes. Process startup does not
    establish HTTP readiness: wait for the serving message or a successful
@@ -434,7 +439,7 @@ selected rank order.
 
 ## Package caching
 
-The agent uses `~/.cache/flare` in its service account:
+Agents and native serving receivers share `~/.cache/flare` in their account:
 
 | Location | Contents |
 | --- | --- |
@@ -464,7 +469,9 @@ Verification failure removes the package directory. Data sent directly by an
 authorized controller is not given that marker by PUT. `--verify-weights` asks
 each serving rank to digest its stored data during loading as well.
 
-Transfer sessions and running groups pin cache entries. Receiving files can
+Transfer sessions and running groups pin cache entries. Native receivers hold
+file locks through serving, preventing agent eviction or concurrent replacement
+of active rank packages. Receiving files can
 evict unpinned executable overrides or package directories, but keeps reusable
 blobs. Group-history pruning and `orbit rm` remove neither packages nor blobs.
 The agent has no blob garbage-collection command; package-directory eviction
@@ -472,7 +479,7 @@ alone may reclaim little space when hardlinks still exist in the blob store.
 
 ## Prestaging
 
-`flare orbit push PACKAGE --to NODE,... [--roce-ring]` places a package on nodes ahead of
+`flare orbit push PACKAGE --to NODE,... [--roce-ring | --roce-chain]` places a package on nodes ahead of
 any launch. It starts no ranks and sends no executable. With one node per
 multi-host rank, the first node receives the complete package and each peer
 receives its rank's data, in the
@@ -542,23 +549,29 @@ so a record carries at most 65519 plaintext bytes. A frame is a tag byte, a
 little-endian `u64` body length, and the body; its header starts a record and
 the body continues across as many records as its length needs, so a PUT or
 FETCH body of hundreds of gigabytes is one frame. Each connection encrypts on
-one thread. Ring transfers use multiple independent connections per destination
+one thread. Fabric transfers use multiple independent connections per destination
 file, and transfers to different nodes also run in parallel.
 
 After the handshake the agent classifies the remote key as an authorized
 controller, a node named in an active grant, or unknown. Unknown keys may only
 pair.
 
-### Package transfers through ring interfaces
+### Package transfers through fabric interfaces
 
-`orbit run --roce-ring` and `orbit push --roce-ring` transfer package data through
-the IPv4 interfaces discovered for the RoCE ring. The controller obtains endpoint
-lists from authenticated agents and uses the collective transport's subnet and
-device matching to select up to two links per neighbor. The signed grant includes
-these TCP endpoints and the selected rank order. Every agent listener must be
-reachable on its fabric IPs at its configured agent port.
+Native `flare run` distributes peer shards after launch through its own CX7
+listeners, with plain TCP and package verification. It shares this path across
+manual, agent-assisted, and Orbit launches. No route signatures or encryption
+configuration are required by serving bootstrap.
 
-Each destination pulls from the source along the shortest ring path; payloads
+Rank-distributing `orbit push` and agent staging of the source onto rank zero
+transfer through the IPv4 interfaces discovered for the CX7 fabric. The controller obtains
+endpoint lists from authenticated agents and selects up to two reachable rails
+per connection. Direct topology connects each destination to the source rank.
+`--roce-ring` uses neighboring agents in rank order. The existing signed grant
+includes the endpoints and rank order; no additional configuration or keys are
+required. Agent listeners must be reachable at their fabric IPs and configured ports.
+
+In ring mode, each destination pulls from the source along the shortest ring path; payloads
 take increasing rank numbers when both directions have equal length. A transfer
 from rank 0 to rank 2 in a four-node ring streams through rank 1. Intermediate
 agents forward encrypted sessions one record at a time, without storing another
@@ -571,9 +584,9 @@ pulls a disjoint, approximately equal share of the requested bytes; sparse holes
 remain holes. Each destination processes one file at a time. The stream count
 applies to each destination, so a source or relay serving several ranks handles
 their combined connections. Higher counts increase CPU and I/O concurrency;
-benchmark the actual package and ring before choosing a larger stream count. A saved group's
+benchmark the actual package and fabric before choosing a larger stream count. A saved group's
 `transfer_streams` value is reused by `orbit run`, and an explicit CLI value
-overrides it. This setting requires ring distribution and does not affect
+overrides it. This setting applies to direct and ring distribution and does not affect
 collectives. A transfer connection fails after 120 seconds without read or write
 progress.
 
@@ -586,15 +599,16 @@ after the workers drain; it cannot publish a verified package. Content-addressed
 payloads are hashed from the assembled file before entering the immutable blob
 store. Signed-package verification runs after all files arrive.
 A controller-held package first uploads to rank zero. A source node outside the
-selected ring first stages a complete copy on rank zero, then ring members fetch
+selected group first stages a complete copy on rank zero, then the other members fetch
 from that copy.
 
 Controller connections, metadata lookup, and serving rendezvous use the
 configured management addresses. Agent payload transfers use encrypted TCP
-and require no host routing changes or IP forwarding. With
-`ignition export --roce-ring`, checkpoint reads and prepared export payloads
-also use agent fabric connections; preparation control and export manifests
-use the rendezvous connection.
+and require no host routing changes or IP forwarding. Ignition checkpoint and
+prepared export transfers use rank-owned fabric helpers with the existing
+shared-token authentication. They require no Orbit
+agents or signed grants; preparation control and export manifests use the
+rendezvous connection.
 Ring and direct package transfers use identical package formats; the captured
 collective ABI is independent of package transport. Encryption at each hop,
 disk throughput, and shared links can limit bulk throughput below interface
@@ -615,7 +629,7 @@ with a message; an ERROR closes the session.
 | TRANSFER | Controller to node | Grant, publisher profile, source node, cache directory, files with sizes and ranges | The node fetches those ranges from the source node into its cache, verifies the directory's stored data unless it verified before, and replies when done; a push's grant authorizes transfers alone |
 | FETCH | Node to node | Grant, file name, ranges | Streams the file's bytes to a node the grant names, from the package the node holds or its cache |
 | FABRIC | Controller to node | None | Reports active RoCE IPv4 endpoints for planning fabric TCP transfers |
-| FETCH_RING | Node to adjacent node | Grant, source and destination ranks, rail, file name, size, ranges | Pulls a stream through the signed ring path; only the destination stores the bytes |
+| FETCH_FABRIC | Node to fabric peer | Grant, source and destination ranks, rail, file name, size, ranges | Pulls directly or through signed ring endpoints; only the destination stores the bytes |
 | GET | Controller to node | Absolute path, offset, length | Streams up to 256 MiB of a node-local file, used to mirror a package's header and index |
 | STAT | Controller to node | Absolute path | The package file's size and its companions' names and sizes |
 | DOWNLOAD | Controller to node | Repository, resolved revision, filename and cache options, optional access token | Downloads a pinned package and its companions into the node's Hugging Face cache and returns its absolute path |
@@ -657,6 +671,13 @@ serving bytes to another node.
   "serving": ["--max-concurrency", "16"],
   "rank_zero": ["--host", "0.0.0.0", "--port", "8000"],
   "roce_ring": false,
+  "transfer_fabric": {
+    "ring": false,
+    "links": [
+      [[], [{"from": "10.200.0.12:29900", "to": "10.200.0.13:29900"}]],
+      [[{"from": "10.200.0.13:29900", "to": "10.200.0.12:29900"}], []]
+    ]
+  },
   "single_host": false,
   "issued": 1792420200,
   "expires": 1792420800
@@ -685,9 +706,11 @@ The grant also authorizes node-to-node transfers. A FETCH is served only to a
 member of the grant, identified by the key that authenticated the session, for
 the package the grant names.
 
-The grant records each rank's fabric TCP links to its successor in
-`transfer_ring[i]`, where `i` is the member's rank. The final rank links to rank
-zero. The `transfer_ring` list is empty for transfers over paired addresses.
+The grant's `transfer_fabric` contains `ring` and a `links[source][destination]`
+matrix of rail endpoints. Direct topology records every peer connection; ring
+topology records neighbors only. Each link carries `from` and `to` socket
+addresses. The topology is present for agent prestaging and source transfer;
+serving ranks discover their own endpoints during bootstrap.
 
 The serving rendezvous checks export identity and rank agreement. The grant
 authenticates the launch at the agent boundary; rank communication requires a
@@ -700,9 +723,10 @@ on every node of the orbit. The controller key is therefore protected like the
 signing key in [signing](signing.md): owner-only permissions, and an encrypted
 backup if the orbit must survive losing the machine.
 
-Packages are signed per rank. An agent digests bytes fetched from another node
-against the signed index before it will run them and keeps the result with the
-cache directory, so a compromised source node that serves tampered weights
+Packages are signed per rank. Native receivers digest received bytes against
+the signed index before GPU loading and keep the result in the shared cache.
+Agent prestaging verifies received data in the same way, so a compromised source
+node that serves tampered weights
 makes the transfer fail rather than a rank run them. PUT does not perform
 signed-resource verification, though content-addressed blobs are checked against
 their filename hashes. `--verify-weights` makes every rank digest its stored data
@@ -719,8 +743,7 @@ host's authorized controller record and pairing code, preserving its node key,
 cached files, and running processes; it is not a stop or cache-cleanup command.
 The controller stores no secrets from nodes. Nodes store controller public keys,
 their own key, and cached files. Transfers and
-output are encrypted on the controller and node network; the RoCE fabric
-between ranks is not.
+output are encrypted on the controller and node network; RDMA collective traffic and rank-owned preparation TCP are not encrypted.
 
 ## Compatibility
 
@@ -729,7 +752,7 @@ refuses an agent whose HELLO reports another version. Serving executables must
 also support the package's GPU architecture, prepared graph contract, and RoCE
 proxy ABI. A controller's CPU architecture does not select the serving build.
 
-Fabric TCP distribution requires agent protocol 5 on the controller and every
+Fabric TCP distribution requires agent protocol 6 on the controller and every
 agent, including relays. Updating only a serving executable does not update the
 resident agents that distribute packages.
 

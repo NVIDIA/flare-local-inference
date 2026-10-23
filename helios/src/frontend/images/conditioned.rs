@@ -180,6 +180,7 @@ impl PreparedImageInput {
         let pixel_width = match self.processor.profile {
             Profile::Qwen(_) | Profile::MiMo(_) => 1536,
             Profile::Radio => 768,
+            Profile::Glm => 1176,
             _ => 588,
         };
         let patches = self.geometry.patches;

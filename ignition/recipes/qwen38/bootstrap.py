@@ -16,6 +16,7 @@ from ignition.components.prompt_logprobs import (
 )
 
 from ignition.preparation.tuning_replicas import TuningReplica
+from ignition.preparation.tuning import with_autotune_effort
 
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.collectives import (
@@ -35,7 +36,7 @@ from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import device_memory_info
 from ignition.preparation.deferred import deferred_mode
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
-from ignition.preparation.frontend import prepare_frontend
+from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.qwen38 import (
@@ -67,12 +68,14 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     device: int = 0
     devices: tuple[int, ...] | None = None
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
     roce_ring: bool = False
+    roce_chain: bool = False
     compile_decoder: bool = True
     retain_graphs: bool = False
     max_active: int = 4
@@ -97,8 +100,11 @@ class PreparationConfig:
         from ignition.components.capacity import image_capacity
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
-        if self.roce_ring and (self.hosts is None or not 2 <= len(self.hosts) <= 16):
-            raise ValueError("RoCE ring requires 2..16 ranks on separate hosts")
+        from ignition.planning import host_shape_error
+
+        error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
+        if error:
+            raise ValueError(error)
         if self.devices is not None and (
                 not isinstance(self.devices, tuple) or len(self.devices) not in (1, 2, 4)
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
@@ -205,6 +211,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
 @torch.no_grad()
 def prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, progress=None,
                   compile_decoder: bool = True, rank: int = 0, group=None, package_storage=None) -> PreparedModel:
+    config = PreparationConfig() if config is None else config
     transient = contextlib.ExitStack()
     try:
         prepared = _prepare_model(snapshot, config, progress=progress, compile_decoder=compile_decoder,
@@ -220,6 +227,7 @@ def prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, pr
         return prepared
 
 
+@with_autotune_effort
 def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, transient,
                    progress=None, compile_decoder: bool = True, rank: int = 0,
                    group=None, package_storage=None) -> PreparedModel:
@@ -274,13 +282,13 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         # one-shot, prefill chunks through the pipelined two-shot path.
         collective = vocabulary_collective = create_roce_runtime(group, device,
             max_tokens=max(config.request_capacity, sample_rows), pipe_tokens=config.token_capacity, hidden_size=2560,
-            gather_bytes=sample_rows * (248320 // shard.world_size) * 2, package_storage=package_storage, ring=config.roce_ring)
+            gather_bytes=sample_rows * (248320 // shard.world_size) * 2, package_storage=package_storage, ring=config.roce_ring, ring_open=config.roce_chain)
     elif group is not None:
         collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity, hidden_size=2560, ipc=ipc)
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=sample_rows, columns=248320, ipc=ipc)
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
-        compile_workers=config.compile_workers, tuning_replica=config.tuning_replica,
+        compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
         device=device, checkpoint=REVISION, coordinator=coordinator,
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size},
         headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
@@ -556,8 +564,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
                 speculative_state_columns=8, draft_raw_ring_capacity=layout.draft_ring_capacity if has_mtp else 0,
                 speculative_fixed_width=config.speculative_fixed_width,
                 history_drafts=config.history_drafts)
-        hashes = {"tokenizer": ("tokenizer.json", FRONTEND_SHA256["tokenizer.json"]),
-            "chat_template": ("chat_template.jinja", FRONTEND_SHA256["chat_template.jinja"])}
+        hashes = {"tokenizer": ("tokenizer.json", FRONTEND_SHA256["tokenizer.json"])}
         cache_regions = [history_region(buffers, f"cache.{layer}.{name}", getattr(value, name), contract_proto.PAGED_KEY_VALUE,
             tokens_per_record=4 if name == "compressed_k_cache" else 1)
             for layer, value in (final_cache or cache).items()
@@ -571,6 +578,9 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
             "model_contract": prepare_contract(signatures, buffers, state, image_slots=config.image_concurrency, page_tokens=64, draft_lag=1 if has_mtp else None, embedding_tables=(0,), regions=cache_regions),
             "assets": {name: {"path": str((manifest.snapshot / filename).resolve()), "sha256": digest}
                        for name, (filename, digest) in hashes.items()}}
+        server_config["assets"]["chat_template"] = annotated_template_asset(
+            (manifest.snapshot / "chat_template.jinja").read_bytes(),
+            Path(__file__).with_name("assets") / "chat_template.jinja")
         if speculation is not None:
             server_config.update(speculative_widths=config.speculative_widths,
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),

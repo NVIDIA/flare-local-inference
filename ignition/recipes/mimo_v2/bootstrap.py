@@ -40,11 +40,11 @@ from ignition.preparation.collectives import (
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.host_memory import release_unused
-from ignition.preparation.frontend import prepare_frontend
+from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
-from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
@@ -64,6 +64,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = tuple(range(8))
     context: int = 1048576
@@ -133,6 +134,7 @@ class PreparationConfig:
 
 
 @torch.no_grad()
+@with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
     if package_storage is None:
         raise ValueError("MiMo preparation requires package storage")
@@ -203,7 +205,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             ).encode()
         ).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             device=device,
             checkpoint=identity,
             workload_schema="mimo_v2-vision",
@@ -472,14 +474,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if group is not None:
         torch.distributed.barrier(group=group)
     free, total = torch.cuda.mem_get_info(device)
-    frontend = snapshot
     assets = {
-        role: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+        role: {"path": str(path)}
         for role, path in (
             ("tokenizer", snapshot / "tokenizer.json"),
-            ("chat_template", frontend / "chat_template.jinja"),
         )
     }
+    assets["chat_template"] = annotated_template_asset(
+        (snapshot / "chat_template.jinja").read_bytes(),
+        Path(__file__).with_name("assets") / "chat_template.jinja")
     cache_regions = [history_region(buffers, "cache." + name, tensor, contract_proto.PAGED_KEY_VALUE)
         for name, tensor in pool.pages.items()]
     buffers["request_pending_token"] = requests.pending_token

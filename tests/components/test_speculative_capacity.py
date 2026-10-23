@@ -20,10 +20,14 @@ def test_recipes_share_bounded_target_coverage(concurrency, drafts, override):
     expected = {(b, w) for b in batch_capacities(concurrency) for w in widths
                 if w == 1 or b * w <= capacity}
     for recipe, enabled in ((Qwen, "mtp"), (Glm, "mtp"), (DeepSeek4, "dspark"),
-                            (DeepSeek41, "dspark"), (Mimo, "dflash")):
+                            (Mimo, "dflash")):
         config = recipe(max_active=concurrency, speculative_widths=widths,
                         speculative_token_capacity=override, **{enabled: True})
         assert set(config.speculative_shapes) == expected
+    config = DeepSeek41(max_active=concurrency, speculative_widths=widths,
+                       speculative_token_capacity=override)
+    assert set(config.speculative_shapes) == {(b, 1) for b in batch_capacities(concurrency)}
+    assert all(b < p <= min(capacity, b * (drafts + 1)) for b, p in config.packed_speculative_shapes)
     if drafts <= 3:
         config = Step5(max_active=concurrency, speculative_widths=widths,
                        speculative_token_capacity=override)
@@ -32,10 +36,10 @@ def test_recipes_share_bounded_target_coverage(concurrency, drafts, override):
     assert all((b, 1) in expected for b in batch_capacities(concurrency))
 
 
-def test_proposals_keep_every_depth_independently_of_target_coverage():
-    assert len(proposal_shapes(4, 7)) == 21
+def test_proposals_keep_full_depth_independently_of_target_coverage():
+    assert len(proposal_shapes(4, 7)) == 3
     assert len(speculative_shapes(4, tuple(range(1, 9)), 8)) == 14
-    assert set(proposal_shapes(4, 7)) == {(b, d) for b in (1, 2, 4) for d in range(1, 8)}
+    assert set(proposal_shapes(4, 7)) == {(b, 7) for b in (1, 2, 4)}
     assert {w for b, w in speculative_shapes(4, tuple(range(1, 9)), 8) if b == 4} == {1, 2}
 
 

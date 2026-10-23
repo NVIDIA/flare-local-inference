@@ -119,6 +119,72 @@ def test_native_proposal_feedback_copies_host_mapped_confidence_without_allocati
         graph.reset()
 
 
+@pytest.mark.parametrize("with_survival", [False, True])
+@torch.no_grad()
+def test_native_verification_feedback_preserves_frames_and_skips_width_one(with_survival):
+    import struct
+    import time
+    from ignition.preparation.execution import GraphSignature, PreparedExecution
+
+    records = torch.zeros((2, 4, 24), dtype=torch.int64, device="cuda")
+    feedback = torch.full((2, 4, 7), -1., device="cuda")
+    values = torch.full((4, 7), -1., device="cuda")
+    frame = torch.zeros(1, dtype=torch.int32, device="cuda")
+    sequence = torch.zeros(1, dtype=torch.int64, device="cuda")
+    graphs, signatures, owners = {}, {}, []
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    for width in (1, 3):
+        row = torch.zeros((4, 24), dtype=torch.int64, device="cuda")
+        row[:, [4, 12, 13, *range(16, 24)]] = -1
+        row[2, :16] = torch.tensor([7, 0, 3, 1, 20, 1, 0, 0, 1, width - 1, 0, 0, -1, -1, 0, width], device="cuda")
+        row[2, 16] = 20
+        stream.wait_stream(torch.cuda.current_stream())
+
+        def forward():
+            row[2, 1].copy_(sequence[0])
+            records.index_copy_(0, frame.long(), row.unsqueeze(0))
+            if with_survival and width > 1:
+                feedback.index_copy_(0, frame.long(), values.unsqueeze(0))
+
+        with torch.cuda.stream(stream):
+            forward()
+        stream.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=stream):
+            forward()
+        graphs[f"verify{width}"] = graph
+        signatures[f"verify{width}"] = GraphSignature("verification", 4, width, ("values",), speculation_enabled=True)
+        owners.append(row)
+    buffers = dict(frame_index=frame, submission_sequence=sequence, completion_records=records, values=values)
+    if with_survival:
+        buffers["completion_speculative_survival"] = feedback
+    model = PreparedExecution(device=0, max_active=4, graphs=graphs, signatures=signatures,
+        buffers=buffers, resources=tuple(owners))
+    executor = model.start_executor()
+    try:
+        allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+        for index in range(24):
+            wide = index % 3 != 1
+            expected = [[-1.] * 7 for _ in range(4)]
+            expected[2][:2] = [.75, .25] if index % 2 else [.5, .125]
+            payload = struct.pack("28f", *(p for row in expected for p in row))
+            fence = executor.submit(int(wide), [("values", 0, payload)], True)
+            deadline = time.monotonic() + 10
+            while (completed := executor.poll()) is None:
+                assert time.monotonic() < deadline
+            assert completed.fence == fence
+            assert completed.records[2][1] == fence
+            assert completed.records[2][9] == (2 if wide else 0)
+            actual = completed.speculative_survival
+            assert (None if actual is None else [list(row) for row in actual]) == (expected if with_survival and wide else None)
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+    finally:
+        executor.close()
+        for graph in graphs.values():
+            graph.reset()
+
+
 @torch.no_grad()
 @pytest.mark.parametrize("target_capacity", [9, 12])
 def test_retained_proposals_regroup_prefixes_and_reject_stale_ownership(target_capacity):
@@ -212,3 +278,58 @@ def test_retained_proposals_regroup_prefixes_and_reject_stale_ownership(target_c
         assert observed.tolist() == [-1] * 4
         assert retained.ready.all()
     graph.reset()
+
+
+@pytest.mark.parametrize("with_bias", [False, True])
+@pytest.mark.parametrize("weight_dtype", [torch.bfloat16, torch.float32])
+@torch.no_grad()
+def test_confidence_head_preserves_fp32_bias_and_preceding_token_features(with_bias, weight_dtype):
+    from types import SimpleNamespace
+    from ignition.components.split_draft import PreparedDraftConfidence
+    from ignition.preparation.tuning import RecordedPreparationSession
+
+    torch.manual_seed(811)
+    batch, block, hidden, rank = 4, 7, 6144, 256
+    head = torch.randn(batch * block, hidden, device="cuda").bfloat16()
+    markov = torch.randn(batch, block, rank, device="cuda").bfloat16()
+    weight = (torch.randn(1, hidden + rank, device="cuda") * .01).to(weight_dtype)
+    bias = torch.tensor([.71], device="cuda") if with_bias else None
+    output = torch.empty(batch, block, device="cuda")
+    with RecordedPreparationSession(device=torch.device("cuda", 0), checkpoint="confidence",
+                                    workload_schema="confidence", numerical_policy="default") as session:
+        source = SimpleNamespace(owner=SimpleNamespace(block_size=block, logit_offset=0, session=session),
+            batch=batch, width=block + 1, draft=SimpleNamespace(head_hidden=head),
+            markov=SimpleNamespace(embedding=markov[:, 0]))
+        confidence = PreparedDraftConfidence(source, weight, output, bias=bias, name="confidence")
+
+        def forward():
+            for position in range(block):
+                confidence.record_embedding(position, markov[:, position])
+            confidence()
+
+        session.tune()
+        compiled = compile_forward(forward)
+        compiled()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            compiled()
+        session.freeze()
+        for shift in (0., .25, -.5):
+            head.add_(shift)
+            markov.add_(shift)
+            features = torch.cat((head.view(batch, block, hidden).float(), markov.float()), dim=-1)
+            expected = (features @ weight.float().T).squeeze(-1)
+            if bias is not None:
+                expected.add_(bias)
+            expected.sigmoid_()
+            confidence.features.fill_(float("nan"))
+            confidence.embeddings.fill_(float("nan"))
+            confidence.logits.fill_(float("nan"))
+            output.fill_(float("nan"))
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(output, expected, atol=2e-6, rtol=2e-6)
+        graph.reset()

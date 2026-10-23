@@ -4,12 +4,14 @@ import ctypes as C
 import json
 from pathlib import Path
 import subprocess
+import struct
 import sys
 from types import SimpleNamespace
 
 from ignition.preparation.runtime_package import (
-    Allocation, Argument, Kernel, Reference, Relocation, RuntimePackage, _Cuda, _KernelParams,
+    Allocation, Argument, Kernel, RuntimePackage, _Cuda,
 )
+from cuda_graph_fixture import KernelParams
 from signing import publisher
 
 
@@ -59,7 +61,7 @@ extern "C" __global__ void ordinary(int *out, int n) { work<false>(out, n); }
         cuda.call("cuModuleGetFunction", C.byref(function), module, C.c_char_p(name.encode()))
         cuda.call("cuFuncSetAttribute", function, C.c_int(8), C.c_int(65536))
         functions[name] = function
-    length = 500003
+    elements = 500003
     allocations, graphs, expected, exported_grids = [], {}, {}, {}
     for name, block, shared, other, size, axis in (
         ("smaller", (32, 4, 1), 0, (1, 1), "small", 0),
@@ -85,14 +87,14 @@ extern "C" __global__ void ordinary(int *out, int n) { work<false>(out, n); }
         captured_grid.insert(axis, workers)
         expected_grid.insert(axis, workers if name == "ordinary" else min(workers, max_workers))
         output = C.c_uint64()
-        nbytes = (length * 2 + 3) * 4
+        nbytes = (elements * 2 + 3) * 4
         cuda.call("cuMemAlloc_v2", C.byref(output), C.c_size_t(nbytes))
         allocations.append(Allocation(name, output.value, nbytes, initialize="zero"))
-        count = C.c_int(length)
+        count = C.c_int(elements)
         arguments = (C.c_void_p * 2)(C.addressof(output), C.addressof(count))
         graph, node, executable = C.c_void_p(), C.c_void_p(), C.c_void_p()
         cuda.call("cuGraphCreate", C.byref(graph), C.c_uint(0))
-        params = _KernelParams(func=function.value, grid=(C.c_uint * 3)(*captured_grid),
+        params = KernelParams(func=function.value, grid=(C.c_uint * 3)(*captured_grid),
                                block=(C.c_uint * 3)(*block), shared=shared, params=arguments)
         cuda.call("cuGraphAddKernelNode_v2", C.byref(node), graph, None, C.c_size_t(0), C.byref(params))
         if name != "ordinary":
@@ -108,26 +110,55 @@ extern "C" __global__ void ordinary(int *out, int n) { work<false>(out, n); }
         cuda.call("cuGraphInstantiateWithFlags", C.byref(executable), graph, C.c_uint64(0))
         graphs[name] = SimpleNamespace(raw_cuda_graph=lambda g=graph: g.value,
                                       raw_cuda_graph_exec=lambda e=executable: e.value)
-        exported_grids[node.value] = captured_grid
+        exported_grids[name] = captured_grid
         expected[name] = expected_grid
 
-    class WorkerPackage(RuntimePackage):
-        def _kernel(self, cuda, handle):
-            params = _KernelParams()
-            cuda.call("cuGraphKernelNodeGetParams_v2", C.c_void_p(handle), C.byref(params))
-            address = C.c_uint64.from_address(params.params[0]).value
-            allocation = next(a for a in allocations if a.address == address)
-            self.kernels[params.func] = Kernel(params.func, "workers", (
-                Argument(8, (Relocation(0, Reference(allocation.name)),)), Argument(4)))
-            node = super()._kernel(cuda, handle)
-            # Encode the larger preparation grid without requiring a larger physical GPU.
-            node["grid"] = exported_grids[handle]
-            return node
-
-    package = WorkerPackage(allocations=allocations, modules={"workers": cubin.read_bytes()},
+    package = RuntimePackage(allocations=allocations, modules={"workers": cubin},
         kernels=[Kernel(f.value, "workers", (Argument(8), Argument(4))) for f in functions.values()])
-    package.write(root / "package", graphs, publisher=publisher())
-    (root / "expected.json").write_text(json.dumps({"length": length, "grids": expected}))
+    stage = root / "rank.json"
+    package.write(stage, graphs, sources=True)
+    from ignition.preparation.package_file import combine, read_sources, write_sources
+    from ignition.preparation import runtime_package_pb2 as proto
+
+    index, locate = read_sources(stage)
+    bundle = index.ranks[0]
+    replacements = {}
+    for graph in bundle.graphs:
+        span = bundle.resources[graph.resource]
+        pieces = locate(span)
+        assert len(pieces) == 1
+        source, offset, length = pieces[0]
+        with source.open("rb") as stream:
+            stream.seek(offset)
+            data = stream.read(length)
+        size, = struct.unpack_from("<I", data)
+        node = proto.Node.FromString(data[4:4 + size])
+        assert graph.node_count == 1 and graph.edge_count == 0
+        assert node.WhichOneof("operation") == "kernel"
+        address = int.from_bytes(node.kernel.arguments[0].data, "little")
+        allocation = next(a for a in allocations if a.address == address)
+        node.kernel.arguments[0].relocations.add(target=proto.Reference(allocation=allocation.name))
+        # Encode the larger preparation grid without requiring a larger physical GPU.
+        node.kernel.grid[:] = exported_grids[graph.name]
+        encoded = node.SerializeToString()
+        target = root / f"{graph.name}.graph"
+        target.write_bytes(struct.pack("<I", len(encoded)) + encoded)
+        replacements[graph.resource] = (target, target.stat().st_size)
+    payload = []
+    for name, span in bundle.resources.items():
+        if name in replacements:
+            source, length = replacements[name]
+            span.nbytes = length
+            payload.append((span.offset, source, 0, length))
+        else:
+            cursor = span.offset
+            for source, offset, length in locate(span):
+                payload.append((cursor, source, offset, length))
+                cursor += length
+    rewritten = root / "workers.json"
+    write_sources(rewritten, index, sorted(payload))
+    combine(root / "package", [rewritten], [], publisher=publisher())
+    (root / "expected.json").write_text(json.dumps({"length": elements, "grids": expected}))
     cuda.call("cuCtxDestroy_v2", context)
 
 

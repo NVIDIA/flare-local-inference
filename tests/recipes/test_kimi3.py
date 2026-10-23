@@ -288,3 +288,17 @@ def test_context_shards_place_interleaved_positions_on_their_owners():
     # Position t lives at local record t // 16 of its page; a third page without a table entry stores nothing.
     assert owned == {0: 7 * PAGE_TOKENS, 1: 7 * PAGE_TOKENS, 15: 7 * PAGE_TOKENS, 16: 7 * PAGE_TOKENS + 1,
                      17: 7 * PAGE_TOKENS + 1, PAGE_TOKENS * world + 5: 3 * PAGE_TOKENS}
+
+
+def test_runtime_assets_preserve_converted_tokenizer_and_bundled_template_bytes(tmp_path):
+    from tokenizers import Tokenizer, models
+    from ignition.recipes.kimi3.tokenizer import runtime_assets
+
+    tokenizer = Tokenizer(models.WordLevel({"<unk>": 0, "hello": 1, "世界": 2}, unk_token="<unk>"))
+    expected = tmp_path / "tokenizer.json"
+    tokenizer.save(str(expected))
+    assets = runtime_assets(tokenizer)
+    assert assets["tokenizer"]["text"].encode() == expected.read_bytes()
+    template = Path(__file__).resolve().parents[2] / "ignition/recipes/kimi3/assets/chat_template.jinja"
+    assert Path(assets["chat_template"]["path"]) == template
+    assert len(list(tmp_path.iterdir())) == 1

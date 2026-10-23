@@ -26,13 +26,45 @@ def make_session(**kwargs):
         numerical_policy="default", **kwargs)
 
 
+@pytest.mark.parametrize("borrowed_state", [False, True])
+def test_recurrent_candidates_share_inputs_with_active_resource_eviction(backend, borrowed_state):
+    from ignition.preparation.fixtures.recurrent import benchmark_call, register_benchmark_state
+
+    state = torch.zeros(3, 1, 2, 2)
+    arguments = {
+        "mixed_qkv": torch.zeros(1, 6, dtype=torch.bfloat16),
+        "recurrent_state": state, "output": torch.zeros(1, 1, 2, dtype=torch.bfloat16),
+        "query_start_loc": torch.zeros(2, dtype=torch.int32),
+        "num_tokens": torch.zeros(1, dtype=torch.int32), "num_seqs": torch.zeros(1, dtype=torch.int32),
+        "num_accepted_tokens": torch.ones(1, dtype=torch.int32),
+        "state_indices": torch.zeros(1, 1, dtype=torch.int64),
+    }
+    workspace = torch.empty(64, dtype=torch.uint8)
+    specs = (SimpleNamespace(shape=(64,), nbytes=64, dtype=torch.uint8, device=workspace.device),)
+    prepared = SimpleNamespace(bind=lambda **kwargs: SimpleNamespace(**kwargs), run=lambda binding: None)
+    session = make_session(device="cuda:0", checkpoint="recurrent-fixture-reuse")
+    if borrowed_state:
+        register_benchmark_state(session, state, storage=torch.empty(state.nbytes, dtype=torch.uint8),
+                                 restore=lambda: None)
+    session._tune_status = "tuning"
+    try:
+        calls = [benchmark_call(prepared, arguments=arguments, session=session, name="decode",
+            mode="decode", scratch_specs=lambda prepared: specs, workspace=workspace, run_options={})
+            for _ in range(4)]
+        assert all(call.owners[0] is calls[0].owners[0] for call in calls)
+        assert all(call.output is calls[0].output for call in calls)
+    finally:
+        session.close()
+
+
 @pytest.fixture
 def backend(monkeypatch):
     events = []
     controls = SimpleNamespace(cancel=False, skip_prime=set(), close_error=False)
 
     def initialize(self, *, device, namespace, **kwargs):
-        assert kwargs["autotune"] is True and kwargs["compile_workers"] == 0
+        assert type(kwargs["autotune"]) is bool and kwargs["compile_workers"] == 0
+        self.autotune = kwargs["autotune"]
         self.device = SimpleNamespace(ordinal=0)
         self.namespace = FrozenMapping(namespace)
         self._stop = Event()
@@ -53,6 +85,8 @@ def backend(monkeypatch):
             if request.name not in controls.skip_prime:
                 call = request.prepare_call(request.plan)
                 if call is not None:
+                    if call.produce is not None:
+                        call.produce()
                     call.invoke()
                 # b12x PreparationJob._publish retains this tuple until plan release.
                 self._published_owners[request.name] = () if call is None else tuple(call.owners)
@@ -68,7 +102,8 @@ def backend(monkeypatch):
                 retained_trials.clear()
 
         return SimpleNamespace(coverage={}, cache_hits=2 if autotune else 0,
-            benchmarked_candidates=7 if autotune else 0, elapsed_seconds=1.25,
+            benchmarked_candidates=7 if autotune else 0, restored_candidates=3 if autotune else 0,
+            rejected_candidates=0, elapsed_seconds=1.25,
             parent_cute_compilations=0, parent_triton_compilations=0, close=close)
 
     def envelope(self, requests):
@@ -162,6 +197,7 @@ def test_declarations_do_no_work_and_prepare_in_one_tuned_batch(backend):
     ]
     assert calls == ["benchmark", "prime"] * 4 + ["bind"]
     assert report["cache_hits"] == 2 and report["benchmarked_candidates"] == 7
+    assert report["restored_candidates"] == 3 and report["rejected_candidates"] == 0
     assert events.count(("result_close", True)) == 1
     assert arena.frozen
 
@@ -244,6 +280,45 @@ def test_benchmark_resource_shared_across_requests_and_released_before_capture(b
     assert report["allocated_after_trial_release"] == report["allocated_before_tuning"] == 4096
     with pytest.raises(RuntimeError, match="only during"):
         benchmark_resource(session, "late", create)
+
+
+def test_indexed_normalization_releases_private_priming_operands(backend, monkeypatch):
+    from ignition.components import rms_norm
+
+    session = make_session(device=0, checkpoint="indexed-normalization")
+    monkeypatch.setattr(PreparationSession, "_allocated", lambda self: 0)
+    plan = declaration("indexed").plan
+    plan.request = lambda **kwargs: Request(plan=plan, **kwargs)
+    monkeypatch.setattr(rms_norm.hyperconnection, "Caps", lambda **kwargs: None)
+    monkeypatch.setattr(rms_norm.hyperconnection, "plan", lambda *args, **kwargs: plan)
+    references = []
+    original = rms_norm.HyperconnectionBenchmarkInputs
+
+    def operands(*args):
+        value = original(*args)
+        references.append(weakref.ref(value))
+        return value
+
+    monkeypatch.setattr(rms_norm, "HyperconnectionBenchmarkInputs", operands)
+
+    def launch(source, weight, output, *, eps, indices):
+        assert torch.isfinite(source).all()
+        assert ((indices >= 0) & (indices < source.shape[0])).all()
+        output.copy_(source[indices])
+
+    plan.launch = launch
+    source = torch.full((257, 128), torch.nan, dtype=torch.bfloat16)
+    indices = torch.full((8,), 1 << 20, dtype=torch.int32)
+    weight = torch.ones(128, dtype=torch.bfloat16)
+    output = torch.full((8, 128), torch.nan, dtype=torch.bfloat16)
+    rms_norm.PreparedIndexedRMSNorm(source, indices, weight, output,
+        eps=1e-6, session=session, name="indexed")
+    session.tune()
+    assert references and all(reference() is None for reference in references)
+    assert not session._published_owners["indexed"]
+    assert torch.isnan(source).all() and torch.isnan(output).all()
+    assert (indices == 1 << 20).all()
+    session.close()
 
 
 
@@ -348,7 +423,10 @@ def test_worker_budget_accounts_for_all_preparing_ranks(backend, monkeypatch):
         session.compile_workers = 8 if count is None else count
 
     monkeypatch.setattr(PreparationSession, "configure_compile_workers", configure)
-    coordinator = SimpleNamespace(ranks=(0, 1, 2, 3), barrier=lambda: None, local_ranks=4, spans_hosts=False)
+    coordinator = SimpleNamespace(ranks=(0, 1, 2, 3), barrier=lambda: None, local_ranks=4, spans_hosts=False,
+                                  same_on_every_rank=lambda value: False)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(is_integrated=False, name="NVIDIA GB10"))
     session = make_session(device=0, checkpoint="revision", coordinator=coordinator)
     session.declare((declaration("op"),))
     report = session.tune()
@@ -369,7 +447,8 @@ def test_explicit_cpu_budget_reaches_b12x_without_environment_switch(backend):
 
 @pytest.mark.parametrize("identical", [True, False])
 @pytest.mark.parametrize("workers", [None, 4])
-def test_ranks_on_separate_hosts_shard_tuning_only_across_identical_gpus(backend, monkeypatch, identical, workers):
+@pytest.mark.parametrize("spans_hosts", [False, True])
+def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, identical, workers, spans_hosts):
     import torch.distributed as dist
 
     monkeypatch.setattr(torch.cuda, "get_device_properties",
@@ -384,16 +463,17 @@ def test_ranks_on_separate_hosts_shard_tuning_only_across_identical_gpus(backend
         coordinated.append(tuple(request.name for request in requests))
         return PreparationSession.prepare(session, requests, autotune=autotune)
 
-    coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda: None, local_ranks=1, spans_hosts=True,
+    coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda: None,
+        local_ranks=1 if spans_hosts else 2, spans_hosts=spans_hosts,
         same_on_every_rank=lambda value: identical and value == "NVIDIA GB10",
         share_selections=shared.append, agree_selections=lambda selections: None, prepare=prepare)
     session = make_session(device=0, checkpoint="revision", coordinator=coordinator, compile_workers=workers)
     session.declare((declaration("op"),))
     report = session.tune()
-    assert report["compile_workers"] == (8 if workers is None else workers)
+    assert report["compile_workers"] == (8 if workers is None else workers // coordinator.local_ranks)
     # Sharded races exchange results through the coordinator even in jobs without collectives.
     assert (shards, shared, coordinated) == (([(1, (0, 1))], [], [("op",)]) if identical
-                                             else ([], ["rank cache"], []))
+                                             else ([], ["rank cache"] if spans_hosts else [], []))
 
 
 def test_helpers_preserve_ordinary_session_behavior():
@@ -1203,3 +1283,75 @@ def test_discrete_gpu_tuning_bounds_races_without_reducing_compiler_pool(backend
     expected = 5 * GIB // 4 if race_budget is None else race_budget
     assert session.race_budget == report["race_budget_bytes"] == expected
     assert [event for event in events if event[0] == "workers"] == [("workers", None)]
+
+
+
+def test_off_prepares_defaults_warms_and_finalizes_without_benchmarks(backend):
+    events, _ = backend
+    session = make_session(device=0, checkpoint="revision", autotune_effort="off")
+    arena = ScratchArena("cpu")
+    session.register_scratch(arena)
+    calls = []
+    session.declare((declaration("op", size=1024, selected_size=512,
+                                prepare=lambda state: calls.append("warmup"),
+                                benchmark=lambda state: pytest.fail("OFF benchmarked")),))
+    session.register_finalizer(lambda: calls.append("bind"))
+    report = session.tune()
+    assert not session.autotune
+    assert report["autotune_effort"] == "off"
+    assert report["selection_counts"] == {"default": 1}
+    assert report["cache_hits"] == report["benchmarked_candidates"] == 0
+    assert calls == ["warmup", "bind"]
+    assert ("prepare", False, ("op",)) in events
+    assert report["scratch_arena"]["selected_scratch_bytes"] == 512
+    assert arena.frozen and arena.nbytes == 512
+
+
+def test_bootstrap_effort_scope_captures_real_contract_and_restores():
+    from b12x.gemm._tuning import DenseGemmQuery
+    from b12x.preparation import autotune_effort
+    from b12x.preparation._efficiency import capture_autotune_effort
+
+    from ignition.preparation.tuning import with_autotune_effort
+
+    @with_autotune_effort
+    def prepare(snapshot, config, *, fail=False):
+        query = DenseGemmQuery(recipe="mxfp8", entry_point="gemm.mm", weight_storage="native",
+                              output_dtype="bfloat16", batch=1, max_rows=8,
+                              in_features=1280, out_features=32768)
+        if fail:
+            raise RuntimeError("bootstrap failed")
+        return query
+
+    config = SimpleNamespace(autotune_effort="high")
+    with autotune_effort("low"):
+        query = prepare("snapshot", config)
+        assert query.autotune_effort == "high"
+        assert capture_autotune_effort() == "low"
+        with pytest.raises(RuntimeError, match="bootstrap failed"):
+            prepare("snapshot", config, fail=True)
+        assert capture_autotune_effort() == "low"
+    assert query.autotune_effort == "high"
+
+
+
+def test_off_multihost_keeps_coordinator_warmup_without_tuning_cache(backend, monkeypatch):
+    events, _ = backend
+    agreed = []
+    coordinator = SimpleNamespace(spans_hosts=True, ranks=(0,), local_ranks=1, group=None,
+        barrier=lambda *args: None,
+        same_on_every_rank=lambda *args: pytest.fail("OFF configured tuning shards"),
+        share_selections=lambda *args: pytest.fail("OFF shared tuning cache"),
+        agree_selections=lambda selections: agreed.append(selections),
+        prepare=lambda session, requests, **kwargs: PreparationSession.prepare(session, requests, **kwargs))
+    session = make_session(device=0, checkpoint="revision", autotune_effort="off", coordinator=coordinator)
+    monkeypatch.setattr(session, "_selection_cache", lambda: pytest.fail("OFF accessed tuning cache"))
+    request = declaration("collective")
+    request.collective = object()
+    calls = []
+    request.prepare_call = lambda state: calls.append("warmup")
+    session.declare((request,))
+    assert session.tune()["selection_counts"] == {"default": 1}
+    assert calls == ["warmup"]
+    assert len(agreed) == 1 and agreed[0][0]["source"] == "default"
+    assert ("prepare", False, ("collective",)) in events

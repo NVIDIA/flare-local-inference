@@ -14,6 +14,10 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
     def project(value, index, output):
         if scales[index] is None:
             bf16_out(value, weights[index], output, plans[index])
+        elif scale_kinds[index] == 3:
+            from ignition.components.block_fp8 import _project
+
+            output.copy_(_project(value, weights[index], scales[index], plans[index]))
         else:
             packed_out_workspace(
                 value, weights[index], scales[index], gains[index], None, output,
@@ -94,6 +98,7 @@ class ConcurrentSharedExpert:
     def __init__(self, mlp, *, parallel_plans, session, workspace: ScratchArena,
                  gate_projection=None, defer_launch=False):
         from b12x.gemm.blockscaled._a16 import _weight_parts
+        from ignition.components.block_fp8 import BlockFP8Projection
 
         if not isinstance(workspace, ScratchArena) or not parallel_plans:
             raise ValueError("shared-expert overlap requires an arena and concurrent main-stream plans")
@@ -118,12 +123,15 @@ class ConcurrentSharedExpert:
                 if scales.dtype == torch.float8_e8m0fnu:
                     scales = scales.view(torch.uint8)
                 kind = projection.weight.global_scale_kind if fp4 else "none"
+            elif isinstance(projection, BlockFP8Projection):
+                values, scales = projection.weight.values, projection.weight.scales
+                gain, kind = None, "block_fp8"
             else:
                 values, scales, gain, kind = projection.weight, None, None, "none"
             self.weights.append(values)
             self.scales.append(scales)
             self.gains.append(gain)
-            self.scale_kinds.append(("none", "multiplier", "reciprocal").index(kind))
+            self.scale_kinds.append(("none", "multiplier", "reciprocal", "block_fp8").index(kind))
             for main_plan in self.parallel_plans:
                 workspace.register_parallel(main_plan, projection.plan)
         self.plans = [projection.plan.handle for projection in self.projections] + [mlp.activation_plan.handle]

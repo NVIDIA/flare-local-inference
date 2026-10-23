@@ -46,11 +46,19 @@ def test_native_mimo_chat_matches_transformers(tmp_path):
     add('tool_history', [user, dict(role='assistant', content='', tool_calls=[dict(type='function',
         function=dict(name='lookup', arguments=dict(city='Paris', count=2)))]),
         dict(role='tool', content='Sunny.')], add_generation_prompt=True)
-    assets = {name: hashlib.sha256((SNAPSHOT / name).read_bytes()).hexdigest()
+    from ignition.preparation.frontend import annotated_template_asset
+    annotated = annotated_template_asset((SNAPSHOT / 'chat_template.jinja').read_bytes(),
+        ROOT / 'ignition/recipes/mimo_v2/assets/chat_template.jinja')
+    native_assets = tmp_path / 'assets'
+    native_assets.mkdir()
+    for name in ('tokenizer.json', 'tokenizer_config.json'):
+        (native_assets / name).symlink_to(SNAPSHOT / name)
+    (native_assets / 'chat_template.jinja').symlink_to(annotated['path'])
+    assets = {name: hashlib.sha256((native_assets / name).read_bytes()).hexdigest()
               for name in ('tokenizer.json', 'tokenizer_config.json', 'chat_template.jinja')}
     fixture = tmp_path / 'chat.json'
     fixture.write_text(json.dumps(dict(assets=assets, cases=cases, encode_cases=[], decode_cases=[])))
-    subprocess.run([str(ROOT / 'helios/target/debug/test_frontend'), str(SNAPSHOT), str(fixture)], check=True)
+    subprocess.run([str(ROOT / 'helios/target/debug/test_frontend'), str(native_assets), str(fixture)], check=True)
 
 
 @pytest.fixture(scope='module')
@@ -95,7 +103,7 @@ def test_native_mimo_images_match_transformers(processor, tmp_path, sizes):
             image += 1
     case = tmp_path / 'case.json'
     case.write_text(json.dumps(dict(images=inputs, prompt=prompt)))
-    subprocess.run([str(ROOT / 'helios/target/debug/test_mimo_images'), str(SNAPSHOT), str(SNAPSHOT),
+    subprocess.run([str(ROOT / 'helios/target/debug/test_mimo_images'), str(SNAPSHOT), str(ROOT / 'ignition/recipes/mimo_v2/assets'),
                     str(case), str(tmp_path)], check=True)
     actual = json.loads((tmp_path / 'metadata.json').read_text())
     assert actual == dict(tokens=tokens, indices=indices, grids=grids, patches=counts,

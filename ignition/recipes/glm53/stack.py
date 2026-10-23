@@ -99,7 +99,7 @@ class PreparedDecoder:
 
     def __init__(self, weights: ModelWeights, scratch: DecoderScratch, state: DecoderState,
                  metadata: DecoderMetadata, *, mode, runtime, vocabulary_runtime, coordinator, session, name,
-                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, scoring=None):
+                 workspace, progress=None, feedback=None, max_cache_pages=None, context=None, kda_records=None, scoring=None, vision=None):
         language = weights.tree.model.language_model
         if len(weights.layers) != 45 or len(language.layers) != 45 or len(state.layers) != 45:
             raise ValueError("GLM text execution requires all 45 decoder layers")
@@ -108,7 +108,8 @@ class PreparedDecoder:
         if metadata.sample_indices.shape != scratch.hidden.shape[:1]:
             raise ValueError("GLM sample indices and hidden-output capacities differ")
         self.weights, self.scratch, self.state, self.metadata = weights, scratch, state, metadata
-        self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.tree.lm_head.weight,
+        self.vision = vision if mode == "prefill" else None
+        self.scoring = None if scoring is None else scoring.prepare(scratch.embedding, weights.head,
             vocabulary=154880, session=session, coordinator=coordinator, name=name + ".prompt", copy_source=True)
         self.feedback = feedback if self.scoring is None else self.scoring.source
         self.embedding = PreparedEmbedding(language.embed_tokens.weight, metadata.token_ids, scratch.embedding,
@@ -133,7 +134,7 @@ class PreparedDecoder:
         indexers = [layer.attention.indexer for layer in self.layers if hasattr(layer.attention, "indexer")]
         for indexer in indexers[1:]:
             indexer.prepares_tables = False
-        self.lm_head = PreparedVocabularyProjection(scratch.hidden, weights.tree.lm_head.weight,
+        self.lm_head = PreparedVocabularyProjection(scratch.hidden, weights.head,
             scratch.local_logits, scratch.logits, runtime=vocabulary_runtime, coordinator=coordinator,
             session=session, name=f"{name}.lm_head")
 
@@ -145,7 +146,10 @@ class PreparedDecoder:
 
     def __call__(self):
         s, language = self.scratch, self.weights.tree.model.language_model
-        s.residual.copy_(self.embedding()[:, None, :])
+        self.embedding()
+        if self.vision is not None:
+            self.vision.inject(self.metadata, s.embedding)
+        s.residual.copy_(s.embedding[:, None, :])
         value = s.residual
         for layer in self.layers:
             value = layer(value)

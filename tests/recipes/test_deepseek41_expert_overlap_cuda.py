@@ -35,7 +35,7 @@ def expert_weights():
     return weights, config
 
 
-@pytest.mark.parametrize("rows", [16, 24, 32])
+@pytest.mark.parametrize("rows", [16, 24, 32, 33, 48, 64, 96, 128])
 @torch.no_grad()
 def test_shared_expert_join_precedes_input_and_scratch_reuse(expert_weights, rows):
     weights, config = expert_weights
@@ -97,6 +97,7 @@ def test_shared_expert_join_precedes_input_and_scratch_reuse(expert_weights, row
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
             compiled()
+        scratch_bytes = arena.tensor.nbytes
         for _ in range(12):
             source.normal_()
             live.copy_(source)
@@ -115,6 +116,7 @@ def test_shared_expert_join_precedes_input_and_scratch_reuse(expert_weights, row
             graph.replay()
             torch.cuda.synchronize()
             assert torch.cuda.memory_allocated() == allocated
+            assert arena.tensor.nbytes == scratch_bytes
             torch.testing.assert_close(shared_output, expected_shared, atol=0, rtol=0)
             # The materialized MoE kernel sums BF16 expert contributions
             # atomically. Bound overlap error by repeated serial execution of
@@ -130,5 +132,17 @@ def test_shared_expert_join_precedes_input_and_scratch_reuse(expert_weights, row
             else:
                 assert float(error.norm()) <= 1.25 * floor, (rows, float(error.norm()), floor)
                 assert float(error.abs().max()) <= 2 * peak, (rows, float(error.abs().max()), peak)
+        timings = {"serial": [], "overlap": []}
+        begin, end = torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)
+        for repeat in range(5):
+            order = (("serial", serial_graph), ("overlap", graph))
+            for name, captured in order[::(-1 if repeat % 2 else 1)]:
+                begin.record()
+                for _ in range(100):
+                    captured.replay()
+                end.record()
+                end.synchronize()
+                timings[name].append(begin.elapsed_time(end) * 10)
+        print(f"expert graph rows={rows} scratch_bytes={scratch_bytes} microseconds={timings}")
         graph.reset()
         serial_graph.reset()

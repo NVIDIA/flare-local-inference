@@ -20,6 +20,11 @@ def linear_format(layers, prefix):
     if not isinstance(entry, Mapping):
         raise ValueError(f"{prefix}: missing quantized_layers declaration")
     algo = entry.get("quant_algo")
+    if algo == "FP8_PB_WO":
+        if (entry.get("weight_block_size") != [128, 128] or entry.get("group_size") is not None
+                or entry.get("weight_scale_encoding") is not None):
+            raise ValueError(f"{prefix}: unsupported block-FP8 quantization {entry!r}")
+        return "block_fp8"
     if algo in ("IQ2_XXS", "Q8_0"):
         group, payload = (256, 66) if algo == "IQ2_XXS" else (32, 34)
         if (entry.get("group_size") != group or entry.get("block_payload_bytes") != payload
@@ -29,7 +34,12 @@ def linear_format(layers, prefix):
     if algo == "FP8" and entry.get("group_size") is None and entry.get("weight_scale_encoding") is None:
         return "tensor_fp8"
     group = {"MXFP8": 32, "MXFP4": 32, "NVFP4": 16, "W4A16_NVFP4": 16}.get(algo)
-    if group is None or entry.get("group_size") != group:
+    declared_group = entry.get("group_size")
+    block = entry.get("weight_block_size")
+    if algo == "MXFP8" and block == [1, 32] and declared_group is None:
+        declared_group = 32
+    if (group is None or declared_group != group
+            or (block is not None and block != [1, group])):
         raise ValueError(f"{prefix}: unsupported linear quantization {entry!r}")
     if entry.get("weight_scale_encoding") is not None:
         raise ValueError(f"{prefix}: dense projections require ordinary block scales")

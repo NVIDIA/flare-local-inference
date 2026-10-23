@@ -1,4 +1,4 @@
-//! Official DeepSeek conversation encoding and canonical prefix probes.
+//! Official DeepSeek conversation encoding with normalized message positions.
 
 use super::{Frontend, Json, Map, PromptEncoder, RenderedPrompt};
 use crate::{Error, Failure, FrontendError, Result};
@@ -375,23 +375,8 @@ pub(super) fn render(
     messages: &[Json],
     options: &Map<String, Json>,
 ) -> Result<RenderedPrompt> {
-    render_prompt(frontend, messages, options, true)
-}
-
-fn render_prompt(
-    frontend: &Frontend,
-    messages: &[Json],
-    options: &Map<String, Json>,
-    generation_prompt: bool,
-) -> Result<RenderedPrompt> {
     let conversation = conversation(frontend, messages, options)?;
-    let mut rendered = official(frontend.prompt_encoder, &conversation);
-    if !generation_prompt {
-        let end = rendered.prompt
-            .rfind(deepseek_recipe_encoding::v4::ASSISTANT_SP_TOKEN)
-            .ok_or_else(|| invalid("canonical prompt lacks its assistant generation header"))?;
-        rendered.prompt.truncate(end);
-    }
+    let rendered = official(frontend.prompt_encoder, &conversation);
     let image_sources = rendered
         .image_sources
         .into_iter()
@@ -401,6 +386,8 @@ fn render_prompt(
         })
         .collect::<Result<Vec<_>>>()?;
     let mut token_ids = Vec::new();
+    let mut offsets = Vec::new();
+    let mut byte_start = 0;
     let spans: Vec<_> = rendered.prompt.split(IMAGE_SPECIAL_TOKEN).collect();
     if spans.len() - 1 != image_sources.len() {
         return Err(invalid(
@@ -418,13 +405,22 @@ fn render_prompt(
     for (index, span) in spans.into_iter().enumerate() {
         if index != 0 {
             token_ids.push(placeholder.unwrap());
+            offsets.push((byte_start, byte_start + IMAGE_SPECIAL_TOKEN.len()));
+            byte_start += IMAGE_SPECIAL_TOKEN.len();
         }
-        token_ids.extend(frontend.encode(span, false)?);
+        let encoding = frontend.tokenizer.encode(span, false).map_err(|error| {
+            Error::frontend(FrontendError::Tokenizer(Failure::boxed(error.to_string(), error)))
+        })?;
+        token_ids.extend_from_slice(encoding.get_ids());
+        offsets.extend(encoding.get_offsets().iter().map(|&(start,end)| (byte_start+start,byte_start+end)));
+        byte_start += span.len();
     }
+    let message_boundaries = super::boundaries::token_ends(&rendered.message_boundaries, &offsets, rendered.prompt.len())?;
     Ok(RenderedPrompt {
         text: rendered.prompt,
         token_ids,
         image_sources,
+        message_boundaries,
     })
 }
 
@@ -440,19 +436,4 @@ impl Frontend {
         Ok(ids[0])
     }
 
-    /// Render a message prefix without its generation header.
-    /// Callers must verify that its tokens are an exact prefix of the complete prompt.
-    pub fn render_boundary(
-        &self,
-        messages: &[Json],
-        options: &Map<String, Json>,
-    ) -> Result<RenderedPrompt> {
-        if self.prompt_encoder == PromptEncoder::Jinja {
-            return self.render_jinja(messages, options, true);
-        }
-        let mut options = options.clone();
-        options.insert("add_generation_prompt".into(), true.into());
-        options.insert("continue_final_message".into(), false.into());
-        render_prompt(self, messages, &options, false)
-    }
 }

@@ -151,3 +151,31 @@ def test_vision_text_and_draft_scratch_share_storage(checkpoint_config):
             == draft.embedding.untyped_storage()._cdata)
     assert sum(footprints) - pool.nbytes > 400 << 20
     assert text.attention.key.dtype == text.attention.value.dtype == torch.bfloat16
+
+
+def test_runtime_assets_preserve_validated_annotated_template_path(tmp_path):
+    import hashlib
+    from ignition.recipes.step5 import frontend
+
+    template = Path(frontend.__file__).with_name("assets") / "chat_template.jinja"
+    annotated = template.read_bytes()
+    source = annotated.replace(b"{%- mark -%}", b"")
+    opening = b"{%- if true %}"
+    closing = b"{%- endif %}\n    {%- elif message.role == \"tool\" %}"
+    assert source.count(opening) == source.count(closing) == 1
+    source = source.replace(opening, b"{%- generation %}").replace(
+        closing, b"{%- endgeneration %}\n    {%- elif message.role == \"tool\" %}")
+    checkpoint_template = tmp_path / "chat_template.jinja"
+    checkpoint_template.write_bytes(source)
+
+    assets = frontend.runtime_assets(tmp_path)
+    assert assets["chat_template"] == {
+        "path": str(template.resolve()), "sha256": hashlib.sha256(annotated).hexdigest()}
+    assert assets["tokenizer"] == {"path": str(tmp_path / "tokenizer.json")}
+    assert checkpoint_template.read_bytes() == source
+    assert template.read_bytes() == annotated
+    assert [path.name for path in tmp_path.iterdir()] == ["chat_template.jinja"]
+
+    checkpoint_template.write_bytes(source + b" ")
+    with pytest.raises(ValueError, match="checkpoint chat template does not match"):
+        frontend.runtime_assets(tmp_path)

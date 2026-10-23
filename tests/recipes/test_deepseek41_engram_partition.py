@@ -1,13 +1,12 @@
 """Engram export and resident delivery use identical interleaved checkpoint rows."""
 
-from types import SimpleNamespace
+from pathlib import Path
 
 import pytest
 from b12x.sequence import engram
 
 from ignition.components.parallel import TensorParallelShard
 from ignition.preparation.runtime_package import FileSource
-from ignition.preparation import runtime_package_pb2 as proto
 from ignition.recipes.deepseek41.engram import Tables
 
 
@@ -24,32 +23,30 @@ def test_package_planes_and_resident_segments_preserve_head_bytes(tmp_path, worl
         contents.append(data)
     tables = Tables(geometry, tuple(range(32)), {1: tuple(sources)}, {}, {}, None,
                     TensorParallelShard(0, world), {}, None)
-    index, payload = SimpleNamespace(engram=proto.Engram()), []
-    tables.append(index, payload, 0)
-    table = index.engram.tables[0]
-    assert list(table.hash.primes) == list(geometry.primes[0])
-    assert list(table.hash.multipliers) == list(geometry.multipliers[0])
+    metadata = tables.export_metadata()
+    table = metadata["tables"][0]
+    assert table["hash"]["primes"] == list(geometry.primes[0])
+    assert table["hash"]["multipliers"] == list(geometry.multipliers[0])
     global_row = 0
     for rank in range(world):
         partition = tables.partition(0, rank)
-        stored = table if world == 1 else table.shards[rank]
+        stored = table if world == 1 else table["shards"][rank]
         if world > 1:
-            assert (stored.first_row, stored.rows) == (global_row, partition.rows)
+            assert (stored["first_row"], stored["rows"]) == (global_row, partition.rows)
         for head in partition.heads:
-            assert table.hash.offsets[head] == global_row + partition.row_mapping[head][2]
+            assert table["hash"]["offsets"][head] == global_row + partition.row_mapping[head][2]
         rank_tables = Tables(geometry, tables.token_map, tables.sources, {}, {}, None,
                              TensorParallelShard(rank, world), {}, None)
         resident = rank_tables.resident_catalog()["tables"][0]["planes"]
         for ordinal, (name, width, source) in enumerate(zip(("weights", "scales"), (256, 8), contents)):
-            span = getattr(stored, name)
-            chunks = [(offset, path, first, nbytes) for offset, path, first, nbytes in payload
-                      if span.offset <= offset < span.offset + span.nbytes]
-            actual = b"".join(path.read_bytes()[first:first + nbytes] for _, path, first, nbytes in chunks)
+            chunks = stored[name]
+            actual = b"".join(Path(chunk["path"]).read_bytes()[chunk["offset"]:chunk["offset"] + chunk["nbytes"]]
+                              for chunk in chunks)
             expected = b"".join(source[first * width:last * width] for first, last in partition.source_rows)
-            assert actual == expected and len(actual) == span.nbytes
-            assert resident[ordinal]["segments"] == [
-                {"path": str(path), "offset": first, "nbytes": nbytes}
-                for _, path, first, nbytes in chunks]
+            assert actual == expected and len(actual) == partition.rows * width
+            assert resident[ordinal]["segments"] == chunks
         global_row += partition.rows
     assert global_row == rows
-    assert sum(nbytes for _, _, _, nbytes in payload) == rows * 264
+    planes = [table] if world == 1 else table["shards"]
+    assert sum(chunk["nbytes"] for plane in planes for name in ("weights", "scales")
+               for chunk in plane[name]) == rows * 264

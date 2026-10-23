@@ -1,5 +1,8 @@
 #![cfg(feature = "frontend")]
 
+#[path = "support/native_prefix.rs"]
+mod native_prefix;
+
 use deepseek_recipe_core::{
     conversation::{Conversation, ReasoningEffort, ResponseFormat},
     messages::InputMessage,
@@ -56,7 +59,7 @@ fn configured_frontend(
     std::fs::write(&path, &bytes).unwrap();
     let settings: FrontendSettings = serde_json::from_value(json!({"tokenizer":{},"eos_token_ids":[],"prompt_encoder":i32::from(encoder),"image_placeholder_token_id":placeholder,"template_encoding":template_encoding})).unwrap();
     let template_path = path.with_extension("jinja");
-    let template_bytes = b"{{ messages|tojson }}";
+    let template_bytes = b"{% mark %}{{ messages|tojson }}";
     let chat_template = if encoder == PromptEncoder::Jinja {
         std::fs::write(&template_path, template_bytes).unwrap();
         Some(Asset {
@@ -155,7 +158,7 @@ fn official_rendering_and_system_prefixes_follow_both_encoders() {
                     assert_eq!(actual.text, expected);
                     assert_eq!(actual.token_ids, frontend.encode(&expected, false).unwrap());
                     options.insert("add_generation_prompt".into(), false.into());
-                    let prefix = frontend.render_boundary(&messages[..2], &options).unwrap();
+                    let prefix = native_prefix::without_generation(&frontend, &messages[..2], &options);
                     assert!(!prefix.token_ids.is_empty());
                     assert!(actual.token_ids.starts_with(&prefix.token_ids));
                     assert!(actual.text.starts_with(&prefix.text));
@@ -376,7 +379,7 @@ fn checkpoint_tokenizer_preserves_canonical_image_order_and_prefixes() {
                     messages.push(json!({"role":"user","content":"Hello"}));
                     let full = frontend.render_chat(&messages, &options).unwrap();
                     options.insert("add_generation_prompt".into(), false.into());
-                    let prefix = frontend.render_boundary(&systems, &options).unwrap();
+                    let prefix = native_prefix::without_generation(&frontend, &systems, &options);
                     assert!(full.token_ids.starts_with(&prefix.token_ids));
                     assert!(full.text.starts_with(&prefix.text));
                 }

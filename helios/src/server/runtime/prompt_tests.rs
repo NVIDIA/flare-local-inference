@@ -46,7 +46,8 @@ fn prompt_prefill_gpu_and_native_costs() {
                         conditioned_inputs: vec![], conditioning: vec![], sampling: crate::model::SamplingParameters {
                             top_k: 1, ..Default::default()
                         }, max_new_tokens: budget, stop_sequences: vec![], stop_strings: vec![],
-                        grammar: None, ignore_eos: false, logprobs: false, prompt_logprobs: scored,
+                        grammar: None, ignore_eos: false, logprobs: false,
+                        logprob_token_ids: vec![], prompt_logprobs: scored,
                     };
                     runtime.metrics().scheduler_trace.drain(&mut samples);
                     let started = Instant::now();

@@ -14,12 +14,14 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     speculation = plan.speculation
     drafting = {} if speculation is None else {
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity,
-        "speculative_fixed_width": speculation.fixed_width, "packed_verification": speculation.packed_verification}
+        "speculative_graph_budget": speculation.graph_budget,
+        "speculative_fixed_width": speculation.fixed_width, "packed_verification": speculation.packed_verification,
+        "draft_prefix_selection": speculation.draft_prefix_selection}
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
+        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         image_concurrency=plan.image_concurrency,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
-        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, compile_decoder=compile_forwards,
+        hosts=None if ranks is None else ranks.hosts, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain, compile_decoder=compile_forwards,
         retain_graphs=retain_graphs, max_active=plan.concurrency, context=plan.context,
         prefill_chunk_size=plan.prefill_chunk, minimum_pages=plan.minimum_pages,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
@@ -45,8 +47,10 @@ RECIPE = Recipe(
         stored_bytes=510_286_023_000, device_bytes=306_557_453_640, draft_bytes=7_932_874_632,
         # Estimate half of backbone scale bytes saved; retain the full draft budget.
         scale_compressed_device_bytes={"csf": 298_063_988_040}),),
-    context=1048576, page_tokens=128, concurrency=4, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
+    speculation=Speculation(draft_tokens=5, token_capacity=128, packed_verification=True,
+                            draft_prefix_selection="gpu", graph_budget=64),
+    max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,
     ranks=MappingProxyType({4: RankCosts(3_043_840, 113_920, 8 << 30)}),

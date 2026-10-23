@@ -18,6 +18,81 @@ from ignition.preparation.tensor_metadata import record_numeric_tensor
 from ignition.preparation.tuning import declare, register_finalizer
 
 
+def prepare_projection(source, weight, output, *, session, name, workspace, activation_mode="auto", staging=None):
+    """Bind a projection without changing its checkpoint weight representation."""
+    from .block_fp8 import BlockFP8Projection, BlockFP8Weight
+    from .weights import GroupedLinearWeights
+
+    if isinstance(weight, GroupedLinearWeights):
+        return PreparedProjectionGroup(source, weight, output, session=session, name=name, workspace=workspace,
+                                       activation_mode=activation_mode, staging=staging)
+    if isinstance(weight, torch.Tensor):
+        return UnquantizedProjection(source, weight, output, session=session, name=name)
+    if isinstance(weight, BlockFP8Weight):
+        return BlockFP8Projection(source, weight, output, session=session, name=name)
+    return QuantizedProjection(source, weight, output, session=session, name=name,
+                               workspace=workspace, activation_mode=activation_mode)
+
+
+class PreparedProjectionGroup:
+    """Project one source into ordered output slices with compatible weights fused."""
+
+    def __init__(self, source, weight, output, *, session, name, workspace, activation_mode, staging):
+        from .block_fp8 import BlockFP8Weight
+
+        self.output = output
+        self.projections, self.copies = [], []
+        for index, (part, target) in enumerate(zip(weight.parts, output.split(weight.widths, dim=-1), strict=True)):
+            destination = target
+            if not isinstance(part, (torch.Tensor, BlockFP8Weight)) and not target.is_contiguous():
+                if (staging is None or not staging.is_contiguous() or staging.numel() < target.numel()
+                        or staging.dtype != target.dtype or staging.device != target.device):
+                    raise ValueError("mixed packed projections require caller-owned contiguous staging")
+                destination = staging.view(-1)[:target.numel()].view(target.shape)
+            self.projections.append(prepare_projection(source, part, destination, session=session,
+                name=f"{name}.part{index}", workspace=workspace, activation_mode=activation_mode))
+            self.copies.append(None if destination is target else target)
+        self.plans = tuple(projection.plan for projection in self.projections)
+
+    def __call__(self, source):
+        for projection, destination in zip(self.projections, self.copies, strict=True):
+            value = projection(source)
+            if destination is not None:
+                destination.copy_(value)
+        return self.output
+
+
+class BatchedUnquantizedProjection:
+    """Multiply BF16 matrix stacks into caller-owned, possibly strided outputs."""
+
+    def __init__(self, source, weight, output, *, major, session, name):
+        del session, name
+        if major not in ("n", "k"):
+            raise ValueError("batched projections take an n-major or k-major RHS")
+        self.weight = weight if major == "n" else weight.transpose(1, 2)
+        if (source.ndim != 3 or output.shape[:2] != source.shape[:2]
+                or self.weight.shape != (source.shape[0], source.shape[2], output.shape[2])
+                or any(value.dtype != torch.bfloat16 or value.device != source.device
+                       for value in (source, weight, output))):
+            raise ValueError("batched BF16 projections require matching matrix stacks and outputs")
+        record_numeric_tensor(weight)
+        self.output = output
+
+    def __call__(self, source):
+        _bmm_out(source, self.weight, self.output)
+        return self.output
+
+
+@torch.library.custom_op("flare::bmm_out", mutates_args=("out",))
+def _bmm_out(source: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
+    torch.bmm(source, weight, out=out)
+
+
+@_bmm_out.register_fake
+def _fake_bmm_out(source, weight, out):
+    pass
+
+
 class UnquantizedProjection:
     def __init__(
         self,

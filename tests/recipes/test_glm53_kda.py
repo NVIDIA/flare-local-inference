@@ -62,7 +62,8 @@ def test_rank_state_and_scratch_geometry(world):
                    reason="requires an explicitly assigned CUDA device and FLARE_RUN_CUDA_TESTS=1")
 # Without stream overlap the output-gate projections follow the input projections on the main stream.
 @pytest.mark.parametrize("world,tokens,decode_capacity,overlap", [
-    (2, 65, 2, True), (2, 65, 1, True), (4, 129, 2, True), (4, 4096, 2, True), (2, 65, 2, False), (4, 129, 2, False)])
+    (1, 4096, 2, True), (2, 65, 2, True), (2, 65, 1, True), (4, 129, 2, True),
+    (4, 4096, 2, True), (2, 65, 2, False), (4, 129, 2, False)])
 @torch.no_grad()
 def test_actual_kda_native_prefill_and_decode(world, tokens, decode_capacity, overlap):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign a CUDA device explicitly"

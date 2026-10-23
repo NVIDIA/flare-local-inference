@@ -1,12 +1,14 @@
 """Render GLM request cases with the checkpoint's canonical Transformers template."""
 
 import argparse
+import base64
+import io
 import copy
 import json
 from pathlib import Path
 
-from transformers import AutoTokenizer
-from transformers.utils.chat_template_utils import _compile_jinja_template
+from transformers import AutoProcessor, AutoTokenizer
+from PIL import Image
 
 
 def generate(snapshot):
@@ -23,29 +25,31 @@ def generate(snapshot):
         effective = {"add_generation_prompt": not continuation, **options}
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, **effective)
         ids = tokenizer.apply_chat_template(messages, tokenize=True, return_dict=False, **effective)
-        prefix_options = {**effective, "add_generation_prompt": False, "continue_final_message": False}
-        boundary_messages = copy.deepcopy(messages)
-        for index, message in enumerate(boundary_messages):
-            if message["role"] != "assistant" or not message.get("tool_calls"):
-                continue
-            ranks = {call["id"]: rank for rank, call in enumerate(message["tool_calls"])}
-            end = index + 1
-            while end < len(boundary_messages) and boundary_messages[end]["role"] == "tool":
-                end += 1
-            boundary_messages[index + 1:end] = sorted(boundary_messages[index + 1:end],
-                key=lambda result: ranks[result["tool_call_id"]])
-        boundaries = []
-        for count in range(len(boundary_messages) + 1):
-            if count:
-                prefix = tokenizer.apply_chat_template(boundary_messages[:count], tokenize=True,
-                    return_dict=False, **prefix_options)
-            else:
-                text = _compile_jinja_template(tokenizer.get_chat_template()).render(
-                    messages=[], **tokenizer.special_tokens_map, **prefix_options)
-                prefix = tokenizer.encode(text, add_special_tokens=False)
-            if 0 < len(prefix) < len(ids) and ids[:len(prefix)] == prefix:
-                boundaries.append(len(prefix))
-        boundaries = sorted(set(boundaries))
+        source = (Path(__file__).resolve().parents[2] / "ignition/recipes/glm53/assets/chat_template.jinja").read_text()
+        assert source.replace("{%- mark -%}", "") == tokenizer.get_chat_template()
+        marker = "\0message-position\0"
+        while marker in rendered:
+            marker += "_"
+        annotated = source.replace("{%- mark -%}", "{{- message_position() -}}")
+        marked = tokenizer.apply_chat_template(messages, chat_template=annotated, tokenize=False,
+            message_position=lambda: marker, **effective)
+        chunks = marked.split(marker)
+        assert "".join(chunks) == rendered
+        positions, position = [], 0
+        for chunk in chunks[:-1]:
+            position += len(chunk)
+            positions.append(position)
+        encoding = tokenizer.backend_tokenizer.encode(rendered, add_special_tokens=False)
+        assert encoding.ids == ids
+        offsets = encoding.offsets
+        prefix_ends = [0]
+        for _, end in offsets:
+            prefix_ends.append(max(prefix_ends[-1], end))
+        suffix_starts = [len(rendered)] * (len(offsets) + 1)
+        for index in range(len(offsets) - 1, -1, -1):
+            suffix_starts[index] = min(suffix_starts[index + 1], offsets[index][0])
+        boundaries = sorted({index for position in positions for index in range(1, len(offsets))
+            if prefix_ends[index] <= position <= suffix_starts[index]})
         body = {"model": "glm53", "messages": copy.deepcopy(messages), "chat_template_kwargs": options}
         if wire_strings:
             for message in body["messages"]:
@@ -77,7 +81,25 @@ def generate(snapshot):
         {"continue_final_message": "reasoning_content"})
     add("empty_assistant_continuation", [system, user, {"role": "assistant", "content": "", "reasoning_content": ""}],
         {"continue_final_message": True})
-    return {"cases": cases}
+    processor = AutoProcessor.from_pretrained(snapshot, local_files_only=True)
+    image_cases = []
+    for count in (1, 2):
+        images = [Image.new("RGB", (112 + 28 * i, 84), (31 * i, 100, 210)) for i in range(count)]
+        content = [{"type": "text", "text": "Describe the images."}]
+        canonical = [{"type": "text", "text": "Describe the images."}]
+        for image in images:
+            encoded = io.BytesIO()
+            image.save(encoded, format="PNG")
+            content.append({"type": "image_url", "image_url": {"url":
+                "data:image/png;base64," + base64.b64encode(encoded.getvalue()).decode()}})
+            canonical.append({"type": "image"})
+        messages = [system, {"role": "user", "content": canonical}]
+        rendered = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        reference = processor(text=rendered, images=images, return_tensors="pt")
+        image_cases.append({"body": {"model": "glm53", "messages": [system, {"role": "user", "content": content}]},
+            "token_ids": reference.input_ids[0].tolist(),
+            "grid_thw": reference.image_grid_thw.tolist()})
+    return {"cases": cases, "image_cases": image_cases}
 
 
 if __name__ == "__main__":

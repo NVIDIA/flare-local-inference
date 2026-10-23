@@ -33,10 +33,10 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         "speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width,
         "speculative_proposal_source": speculation.proposal_source, "history_drafts": speculation.history_drafts}
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
+        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,
         hosts=None if ranks is None else ranks.hosts, compile_decoder=compile_forwards, retain_graphs=retain_graphs,
-        max_active=plan.concurrency, image_concurrency=plan.image_concurrency, roce_ring=plan.roce_ring, stream_overlap=plan.stream_overlap,
+        max_active=plan.concurrency, image_concurrency=plan.image_concurrency, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain, stream_overlap=plan.stream_overlap,
         context=plan.recipe.context, prefill_chunk_size=plan.prefill_chunk, mixed_prefill=plan.mixed_prefill,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
         headroom_bytes=plan.headroom_bytes + plan.reserve_bytes, kernel_cache=kernel_cache,
@@ -72,11 +72,11 @@ RECIPE = Recipe(
         # Routed-expert block scales expand at load from 4,156,604,564 CSF bytes to
         # 48 layers x 512 experts x 307,200 bytes.
         expansion_bytes=3_393_142_636),),
-    context=262144, page_tokens=64, concurrency=4, max_concurrency=64, prefill_chunk=4096,
+    context=262144, page_tokens=64, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     # Rounds adapt among zero through five drafts, up to seven. Verification records
     # corrections and commits accepted tokens into the live state row, so it keeps
     # no extra rows.
-    speculation=Speculation(draft_tokens=5), max_draft_tokens=7, verification_rows=0, history_copy=True,
+    speculation=Speculation(draft_tokens=5, token_capacity=128), max_draft_tokens=7, verification_rows=0, history_copy=True,
     # Shared experts, small-batch attention projections and selection, and GDN input projections run
     # on an auxiliary stream.
     stream_overlap=True,

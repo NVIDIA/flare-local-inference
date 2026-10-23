@@ -253,6 +253,8 @@ impl SchedulerView {
         let origin = match sample.selection.origin {
             TimingOrigin::Ordinary => "service".to_owned(),
             TimingOrigin::Discovery => "discovery".to_owned(),
+            TimingOrigin::Acceptance => sample.selection.refresh_episode
+                .map_or_else(|| "acceptance".to_owned(), |id| format!("acceptance #{id}")),
             TimingOrigin::Refresh => sample.selection.refresh_episode
                 .map_or_else(|| "refresh".to_owned(), |id| format!("refresh #{id}")),
         };
@@ -453,6 +455,7 @@ fn shape(graph: &GraphLabel) -> String {
         GraphKind::Speculative => "speculative",
         GraphKind::Proposal => "proposal",
         GraphKind::Verification => "verification",
+        GraphKind::PackedSpeculative => "packed speculative",
         GraphKind::Mixed => "mixed",
         GraphKind::Init => "init",
         GraphKind::Restore => "restore",
@@ -485,6 +488,7 @@ fn kind_style(kind: GraphKind) -> (&'static str, Color) {
         GraphKind::Speculative => ("S", PURPLE),
         GraphKind::Proposal => ("Q", PURPLE),
         GraphKind::Verification => ("T", PURPLE),
+        GraphKind::PackedSpeculative => ("S", PURPLE),
         GraphKind::Mixed => ("M", CYAN),
         GraphKind::Init => ("I", MUTED),
         GraphKind::Restore => ("R", GOLD),

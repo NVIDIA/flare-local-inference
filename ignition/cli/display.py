@@ -28,9 +28,10 @@ def speculation(settings, *, brief: bool = False) -> str:
         return "speculation off" if brief else "off"
     drafts = settings.draft_tokens
     depth = f"{'up to' if settings.adaptive else 'exactly'} {drafts} draft token{'' if drafts == 1 else 's'}"
+    selection = " · GPU prefix selection" if settings.draft_prefix_selection == "gpu" else ""
     if brief:
         source = " from history" if not settings.learned else " with history drafts" if settings.history_drafts else ""
-        return depth + source
-    source = ("request history" if not settings.learned
-              else "MTP module and request history" if settings.history_drafts else "MTP module")
-    return f"{depth} per round · {source}"
+        return depth + source + selection
+    source = ("shared decoded history" if not settings.learned
+              else "MTP module and shared decoded history" if settings.history_drafts else "MTP module")
+    return f"{depth} per round · {source}" + selection

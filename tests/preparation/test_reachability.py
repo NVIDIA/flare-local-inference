@@ -8,83 +8,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from ignition.preparation.reachability import Reachability
-from ignition.preparation.runtime_package import Allocation, Argument, Kernel
+from ignition.preparation.runtime_package import Allocation
 from ignition.preparation.tensor_metadata import NumericStorage, tensor_ranges
-
-
-def test_numeric_scale_and_adjacent_bytes_do_not_form_a_pointer():
-    scale = 0x200a295e5000
-    target = 0x200a3f800000
-    owner = Allocation("data", scale, 256)
-    traversal = Reachability([owner, Allocation("unused", target, 256)],
-                             roots=("data",), numeric=((scale, scale + 4),))
-    data = struct.pack("<Q", target)
-    assert struct.unpack("<f", data[:4])[0] == 1.0
-    traversal.contents(owner, 0, data)
-    assert traversal.reached == {"data"}
-
-
-def test_pointer_table_is_followed_beside_numeric_tensor_and_across_chunks():
-    base = 0x200000000000
-    owner = Allocation("mixed", base, 256)
-    traversal = Reachability([owner, Allocation("live", base + 256, 256),
-                              Allocation("dead", base + 512, 256)],
-                             roots=("mixed",), numeric=((base, base + 16),))
-    data = struct.pack("<QQ", base + 512, base + 512) + b"padding" + struct.pack("<Q", base + 257)
-    traversal.contents(owner, 0, data[:26])
-    traversal.contents(owner, 26, data[26:])
-    assert traversal.reached == {"mixed", "live"}
-
-
-def test_numeric_argument_and_pointer_argument_with_identical_bytes():
-    allocations = [Allocation("scalar_bits", 0x200000000000, 256),
-                   Allocation("input", 0x200000000100, 256)]
-    kernel = Kernel(1, "module", (Argument(8, numeric=((0, 8),)), Argument(8)))
-    traversal = Reachability(allocations)
-    node = {"kind": "kernel", "function": 0, "attributes": [], "arguments": [
-        {"data": struct.pack("<Q", allocations[0].address), "relocations": []},
-        {"data": struct.pack("<Q", allocations[1].address), "relocations": []},
-    ]}
-    traversal.graph({"nodes": [node]}, [kernel])
-    assert traversal.reached == {"input"}
-    node["arguments"][1]["data"] = node["arguments"][0]["data"]
-    traversal.graph({"nodes": [node]}, [kernel])
-    assert traversal.reached == {"scalar_bits", "input"}
-
-
-def test_unknown_struct_keeps_unaligned_pointer_but_never_combines_arguments():
-    allocation = Allocation("input", 0x200000001000, 256)
-    traversal = Reachability([allocation])
-    pointer = struct.pack("<Q", allocation.address)
-    traversal.blob(pointer[:4])
-    traversal.blob(pointer[4:])
-    assert not traversal.reached
-    traversal.blob(b"abc" + pointer + b"xyz")
-    assert traversal.reached == {"input"}
-
-
-def test_opaque_value_cannot_retain_freed_preparation_storage():
-    base = 0x200000000000
-    allocation = Allocation("segment", base, 4096)
-    free = ((base + 1024, base + 3072),)
-    for offset, expected in ((0, True), (1023, True), (1024, False),
-                             (2048, False), (3071, False), (3072, True)):
-        traversal = Reachability([allocation], inactive=free)
-        traversal.blob(b"unaligned" + struct.pack("<Q", base + offset))
-        assert bool(traversal.reached) == expected
-
-
-def test_free_storage_filter_applies_to_pointer_tables_and_not_explicit_bindings():
-    base = 0x200000000000
-    table = Allocation("table", base, 16)
-    target = Allocation("freed", base + 4096, 4096)
-    traversal = Reachability([table, target], roots=("table",),
-                             inactive=((target.address, target.address + target.nbytes),))
-    traversal.contents(table, 0, struct.pack("<Q", target.address))
-    assert traversal.reached == {"table"}
-    traversal.reference({"allocation": "freed"})
-    assert traversal.reached == {"table", "freed"}
 
 
 def test_tensor_views_exclude_holes_and_padding_and_deduplicate_aliases():
@@ -95,13 +20,6 @@ def test_tensor_views_exclude_holes_and_padding_and_deduplicate_aliases():
         (address + 32, address + 40), (address + 56, address + 64), (address + 80, address + 88)]
     assert tensor_ranges(tensor[0, :1].expand(100)) == [(address, address + 4)]
     assert tensor_ranges(tensor[:, :0]) == []
-    table = Allocation("mixed", address, 120, alignment=1)
-    traversal = Reachability([table, Allocation("peer", 0x200000000000, 256)],
-                             roots=("mixed",), numeric=tensor_ranges(tensor[:, 2:4]))
-    data = bytearray(120)
-    struct.pack_into("<Q", data, 0, 0x200000000000)
-    traversal.contents(table, 0, data)
-    assert traversal.reached == {"mixed", "peer"}
 
 
 def test_checkpoint_role_tracks_storage_lifetime_without_retaining_weights():
@@ -128,24 +46,8 @@ def test_sampling_indices_do_not_retain_allocations_from_unaligned_token_ids():
             torch.zeros(1, dtype=torch.int32), torch.zeros(1, dtype=torch.int64),
             torch.ones(1, dtype=torch.int32), torch.zeros((1, 1), dtype=torch.int64))
     indices = sampling.vocab_ids
-    owner = Allocation("indices", indices.data_ptr(), indices.nbytes)
-    unused = Allocation("unrelated", 50 << 16, 8)
-    data = indices.numpy().tobytes()
-    raw = Reachability([owner, unused], roots=("indices",))
-    raw.contents(owner, 0, data)
-    assert raw.reached == {"indices", "unrelated"}
-    typed = Reachability([owner, unused], roots=("indices",), numeric=numeric.ranges())
-    typed.contents(owner, 0, data)
-    assert typed.reached == {"indices"}
-
-
-def test_opaque_bytes_do_not_bridge_noncontiguous_snapshot_spans():
-    allocation = Allocation("data", 0x200000000000, 256)
-    traversal = Reachability([allocation, Allocation("unused", 0x200000000100, 256)], roots=("data",))
-    pointer = struct.pack("<Q", 0x200000000100)
-    traversal.contents(allocation, 0, pointer[:4])
-    traversal.contents(allocation, 128, pointer[4:])
-    assert traversal.reached == {"data"}
+    assert any(start <= indices.data_ptr() and indices.data_ptr() + indices.nbytes <= end
+               for start, end in numeric.ranges())
 
 
 def test_resized_checkpoint_storage_invalidates_numeric_metadata():
@@ -209,12 +111,8 @@ def test_repacked_weight_planes_remain_numeric_leaves(codec, kind):
         payload = plane.view(torch.uint8).reshape(-1)[:len(data)]
         payload.copy_(torch.tensor(list(data), dtype=torch.uint8, device=plane.device))
         data = payload.cpu().numpy().tobytes()
-        raw_scan = Reachability([owner, unrelated], roots=("weight",))
-        raw_scan.contents(owner, 0, data)
-        assert raw_scan.reached == {"weight", "unrelated"}
-        typed_scan = Reachability([owner, unrelated], roots=("weight",), numeric=numeric.ranges())
-        typed_scan.contents(owner, 0, data)
-        assert typed_scan.reached == {"weight"}
+        assert any(start <= owner.address and owner.address + len(data) <= end
+                   for start, end in numeric.ranges())
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
@@ -269,4 +167,69 @@ def test_metadata_skips_uninitialized_cache_and_deduplicates_live_views(monkeypa
     ], NumericStorage(), {})
     assert len(visited) == 2
     assert numeric == [(weights.data_ptr() + 32, weights.data_ptr() + 64)]
+    assert arguments == {}
+
+
+def test_overlapping_recorder_bounds_preserve_integer_alias_exclusion(monkeypatch):
+    import ignition.preparation.tensor_metadata as metadata
+
+    storage = torch.zeros(16, dtype=torch.float32)
+    floating, pointers = storage[2:4], storage.view(torch.int64)[1:3]
+    address = storage.data_ptr()
+    # Classification inspects tensor metadata; CPU backing avoids creating a CUDA context.
+    monkeypatch.setattr(torch.Tensor, "device", property(lambda _: SimpleNamespace(type="cuda")))
+    monkeypatch.setattr(metadata.gc, "get_objects", lambda: [floating, pointers])
+    numeric, arguments = metadata.live_metadata([
+        Allocation("storage", address, storage.nbytes),
+        Allocation("recorded", address + 8, 8),
+    ], NumericStorage(), {})
+    assert numeric == []
+    assert arguments == {}
+
+
+def test_numeric_views_crossing_zero_coverage_keep_opaque_aliases_and_skip_zero_bytes(monkeypatch):
+    import ignition.preparation.tensor_metadata as metadata
+
+    storage = torch.zeros(16, dtype=torch.float32)
+    address = storage.data_ptr()
+    floating, pointers = storage[:12], storage.view(torch.int64)[1:4]
+    monkeypatch.setattr(torch.Tensor, "device", property(lambda _: SimpleNamespace(type="cuda")))
+    monkeypatch.setattr(metadata.gc, "get_objects", lambda: [floating, pointers])
+    numeric, _ = metadata.live_metadata([
+        Allocation("recorded", address, storage.nbytes),
+        Allocation("cache", address + 16, 8, initialize="zero"),
+    ], NumericStorage(), {})
+    assert numeric == [(address, address + 8), (address + 32, address + 48)]
+    monkeypatch.setattr(metadata.gc, "get_objects", lambda: [floating])
+    numeric, _ = metadata.live_metadata([
+        Allocation("recorded", address, storage.nbytes),
+        Allocation("cache", address + 16, 8, initialize="zero"),
+    ], NumericStorage(), {})
+    assert numeric == [(address, address + 16), (address + 24, address + 48)]
+
+
+def test_declared_zero_ranges_skip_disposable_views_before_span_discovery(monkeypatch):
+    import ignition.preparation.tensor_metadata as metadata
+
+    scratch = torch.empty((32, 16), dtype=torch.float32)
+    weights = torch.ones(4, dtype=torch.float32)
+    objects = [scratch[:, ::2], weights]
+    monkeypatch.setattr(torch.Tensor, "device", property(lambda _: SimpleNamespace(type="cuda")))
+    monkeypatch.setattr(metadata.gc, "get_objects", lambda: objects)
+    ranges = metadata.tensor_ranges
+    visited = []
+
+    def classify(tensor):
+        assert tensor.data_ptr() != scratch.data_ptr()
+        visited.append(tensor)
+        return ranges(tensor)
+
+    monkeypatch.setattr(metadata, "tensor_ranges", classify)
+    numeric, arguments = metadata.live_metadata([
+        Allocation("scratch", scratch.data_ptr(), scratch.nbytes),
+        Allocation("recorded-scratch", scratch.data_ptr(), scratch.nbytes),
+        Allocation("weights", weights.data_ptr(), weights.nbytes),
+    ], NumericStorage(), {}, zero_ranges=[(scratch.data_ptr(), scratch.nbytes)])
+    assert len(visited) == 1 and visited[0] is weights
+    assert numeric == [(weights.data_ptr(), weights.data_ptr() + weights.nbytes)]
     assert arguments == {}

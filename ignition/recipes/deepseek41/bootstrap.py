@@ -31,7 +31,7 @@ from ignition.preparation.host_memory import virtual_device_memory, release_unus
 from ignition.preparation.frontend import PromptEncoder, prepare_frontend
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
-from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
@@ -64,14 +64,16 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = (0, 1, 2, 3)
     # Device ordinals are host-local when each rank runs on its own Spark.
     hosts: tuple[str, ...] | None = None
     roce_ring: bool = False
+    roce_chain: bool = False
     context: int = 1048576
     prefill_chunk_size: int = 4096
-    max_active: int = 4
+    max_active: int = 32
     minimum_pages: int = 8
     # An explicit cache capacity makes memory comparisons independent of automatic sizing.
     kv_pages: int | None = None
@@ -83,15 +85,15 @@ class PreparationConfig:
     dspark: bool = True
     speculative_widths: tuple[int, ...] = (1, 2, 3, 4, 5, 6)
     speculative_fixed_width: int | None = None
-    speculative_token_capacity: int | None = None
-    # Run single-row decode's shared expert on an auxiliary stream; without overlap it runs serially.
+    speculative_token_capacity: int | None = 128
+    speculative_graph_budget: int = 64
+    # Overlap shared and routed experts within each eligible text graph.
     stream_overlap: bool = True
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
-    # Separate proposal and verification graphs for native confidence-prefix scheduling.
-    split_speculation: bool = False
-    packed_verification: bool = False
-    # Additional combined graphs for exact qualification; omit when measuring service memory.
+    split_speculation: bool | None = None
+    packed_verification: bool | None = None
+    draft_prefix_selection: str | None = None
     speculation_reference_graphs: bool = False
 
     def __post_init__(self):
@@ -99,16 +101,29 @@ class PreparationConfig:
         from ignition.components.compressed_mla import validate_mla_compute_mode
 
         validate_mla_compute_mode(self.mla_compute_mode)
+        self.speculative_shapes
+        self.packed_speculative_shapes
+        drafting = self.dspark and self.draft_tokens > 0
+        for name in ("split_speculation", "packed_verification"):
+            value = getattr(self, name)
+            if value is None:
+                object.__setattr__(self, name, drafting)
+            elif type(value) is not bool:
+                raise TypeError(f"{name} must be a boolean")
+        if self.draft_prefix_selection is None:
+            object.__setattr__(self, "draft_prefix_selection", "gpu" if drafting else "cpu")
+        if self.draft_prefix_selection not in ("cpu", "gpu"):
+            raise ValueError("draft prefix selection must be cpu or gpu")
+        if drafting:
+            if not self.split_speculation or not self.packed_verification or self.draft_prefix_selection != "gpu":
+                raise ValueError("DeepSeek V4.1 DSpark requires packed GPU draft prefix selection")
+            if self.speculative_fixed_width is not None or self.speculation_reference_graphs:
+                raise ValueError("DeepSeek V4.1 DSpark requires adaptive packed GPU rounds")
+        elif self.split_speculation or self.packed_verification or self.draft_prefix_selection != "cpu" or self.speculation_reference_graphs:
+            raise ValueError("packed GPU speculation requires positive DSpark draft depth")
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
         if self.expert_scale_compression not in (None, "csf"):
             raise ValueError("DeepSeek V4.1 expert scale compression must be None or 'csf'")
-        if self.speculation_reference_graphs and not self.split_speculation:
-            raise ValueError("speculation reference graphs require split speculation")
-        if self.split_speculation and (not self.dspark or self.draft_tokens < 1):
-            raise ValueError("split speculation requires a learned draft model and positive draft depth")
-        if self.packed_verification and (not self.split_speculation or self.speculative_fixed_width is not None
-                                         or self.speculation_reference_graphs):
-            raise ValueError("packed verification requires an adaptive retained-proposal catalog")
         if type(self.stream_overlap) is not bool:
             raise TypeError("stream_overlap must be a boolean")
         placements = tuple(zip(self.hosts or ("",) * len(self.devices), self.devices))
@@ -116,8 +131,11 @@ class PreparationConfig:
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != 4)
                 or any(type(d) is not int or d < 0 for d in self.devices)):
             raise ValueError("DeepSeek V4.1 Flash preparation requires four distinct GPUs")
-        if self.roce_ring and self.hosts is None:
-            raise ValueError("RoCE ring requires ranks on separate hosts")
+        from ignition.planning import host_shape_error
+
+        error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
+        if error:
+            raise ValueError(error)
         if not PAGE_TOKENS <= self.context <= 1048576 or self.context % PAGE_TOKENS:
             raise ValueError("DeepSeek context must be 128-aligned in [128,1048576]")
         if not 64 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 64:
@@ -147,11 +165,20 @@ class PreparationConfig:
     def speculative_shapes(self):
         from ignition.components.capacity import speculative_shapes
 
-        return speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity) if self.dspark else ()
+        return tuple((batch, width) for batch, width in
+            speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity)
+            if width == 1) if self.dspark else ()
+
+    @property
+    def packed_speculative_shapes(self):
+        from ignition.components.capacity import packed_speculative_shapes
+
+        return packed_speculative_shapes(self.max_active, max(self.speculative_widths),
+            self.speculative_token_capacity, self.speculative_graph_budget) if self.draft_tokens else ()
 
     @property
     def decode_tokens(self):
-        return max((b * w for b, w in self.speculative_shapes), default=self.request_capacity)
+        return max(self.request_capacity, max((tokens for _, tokens in self.packed_speculative_shapes), default=0))
 
     @property
     def draft_tokens(self):
@@ -161,6 +188,61 @@ class PreparationConfig:
     def all_reduce_tokens(self):
         return max(self.decode_tokens, self.request_capacity * self.draft_tokens,
                    *(capacity for capacity in self.prefill_capacities if capacity < 128))
+
+
+def _prepare_speculation_catalog(config, speculation, *, add, buffers, graph_buffers,
+                                 forward_inputs, host_allocate, device):
+    if speculation is None:
+        return None, None
+    from ignition.components.parallel_draft import PreparedParallelDraftRound
+
+    speculation.sampling_buffers = graph_buffers
+    split = confidence = None
+    if config.draft_tokens:
+        from ignition.components.capacity import proposal_shapes
+        from ignition.components.split_draft import (
+            PreparedDraftProposal, PreparedDraftVerification, PreparedProposalStorage)
+        from ignition.components.packed_speculation import PreparedPackedSpeculativeRound
+
+        slots = config.request_capacity
+        confidence = host_allocate("proposal_confidence", (slots, config.draft_tokens), torch.float32)
+        buffers["proposal_confidence"] = confidence.device_view
+        split = PreparedProposalStorage(speculation, config.draft_tokens)
+        buffers.update(split.buffers())
+        prefix_limits = torch.zeros(slots, dtype=torch.int32, device=device)
+        buffers["speculative_prefix_limits"] = prefix_limits
+        packed_inputs = tuple(field for field in forward_inputs if field != "query_lengths")
+        packed_inputs += ("speculative_prefix_limits",)
+        packed_batches = {batch for batch, _ in config.packed_speculative_shapes}
+        proposals = {}
+        for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
+            if batch not in packed_batches:
+                continue
+            name = f"proposal{batch}x{depth + 1}"
+            source = PreparedParallelDraftRound(speculation, batch, depth + 1, name,
+                buffers=graph_buffers.cursor(), proposal_only=True)
+            source.prepare()
+            proposals[batch] = PreparedDraftProposal(source, confidence.device_view, split)
+    for batch, _ in reversed(config.speculative_shapes):
+        name = f"speculative{batch}x1"
+        forward = PreparedParallelDraftRound(speculation, batch, 1, name,
+            buffers=graph_buffers.cursor())
+        forward.prepare()
+        add(name, forward, "speculative", batch, 1, forward_inputs, enabled=True)
+    for batch, packed_tokens in sorted(config.packed_speculative_shapes,
+            key=lambda shape: (shape[1], shape[0]), reverse=True):
+        logical_width = max(config.speculative_widths)
+        target_name = f"verification{batch}x{logical_width}-tokens{packed_tokens}"
+        target = PreparedParallelDraftRound(speculation, batch, logical_width, target_name,
+            generate_proposals=False, buffers=graph_buffers.cursor(), target_token_capacity=packed_tokens)
+        target.prepare()
+        verification = PreparedDraftVerification(split, target)
+        name = f"packed-speculative{batch}x{logical_width}-drafts{config.draft_tokens}-tokens{packed_tokens}"
+        forward = PreparedPackedSpeculativeRound(proposals[batch], verification, prefix_limits,
+            name=name, buffers=graph_buffers.cursor())
+        add(name, forward, "packed_speculative", batch, logical_width, packed_inputs,
+            enabled=True, packed_tokens=packed_tokens, draft_tokens=config.draft_tokens)
+    return split, confidence
 
 
 def _collective_runtimes(config, group, device, *, coordinator, package_storage, verification_samples):
@@ -173,7 +255,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
         from ignition.components.speculation import SpeculativeAcceptance
 
         batch = max(config.batch_capacities)
-        layouts = (SpeculativeAcceptance.storage_layout(batch, max(config.speculative_widths)),)
+        layouts = (SpeculativeAcceptance.broadcast_layout(batch, max(config.speculative_widths)),)
         if config.draft_tokens:
             layouts += (PreparedDraftDistribution.broadcast_layout(batch),)
     if coordinator.spans_hosts:
@@ -185,7 +267,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
                            (result_bytes + 15) // 16 * 16)
         decode_tokens = config.all_reduce_tokens
         runtime = create_roce_runtime(group, device, max_tokens=decode_tokens, pipe_tokens=tokens,
-            hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, package_storage=package_storage)
+            hidden_size=5120, gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage)
         return runtime, runtime, runtime, runtime if layouts else None
     ipc = package_storage.peer_storage
     collective = create_all_reduce_runtime(group, device, max_tokens=config.all_reduce_tokens, hidden_size=5120, ipc=ipc)
@@ -197,6 +279,7 @@ def _collective_runtimes(config, group, device, *, coordinator, package_storage,
 
 
 @torch.no_grad()
+@with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage=None):
     if package_storage is None:
         raise ValueError("DeepSeek preparation requires package storage")
@@ -252,7 +335,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "headers": [s.header_sha256 for s in manifest.shards], "world_size": shard.world_size,
             "contract": "deepseek41.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             device=device, checkpoint=identity,
             workload_schema="deepseek41-text", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
@@ -315,23 +398,20 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     modes = (True, False) if config.dspark else (False,)
     count = (len(modes) * (prefill_graph_count(config.prefill_capacities, scoring)
                            + 4 * len(config.batch_capacities))
-             + len(config.speculative_shapes) + len(config.batch_capacities))
-    if config.split_speculation:
-        count += len(config.batch_capacities) * (config.draft_tokens + 1)
-        if config.speculation_reference_graphs:
-            count += len(config.speculative_shapes)
+             + len(config.speculative_shapes) + len(config.packed_speculative_shapes)
+             + len(config.batch_capacities))
     count += len(PATCH_CAPACITIES) if vision_state is not None else 0
     catalog_bytes = {}
     catalog_previous = torch.cuda.memory_allocated(device)
     with phase(progress, "Construct graph catalog", total=count) as stage:
-        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0):
+        def add(name, forward, kind, rows, tokens, fields, *, enabled=None, packed_tokens=0, draft_tokens=None):
             nonlocal catalog_previous
             if kind == "scored_prefill":
                 forward = PreparedScoredPrefill(forward, requests, inputs)
                 fields = (*fields, "prompt_target_tokens")
             forwards[name] = forward
             signatures[name] = GraphSignature(kind, rows, tokens, tuple(fields), speculation_enabled=enabled,
-                                              packed_token_capacity=packed_tokens)
+                                              packed_token_capacity=packed_tokens, draft_tokens=draft_tokens)
             allocated = torch.cuda.memory_allocated(device)
             catalog_bytes[kind] = catalog_bytes.get(kind, 0) + allocated - catalog_previous
             catalog_previous = allocated
@@ -367,61 +447,9 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                         context_factory=PreparedContext if kind == "scored_prefill" else _CONTEXT, buffers=cursor)
                     fields = (*forward_inputs, "vision_token_indices", "vision_feature_slot") if mode == "prefill" and vision_state is not None else forward_inputs
                     add(name, forward, kind, rows, capacity if mode == "prefill" else 1, fields, enabled=enabled)
-        split = None
-        if speculation is not None:
-            from ignition.components.parallel_draft import PreparedParallelDraftRound
-            speculation.sampling_buffers = graph_buffers
-            if config.split_speculation:
-                from copy import copy
-                from ignition.components.capacity import proposal_shapes
-                from ignition.components.split_draft import (
-                    PreparedCombinedDraftRound, PreparedDraftProposal, PreparedDraftVerification, PreparedProposalStorage)
-
-                confidence = package_storage.host_allocate("proposal_confidence", (slots, config.draft_tokens), torch.float32)
-                buffers["proposal_confidence"] = confidence.device_view
-                split = PreparedProposalStorage(speculation, config.draft_tokens)
-                buffers.update(split.buffers())
-                proposals = {}
-                for batch, depth in sorted(proposal_shapes(config.max_active, config.draft_tokens), reverse=True):
-                    owner = copy(speculation)
-                    owner.block_size = depth
-                    name = f"proposal{batch}x{depth + 1}"
-                    source = PreparedParallelDraftRound(owner, batch, depth + 1, name,
-                        buffers=speculation.sampling_buffers.cursor(), proposal_only=True)
-                    source.prepare()
-                    proposal = PreparedDraftProposal(source, confidence.device_view, split)
-                    proposals[batch, depth] = proposal
-                    add(name, proposal, "proposal", batch, depth + 1, forward_inputs, enabled=True)
-                for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
-                    name = f"verification{batch}x{width}"
-                    logical_width = max(config.speculative_widths) if config.packed_verification else width
-                    packed_tokens = batch * width if config.packed_verification else 0
-                    if packed_tokens:
-                        name = f"verification{batch}x{logical_width}-tokens{packed_tokens}"
-                    target = PreparedParallelDraftRound(speculation, batch, logical_width, name,
-                        generate_proposals=False, buffers=speculation.sampling_buffers.cursor(),
-                        target_token_capacity=packed_tokens or None)
-                    target.prepare()
-                    verification = PreparedDraftVerification(split, target)
-                    add(name, verification, "verification", batch, logical_width, forward_inputs, enabled=True,
-                        packed_tokens=packed_tokens)
-                    if width == 1:
-                        # No proposal is needed to decode while retaining draft context.
-                        decode = PreparedParallelDraftRound(speculation, batch, 1, f"speculative{batch}x1",
-                            buffers=speculation.sampling_buffers.cursor())
-                        decode.prepare()
-                        add(f"speculative{batch}x1", decode, "speculative", batch, 1, forward_inputs, enabled=True)
-                    if config.speculation_reference_graphs:
-                        add(f"combined{batch}x{width}", PreparedCombinedDraftRound(
-                            proposals[batch, config.draft_tokens], verification),
-                            "speculative", batch, width, forward_inputs, enabled=True)
-            else:
-                for batch, width in sorted(config.speculative_shapes, key=lambda shape: shape[0] * shape[1], reverse=True):
-                    name = f"speculative{batch}x{width}"
-                    forward = PreparedParallelDraftRound(speculation, batch, width, name,
-                        buffers=speculation.sampling_buffers.cursor())
-                    forward.prepare()
-                    add(name, forward, "speculative", batch, width, forward_inputs, enabled=True)
+        split, confidence = _prepare_speculation_catalog(config, speculation, add=add, buffers=buffers,
+            graph_buffers=graph_buffers, forward_inputs=forward_inputs,
+            host_allocate=package_storage.host_allocate, device=device)
         if vision_state is not None:
             for capacity in reversed(PATCH_CAPACITIES):
                 name = f"vision{capacity}"
@@ -459,7 +487,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
         pool=graph_pool, collective=collective, coordinator=coordinator, compile_decoder=config.compile_decoder,
         progress=progress, cache_root=config.kernel_cache, retain_graphs=config.retain_graphs,
         materialize=pool.clear_for_preparation, warmup_storage=package_storage,
-        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "proposal", "verification", "vision"))
+        compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "packed_speculative", "vision"))
     session.freeze()
     pool.clear_for_preparation()
     if split is not None:
@@ -471,7 +499,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if group is not None:
         torch.distributed.barrier(group=group)
     free, total = torch.cuda.mem_get_info(device)
-    assets = {role: {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    assets = {role: {"path": str(path)}
         for role, path in (("tokenizer", metadata_path / "tokenizer.json"),)}
     buffers["request_pending_token"] = requests.pending_token
     server_config = {"identity": identity, "model_id": snapshot.name,
@@ -503,11 +531,15 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     if scoring is not None:
         memory.update(scoring.memory_report())
     memory["split_speculation"] = config.split_speculation
+    memory["draft_prefix_selection"] = config.draft_prefix_selection
     if config.dspark:
         server_config.update(speculative_widths=config.speculative_widths,
             speculative_token_capacity=speculative_token_capacity(config.max_active, max(config.speculative_widths), config.speculative_token_capacity),
             speculative_fixed_width=config.speculative_fixed_width)
-        memory.update(speculative_shapes=config.speculative_shapes)
+        memory.update(speculative_shapes=config.speculative_shapes,
+            packed_speculative_shapes=config.packed_speculative_shapes,
+            speculative_graph_budget=config.speculative_graph_budget,
+            packed_speculative_graphs=len(config.packed_speculative_shapes))
     disposable = [activation_buffers, arena.tensor, metadata, tables.buffers(), graph_buffers]
     if vision_state is not None:
         disposable.extend((vision_storage, vision_state.arena))

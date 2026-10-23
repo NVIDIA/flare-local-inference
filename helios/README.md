@@ -9,8 +9,8 @@ or the internal preparation tools.
 The internal `ignition` command imports the `flare_heliopause` CPython extension
 to prepare and export a model in its own process. Heliopause depends on Helios;
 its crate owns the Python bindings and export allocator and builds no executable.
-`ignition run` caches the package, closes the prepared model, and replaces itself
-with `flare` through `execv`. See
+`ignition export` writes the package and closes the prepared model.
+`flare run PACKAGE` loads it in a separate serving process. See
 [runtime packages](../docs/runtime-package-design.md) for the resource contract.
 
 The `server` feature supplies HTTP/SSE and model scheduling. Native package
@@ -63,6 +63,10 @@ forwards inside completed speculative graphs; verification steps count completed
 speculative graphs. Copy-only proposals contribute no drafter steps. Mean draft
 acceptance length is accepted draft tokens per progressing request round with
 at least one offered draft, excluding the bonus token and width-one rounds.
+DEPTH is allocated draft positions per progressing decode or verification request
+round, including zero-draft rounds. Packed rounds contribute their allocated
+per-request prefixes; the graph's maximum width and padded batch size do not
+determine this average. Rejected drafts count toward depth.
 The display also shows active/queued requests, completed/failed requests, reused
 tokens, and cached/free KV pages. Token counters are available through `/metrics`.
 
@@ -328,7 +332,13 @@ This bounds aggregate refresh expense, not individual stalls; see
 [funded timing refresh](../docs/scheduling-runtime-design.md#funded-timing-refresh).
 
 Speculative width selection combines this cost with request-local expected
-acceptance. Each request accrues equal entitlement while GPU work is outstanding;
+prefix survival. Combined graphs learn from completed verification; split
+graphs keep proposal-confidence forecasts separate. Ordinary selection uses
+historical means, while a separate 1% raw-time budget funds optimistic
+acceptance probes. Observational weight ages without changing unobserved means;
+width-one rounds still measure cost. See
+[funded acceptance learning](../docs/scheduling-runtime-design.md#funded-acceptance-learning).
+Each request accrues equal entitlement while GPU work is outstanding;
 completion earns useful-progress credit at frozen reference rates. Unknown
 reference rates initialize from runtime observations and credit accumulated
 progress once. Timing freshness does not alter those accounting units.
@@ -383,11 +393,41 @@ Each asset is hashed and parsed from the same bytes. No model lookup, downloadin
 Python import, or Python callback occurs in this API.
 
 `Frontend::render_chat` preserves JSON message content and tool argument order,
-applies the verified checkpoint's Jinja template, and returns prompt bytes and
-token IDs. Template defaults fill missing options; explicit request options win.
-The renderer uses MiniJinja's Python-method compatibility and a JSON filter with
-Hugging Face spacing, Unicode, and float formatting. Continuation strips the
-template's final message suffix according to the selected content field.
+applies the verified checkpoint's template, and returns prompt bytes, token IDs,
+and complete-message token endpoints. Template defaults fill missing options;
+explicit request options win. `frontend::jinja` compiles Jinja statements and
+expressions to compact bytecode at asset load. Constants, names, call arguments,
+and jump targets belong to the immutable compiled template; operand stacks,
+lexical scopes, namespaces, and output buffers belong to each render. Rendering
+borrows JSON input values, emits concatenations directly into the output, and
+appends namespace lists without copying their accumulated contents. Python
+methods and the JSON filter preserve Hugging Face spacing, Unicode, insertion
+order, and float formatting. MiniJinja 2.24.0 is a development-only differential
+and benchmark reference.
+
+Recipe templates annotate complete preambles and messages in their actual
+rendered order with `{% mark %}`, which records the UTF-8 output byte position
+without emitting text. Segmented templates use `{% mark expression %}` with a
+nonnegative segment count, translated through the segment text lengths after
+rendering. Marks are forbidden inside macros, captured assignments, and filter
+blocks; a root call site marks output after a macro returns. Generation headers
+remain outside completed messages. Annotations follow Jinja whitespace controls.
+
+The exact deployed Qwen3.8 and inference-transformed Step templates are replaced
+in memory with their annotated recipe assets. Other unannotated templates fail
+to load. Preparation verifies that removing annotations reproduces the checkpoint
+template bytes. Package files and metadata formats remain unchanged.
+
+DeepSeek V4 and V4.1 use the canonical native encoder, patched to record byte
+positions in its normalized-message append loop. Adjacent users share a merged
+message endpoint, and reordered tool results receive endpoints in output order.
+Continuation truncates the rendered text before tokenization and clips later
+positions. Existing text, ordinary-token, and image-placeholder encoding divisions
+are preserved. The single encoding supplies original byte offsets; a cut is
+retained only if every preceding token ends at or before it and every following
+token starts at or after it. Overlapping Unicode spans and BPE tokens crossing a mark cannot
+create partial-token cuts. Token endpoints are sorted, unique, and strictly
+inside the prompt. Image expansion adjusts them with one ordered pass.
 
 `Frontend::encode`, `decode`, and `incremental_decoder` use Hugging Face's Rust
 tokenizers library pinned to the fixture environment's version. Incremental
@@ -414,11 +454,22 @@ The Jinja environment and continuation semantics follow Transformers
 `utils/chat_template_utils.py` at revision
 `4cc2aa84301c9aa210b5513dab9fefae03981f6e` (Apache-2.0).
 
+`cargo bench --manifest-path helios/Cargo.toml --features frontend --bench template --
+NAME=/absolute/path/to/chat_template.jinja` compares annotated bytecode rendering
+against the equivalent unannotated MiniJinja template. It measures compilation,
+warm median and p95 latency, allocations, peak live bytes, compiled storage, and
+four-thread throughput on short prompts, long histories, large messages, tools,
+and images. Tokenization is excluded. `--check` runs output comparisons without
+timing; `--owned-only` measures the owned renderer while retaining output checks
+and concurrent comparisons against MiniJinja.
+
 ## Embedding row cache
 
-Disk-backed embedding tables can use a separate bounded row cache through
-`flare run --embedding-table-cache-size 1G`. The loader accounts for its host
-storage before sizing KV pages and continuation snapshots. Entries hold immutable
+Disk-backed embedding tables use a bounded host-RAM row cache, defaulting to
+4 GiB per host on discrete GPUs or 1 GiB when any selected GPU shares host memory.
+`flare run --embedding-table-cache-size SIZE` overrides the budget; `0` disables
+caching. RAM table storage allocates no separate row cache. The loader accounts
+for its host storage before sizing KV pages and continuation snapshots. Entries hold immutable
 table rows shared across requests; they copy into existing pinned row staging,
 whose consumer fences remain unchanged. Approximate usage counts protect frequently
 requested rows; recency breaks ties, and periodic count decay adapts to workload

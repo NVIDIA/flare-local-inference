@@ -35,6 +35,7 @@ pub struct Prompt {
     /// Generate through end-of-sequence tokens until the output limit, as vLLM's `ignore_eos`.
     pub ignore_eos: bool,
     pub logprobs: bool,
+    pub logprob_token_ids: Vec<u32>,
     pub prompt_logprobs: bool,
 }
 
@@ -69,13 +70,15 @@ pub enum GenerationEvent {
 pub struct Generation {
     pub events: async_mpsc::Receiver<GenerationEvent>,
     admission: oneshot::Receiver<Result<()>>,
+    /// Completes before stop matching or decoding can hide the first token.
+    first_token: oneshot::Receiver<Result<()>>,
     cancelled: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<Error>>>,
     pub(super) enqueue_ns: Option<u64>,
 }
 
-/// A grouped response can start when one choice is admitted. Waiting for every
-/// choice would leave admitted choices' bounded output queues undrained.
+/// A buffered group waits for one admission. Waiting for every choice would
+/// leave admitted choices' bounded output queues undrained.
 pub(super) async fn await_admission(generations: &mut [Generation]) -> Result<()> {
     use std::{future::Future, pin::Pin, task::Poll};
     std::future::poll_fn(|cx| {
@@ -106,6 +109,12 @@ pub(super) async fn await_admission(generations: &mut [Generation]) -> Result<()
 }
 
 impl Generation {
+    pub(super) async fn wait_for_first_token(&mut self) -> Result<()> {
+        (&mut self.first_token)
+            .await
+            .unwrap_or_else(|_| Err(self.failure()))
+    }
+
     pub fn failure(&self) -> Error {
         self.failure
             .lock()
@@ -132,6 +141,7 @@ struct Incoming {
     prompt: Prompt,
     events: async_mpsc::Sender<GenerationEvent>,
     admission: Mutex<Option<oneshot::Sender<Result<()>>>>,
+    first_token: std::cell::Cell<Option<oneshot::Sender<Result<()>>>>,
     cancelled: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<Error>>>,
     metrics: Arc<super::metrics::Metrics>,
@@ -174,6 +184,9 @@ impl Incoming {
         }
         *failure = Some(error.clone());
         self.notify_admission(Err(error.clone()));
+        if let Some(sender) = self.first_token.take() {
+            let _ = sender.send(Err(error.clone()));
+        }
         self.metrics.failed.fetch_add(1, Ordering::Relaxed);
         let _ = self.events.try_send(event(error));
     }
@@ -181,6 +194,9 @@ impl Incoming {
         self.emit(GenerationEvent::Token(token));
     }
     fn observe_token(&self, token: u32) {
+        if let Some(sender) = self.first_token.take() {
+            let _ = sender.send(Ok(()));
+        }
         if let Some(timestamps) = self.observation {
             let timestamp_ns = timestamps.then(super::observation::monotonic_ns);
             self.emit(GenerationEvent::ObservedToken {
@@ -220,9 +236,10 @@ struct Active<'a> {
     held_logprobs: VecDeque<Option<crate::execution::TokenLogprobs>>,
 }
 
-/// What earlier admissions of a preempted request already reported.
+/// Output accounting and decoded tail retained across admissions.
 #[derive(Clone, Copy, Default)]
 struct Carried {
+    decoded_sequence: crate::scheduler::decoded_history::DecodedSequence,
     prompt_tokens: Option<usize>,
     reused_prompt_tokens: Option<u64>,
     generated_tokens: u32,
@@ -356,7 +373,7 @@ impl ModelRuntime {
             .name("flare-model".into())
             .spawn(move || {
                 if matches!(peers, Some(crate::execution::RankPeers::Processes(_)))
-                    && manifest.offload.is_some()
+                    && manifest.offload.as_ref().is_some_and(|binding| !binding.sharded())
                 {
                     let error = Error::execution(
                         ExecutionError::Manifest,
@@ -408,6 +425,15 @@ impl ModelRuntime {
                         scheduler.proposal_source(worker_config.speculative_proposal_source)
                     })
                     .and_then(|()| {
+                        if worker_config.history_drafts
+                            || worker_config.speculative_proposal_source == crate::scheduler::speculation::ProposalSource::Copy
+                        {
+                            scheduler.enable_history_drafts()
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    .and_then(|()| {
                         scheduler.fixed_speculative_width(worker_config.speculative_fixed_width)
                     })
                     .and_then(|()| {
@@ -443,7 +469,7 @@ impl ModelRuntime {
                                 .filter(|graph| {
                                     matches!(
                                         graph.kind,
-                                        GraphKind::Speculative | GraphKind::Verification
+                                        GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative
                                     )
                                 })
                                 .flat_map(|graph| {
@@ -460,7 +486,7 @@ impl ModelRuntime {
                             .manifest()
                             .graphs
                             .iter()
-                            .filter(|g| g.kind == GraphKind::Proposal)
+                            .filter(|g| matches!(g.kind, GraphKind::Proposal | GraphKind::PackedSpeculative))
                             .map(|g| g.token_capacity)
                             .max()
                         {
@@ -667,6 +693,7 @@ impl ModelRuntime {
                 .map_err(|error| error.admission_context(AdmissionError::Invalid))?;
             let (events, receiver) = async_mpsc::channel(self.event_capacity);
             let (admission, admitted) = oneshot::channel();
+            let (first_token, first_token_ready) = oneshot::channel();
             let cancelled = Arc::new(AtomicBool::new(false));
             let failure = Arc::new(Mutex::new(None));
             let incoming = Incoming {
@@ -678,6 +705,7 @@ impl ModelRuntime {
                 prompt,
                 events,
                 admission: Mutex::new(Some(admission)),
+                first_token: std::cell::Cell::new(Some(first_token)),
                 cancelled: cancelled.clone(),
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
@@ -693,6 +721,7 @@ impl ModelRuntime {
             generations.push(Generation {
                 events: receiver,
                 admission: admitted,
+                first_token: first_token_ready,
                 cancelled,
                 failure,
                 enqueue_ns,
@@ -824,6 +853,8 @@ struct Worker<'a> {
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
     store: Option<Box<dyn crate::offload::PrefixStore>>,
+    deferred_stores: Vec<crate::cache::CheckpointId>,
+    store_progress: u64,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
     prefill_rate: f64,
@@ -852,6 +883,8 @@ impl<'a> Worker<'a> {
             receiver,
             queue_capacity,
             store: None,
+            deferred_stores: Vec::new(),
+            store_progress: 0,
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
             active: (0..config.limits.max_active).map(|_| None).collect(),
@@ -1104,7 +1137,13 @@ impl<'a> Worker<'a> {
             let admission = if let Some(store) =
                 self.store.as_mut().filter(|_| incoming.host_lookup && !spec.prompt_logprobs)
             {
-                admit_with_host_store(&mut self.scheduler, store.as_mut(), spec, self.prefill_rate)
+                admit_with_host_store(
+                    &mut self.scheduler,
+                    store.as_mut(),
+                    spec,
+                    self.prefill_rate,
+                    self.metrics,
+                )
             } else {
                 self.scheduler.admit(spec)
             };
@@ -1202,6 +1241,7 @@ impl<'a> Worker<'a> {
             if !incoming.readmitted {
                 self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
             }
+            self.scheduler.resume_decoded_sequence(handle, parked.carried.decoded_sequence)?;
             incoming.notify_admission(Ok(()));
             self.active[slot] = Some(Active {
                 request: handle,
@@ -1264,7 +1304,7 @@ impl<'a> Worker<'a> {
     fn complete(
         &mut self,
         kind: GraphKind,
-        completion: crate::execution::FrameCompletion,
+        mut completion: crate::execution::FrameCompletion,
     ) -> Result<()> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
@@ -1290,12 +1330,16 @@ impl<'a> Worker<'a> {
         let mut prefill = 0;
         let mut accepted = 0;
         let mut draft_rounds = 0;
+        let mut verification_drafts = 0;
+        let mut verification_rounds = 0;
         if matches!(
             kind,
             GraphKind::Prefill
                 | GraphKind::ScoredPrefill
+                | GraphKind::Decode
                 | GraphKind::Speculative
                 | GraphKind::Verification
+                | GraphKind::PackedSpeculative
                 | GraphKind::Mixed
         ) {
             let step = self.scheduler.submitted_step(completion.fence)?;
@@ -1313,9 +1357,11 @@ impl<'a> Worker<'a> {
                         .saturating_sub(live.consumed_tokens)
                         .min(lane.tokens as u64);
                 } else if record.generated_tokens > live.generated_tokens as i64 {
+                    verification_rounds += 1;
                     if let Some(vector) = record.vector {
                         let offered =
                             (vector.offered_drafts as usize).min(lane.tokens.saturating_sub(1));
+                        verification_drafts += offered as u64;
                         if offered > 0 {
                             accepted += (vector.accepted_drafts as usize).min(offered) as u64;
                             draft_rounds += 1;
@@ -1335,12 +1381,20 @@ impl<'a> Worker<'a> {
                 completion.timing,
                 &confidence[..measured_step.batch_capacity],
             )?
+        } else if kind == GraphKind::PackedSpeculative {
+            let confidence = completion.proposal_confidence.as_ref()
+                .ok_or("packed combined completion lacks confidence")?;
+            self.scheduler.complete_packed_round_with_survival(completion.fence, &completion.records,
+                completion.timing, &confidence[..measured_step.batch_capacity],
+                completion.speculative_survival.as_ref().map(|rows| rows.as_slice()))?
         } else {
             self.scheduler
-                .complete(completion.fence, &completion.records, completion.timing)?
+                .complete_with_survival(completion.fence, &completion.records, completion.timing,
+                    completion.speculative_survival.as_ref().map(|rows| rows.as_slice()))?
         };
         self.metrics
-            .progress(prefill, generated.len(), accepted, draft_rounds);
+            .progress(prefill, generated.len(), accepted, draft_rounds,
+                verification_drafts, verification_rounds);
         self.metrics.replay_completed(completion.timing);
         if prefill > 0 && self.store.is_some() {
             self.observe_prefill_rate(completion.fence, prefill);
@@ -1352,13 +1406,15 @@ impl<'a> Worker<'a> {
             &measured_step,
             completion.timing,
             selection,
-            self.scheduler.refresh_credit_ns(),
+            if matches!(selection.origin, crate::scheduler::TimingOrigin::Acceptance) {
+                self.scheduler.acceptance_credit_ns()
+            } else { self.scheduler.refresh_credit_ns() },
         );
         if kind == GraphKind::Proposal {
             self.metrics.proposal_completed(measured_step.batch_capacity, measured_step.token_capacity,
                 completion.timing.gpu_ns.into_iter().flatten().max().unwrap_or(0));
         }
-        if matches!(kind, GraphKind::Speculative | GraphKind::Verification) {
+        if matches!(kind, GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative) {
             let nanos = completion
                 .timing
                 .gpu_ns
@@ -1367,13 +1423,16 @@ impl<'a> Worker<'a> {
                 .max()
                 .unwrap_or(0);
             let step = &measured_step;
-            self.metrics.speculative_completed(
+            if kind == GraphKind::PackedSpeculative {
+                self.metrics.packed_speculative_completed(step.batch_capacity, step.token_capacity,
+                    step.draft_tokens, nanos, &completion.records);
+            } else { self.metrics.speculative_completed(
                 kind,
                 step.batch_capacity,
                 step.token_capacity,
                 nanos,
                 &completion.records,
-            );
+            ); }
         }
         if kind == GraphKind::ScoredPrefill {
             let lane = &measured_step.lanes[0];
@@ -1392,7 +1451,7 @@ impl<'a> Worker<'a> {
                     let value = payload.get(position - lane.start_position as usize - 1)
                         .and_then(Option::as_ref).ok_or("scored prefill omitted a prompt token")?;
                     if value.value.token != prompt.tokens[position] || value.rank as usize > self.config.contract.vocabulary
-                        || value.value.top[..value.value.top_count].iter().any(|(t, _)| *t as usize >= self.config.contract.vocabulary) {
+                        || value.value.top.iter().any(|(t, _)| *t as usize >= self.config.contract.vocabulary) {
                         return Err(crate::Error::from("scored prefill returned an invalid token or rank"));
                     }
                     Ok(Some(value.clone()))
@@ -1443,8 +1502,9 @@ impl<'a> Worker<'a> {
                 let terminating_eos = !request.incoming.prompt.ignore_eos
                     && self.config.eos_token_ids.contains(&token.token);
                 let logprob = if request.incoming.prompt.logprobs && !terminating_eos {
-                    match completion.logprobs.as_ref().and_then(|v| v[slot][position]) {
-                        Some(value) if value.token == token.token => Some(value),
+                    match completion.logprobs.as_mut().and_then(|v| v[slot][position].take()) {
+                        Some(value) if value.token == token.token
+                            && value.top.iter().all(|(id, _)| (*id as usize) < self.config.contract.vocabulary) => Some(value),
                         _ => {
                             request.incoming.fail(Error::execution(
                                 ExecutionError::Completion,
@@ -1657,6 +1717,7 @@ impl<'a> Worker<'a> {
             return Ok(false);
         }
         let tokens = live.tokens().to_vec();
+        let decoded_sequence = live.decoded_sequence;
         let (generated, prompt_tokens, reused) = (
             live.generated_tokens,
             live.prompt_tokens,
@@ -1680,6 +1741,7 @@ impl<'a> Worker<'a> {
             text_stops: active.text_stops,
             held_logprobs: active.held_logprobs,
             carried: Carried {
+                decoded_sequence,
                 prompt_tokens: Some(active.carried.prompt_tokens.unwrap_or(prompt_tokens)),
                 reused_prompt_tokens: Some(active.carried.reused_prompt_tokens.unwrap_or(reused)),
                 generated_tokens,
@@ -1716,14 +1778,9 @@ impl<'a> Worker<'a> {
                     continue;
                 }
                 let proposal = prepare_copy_proposal(
-                    live.tokens(),
+                    self.scheduler.history_proposal(live.tokens(), if live.host_stops() { 0 } else { 7 }),
                     live.consumed_tokens,
                     request.incoming.prompt.grammar.as_ref(),
-                    if self.config.history_drafts && !live.host_stops() {
-                        7
-                    } else {
-                        0
-                    },
                     &self.config.eos_token_ids,
                 );
                 match proposal {
@@ -1810,7 +1867,7 @@ impl<'a> Worker<'a> {
             return Ok(false);
         }
         validate_sampling_admissions(step, &self.admissions)?;
-        let graph = crate::model::catalog::select_shape(
+        let graph = crate::model::catalog::select_shape_with_drafts(
             self.config,
             executor.manifest(),
             step.kind,
@@ -1818,6 +1875,7 @@ impl<'a> Worker<'a> {
             step.token_capacity,
             step.prefill_capacity(),
             step.packed_token_capacity,
+            step.draft_tokens,
             SamplingMode::General,
         )?;
         let fence = executor.next_fence()?;
@@ -1845,15 +1903,53 @@ impl<'a> Worker<'a> {
             ));
         }
         let mut flags = [0u8; crate::execution::REQUEST_LANES * size_of::<i32>()];
+        let mut counts = [0u8; crate::execution::REQUEST_LANES * size_of::<i32>()];
+        let mut selections = Vec::new();
         for lane in &step.lanes {
             let slot = lane.request.slot as usize;
-            if self.active[slot].as_ref().is_some_and(|a| a.incoming.prompt.logprobs) {
-                flags[slot * size_of::<i32>()..(slot + 1) * size_of::<i32>()].copy_from_slice(&1i32.to_ne_bytes());
+            if let Some(active) = &self.active[slot] {
+                let start = slot * size_of::<i32>();
+                let end = start + size_of::<i32>();
+                if active.incoming.prompt.logprobs {
+                    flags[start..end].copy_from_slice(&1i32.to_ne_bytes());
+                }
+                let ids = &active.incoming.prompt.logprob_token_ids;
+                counts[start..end].copy_from_slice(&(ids.len() as i32).to_ne_bytes());
+                if !ids.is_empty() {
+                    selections.push((
+                        slot,
+                        ids.iter()
+                            .flat_map(|id| id.to_ne_bytes())
+                            .collect::<Vec<_>>(),
+                    ));
+                }
             }
         }
-        let mut uploads = crate::model::Inputs::uploads(self.inputs.as_ref().expect("worker inputs initialized before submission"));
+        let mut uploads = crate::model::Inputs::uploads(
+            self.inputs
+                .as_ref()
+                .expect("worker inputs initialized before submission"),
+        );
         if self.config.max_top_logprobs != 0 {
-            uploads.push(crate::execution::Upload { buffer: "logprob_requested", offset: 0, bytes: &flags[..self.config.limits.request_capacity() * size_of::<i32>()] });
+            uploads.push(crate::execution::Upload {
+                buffer: "logprob_requested",
+                offset: 0,
+                bytes: &flags[..self.config.limits.request_capacity() * size_of::<i32>()],
+            });
+        }
+        if self.config.logprob_token_id_capacity != 0 {
+            uploads.push(crate::execution::Upload {
+                buffer: "logprob_token_id_counts",
+                offset: 0,
+                bytes: &counts[..self.config.limits.request_capacity() * size_of::<i32>()],
+            });
+            for (slot, bytes) in &selections {
+                uploads.push(crate::execution::Upload {
+                    buffer: "logprob_token_ids",
+                    offset: slot * crate::execution::MAX_LOGPROB_TOKEN_IDS * size_of::<i32>(),
+                    bytes,
+                });
+            }
         }
         if executor.submit(
             graph,
@@ -1878,33 +1974,88 @@ impl<'a> Worker<'a> {
         let Some(store) = self.store.as_mut() else {
             return Ok(false);
         };
-        let mut progress = false;
-        for publication in self.scheduler.take_publications() {
-            progress = true;
-            // The checkpoint may have been evicted between readiness and this drain.
-            if self.scheduler.pin_checkpoint(publication.id).is_err() {
-                continue;
-            }
-            if !matches!(store.store(&publication), Ok(true)) {
-                self.scheduler.unpin_checkpoint(publication.id)?;
-            }
-        }
+        use crate::offload::{StoreEvent, StoreOutcome};
         let mut events = Vec::new();
-        store.poll(&mut events);
+        store.poll(&mut events)?;
+        let mut progress = !events.is_empty();
         let mut requeued = Vec::new();
+        let mut released = false;
         for event in events {
-            progress = true;
             match event {
-                crate::offload::StoreEvent::Stored { checkpoint, .. } => {
-                    // The pin taken before `store` is released; a checkpoint retired
-                    // meanwhile has no pin left and is ignored.
-                    let _ = self.scheduler.unpin_checkpoint(checkpoint);
+                StoreEvent::Stored { checkpoint, .. } => {
+                    self.scheduler.unpin_checkpoint(checkpoint)?;
+                    released = true;
                 }
-                crate::offload::StoreEvent::Fetched { key, result } => {
+                StoreEvent::Deferred { checkpoint } => {
+                    self.scheduler.unpin_checkpoint(checkpoint)?;
+                    released = true;
+                    if !self.deferred_stores.contains(&checkpoint) {
+                        self.deferred_stores.push(checkpoint);
+                    }
+                }
+                StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
                 }
             }
         }
+        if released {
+            for incoming in self
+                .pending
+                .iter_mut()
+                .chain(self.parked.iter_mut().map(|(incoming, _)| incoming))
+            {
+                incoming.blocked = None;
+            }
+        }
+        let current_progress = store.stats().progress;
+        let retry = current_progress != self.store_progress;
+        self.store_progress = current_progress;
+        let mut publications = self.scheduler.take_publications();
+        let retry_ids = self.deferred_stores.clone();
+        let mut waiting = Vec::new();
+        for id in self.deferred_stores.drain(..) {
+            if let Some(publication) = self.scheduler.publication(id) {
+                if retry {
+                    publications.push(publication);
+                } else {
+                    waiting.push(id);
+                }
+            } else {
+                self.metrics
+                    .host_retry_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        for publication in publications {
+            progress = true;
+            let outcome = store.store(&publication);
+            if let Ok(outcome) = outcome {
+                self.metrics.host_store_outcome(outcome);
+                match outcome {
+                    StoreOutcome::Queued => self.scheduler.pin_checkpoint(publication.id)?,
+                    StoreOutcome::Retry(_) => {
+                        if !waiting.contains(&publication.id) {
+                            waiting.push(publication.id);
+                        }
+                        continue;
+                    }
+                    _ => {}
+                }
+                if retry_ids.contains(&publication.id) {
+                    let counter = if outcome == StoreOutcome::Oversize {
+                        &self.metrics.host_retry_abandoned
+                    } else {
+                        &self.metrics.host_retry_success
+                    };
+                    counter.fetch_add(1, Ordering::Relaxed);
+                }
+            } else if retry_ids.contains(&publication.id) {
+                self.metrics
+                    .host_retry_abandoned
+                    .fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        self.deferred_stores = waiting;
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {
@@ -1979,11 +2130,25 @@ fn admit_with_host_store(
     store: &mut dyn crate::offload::PrefixStore,
     spec: RequestSpec,
     prefill_rate: f64,
+    metrics: &super::metrics::Metrics,
 ) -> Result<RequestHandle> {
     let plan = scheduler.plan_admission(&spec)?;
-    let hit = store
-        .lookup(plan.history(), plan.resident_tokens())
-        .filter(|hit| crate::offload::worth_fetching(hit, prefill_rate));
+    use crate::offload::LookupOutcome;
+    let mut before = u64::MAX;
+    let hit = loop {
+        let Some(hit) = store.lookup(plan.history(), plan.resident_tokens(), before) else {
+            if before == u64::MAX {
+                metrics.host_lookup_outcome(LookupOutcome::NoMatch);
+            }
+            break None;
+        };
+        metrics.host_lookup_cost(&hit, prefill_rate);
+        if crate::offload::worth_fetching(&hit, prefill_rate) {
+            break Some(hit);
+        }
+        metrics.host_lookup_outcome(LookupOutcome::CostRejected);
+        before = hit.consumed_tokens;
+    };
     let Some(hit) = hit else {
         let handle = scheduler.admit_planned(spec, plan, None)?.handle;
         // Lookups count once per admitted request, not per attempt of a waiting one.
@@ -1998,6 +2163,7 @@ fn admit_with_host_store(
     let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
         Ok(admitted) => admitted,
         Err(Error::Admission(AdmissionError::Capacity(_))) => {
+            metrics.host_lookup_outcome(LookupOutcome::CapacityRejected);
             let handle = scheduler.admit(spec)?;
             scheduler.record_host_lookup();
             return Ok(handle);
@@ -2006,15 +2172,18 @@ fn admit_with_host_store(
     };
     scheduler.record_host_lookup();
     let Some(ticket) = admitted.ticket else {
+        metrics.host_lookup_outcome(LookupOutcome::Admitted);
         return Ok(admitted.handle);
     };
     let key = ticket.key;
     if store.fetch(hit, ticket).is_err() {
+        metrics.host_lookup_outcome(LookupOutcome::EnqueueRejected);
         // No event follows a rejected fetch; this request is the ticket's only
         // waiter, so retire it and admit the request again without the store.
         scheduler.finish_inbound(key, false)?;
         return scheduler.admit(spec);
     }
+    metrics.host_lookup_outcome(LookupOutcome::Admitted);
     Ok(admitted.handle)
 }
 
@@ -2037,13 +2206,11 @@ fn cancel_stopped(
 }
 
 fn prepare_copy_proposal(
-    tokens: &[u32],
+    (mut ids, mut count): ([i64; 7], usize),
     consumed: u64,
     grammar: Option<&crate::grammar::RequestGrammar>,
-    maximum: usize,
     eos_ids: &[u32],
 ) -> Result<crate::scheduler::speculation::CopyProposal> {
-    let (mut ids, mut count) = crate::scheduler::speculation::copy_proposal(tokens, maximum);
     if let Some(end) = ids[..count]
         .iter()
         .position(|id| eos_ids.contains(&(*id as u32)))
@@ -2158,7 +2325,7 @@ mod tests {
             GraphKind::Resume,
             GraphKind::Speculative,
         ] {
-            let mut step = ScheduledStep { packed_token_capacity: 0,
+            let mut step = ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
                 kind,
                 batch_capacity: 4,
                 token_capacity: 1,
@@ -2180,7 +2347,7 @@ mod tests {
                 Error::Execution(ExecutionError::State(_))
             ));
         }
-        let mut step = ScheduledStep { packed_token_capacity: 0,
+        let mut step = ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
             kind: GraphKind::Decode,
             batch_capacity: 1,
             token_capacity: 1,
@@ -2203,17 +2370,14 @@ mod tests {
     }
 
     #[test]
-    fn copy_preparation_trims_eos_and_explicit_disable_has_no_proposals() {
-        let history = [1, 2, 3, 4, 11, 12, 13, 99, 1, 2, 3, 4];
-        let copy = prepare_copy_proposal(&history, 11, None, 7, &[12]).unwrap();
+    fn copy_preparation_trims_eos_and_preserves_empty_proposals() {
+        let copy = prepare_copy_proposal(([11, 12, 13, -1, -1, -1, -1], 3), 11, None, &[12]).unwrap();
         assert_eq!(copy.count, 1);
         assert_eq!(copy.tokens, [11, -1, -1, -1, -1, -1, -1]);
         assert_eq!(copy.consumed, 11);
         assert!(copy.grammar_masks.is_empty());
-        let disabled = prepare_copy_proposal(&history, 11, None, 0, &[12]).unwrap();
-        assert_eq!((disabled.count, disabled.tokens), (0, [-1; 7]));
-        let absent = prepare_copy_proposal(&[1, 2, 3, 4], 3, None, 7, &[]).unwrap();
-        assert_eq!(absent.count, 0);
+        let empty = prepare_copy_proposal(([-1; 7], 0), 11, None, &[12]).unwrap();
+        assert_eq!((empty.count, empty.tokens), (0, [-1; 7]));
     }
 
     #[test]
@@ -2370,6 +2534,7 @@ mod tests {
     fn stream(capacity: usize) -> (Incoming, Generation) {
         let (events, receiver) = async_mpsc::channel(capacity);
         let (admission, admitted) = oneshot::channel();
+        let (first_token, first_token_ready) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         let incoming = Incoming {
@@ -2391,12 +2556,14 @@ mod tests {
                 stop_sequences: vec![],
                 stop_strings: vec![],
                 logprobs: false,
+                logprob_token_ids: vec![],
                 prompt_logprobs: false,
                 ignore_eos: false,
                 grammar: None,
             },
             events,
             admission: Mutex::new(Some(admission)),
+            first_token: std::cell::Cell::new(Some(first_token)),
             cancelled: cancelled.clone(),
             failure: failure.clone(),
             metrics: Arc::new(super::super::metrics::Metrics::default()),
@@ -2412,6 +2579,7 @@ mod tests {
             Generation {
                 events: receiver,
                 admission: admitted,
+                first_token: first_token_ready,
                 cancelled,
                 failure,
                 enqueue_ns: None,

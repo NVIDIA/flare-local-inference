@@ -4,7 +4,6 @@ import contextlib
 from dataclasses import dataclass, replace
 import hashlib
 import json
-from tempfile import TemporaryDirectory
 from pathlib import Path
 
 import torch
@@ -36,7 +35,7 @@ from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena, scratch_views
-from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
@@ -59,6 +58,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     devices: tuple[int, ...] = tuple(range(16))
     context: int = 1048576
@@ -133,6 +133,7 @@ class PreparationConfig:
 
 
 @torch.no_grad()
+@with_autotune_effort
 def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storage):
     from .recipe import RECIPE
 
@@ -223,7 +224,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "draft": None if not drafting else weights.config.draft.raw,
             "world_size": shard.world_size, "contract": "kimi3.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             device=device, checkpoint=identity,
             workload_schema="kimi3", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
@@ -402,14 +403,8 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
     release_unused()
-    from .tokenizer import convert
-    frontend_assets = TemporaryDirectory(prefix="flare-kimi3-frontend-")
-    assets_path = Path(frontend_assets.name)
-    convert(snapshot).save(str(assets_path / "tokenizer.json"))
-    template = Path(__file__).with_name("assets") / "chat_template.jinja"
-    (assets_path / "chat_template.jinja").write_bytes(template.read_bytes())
-    assets = {role: {"path": str(assets_path / file), "sha256": hashlib.sha256((assets_path / file).read_bytes()).hexdigest()}
-              for role, file in (("tokenizer", "tokenizer.json"), ("chat_template", "chat_template.jinja"))}
+    from .tokenizer import convert, runtime_assets
+    assets = runtime_assets(convert(snapshot))
     eos = weights.config.text["eos_token_id"]
     eos_ids = list(dict.fromkeys([*(eos if isinstance(eos, list) else [eos]), 163586]))
     frontend = prepare_frontend(snapshot, eos_token_ids=eos_ids, image_profile="moonvit" if patches else None)
@@ -451,6 +446,6 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
                                            decoder_buffers.scratch_tensors(), *draft_disposable]), *completion.zero_ranges()),
         resources=(scoring, weights, pool, requests, inputs, admission, commands, arena, forwards, prefill_storage, context,
                    decode_storage, metadata, compiled, stream, graph_pool, session, coordinator, collective,
-                   vocabulary_collective, embedding_collective, router_collective, route_collective, frontend_assets,
+                   vocabulary_collective, embedding_collective, router_collective, route_collective,
                    vision_inputs, vision_prefill, vision_state, vision_storage, scratch_pool, shared_scratch, graph_buffers,
                    speculation, context_collective, draft_argmax, latent_runtimes))

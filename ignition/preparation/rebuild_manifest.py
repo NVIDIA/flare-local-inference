@@ -4,7 +4,6 @@ The catalog describes prepared layouts, not checkpoint tensors. Reading it does
 not instantiate Python objects or establish that a recipe can rebuild from it.
 """
 
-from bisect import bisect_right
 from collections.abc import Mapping
 from dataclasses import fields, is_dataclass
 import math
@@ -15,23 +14,24 @@ from . import runtime_package_pb2 as proto
 def from_plan(model, plan, *, compiled_forwards):
     from .source_identity import source_identity
 
-    result = proto.RebuildManifest(version=1, recipe=plan.recipe.name,
-        source_identity=source_identity(), checkpoint_repository=plan.checkpoint.repository,
+    result = dict(version=1, recipe=plan.recipe.name, source_identity=source_identity(),
+        checkpoint_repository=plan.checkpoint.repository,
         checkpoint_revision=plan.checkpoint.revision if model.directory is None else '',
         local_checkpoint=model.directory is not None, tensor_parallel=plan.world_size,
         max_concurrency=plan.concurrency, prefill_chunk=plan.prefill_chunk,
         image_concurrency=plan.image_concurrency, context_parallel=plan.context_parallel,
         stream_overlap=plan.stream_overlap, mixed_prefill=plan.mixed_prefill,
-        mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring,
+        mla_compute_mode=plan.mla_compute_mode, roce_ring=plan.roce_ring, roce_chain=plan.roce_chain,
         online_mxfp8=plan.online_mxfp8, language_model_only=plan.language_model_only,
         compiled_forwards=compiled_forwards, reserve_bytes=plan.reserve_bytes)
     if plan.expert_scale_compression is not None:
-        result.expert_scale_compression = plan.expert_scale_compression
+        result['expert_scale_compression'] = plan.expert_scale_compression
     if (s := plan.speculation) is not None:
-        result.speculation.CopyFrom(proto.RebuildSpeculation(draft_tokens=s.draft_tokens,
+        result['speculation'] = dict(draft_tokens=s.draft_tokens,
             adaptive=s.adaptive, proposal_source=s.proposal_source, history_drafts=s.history_drafts,
-            token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification))
-    return result.SerializeToString(deterministic=True)
+            token_capacity=plan.speculative_token_capacity, packed_verification=s.packed_verification,
+            draft_prefix_selection=s.draft_prefix_selection)
+    return result
 
 
 def weight_views(roots):
@@ -73,31 +73,22 @@ def weight_views(roots):
         yield from walk(value, name, '', set())
 
 
-def describe_weights(roots, allocations, *, zero_ranges=()):
-    """Resolve live tensor views after reachability pruning to rank-local allocation references."""
+def rebuild_weights_metadata(roots):
+    """Describe tensor views for native resolution against retained storage."""
     import torch
 
-    result = proto.RebuildWeights(version=1)
-    retained = sorted((a.address, a.address + a.nbytes, a) for a in allocations
-                      if a.memory != 'peer' and not a.sizing)
-    starts = [a for a, _, _ in retained]
+    tensors, unavailable = [], []
     for name, owner, tensor in weight_views(roots):
-        if tensor.device.type == 'meta' or tensor.layout != torch.strided or not tensor.numel():
-            result.unavailable.append(name)
+        if (tensor.device.type == 'meta' or tensor.layout != torch.strided or not tensor.numel()
+                or any(stride < 0 for stride in tensor.stride())):
+            unavailable.append(name)
             continue
-        address = tensor.data_ptr()
         extent = tensor.element_size() * (1 + sum((size - 1) * stride
             for size, stride in zip(tensor.shape, tensor.stride(), strict=True)))
-        slot = bisect_right(starts, address) - 1
-        if (slot < 0 or address + extent > retained[slot][1]
-                or any(address < start + size and start < address + extent for start, size in zero_ranges)):
-            result.unavailable.append(name)
-            continue
-        start, _, allocation = retained[slot]
-        result.tensors.add(name=name, dtype=str(tensor.dtype).removeprefix('torch.'),
+        tensors.append(dict(name=name, dtype=str(tensor.dtype).removeprefix('torch.'),
             element_bytes=tensor.element_size(), shape=list(tensor.shape), stride=list(tensor.stride()),
-            layout_type=owner, storage=proto.Reference(allocation=allocation.name, offset=address - start))
-    return result
+            layout_type=owner, address=tensor.data_ptr(), extent=extent))
+    return dict(version=1, tensors=tensors, unavailable=unavailable)
 
 
 def validate_weights(bundle):

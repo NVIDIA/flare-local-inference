@@ -20,7 +20,8 @@ def test_export_keeps_host_mailbox_and_omits_unused_library_storage(tmp_path):
     root = Path(__file__).resolve().parents[2]
     output = tmp_path / "mailbox"
     result = subprocess.run([sys.executable, str(root / "helios/tests/engram_package_fixture.py"), str(output)],
-                            check=True, cwd=root, timeout=180, capture_output=True, text=True)
+                            cwd=root, timeout=180, capture_output=True, text=True)
+    assert result.returncode == 0, result.stdout + result.stderr
     assert "VRAM inventory at export" in result.stderr
     assert "Rank 0 / CUDA 0" in result.stderr
     assert "Graph I/O / persistent state" in result.stderr
@@ -141,12 +142,12 @@ def mailbox_storage():
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                     reason="requires an explicitly assigned CUDA device")
-def test_retired_loading_pools_release_staging_and_preserve_graph_reachability(mailbox_storage):
+def test_retired_loading_pools_release_staging_and_preserve_graph_reachability(mailbox_storage, tmp_path):
     import ctypes as C
     import torch
     from torch.multiprocessing.reductions import StorageWeakRef
-    from ignition.preparation.reachability import Reachability
-    from ignition.preparation.runtime_package import Allocation, Kernel, RuntimePackage
+    from ignition.preparation.module_images import ModuleImages
+    from ignition.preparation.runtime_package import Allocation, RuntimePackage
 
     storage = mailbox_storage
     graph_pool = storage.graph_pool.id
@@ -166,29 +167,30 @@ def test_retired_loading_pools_release_staging_and_preserve_graph_reachability(m
     assert sum(segment["total_size"] for segment in retained) <= sum(t.nbytes for t in weights) + 3 * storage.granularity
     assert storage.graph_pool.id == graph_pool and graph_pool not in storage._preparation_pools
 
-    output = torch.empty_like(weights[-1])
-    stream = torch.cuda.Stream()
-    stream.wait_stream(torch.cuda.current_stream())
-    graph = torch.cuda.CUDAGraph(keep_graph=True)
-    with torch.cuda.graph(graph, pool=graph_pool, stream=stream):
-        storage.cuda.call("cuMemcpyDtoDAsync_v2", C.c_uint64(output.data_ptr()), C.c_uint64(weights[-1].data_ptr()),
-                          C.c_size_t(output.nbytes), C.c_void_p(stream.cuda_stream))
-    graph.instantiate()
-    mappings = storage.mappings
-    allocations = tuple(Allocation(f"device-{i}", m.address, m.nbytes, preserve_address=True)
-                        for i, m in enumerate(mappings.values()))
-    package = RuntimePackage(allocations=allocations, modules={"fixture": b"\x7fELFfixture"},
-                             kernels=(Kernel(1, "fixture", ()),))
-    description = package._graph(storage.cuda, "weight-copy", graph.raw_cuda_graph())
-    traversal = Reachability(allocations, inactive=storage.unused_ranges())
-    traversal.graph(description, ())
-    for tensor in (weights[-1], output):
-        owner = next(a for a in allocations if a.address <= tensor.data_ptr() < a.address + a.nbytes)
-        assert owner.name in traversal.reached
-    graph.replay()
-    torch.cuda.synchronize()
-    torch.testing.assert_close(output, weights[-1], rtol=0, atol=0)
-    graph.reset()
+    with ModuleImages() as images:
+        output = torch.empty_like(weights[-1])
+        output.add_(0)
+        stream = torch.cuda.Stream()
+        stream.wait_stream(torch.cuda.current_stream())
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(graph, pool=graph_pool, stream=stream):
+            storage.cuda.call("cuMemcpyDtoDAsync_v2", C.c_uint64(output.data_ptr()), C.c_uint64(weights[-1].data_ptr()),
+                              C.c_size_t(output.nbytes), C.c_void_p(stream.cuda_stream))
+            output.add_(0)
+        graph.instantiate()
+        mappings = storage.mappings
+        allocations = tuple(Allocation(f"device-{i}", m.address, m.nbytes, preserve_address=True)
+                            for i, m in enumerate(mappings.values()))
+        package = RuntimePackage(allocations=allocations, modules={}, kernels=(), recorder=images.native,
+                                 owners=(weights, output, storage, graph))
+        package.write(tmp_path / "rank.json", {"weight-copy": graph}, sources=True)
+        for tensor in (weights[-1], output):
+            assert any(a.address <= tensor.data_ptr() < a.address + a.nbytes for a in package.allocations)
+        graph.replay()
+        torch.cuda.synchronize()
+        torch.testing.assert_close(output, weights[-1], rtol=0, atol=0)
+        graph.reset()
+
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",

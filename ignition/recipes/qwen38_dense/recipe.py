@@ -12,7 +12,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     if plan.world_size != 1 or ranks is not None or plan.speculation is not None:
         raise ValueError("Qwen dense preparation supports one local GPU and ordinary text generation")
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
+        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         max_active=plan.concurrency, context=plan.recipe.context,
         prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
@@ -35,6 +35,6 @@ RECIPE = Recipe(
     checkpoints=(Checkpoint(alias="qwen3.8-27b", repository="nvidia/Qwen3.8-27B-NVFP4",
         revision="482ca0f3832238542f8f5295dde86b5f22711d80", architecture="Qwen3_5ForConditionalGeneration",
         stored_bytes=21_921_428_072, device_bytes=20_150_569_096, expansion_bytes=307_871_744),),
-    context=262144, page_tokens=128, concurrency=4, max_concurrency=64, prefill_chunk=4096,
+    context=262144, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
     max_draft_tokens=0, ranks=MappingProxyType({1: RankCosts(158_148_864, 4_194_304, 4 << 30)}),
 )

@@ -13,8 +13,8 @@ pub struct LoadOptions {
     pub memory_limit: Option<super::MemoryLimit>,
     /// Auxiliary embedding-table storage; defaults to disk when absent.
     pub embedding_table_storage: Option<crate::engram::Storage>,
-    /// Per-host bytes for disk-backed embedding row caches; zero disables.
-    pub embedding_table_cache_bytes: u64,
+    /// Per-host RAM bytes for disk-backed embedding rows; zero disables, absent selects by memory topology.
+    pub embedding_table_cache_bytes: Option<u64>,
     /// Keep original scale-plane bytes in host RAM while embedding weights remain on disk.
     pub embedding_table_resident_scales: bool,
     /// Disk workers per table: four on Windows, one elsewhere. Share 128 slots and 8 MiB staging.
@@ -40,6 +40,18 @@ impl LoadOptions {
             .unwrap_or(if cfg!(windows) { 4 } else { 1 })
     }
 
+    pub(super) fn embedding_cache_bytes(&self, has_tables: bool, integrated: bool) -> u64 {
+        self.embedding_table_cache_bytes.unwrap_or_else(|| {
+            if has_tables
+                && self.embedding_table_storage.unwrap_or_default() == crate::engram::Storage::Disk
+            {
+                if integrated { 1 << 30 } else { 4 << 30 }
+            } else {
+                0
+            }
+        })
+    }
+
     pub(super) fn select(&self, packages: &mut [Package], config: &mut Value) -> Result<usize> {
         if self.mtp_verification_token_budget.is_some() && self.mtp_max_verification_token_budget.is_some() {
             return Err(invalid("exact and maximum verification token budgets are mutually exclusive"));
@@ -59,7 +71,7 @@ impl LoadOptions {
                 return Err(invalid("parallel embedding disk workers require Windows"));
             }
         }
-        if self.embedding_table_cache_bytes != 0
+        if self.embedding_table_cache_bytes.is_some_and(|bytes| bytes != 0)
             && self.embedding_table_storage == Some(crate::engram::Storage::Ram)
         {
             return Err(invalid("embedding row cache requires disk table storage"));
@@ -104,6 +116,7 @@ impl LoadOptions {
         if widths.last().is_some_and(|w| token_capacity < *w as u64) {
             return Err(invalid("speculative token capacity must cover the maximum verification width"));
         }
+        let packed_round = execution.graphs.iter().any(|g| g.kind == "packed_speculative");
         let maximum = execution
             .graphs
             .iter()
@@ -154,7 +167,7 @@ impl LoadOptions {
         let fixed = enabled.then_some(fixed).flatten();
         let widths: Vec<_> = widths
             .into_iter()
-            .filter(|width| enabled && *width <= drafts + 1)
+            .filter(|width| enabled && (packed_round || *width <= drafts + 1))
             .collect();
         let source = match config
             .get("speculative_proposal_source")
@@ -167,12 +180,12 @@ impl LoadOptions {
         };
         let split = execution.graphs.iter().any(|g| g.kind == "proposal");
         if enabled && execution.graphs.iter().any(|g| g.packed_token_capacity != 0)
-            && (fixed.is_some() || drafts != maximum)
+            && (fixed.is_some() || (!packed_round && drafts != maximum))
         {
             return Err(invalid("packed verification requires adaptive execution at the captured draft depth"));
         }
         let packed_width = execution.graphs.iter()
-            .filter(|g| g.kind == "verification" && g.packed_token_capacity != 0)
+            .filter(|g| matches!(g.kind.as_str(), "verification" | "packed_speculative") && g.packed_token_capacity != 0)
             .map(|g| g.token_capacity).max();
         let verification_token_limit = self.mtp_verification_token_budget
             .or(self.mtp_max_verification_token_budget);
@@ -180,10 +193,10 @@ impl LoadOptions {
             if !enabled || !adaptive {
                 return Err(invalid("verification token budget requires enabled adaptive speculation"));
             }
-            if !split || packed_width.is_none() {
+            if !(split || packed_round) || packed_width.is_none() {
                 return Err(invalid("verification token budget requires captured packed verification graphs"));
             }
-            if budget < active.next_power_of_two() {
+            if budget < active.next_power_of_two() && !(packed_round && !split) {
                 return Err(invalid(format!(
                     "verification token budget must cover the selected batch capacity {}",
                     active.next_power_of_two()
@@ -236,7 +249,7 @@ impl LoadOptions {
                     _ => {
                         BATCH_CAPACITIES.contains(&(graph.batch_capacity as usize))
                             && graph.batch_capacity <= prepared.next_power_of_two() as u64
-                            && if matches!(kind, crate::execution::GraphKind::Speculative | crate::execution::GraphKind::Verification) {
+                            && if matches!(kind, crate::execution::GraphKind::Speculative | crate::execution::GraphKind::Verification | crate::execution::GraphKind::PackedSpeculative) {
                                 (1..=8).contains(&graph.token_capacity)
                             } else if kind == crate::execution::GraphKind::Proposal {
                                 (2..=8).contains(&graph.token_capacity)
@@ -247,7 +260,7 @@ impl LoadOptions {
                 };
                 if !valid
                     || (graph.packed_token_capacity != 0
-                        && (kind != crate::execution::GraphKind::Verification
+                        && (!matches!(kind, crate::execution::GraphKind::Verification | crate::execution::GraphKind::PackedSpeculative)
                             || graph.packed_token_capacity < graph.batch_capacity
                             || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)))
                     || (kind != crate::execution::GraphKind::Mixed && graph.prefill_capacity != 0)
@@ -255,7 +268,12 @@ impl LoadOptions {
                         && graph.speculation_enabled == Some(false))
                     || (kind == crate::execution::GraphKind::Decode
                         && graph.speculation_enabled == Some(true))
-                    || if speculative {
+                    || if kind == crate::execution::GraphKind::PackedSpeculative {
+                        graph.verify_tokens != Some(graph.token_capacity as u32)
+                            || graph.draft_tokens.is_none_or(|n| !(1..=7).contains(&n) || n + 1 > graph.token_capacity as u32)
+                            || graph.draft_source != 1 || graph.packed_token_capacity == 0
+                            || graph.speculation_enabled == Some(false)
+                    } else if speculative {
                         graph.verify_tokens != Some(graph.token_capacity as u32)
                             || graph
                                 .draft_tokens
@@ -273,7 +291,7 @@ impl LoadOptions {
                             || graph.verify_tokens.is_some()
                             || graph.draft_source != 0
                     }
-                    || ((speculative || kind == crate::execution::GraphKind::Verification)
+                    || ((speculative || matches!(kind, crate::execution::GraphKind::Verification | crate::execution::GraphKind::PackedSpeculative))
                         && graph.token_capacity > 1
                         && (if graph.packed_token_capacity == 0 {
                             graph.batch_capacity.saturating_mul(graph.token_capacity)
@@ -314,9 +332,15 @@ impl LoadOptions {
                         .speculation_enabled
                         .is_none_or(|value| value == enabled)
                     && (graph.kind != "decode" || !enabled)
+                    && (graph.kind != "speculative" || graph.token_capacity == 1
+                        || graph.batch_capacity * graph.token_capacity <= selected_token_capacity)
                     && (graph.kind != "proposal" || (enabled
-                        && graph.draft_tokens.is_some_and(|n| n as usize <= drafts
-                            && (fixed.is_none() || n as usize == drafts))))
+                        && graph.draft_tokens == Some(drafts as u32)))
+                    && (graph.kind != "packed_speculative" || (enabled
+                        && graph.draft_tokens == Some(drafts as u32)
+                        && widths.contains(&(graph.token_capacity as usize))
+                        && self.mtp_verification_token_budget.is_none_or(|budget| graph.packed_token_capacity == (budget as u64).min(graph.batch_capacity * graph.token_capacity))
+                        && self.mtp_max_verification_token_budget.is_none_or(|budget| graph.packed_token_capacity <= budget as u64)))
                     && (graph.kind != "verification" || (enabled
                         && widths.contains(&(graph.token_capacity as usize))
                         && self.mtp_verification_token_budget.is_none_or(|budget|
@@ -335,7 +359,7 @@ impl LoadOptions {
             });
             let mut draft_counts = HashMap::new();
             for graph in &execution.graphs {
-                if let Some(drafts) = graph.draft_tokens {
+                if let Some(drafts) = graph.draft_tokens.filter(|_| graph.kind != "packed_speculative") {
                     let key = (
                         graph.kind.clone(),
                         graph.batch_capacity,
@@ -348,7 +372,7 @@ impl LoadOptions {
                 }
             }
             execution.graphs.retain(|g| {
-                g.draft_tokens.is_none_or(|drafts| {
+                g.kind == "packed_speculative" || g.draft_tokens.is_none_or(|drafts| {
                     draft_counts[&(
                         g.kind.clone(),
                         g.batch_capacity,
@@ -358,6 +382,9 @@ impl LoadOptions {
                     )] == drafts
                 })
             });
+            if enabled && packed_round && !execution.graphs.iter().any(|g| g.kind == "packed_speculative") {
+                return Err(invalid(format!("rank {rank} has no packed combined graphs within the selected proposal and row limits")));
+            }
             let mut selected_variants = HashSet::new();
             for graph in &execution.graphs {
                 if !selected_variants.insert((
@@ -367,6 +394,7 @@ impl LoadOptions {
                     graph.token_capacity,
                     graph.prefill_capacity,
                     graph.packed_token_capacity,
+                    (graph.kind == "packed_speculative").then_some(graph.draft_tokens),
                 )) {
                     return Err(invalid(
                         "ambiguous graph variants for the selected speculation mode",
@@ -391,12 +419,21 @@ impl LoadOptions {
                     if !execution
                         .graphs
                         .iter()
-                        .any(|g| g.kind == kind && g.batch_capacity == batch as u64)
+                        .any(|g| g.kind == kind && g.batch_capacity == batch as u64
+                            && (kind != "speculative" || !packed_round || g.token_capacity == 1))
                     {
                         return Err(invalid(format!(
                             "rank {rank} has no captured {kind} graph for batch {batch} within the requested verification limits; export the required capacity range"
                         )));
                     }
+                }
+                if enabled && packed_round {
+                    if batch as u64 * 2 <= selected_token_capacity
+                        && !execution.graphs.iter().any(|g| g.kind == "packed_speculative"
+                        && g.batch_capacity == batch as u64) {
+                        return Err(invalid(format!("rank {rank} lacks packed combined batch {batch} within the selected proposal and row limits")));
+                    }
+                    continue;
                 }
                 if enabled {
                     if let Some(budget) = self.mtp_verification_token_budget {
@@ -631,10 +668,39 @@ mod tests {
     }
 
     #[test]
+    fn embedding_cache_defaults_follow_storage_and_memory_topology() {
+        use crate::engram::Storage;
+        for storage in [None, Some(Storage::Disk)] {
+            let mut options = LoadOptions { embedding_table_storage: storage, ..Default::default() };
+            options.select(&mut [package()], &mut config()).unwrap();
+            assert_eq!(options.embedding_cache_bytes(true, false), 4 << 30);
+            assert_eq!(options.embedding_cache_bytes(true, true), 1 << 30);
+            assert_eq!(options.embedding_cache_bytes(false, false), 0);
+            assert_eq!(options.embedding_cache_bytes(false, true), 0);
+            for bytes in [0, 2 << 30, 8 << 30] {
+                options.embedding_table_cache_bytes = Some(bytes);
+                options.select(&mut [package()], &mut config()).unwrap();
+                assert_eq!(options.embedding_cache_bytes(true, false), bytes);
+                assert_eq!(options.embedding_cache_bytes(true, true), bytes);
+            }
+        }
+        for bytes in [None, Some(0)] {
+            let options = LoadOptions {
+                embedding_table_storage: Some(Storage::Ram),
+                embedding_table_cache_bytes: bytes,
+                ..Default::default()
+            };
+            options.select(&mut [package()], &mut config()).unwrap();
+            assert_eq!(options.embedding_cache_bytes(true, false), 0);
+            assert_eq!(options.embedding_cache_bytes(true, true), 0);
+        }
+    }
+
+    #[test]
     fn cached_disk_rows_reject_resident_table_storage_before_cuda() {
         let options = LoadOptions {
             embedding_table_storage: Some(crate::engram::Storage::Ram),
-            embedding_table_cache_bytes: 1 << 30,
+            embedding_table_cache_bytes: Some(1 << 30),
             ..Default::default()
         };
         assert!(
@@ -650,11 +716,11 @@ mod tests {
     fn resident_scales_allow_cached_disk_rows_and_reject_whole_table_ram() {
         let mut options = LoadOptions {
             embedding_table_resident_scales: true,
-            embedding_table_cache_bytes: 1 << 30,
+            embedding_table_cache_bytes: Some(1 << 30),
             ..Default::default()
         };
         options.select(&mut [package()], &mut config()).unwrap();
-        options.embedding_table_cache_bytes = 0;
+        options.embedding_table_cache_bytes = Some(0);
         options.embedding_table_storage = Some(crate::engram::Storage::Ram);
         assert!(options.select(&mut [package()], &mut config()).unwrap_err().to_string()
             .contains("resident embedding scales require disk table storage"));
@@ -1258,7 +1324,7 @@ mod tests {
     }
 
     #[test]
-    fn split_catalog_selects_proposal_depth_independently_of_ragged_verification() {
+    fn split_catalog_selects_one_configured_producer_and_ragged_verification() {
         for prepared in [1usize, 3, 4, 9, 33, 64] {
             let budget = prepared.next_power_of_two().max(8);
             for active in [1, prepared] {
@@ -1272,8 +1338,8 @@ mod tests {
                             .select(std::slice::from_mut(&mut p), &mut c).unwrap();
                         let graphs = &p.execution.as_ref().unwrap().graphs;
                         let proposals: Vec<_> = graphs.iter().filter(|g| g.kind == "proposal").collect();
-                        assert_eq!(proposals.len(), if depth == 0 { 0 } else { (active.next_power_of_two().ilog2() as usize + 1) * if adaptive { depth } else { 1 } });
-                        assert!(proposals.iter().all(|g| g.draft_tokens.is_some_and(|n| n > 0 && n as usize <= depth && (adaptive || n as usize == depth)) && g.verify_tokens.is_none()));
+                        assert_eq!(proposals.len(), if depth == 0 { 0 } else { active.next_power_of_two().ilog2() as usize + 1 });
+                        assert!(proposals.iter().all(|g| g.draft_tokens == Some(depth as u32) && g.verify_tokens.is_none()));
                         for b in BATCH_CAPACITIES.into_iter().filter(|b| *b <= active.next_power_of_two()) {
                             for w in 1..=8 {
                                 let present = graphs.iter().any(|g| g.kind == "verification" && g.batch_capacity == b as u64 && g.token_capacity == w as u64);
@@ -1609,6 +1675,227 @@ mod tests {
             .select(&mut [split_package(8, 48)], &mut serde_json::json!({
                 "speculative_widths": [1,2,3,4,5,6,7,8], "speculative_token_capacity": 48})).unwrap_err();
         assert!(error.to_string().contains("requires captured packed verification graphs"));
+    }
+
+    fn combined_package() -> Package {
+        let mut p = packed_draft_five_package();
+        let e = p.execution.as_mut().unwrap();
+        let proposals: Vec<_> = e.graphs.iter().filter(|g| g.kind == "proposal").cloned().collect();
+        let targets: Vec<_> = e.graphs.iter().filter(|g| g.kind == "verification").cloned().collect();
+        e.graphs.retain(|g| !matches!(g.kind.as_str(), "proposal" | "verification"));
+        for proposal in proposals {
+            for target in targets.iter().filter(|g| g.batch_capacity == proposal.batch_capacity) {
+                let mut graph = target.clone();
+                graph.kind = "packed_speculative".into();
+                graph.name = format!("round-{}-{}-{}", graph.batch_capacity,
+                    proposal.draft_tokens.unwrap(), graph.packed_token_capacity);
+                graph.draft_tokens = proposal.draft_tokens;
+                graph.draft_source = 1;
+                e.graphs.push(graph);
+            }
+        }
+        p.graphs = e.graphs.iter().map(|g| Graph { name: g.name.clone(), flags: 0,
+            resource: g.name.clone(), node_count: 1, edge_count: 0, functions: vec![0] }).collect();
+        p
+    }
+
+    fn combined_only_package(active: usize, budget: usize) -> Package {
+        let mut p = packed_package(active, budget);
+        let execution = p.execution.as_mut().unwrap();
+        execution.graphs.retain(|g| match g.kind.as_str() {
+            "proposal" => false,
+            "speculative" => g.token_capacity == 1,
+            "verification" => g.packed_token_capacity > g.batch_capacity
+                && g.packed_token_capacity <= g.batch_capacity * 6,
+            _ => true,
+        });
+        for graph in &mut execution.graphs {
+            if graph.kind == "verification" {
+                graph.kind = "packed_speculative".into();
+                graph.token_capacity = 6;
+                graph.verify_tokens = Some(6);
+                graph.draft_tokens = Some(5);
+                graph.draft_source = 1;
+            }
+        }
+        let names: HashSet<_> = execution.graphs.iter().map(|g| g.name.clone()).collect();
+        p.graphs.retain(|g| names.contains(&g.name));
+        p
+    }
+
+    #[test]
+    fn combined_only_low_budgets_preserve_width_one_at_full_concurrency() {
+        for prepared_budget in [8usize, 128] {
+            for options in [LoadOptions::default(),
+                LoadOptions { mtp_verification_token_budget: Some(8), ..Default::default() },
+                LoadOptions { mtp_max_verification_token_budget: Some(8), ..Default::default() }] {
+                let mut ranks = [combined_only_package(32, prepared_budget), combined_only_package(32, prepared_budget)];
+                let mut config = packed_draft_five_config();
+                config["speculative_token_capacity"] = prepared_budget.into();
+                options.select(&mut ranks, &mut config).unwrap();
+                let selected_budget = if options.mtp_verification_token_budget.is_some()
+                    || options.mtp_max_verification_token_budget.is_some() { 8 } else { prepared_budget };
+                for package in &ranks {
+                    let graphs = &package.execution.as_ref().unwrap().graphs;
+                    let rounds: Vec<_> = graphs.iter().filter(|g| g.kind == "packed_speculative").collect();
+                    assert_eq!(rounds.len(), if options.mtp_verification_token_budget.is_some() { 3 }
+                        else if selected_budget == 8 { 9 } else { 28 });
+                    assert!(rounds.iter().all(|g| g.draft_tokens == Some(5) && g.token_capacity == 6
+                        && g.packed_token_capacity > g.batch_capacity && g.packed_token_capacity <= selected_budget as u64));
+                    assert!(!graphs.iter().any(|g| matches!(g.kind.as_str(), "proposal" | "verification")));
+                    for batch in [1u64, 2, 4, 8, 16, 32] {
+                        assert!(graphs.iter().any(|g| g.kind == "speculative" && g.batch_capacity == batch && g.token_capacity == 1));
+                        assert_eq!(rounds.iter().any(|g| g.batch_capacity == batch), batch * 2 <= selected_budget as u64);
+                    }
+                }
+                assert_eq!(config["speculative_token_capacity"], selected_budget);
+            }
+        }
+    }
+
+    #[test]
+    fn combined_only_budgets_reject_missing_useful_rounds_and_width_one() {
+        for rank in [0usize, 1] {
+            for (kind, batch) in [("packed_speculative", 4u64), ("speculative", 32)] {
+                let mut ranks = [combined_only_package(32, 8), combined_only_package(32, 8)];
+                let package = &mut ranks[rank];
+                let omitted = package.execution.as_ref().unwrap().graphs.iter()
+                    .find(|g| g.kind == kind && g.batch_capacity == batch).unwrap().name.clone();
+                package.execution.as_mut().unwrap().graphs.retain(|g| g.name != omitted);
+                package.graphs.retain(|g| g.name != omitted);
+                let mut config = packed_draft_five_config();
+                config["speculative_token_capacity"] = 8.into();
+                let error = LoadOptions::default().select(&mut ranks, &mut config).unwrap_err().to_string();
+                assert!(error.contains(&format!("rank {rank}")) && error.contains(&format!("batch {batch}")), "{error}");
+            }
+        }
+        for budget in [1usize, 7] {
+            let mut config = packed_draft_five_config();
+            config["speculative_token_capacity"] = 128.into();
+            assert!(LoadOptions { mtp_verification_token_budget: Some(budget), ..Default::default() }
+                .select(&mut [combined_only_package(32, 128)], &mut config).is_err());
+        }
+    }
+
+    #[test]
+    fn combined_only_partial_batch_capacity_remains_loadable() {
+        let mut package = combined_only_package(32, 9);
+        let mut graph = package.execution.as_ref().unwrap().graphs.iter()
+            .find(|g| g.kind == "packed_speculative" && g.batch_capacity == 4).unwrap().clone();
+        graph.name = "packed-partial-eight".into();
+        graph.batch_capacity = 8;
+        graph.packed_token_capacity = 9;
+        package.graphs.push(Graph { name: graph.name.clone(), flags: 0,
+            resource: graph.name.clone(), node_count: 1, edge_count: 0, functions: vec![0] });
+        package.execution.as_mut().unwrap().graphs.push(graph);
+        let mut config = packed_draft_five_config();
+        config["speculative_token_capacity"] = 9.into();
+        LoadOptions::default().select(std::slice::from_mut(&mut package), &mut config).unwrap();
+        assert!(package.execution.as_ref().unwrap().graphs.iter().any(|g|
+            g.kind == "packed_speculative" && g.batch_capacity == 8 && g.packed_token_capacity == 9));
+    }
+
+    #[test]
+    fn exact_combined_budget_equal_to_batch_preserves_pending_only_captures() {
+        for pending_only in [false, true] {
+            let mut package = if pending_only { combined_package() } else { combined_only_package(8, 48) };
+            LoadOptions { mtp_verification_token_budget: Some(8), ..Default::default() }
+                .select(std::slice::from_mut(&mut package), &mut packed_draft_five_config()).unwrap();
+            let graphs = &package.execution.as_ref().unwrap().graphs;
+            assert!(graphs.iter().any(|g| g.kind == "speculative" && g.batch_capacity == 8 && g.token_capacity == 1));
+            assert_eq!(graphs.iter().any(|g| g.kind == "packed_speculative"
+                && g.batch_capacity == 8 && g.packed_token_capacity == 8), pending_only);
+        }
+    }
+
+    #[test]
+    fn packed_combined_selection_keeps_one_producer_and_exact_row_limits() {
+        for budget in [24usize, 32] {
+            let mut ranks = [combined_package(), combined_package()];
+            let mut config = packed_draft_five_config();
+            LoadOptions { mtp_verification_token_budget: Some(budget), ..Default::default() }
+                .select(&mut ranks, &mut config).unwrap();
+            for package in ranks {
+                let graphs = &package.execution.unwrap().graphs;
+                assert!(!graphs.iter().any(|g| matches!(g.kind.as_str(), "proposal" | "verification")));
+                for batch in [1u64, 2, 4, 8] {
+                    let rounds: Vec<_> = graphs.iter().filter(|g| g.kind == "packed_speculative"
+                        && g.batch_capacity == batch).collect();
+                    assert_eq!(rounds.len(), 1);
+                    assert_eq!(rounds[0].draft_tokens, Some(5));
+                    assert_eq!(rounds[0].token_capacity, 6);
+                    assert_eq!(rounds[0].verify_tokens, Some(6));
+                    assert_eq!(rounds[0].packed_token_capacity, (budget as u64).min(batch * 6));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn packed_combined_selection_rejects_unknown_missing_or_inconsistent_geometry() {
+        for mutation in 0..6 {
+            let mut p = combined_package();
+            let graph = p.execution.as_mut().unwrap().graphs.iter_mut()
+                .find(|g| g.kind == "packed_speculative").unwrap();
+            match mutation {
+                0 => graph.draft_tokens = None,
+                1 => graph.draft_tokens = Some(0),
+                2 => graph.draft_tokens = Some(7),
+                3 => graph.verify_tokens = Some(2),
+                4 => graph.packed_token_capacity = 0,
+                _ => graph.kind = "packed_speculative_unknown".into(),
+            }
+            assert!(LoadOptions::default().select(&mut [p], &mut packed_draft_five_config()).is_err());
+        }
+        let mut ranks = [combined_package(), combined_package()];
+        let e = ranks[1].execution.as_mut().unwrap();
+        let name = e.graphs.iter().find(|g| g.kind == "packed_speculative" && g.draft_tokens == Some(5)).unwrap().name.clone();
+        e.graphs.retain(|g| g.name != name);
+        ranks[1].graphs.retain(|g| g.name != name);
+        assert!(LoadOptions::default().select(&mut ranks, &mut packed_draft_five_config()).is_err());
+    }
+
+    #[test]
+    fn packed_combined_short_depth_keeps_its_declared_wide_target_catalog() {
+        let mut p = combined_package();
+        let e = p.execution.as_mut().unwrap();
+        e.graphs.retain(|g| g.kind != "packed_speculative" || g.draft_tokens == Some(1));
+        let names: HashSet<_> = e.graphs.iter().map(|g| g.name.clone()).collect();
+        p.graphs.retain(|g| names.contains(&g.name));
+        let mut ranks = [p];
+        let mut c = packed_draft_five_config();
+        LoadOptions::default().select(&mut ranks, &mut c).unwrap();
+        assert_eq!(c["speculative_widths"], serde_json::json!([1, 2, 3, 4, 5, 6]));
+        let graphs = &ranks[0].execution.as_ref().unwrap().graphs;
+        assert!(graphs.iter().any(|g| g.kind == "packed_speculative"));
+        assert!(graphs.iter().filter(|g| g.kind == "packed_speculative")
+            .all(|g| g.draft_tokens == Some(1) && g.token_capacity == 6 && g.verify_tokens == Some(6)));
+    }
+
+    #[test]
+    fn packed_catalog_selection_retains_joined_and_split_operations() {
+        for drafts in [None, Some(2)] {
+            let mut package = combined_package();
+            let split = packed_draft_five_package();
+            let execution = package.execution.as_mut().unwrap();
+            for graph in split.execution.unwrap().graphs.into_iter().filter(|g|
+                matches!(g.kind.as_str(), "proposal" | "verification")) {
+                execution.graphs.push(graph);
+            }
+            package.graphs = execution.graphs.iter().map(|g| Graph { name: g.name.clone(), flags: 0,
+                resource: g.name.clone(), node_count: 1, edge_count: 0, functions: vec![0] }).collect();
+            let mut ranks = [package];
+            LoadOptions { mtp_draft_tokens: drafts, mtp_max_verification_token_budget: Some(24), ..Default::default() }
+                .select(&mut ranks, &mut packed_draft_five_config()).unwrap();
+            let graphs = &ranks[0].execution.as_ref().unwrap().graphs;
+            assert!(graphs.iter().filter(|g| g.kind == "speculative")
+                .all(|g| g.token_capacity == 1 || g.packed_tokens() <= 24));
+            for kind in ["speculative", "proposal", "verification", "packed_speculative"] {
+                assert!(graphs.iter().any(|g| g.kind == kind), "missing {kind}");
+            }
+            assert!(graphs.iter().filter(|g| g.kind == "packed_speculative")
+                .all(|g| g.draft_tokens.unwrap() as usize <= drafts.unwrap_or(5)));
+        }
     }
 
 }

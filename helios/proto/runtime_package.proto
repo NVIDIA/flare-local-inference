@@ -96,6 +96,8 @@ message RebuildManifest {
   uint64 reserve_bytes = 20;
   // Local checkpoint overrides have no asserted upstream revision.
   bool local_checkpoint = 21;
+  // Neighbor relays over a chain in rank order; exclusive with roce_ring.
+  bool roce_chain = 22;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;
@@ -104,6 +106,7 @@ message RebuildSpeculation {
   bool history_drafts = 4;
   uint64 token_capacity = 5;
   bool packed_verification = 6;
+  string draft_prefix_selection = 7;
 }
 // Views of retained prepared weight storage, with no additional payload copies.
 // Names are paths in the recipe's weight objects, not original checkpoint keys.
@@ -237,6 +240,8 @@ enum ValueSource {
   IMAGE_TENSOR = 37;
   IMAGE_FEATURE_SLOT = 38;
   PROMPT_TARGET_TOKEN = 39;
+  // Immutable per-request query-length ceiling for GPU-owned packed allocation.
+  SPECULATIVE_PREFIX_LIMIT = 40;
 }
 enum InputIndexing {
   INDEXING_UNSPECIFIED = 0;
@@ -288,6 +293,8 @@ enum GraphOperation {
   PROPOSAL = 10;
   VERIFICATION = 11;
   SCORED_PREFILL = 12;
+  // A bounded proposal, causal prefix allocation, and one target pass.
+  PACKED_SPECULATIVE = 13;
 }
 message GraphContract {
   string graph = 1;
@@ -307,11 +314,13 @@ enum ToolParserKind {
   GLM_ARGUMENT_TAGS = 2;
   DSML = 3;
   XTML = 4;
+  MINIMAX_XML = 5;
 }
 enum ReasoningParserKind {
   REASONING_PARSER_UNSPECIFIED = 0;
   THINK_TAGS = 1;
   XTML_THINK = 2;
+  MM_THINK = 3;
 }
 enum ImagePreparationKind {
   IMAGE_PREPARATION_UNSPECIFIED = 0;
@@ -322,6 +331,8 @@ enum ImagePreparationKind {
   STEP_IMAGE_PREPARATION = 5;
   RADIO_IMAGE_PREPARATION = 6;
   DEEPSEEK_ROW_MAJOR_IMAGE_PREPARATION = 7;
+  GLM_IMAGE_PREPARATION = 8;
+  PATCH_MERGE_IMAGE_PREPARATION = 9;
 }
 enum ImageLayoutKind {
   IMAGE_LAYOUT_UNSPECIFIED = 0;
@@ -332,6 +343,8 @@ enum ImageLayoutKind {
   STEP_IMAGE_LAYOUT = 5;
   RADIO_IMAGE_LAYOUT = 6;
   DEEPSEEK_ROW_MAJOR_IMAGE_LAYOUT = 7;
+  GLM_IMAGE_LAYOUT = 8;
+  BRACKETED_IMAGE_LAYOUT = 9;
 }
 message ToolParser {
   ToolParserKind kind = 1;
@@ -449,7 +462,19 @@ message ImageSettings {
     Empty step = 5;
     Empty radio = 6;
     DeepseekRowMajorImageSettings deepseek_row_major = 7;
+    Empty glm = 8;
+    PatchMergeImageSettings patch_merge = 9;
   }
+}
+message PatchMergeImageSettings {
+  uint32 patch_size = 1;
+  uint64 min_pixels = 2;
+  uint64 max_pixels = 3;
+  repeated float image_mean = 4;
+  repeated float image_std = 5;
+  string image_token = 6;
+  string start_token = 7;
+  string end_token = 8;
 }
 message DeepseekRowMajorImageSettings {
   uint64 min_pixels = 1;

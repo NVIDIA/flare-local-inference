@@ -850,7 +850,7 @@ pub fn render(value: &Value, width: usize, color: bool) -> String {
                 "proposal source",
                 match text(&speculation["proposal_source"]).as_str() {
                     "mtp" => "multi-token prediction head",
-                    "copy" => "copy drafts from the prompt",
+                    "copy" => "copy drafts from shared decoded history",
                     other => other,
                 },
             );

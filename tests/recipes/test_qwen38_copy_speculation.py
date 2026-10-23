@@ -179,6 +179,19 @@ def test_copy_round_constructs_no_draft_module_and_commits_only_verified_prefix(
         operator._flashinfer = OneHotLibrary
         operator.library_scratch = ()
         operator.top_p_workspace = None
+        for mask in getattr(operator, "probability_masks", ()):
+            # This wiring double substitutes the prepared stores as well as
+            # FlashInfer; CUDA tests exercise their compiled/native execution.
+            def copy_probabilities(mask=mask):
+                selected = mask.valid[:, None, None]
+                if mask.limits is not None:
+                    columns = torch.arange(mask.source.shape[1])[None, :, None]
+                    selected = selected & (columns < mask.limits[:, None, None] - mask.limit_offset)
+                source = mask.source if mask.snapshot is None else mask.snapshot
+                mask.destination.copy_(torch.where(selected, source, mask.dummy))
+
+            mask.kernel = copy_probabilities
+            mask.prepared = True
         operator._prepared = True
 
     def normalize_one_hot(operator, probabilities, params):

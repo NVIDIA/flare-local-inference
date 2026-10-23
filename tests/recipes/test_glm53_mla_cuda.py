@@ -81,7 +81,7 @@ def assert_selection(actual, expected, indexer):
         assert torch.all(logits[row][changed] == cutoff)
 
 
-@pytest.fixture(scope="module", params=[2, 4])
+@pytest.fixture(scope="module", params=[1, 2, 4])
 def model_weights(request):
     snapshot = Path(os.environ.get("FLARE_GLM53_SNAPSHOT",
         "/data/checkpoint-releases/GLM-5.3-Flash-NVFP4-MXFP8-CSF-QAD"))
@@ -210,8 +210,14 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                     expected[key] = stages[key].clone()
                 assert_selection(actual_pools, expected_pools, attention.indexer)
                 scratch.index.pools.copy_(actual_pools)
-                sparse_mla.expand_pooled_topk_to_physical_slots(*attention.indexer.expand_arguments,
-                    **attention.indexer.expand_options, plan=attention.indexer.expand_plan)
+                if attention.indexer.logical:
+                    from ignition.recipes.glm53.dcp import expand_tokens
+
+                    expand_tokens(scratch.index.pools, metadata.positions,
+                                  scratch.index.physical, scratch.index.selected_lengths)
+                else:
+                    sparse_mla.expand_pooled_topk_to_physical_slots(*attention.indexer.expand_arguments,
+                        **attention.indexer.expand_options, plan=attention.indexer.expand_plan)
                 torch.testing.assert_close(scratch.index.physical, actual_physical, rtol=0, atol=0)
                 for key, value in actual.items():
                     assert torch.isfinite(value).all(), key

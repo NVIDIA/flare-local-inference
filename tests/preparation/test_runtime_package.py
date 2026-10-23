@@ -1,6 +1,6 @@
-"""Resource binding validation and cross-process native CUDA graph replay."""
+"""Native export validation and cross-process Helios CUDA graph replay."""
 
-import ctypes as C
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -8,378 +8,88 @@ import sys
 
 import pytest
 
-from ignition.preparation.runtime_package import (
-    Allocation, Argument, FileSource, Kernel, Reference, Relocation, RuntimePackage,
-    _external_allocations, _live_pieces, _merge_ranges, _without_zero_ranges, _write_allocation,
-    _KernelParams, _kernel_argument_data,
-)
+from ignition.preparation.runtime_package import FileSource
 
 
-def package(*, allocations=None, arguments=None):
-    return RuntimePackage(
-        allocations=[Allocation("weight", 0x1000, 256)] if allocations is None else allocations,
-        modules={"kernel": b"\x7fELFfixture"},
-        kernels=[Kernel(1, "kernel", (Argument(8, (Relocation(0, Reference("weight")),)),)
-                        if arguments is None else arguments)],
-    )
+def test_invalid_serving_metadata_fails_before_cuda_or_weight_copy(tmp_path):
+    import flare_heliopause
 
-
-def test_kernel_arguments_preserve_abi_padding_and_allow_parameterless_kernels():
-    packed = C.create_string_buffer(b"ab______12345678")
-    size = C.c_size_t(16)
-    extra = (C.c_void_p * 5)(1, C.addressof(packed), 2, C.addressof(size), None)
-    layout = [(0, 2), (8, 8)]
-    assert _kernel_argument_data(_KernelParams(extra=extra), layout) == [b"ab", b"12345678"]
-    pointers = (C.c_void_p * 2)(C.addressof(packed), C.addressof(packed) + 8)
-    assert _kernel_argument_data(_KernelParams(params=pointers), layout) == [b"ab", b"12345678"]
-    assert _kernel_argument_data(_KernelParams(), []) == []
-    with pytest.raises(ValueError, match="both"):
-        _kernel_argument_data(_KernelParams(params=pointers, extra=extra), layout)
-    with pytest.raises(ValueError, match="no launch arguments"):
-        _kernel_argument_data(_KernelParams(), layout)
-    size.value = 15
-    with pytest.raises(ValueError, match="beyond"):
-        _kernel_argument_data(_KernelParams(extra=extra), layout)
-
-
-@pytest.mark.parametrize("tag,buffer,size_pointer", [(3, True, True), (1, False, True), (1, True, False)])
-def test_invalid_packed_kernel_arguments_are_rejected(tag, buffer, size_pointer):
-    packed = C.create_string_buffer(8)
-    size = C.c_size_t(8)
-    extra = (C.c_void_p * 5)(tag, C.addressof(packed) if buffer else None,
-                            2, C.addressof(size) if size_pointer else None, None)
-    with pytest.raises(ValueError):
-        _kernel_argument_data(_KernelParams(extra=extra), [(0, 8)])
-
-
-def test_views_must_share_one_registered_backing_storage():
-    with pytest.raises(ValueError, match="shared backing storage"):
-        package(allocations=[Allocation("weight", 0x1000, 512), Allocation("view", 0x1100, 256)])
-    owner = package(arguments=(Argument(8, (Relocation(0, Reference("weight", 128)),)),))
-    assert owner._reference(0x1080, 128) == {"allocation": "weight", "offset": 128}
-    with pytest.raises(ValueError, match="unregistered CUDA span"):
-        owner._reference(0x1080, 129)
-
-
-def test_peer_allocations_name_recorded_storage_without_payload():
-    peer = Allocation("peer-0", 0x10000, 4096, alignment=4096, initialize="zero", preserve_address=True, memory="peer")
-    owner = package(allocations=[Allocation("weight", 0x1000, 256), peer])
-    assert owner._reference(0x10800, 64) == {"allocation": "peer-0", "offset": 0x800}
-    for invalid in ({"initialize": "snapshot"}, {"preserve_address": False}):
-        with pytest.raises(ValueError, match="another rank's storage"):
-            package(allocations=[Allocation("weight", 0x1000, 256), Allocation(
-                "peer-0", 0x10000, 4096, alignment=4096, memory="peer",
-                **{"initialize": "zero", "preserve_address": True, **invalid})])
-
-
-@pytest.mark.parametrize("relocations", [
-    (Relocation(0, Reference("absent")),),
-    (Relocation(0, Reference("weight", 256)),),
-    (Relocation(1, Reference("weight")),),
-    (Relocation(0, Reference("weight")), Relocation(0, Reference("weight"))),
-    (Relocation(0, Reference("weight"), "tensor_map"),),
-])
-def test_invalid_reference_or_relocation_extent_is_rejected(relocations):
-    with pytest.raises(ValueError):
-        package(arguments=(Argument(8, relocations),))
-
-
-def test_declared_pointer_must_match_live_binding():
-    owner = package()
-    relocation = Relocation(0, Reference("weight"))
-    owner._check_bindings(None, (0x1000).to_bytes(8, "little"), [relocation])
-    with pytest.raises(ValueError, match="pointer binding does not match"):
-        owner._check_bindings(None, (0x1080).to_bytes(8, "little"), [relocation])
-
-
-def test_export_never_overwrites_an_existing_directory(tmp_path):
-    with pytest.raises(FileExistsError):
-        package().write(tmp_path, {})
-
-
-def test_invalid_serving_metadata_fails_before_cuda_or_weight_copy(tmp_path, monkeypatch):
-    from google.protobuf.json_format import ParseError
-    from ignition.preparation import runtime_package
-
-    def unexpected_cuda():
-        raise AssertionError("invalid metadata must fail before CUDA initialization")
-
-    monkeypatch.setattr(runtime_package, "_Cuda", unexpected_cuda)
-    server = dict(assets={"tokenizer": {}, "chat_template": {}}, frontend={},
-        sampling_defaults=dict(seed=0, temperature=1., top_p=.95, top_k=-1, min_p=0.,
-            repetition_penalty=1., presence_penalty=0., frequency_penalty=0.),
-        scheduler_policy="throughput")
-    with pytest.raises(ParseError, match="scheduler_policy"):
-        package().write(tmp_path / "invalid.safetensors", {"decode": object()}, server=server)
+    request = dict(path=str(tmp_path / "invalid.safetensors"), context=0,
+        graphs=[dict(name="decode", graph=1, executable=1)], allocations=[],
+        execution=None, package_data=None, rebuild_weights=None, shard_size=64 << 30,
+        server=dict(assets={"tokenizer": {}, "chat_template": {}}, frontend={},
+            sampling_defaults=dict(seed=0, temperature=1., top_p=.95, top_k=-1, min_p=0.,
+                repetition_penalty=1., presence_penalty=0., frequency_penalty=0.),
+            scheduler_policy="throughput"))
+    with pytest.raises(ValueError, match="scheduler_policy"):
+        flare_heliopause.export_capture(json.dumps(request), (), None)
     assert not list(tmp_path.iterdir())
 
 
-@pytest.mark.parametrize("offset,nbytes,closed,accepted", [
-    (0, 2 << 20, False, True),
-    (4096, 4096, False, True),
-    (0, 2 << 20, True, False),
-    (0, (2 << 20) + 4096, False, False),
-    (-4096, 8192, False, False),
-    (2 << 20, 4096, False, False),
-])
-def test_export_classifies_recorded_host_vmm_by_declared_ownership(
-        tmp_path, monkeypatch, offset, nbytes, closed, accepted):
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
+def test_native_graph_export_preserves_construction_order_across_branches(tmp_path):
+    import ctypes as C
     from types import SimpleNamespace
 
-    from ignition.preparation import runtime_package, tensor_metadata
+    import torch
+    from helios.tests.cuda_graph_fixture import MemsetParams
+    from ignition.preparation.module_images import ModuleImages
+    from ignition.preparation.package_file import read_sources
+    from ignition.preparation import runtime_package_pb2 as proto
+    from ignition.preparation.runtime_package import Allocation, RuntimePackage, _Cuda
 
-    base = 0xc0000000000
-    calls = []
-
-    class Cuda:
-        def call(self, name, *args):
-            if name == "cuCtxGetCurrent":
-                args[0]._obj.value = 17
-            elif name == "cuPointerGetAttribute":
-                calls.append(args[2].value)
-                # Host-backed VMM has host memory type and no owning context.
-                args[0]._obj.value = 1 if args[1].value == 2 else None
-
-    class Classified(Exception):
-        pass
-
-    def classified(allocations, *args):
-        host, = allocations
-        assert (host.address, host.nbytes, host.memory) == (base, 2 << 20, "mapped_host")
-        raise Classified
-
-    monkeypatch.setattr(runtime_package, "_Cuda", Cuda)
-    monkeypatch.setattr(tensor_metadata, "live_metadata", classified)
-    prepared = SimpleNamespace(_consumed=False, signatures={}, export_zero_ranges=[], buffers={})
-    storage = SimpleNamespace(error=None, dynamic_regions=[], transports=[], mappings={}, peer_storage=None,
-        host_regions=[SimpleNamespace(address=base, extent=2 << 20, closed=closed)], granularity=2 << 20,
-        unused_ranges=lambda: [],
-        graph_pool=SimpleNamespace(snapshot=lambda **kwargs: []), numeric_storage=None)
-    images = SimpleNamespace(allocations={base + offset: (nbytes, "device")},
-                             allocation_contexts={base + offset: 17})
-    if accepted:
-        with pytest.raises(Classified):
-            runtime_package.export_model(prepared, images, storage, tmp_path / "package", options={})
-        assert calls == []
-    else:
-        with pytest.raises(ValueError, match="not device memory in the serving context"):
-            runtime_package.export_model(prepared, images, storage, tmp_path / "package", options={})
-        assert calls == [base + offset, base + offset]
-
-
-def test_peer_export_keeps_shared_frontend_only_on_rank_zero(tmp_path, monkeypatch):
-    import hashlib
-    from types import SimpleNamespace
-
-    from ignition.preparation import memory_inventory, runtime_package
-
-    monkeypatch.setattr(memory_inventory, "collect_inventory", lambda *args, **kwargs: {})
-    from ignition.preparation.package_file import extend_cluster, read_index
-    from ignition.recipes.declaration import SamplingDefaults
-
-    class Cuda:
-        lib = SimpleNamespace(cuCtxGetLimit=lambda *args: 215, cuFuncGetParamInfo=lambda *args: 1)
-
-        def call(self, name, *args):
-            if name == "cuGraphGetNodes":
-                args[2]._obj.value = 1
-                if args[1] is not None:
-                    args[1][0] = 1
-            elif name == "cuGraphKernelNodeGetParams_v2":
-                args[1]._obj.func = 1
-            elif name == "cuFuncGetName":
-                args[0]._obj.value = b"fixture"
-
-    cuda = Cuda()
-    monkeypatch.setattr(runtime_package, "_Cuda", lambda: cuda)
-    monkeypatch.setattr(RuntimePackage, "_graph", lambda self, cuda, name, graph:
-                        {"name": name, "nodes": [], "edges": []})
-    from ignition.preparation import cubin, module_images
-
-    monkeypatch.setattr(module_images, "strip_debug", lambda image: image)
-    monkeypatch.setattr(cubin, "redact_symbols", lambda image: (image, {"fixture": "_f0"}))
-    monkeypatch.setattr(module_images, "global_symbols", lambda image: [])
-    assets = {}
-    for name in ("tokenizer", "chat_template"):
-        path = tmp_path / name
-        path.write_text(name)
-        assets[name] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    graph = SimpleNamespace(raw_cuda_graph=lambda: 1, raw_cuda_graph_exec=lambda: 1)
-    address = 0x100000000000
-    prepared = SimpleNamespace(_consumed=False, signatures={"decode": SimpleNamespace(kind="decode", packed_token_capacity=0)},
-        export_zero_ranges=[(address, 4096)], graphs={"decode": graph},
-        buffers={}, export_events={}, package_data=None,
-        server_config={"model_id": "fixture", "assets": assets,
-                       "sampling_defaults": SamplingDefaults(temperature=1., top_p=.95, top_k=-1).as_dict(),
-                       "frontend": {"eos_token_ids": [17]}},
-        manifest=lambda **kwargs: {"context": {}, "device": 0, "buffers": [], "graphs": []})
-    storage = SimpleNamespace(error=None, dynamic_regions=[], transports=[], integrated=False,
-        mappings={address: SimpleNamespace(address=address, nbytes=4096)},
-        peer_storage=None, host_regions=[], granularity=4096, DEVICE_BASE=0x100000000000,
-        RESERVATION_BYTES=1 << 20, unused_ranges=lambda: [],
-        graph_pool=SimpleNamespace(snapshot=lambda **kwargs: []),
-        numeric_storage=SimpleNamespace(ranges=lambda: []))
-    images = SimpleNamespace(allocations={}, image_for=lambda cuda, function: b"\x7fELFfixture")
-    paths = [tmp_path / f"rank-{rank}.safetensors" for rank in range(2)]
-    for rank, path in enumerate(paths):
-        runtime_package.export_model(prepared, images, storage, path, options={}, bundle_only=rank > 0)
-    peer, _ = read_index(paths[1])
-    assert not peer.assets and not peer.HasField("contract")
-    assert not peer.HasField("frontend") and not peer.HasField("sampling_defaults")
-    assert [graph.name for graph in peer.ranks[0].graphs] == ["decode"]
-    with paths[1].open("rb") as stream:
-        extend_cluster(paths[0], [stream], (2, "fixture"))
-    combined, _ = read_index(paths[0])
-    assert len(combined.ranks) == 2
-    assert {asset.name for asset in combined.assets} == {"tokenizer", "chat_template"}
-    assert combined.contract.model_id == "fixture"
-    assert list(combined.frontend.eos_token_ids) == [17]
-    assert combined.sampling_defaults.temperature == 1.
-    assert prepared.server_config["assets"] == assets
-
-
-def test_external_allocations_share_pages_without_reading_unallocated_bytes():
-    allocations = _external_allocations([(0x1300, 512), (0x1F00, 512), (0x5800, 256)], 4096)
-    assert [(a.address, a.nbytes) for a in allocations] == [(0x1000, 8192), (0x5000, 4096)]
-    assert allocations[0].snapshot_spans == ((0x300, 512), (0xF00, 512))
-    owner = package(allocations=allocations, arguments=(Argument(8),))
-    assert owner._reference(0x1F00, 512) == {"allocation": "external-0", "offset": 0xF00}
-
-
-@pytest.mark.parametrize("dependency", ["unused", "direct", "indirect"])
-def test_export_rejects_reachable_storage_below_the_address_floor(tmp_path, monkeypatch, dependency):
-    from types import SimpleNamespace
-    from ignition.preparation import memory_inventory, module_images, runtime_package, tensor_metadata
-    monkeypatch.setattr(memory_inventory, "collect_inventory", lambda *args, **kwargs: {})
-    from ignition.preparation.package_file import read_index
-
-    low, high, floor = 0x1208400000, 0x40000000000, 0x4000000000
-
-    class Cuda:
-        lib = SimpleNamespace(cuCtxGetLimit=lambda *args: 215, cuFuncGetParamInfo=lambda *args: 1)
-
-        def call(self, name, *args):
-            if name == "cuCtxGetCurrent":
-                args[0]._obj.value = 17
-            elif name == "cuPointerGetAttribute":
-                args[0]._obj.value = 2 if args[1].value == 2 else 17
-            elif name == "cuGraphGetNodes":
-                args[2]._obj.value = 1
-                if args[1] is not None:
-                    args[1][0] = 1
-            elif name == "cuGraphKernelNodeGetParams_v2":
-                args[1]._obj.func = 1
-            elif name == "cuFuncGetName":
-                args[0]._obj.value = b"fixture"
-
-        def download(self, address, size):
-            assert address == high and size == 256
-            return (low if dependency == "indirect" else 0).to_bytes(8, "little") + bytes(248)
-
-    monkeypatch.setattr(runtime_package, "_Cuda", Cuda)
-    monkeypatch.setattr(RuntimePackage, "_graph", lambda self, cuda, name, graph:
-                        {"name": name, "nodes": [], "edges": []})
-    monkeypatch.setattr(module_images, "strip_debug", lambda image: image)
-    from ignition.preparation import cubin
-    monkeypatch.setattr(cubin, "redact_symbols", lambda image: (image, {"fixture": "_f0"}))
-    monkeypatch.setattr(module_images, "global_symbols", lambda image: [])
-    monkeypatch.setattr(tensor_metadata, "live_metadata", lambda *args: ([], {}))
-    graph = SimpleNamespace(raw_cuda_graph=lambda: 1, raw_cuda_graph_exec=lambda: 1)
-    prepared = SimpleNamespace(_consumed=False, signatures={"decode": SimpleNamespace(kind="decode", packed_token_capacity=0)},
-        export_zero_ranges=[], graphs={"decode": graph},
-        buffers={}, export_events={}, package_data=None, server_config={},
-        manifest=lambda **kwargs: {"context": {}, "device": 0, "graphs": [], "buffers": [
-            {"name": "root", "address": low if dependency == "direct" else high, "nbytes": 8}]})
-    storage = SimpleNamespace(error=None, dynamic_regions=[], transports=[], integrated=True,
-        mappings={high: SimpleNamespace(address=high, nbytes=256)}, peer_storage=None,
-        host_regions=[], granularity=256, EXTERNAL_FLOOR=floor,
-        unused_ranges=lambda: [],
-        graph_pool=SimpleNamespace(snapshot=lambda **kwargs: []), numeric_storage=None)
-    images = SimpleNamespace(allocations={low: (256, "device")}, allocation_contexts={low: 17},
-                             image_for=lambda cuda, function: b"\x7fELFfixture")
-    path = tmp_path / "package.safetensors"
-
-    def export():
-        return runtime_package.export_model(prepared, images, storage, path, options={}, bundle_only=True)
-
-    if dependency == "unused":
-        export()
-        index, _ = read_index(path)
-        assert [a.name for a in index.ranks[0].allocations] == ["device-0"]
-        assert all(reservation.address >= floor for reservation in index.ranks[0].reservations)
-    else:
-        with pytest.raises(ValueError, match="below the restorable address floor"):
-            export()
-        assert not path.exists()
-        assert not list(tmp_path.iterdir())
-
-
-def test_disposable_spans_preserve_neighbors_and_external_page_gaps():
-    zero = _merge_ranges(((0x1080, 32), (0x1090, 64), (0x1180, 128)))
-    allocation = _without_zero_ranges(Allocation("mixed", 0x1000, 512), zero)
-    assert allocation.snapshot_spans == ((0, 128), (208, 176))
-    external = Allocation("external", 0x1000, 512, snapshot_spans=((64, 128), (384, 64)))
-    assert _without_zero_ranges(external, zero).snapshot_spans == ((64, 64),)
-    assert _without_zero_ranges(external, ((0x1000, 512),)).initialize == "zero"
-
-
-@pytest.mark.parametrize("nonzero", [False, True])
-def test_packed_payload_elides_zero_blocks_without_changing_contents(tmp_path, nonzero):
-    block = 64 << 10
-    source = bytearray(4 * block + 17)
-    if nonzero:
-        source[block + 3] = 7
-        source[3 * block + 8] = 11
-        source[-1] = 19
-    class Cuda:
-        def download(self, address, nbytes):
-            return bytes(source[address - 0x1000:address - 0x1000 + nbytes])
-    file = tmp_path / "data.bin"
-    name, spans = _write_allocation(Cuda(), Allocation("data", 0x1000, len(source)), file)
-    if not nonzero:
-        assert name is None and spans == [] and not file.exists()
-        return
-    assert spans == [[block, block], [3 * block, block + 17]]
-    assert file.stat().st_size == 2 * block + 17
-    rebuilt = bytearray(len(source))
-    with file.open("rb") as payload:
-        for offset, size in spans:
-            rebuilt[offset:offset + size] = payload.read(size)
-    assert rebuilt == source
-
-
-def test_payload_writes_flush_in_bounded_batches(tmp_path, monkeypatch):
-    from ignition.preparation import runtime_package
-
-    synced, dropped = [], []
-    monkeypatch.setattr(runtime_package, "_WRITE_BACK_BYTES", 16 << 20)
-    monkeypatch.setattr(runtime_package.os, "fsync" if os.name == "nt" else "fdatasync",
-                        lambda fd: synced.append(fd))
-    if os.name != "nt":
-        monkeypatch.setattr(runtime_package.os, "posix_fadvise",
-                            lambda fd, offset, length, advice: dropped.append((offset, length, advice)))
-
-    class Cuda:
-        def download(self, address, nbytes):
-            return bytes([5]) * nbytes
-    file = tmp_path / "weights.bin"
-    _, spans = _write_allocation(Cuda(), Allocation("weights", 0x1000, 40 << 20), file)
-    # Flush after 16 and 32 MiB and at the end.
-    assert spans == [[0, 40 << 20]] and file.stat().st_size == 40 << 20
-    assert len(synced) == 3
-    if os.name != "nt":
-        assert dropped == [(0, 0, os.POSIX_FADV_DONTNEED)] * 3
-
-
-def test_declared_zero_ranges_are_not_downloaded(tmp_path):
-    class Cuda:
-        def download(self, address, nbytes):
-            assert (address, nbytes) in ((0x1000, 64), (0x1100, 64))
-            return bytes([13]) * nbytes
-    allocation = _without_zero_ranges(Allocation("mixed", 0x1000, 320), ((0x1040, 192),))
-    file = tmp_path / "mixed.bin"
-    _, spans = _write_allocation(Cuda(), allocation, file)
-    assert spans == [[0, 64], [256, 64]] and file.read_bytes() == bytes([13]) * 128
+    assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA_VISIBLE_DEVICES before running GPU tests"
+    data = torch.zeros(256, dtype=torch.uint8, device="cuda:0")
+    cuda = _Cuda()
+    with ModuleImages() as images:
+        data.add_(1)
+        torch.cuda.synchronize()
+        graph = torch.cuda.CUDAGraph(keep_graph=True)
+        with torch.cuda.graph(graph):
+            data.add_(1)
+        nodes = []
+        context = C.c_void_p()
+        cuda.call("cuCtxGetCurrent", C.byref(context))
+        for value in (17, 29, 41):
+            params = MemsetParams(dst=data.data_ptr() + len(nodes) * 64, pitch=0,
+                                  value=value, element_size=1, width=64, height=1)
+            node = C.c_void_p()
+            dependencies = (C.c_void_p * 1)(nodes[0].value) if nodes else None
+            cuda.call("cuGraphAddMemsetNode", C.byref(node), C.c_void_p(graph.raw_cuda_graph()),
+                      dependencies, C.c_size_t(int(bool(nodes))), C.byref(params), context)
+            nodes.append(node)
+        executable = C.c_void_p()
+        cuda.call("cuGraphInstantiateWithFlags", C.byref(executable),
+                  C.c_void_p(graph.raw_cuda_graph()), C.c_uint64(0))
+        try:
+            owner = RuntimePackage(allocations=[Allocation("weight", data.data_ptr(), data.nbytes)],
+                                   modules={}, kernels=[], recorder=images.native, owners=(data, graph))
+            path = tmp_path / "rank.json"
+            owner.write(path, {"branches": SimpleNamespace(raw_cuda_graph=graph.raw_cuda_graph,
+                raw_cuda_graph_exec=lambda: executable.value)}, sources=True)
+        finally:
+            cuda.call("cuGraphExecDestroy", executable)
+    index, locate = read_sources(path)
+    description, = index.ranks[0].graphs
+    contents = bytearray()
+    for source, offset, nbytes in locate(index.ranks[0].resources[description.resource]):
+        with source.open("rb") as stream:
+            stream.seek(offset)
+            contents.extend(stream.read(nbytes))
+    import struct
+    decoded, cursor = [], 0
+    for record in [proto.Node] * description.node_count + [proto.Edge] * description.edge_count:
+        size, = struct.unpack_from("<I", contents, cursor)
+        cursor += 4
+        decoded.append(record.FromString(contents[cursor:cursor + size]))
+        cursor += size
+    assert cursor == len(contents)
+    memset = [(i, node.memset.value) for i, node in enumerate(decoded[:description.node_count])
+              if node.WhichOneof("operation") == "memset"]
+    assert [value for _, value in memset] == [17, 29, 41]
+    first, second, third = [i for i, _ in memset]
+    edges = {(edge.source, edge.destination) for edge in decoded[description.node_count:]}
+    assert {(first, second), (first, third)} <= edges
 
 
 def test_checkpoint_source_requires_a_complete_nonempty_file_range(tmp_path):
@@ -390,35 +100,6 @@ def test_checkpoint_source_requires_a_complete_nonempty_file_range(tmp_path):
         with pytest.raises(ValueError, match="within its checkpoint"):
             FileSource(checkpoint, offset, size)
 
-
-@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
-def test_graph_export_preserves_construction_order_across_branches():
-    import ctypes as C
-    import torch
-    from ignition.preparation.runtime_package import _Cuda, _MemsetParams
-
-    assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA_VISIBLE_DEVICES before running GPU tests"
-    data = torch.empty(256, dtype=torch.uint8, device="cuda:0")
-    cuda = _Cuda()
-    graph, context = C.c_void_p(), C.c_void_p()
-    cuda.call("cuCtxGetCurrent", C.byref(context))
-    cuda.call("cuGraphCreate", C.byref(graph), C.c_uint(0))
-    try:
-        nodes = []
-        for value in (17, 29, 41):
-            params = _MemsetParams(dst=data.data_ptr() + len(nodes) * 64, pitch=0,
-                                   value=value, element_size=1, width=64, height=1)
-            node = C.c_void_p()
-            dependencies = (C.c_void_p * 1)(nodes[0].value) if nodes else None
-            cuda.call("cuGraphAddMemsetNode", C.byref(node), graph, dependencies,
-                      C.c_size_t(int(bool(nodes))), C.byref(params), context)
-            nodes.append(node)
-        owner = package(allocations=[Allocation("weight", data.data_ptr(), data.nbytes)])
-        description = owner._graph(cuda, "branches", graph.value)
-        assert [node["value"] for node in description["nodes"]] == [17, 29, 41]
-        assert {(edge["source"], edge["destination"]) for edge in description["edges"]} == {(0, 1), (0, 2)}
-    finally:
-        cuda.call("cuGraphDestroy", graph)
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
@@ -474,16 +155,15 @@ def test_package_replays_without_python(tmp_path, fixture, binary, expected, exe
     def contents(key):
         span = document.resources[key]
         from ignition.preparation.package_file import PackageFiles
-        from ignition.preparation.package_snapshot import read_at
         with package_path.open("rb") as source, PackageFiles(package_path, source, start, 0) as files:
             file, base, _ = files.get(span.filename)
-            stored = read_at(file, span.nbytes, base + span.offset)
+            stored = file.read_at(span.nbytes, base + span.offset)
         resource = next((item for item in signed.executables.resources if item.offset == span.offset), None)
         if resource is None:
             return stored
         from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-        from helios.tests.signing import publisher
-        from ignition.preparation.protection import CHUNK, chunk_aad, resource_key
+        from helios.tests.signing import publisher, chunk_aad, resource_key
+        from ignition.preparation.protection import CHUNK
         signer = publisher()
         cipher = AESGCM(resource_key(signer.public_key, protected.package_id, span.offset, signer.namespace))
         result, cursor = bytearray(), 0
@@ -512,6 +192,7 @@ def test_package_replays_without_python(tmp_path, fixture, binary, expected, exe
     assert expected in result.stdout
 
 
+
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
 def test_cooperative_package_clamps_to_device_capacity(tmp_path):
     assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA_VISIBLE_DEVICES before running GPU tests"
@@ -527,22 +208,17 @@ def test_cooperative_package_clamps_to_device_capacity(tmp_path):
         env={**os.environ, "FLARE_COOPERATIVE_TEST_PACKAGE": str(tmp_path)})
 
 
-def test_only_allocator_inactive_granules_are_released():
-    allocation = Allocation("weights", 0x80000000000, 66 << 20, alignment=2 << 20, preserve_address=True)
-    begin, end = allocation.address, allocation.address + allocation.nbytes
-    live = begin + (51 << 20) + (128 << 10)
-    trimmed, = _live_pieces(allocation, [(live, end)])
-    assert (trimmed.name, trimmed.address, trimmed.nbytes) == ("weights", begin, 52 << 20)
-    # Freed blocks between live ones release their whole granules; partial granules stay backed.
-    pieces = _live_pieces(allocation, [(begin + (3 << 20), begin + (9 << 20)),
-                                       (begin + (9 << 20) + 256, begin + (20 << 20)), (end - (1 << 20), end)])
-    assert [(p.name, p.address - begin, p.nbytes) for p in pieces] == [
-        ("weights.0", 0, 4 << 20), ("weights.1", 8 << 20, 2 << 20), ("weights.2", 20 << 20, 46 << 20)]
-    leading, = _live_pieces(allocation, [(begin - (8 << 20), begin + (5 << 20))])
-    assert (leading.address - begin, leading.nbytes) == (4 << 20, 62 << 20)
-    assert _live_pieces(allocation, [(begin, end)]) == (allocation,)
-    assert _live_pieces(allocation, []) == (allocation,)
-    # Disposable live scratch has no initializer, but still needs physical backing.
-    zero = _without_zero_ranges(allocation, [(allocation.address, allocation.nbytes)])
-    assert zero.initialize == "zero"
-    assert _live_pieces(zero, []) == (zero,)
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires explicit CUDA test opt-in")
+def test_captured_shared_memory_exceeds_function_allowance(tmp_path):
+    assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA_VISIBLE_DEVICES before running GPU tests"
+    root = Path(__file__).resolve().parents[2]
+    subprocess.run([
+        sys.executable, str(root / "helios/tests/shared_memory_package_fixture.py"), str(tmp_path),
+    ], check=True, cwd=root, timeout=120)
+    subprocess.run([
+        "cargo", "test", "--manifest-path", str(root / "helios/Cargo.toml"),
+        "--no-default-features", "--features", "runtime-package", "--lib",
+        "captured_shared_memory_exceeding_function_allowance_replays", "--", "--ignored",
+    ], check=True, cwd=root, timeout=180,
+        env={**os.environ, "FLARE_SHARED_MEMORY_TEST_PACKAGE": str(tmp_path)})

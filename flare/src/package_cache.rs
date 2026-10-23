@@ -1,4 +1,4 @@
-//! The agent's cache of executables and package files, under `~/.cache/flare`.
+//! Shared native cache of executables and rank package files, under `~/.cache/flare`.
 //!
 //! Executables live in `bin/` under their SHA-256 names and run only from there. Package files
 //! live in `packages/<directory>/<filename>`: one directory per package and rank, holding each
@@ -16,10 +16,82 @@ use std::sync::{Arc, Mutex};
 
 use sha2::{Digest, Sha256};
 
-use super::{Failure, home};
+use crate::fabric::Failure;
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
 
 pub fn default_root() -> PathBuf {
-    home().join(".cache/flare")
+    crate::environment::home_directory()
+        .expect("home directory")
+        .join(".cache/flare")
+}
+
+/// File locks protect rank files from concurrent writes and agent eviction.
+/// Lock files live outside the removable package directory, so their inodes stay stable.
+pub struct Lease(File);
+
+impl Drop for Lease {
+    fn drop(&mut self) {
+        // A concurrent process launch can briefly inherit this open file description before
+        // exec closes it. Release the lock when its owning rank finishes, independently of that.
+        let _ = self.lock(libc::LOCK_UN);
+    }
+}
+
+impl Lease {
+    pub fn shared(directory: &Path) -> Result<Self, Failure> {
+        let file = Self::open(directory)?;
+        let lease = Self(file);
+        lease.lock(libc::LOCK_SH)?;
+        Ok(lease)
+    }
+
+    fn open(directory: &Path) -> Result<File, Failure> {
+        let locks = directory
+            .parent()
+            .ok_or("cache directory lacks a parent")?
+            .join(".locks");
+        fs::create_dir_all(&locks)?;
+        let name = directory
+            .file_name()
+            .ok_or("cache directory lacks a name")?;
+        Ok(fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(locks.join(name))?)
+    }
+
+    fn lock(&self, mode: i32) -> Result<(), Failure> {
+        use std::os::fd::AsRawFd;
+        if unsafe { libc::flock(self.0.as_raw_fd(), mode) } != 0 {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(())
+    }
+
+    pub fn exclusive(&self) -> Result<(), Failure> {
+        self.lock(libc::LOCK_EX)
+    }
+    pub fn downgrade(&self) -> Result<(), Failure> {
+        self.lock(libc::LOCK_SH)
+    }
+
+    fn evict(directory: &Path) -> Result<Option<Self>, Failure> {
+        use std::os::fd::AsRawFd;
+        let lease = Self(Self::open(directory)?);
+        if unsafe { libc::flock(lease.0.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::WouldBlock {
+                return Ok(None);
+            }
+            return Err(error.into());
+        }
+        Ok(Some(lease))
+    }
 }
 
 /// The SHA-256 name under which an executable is cached and verified.
@@ -28,7 +100,7 @@ pub fn binary_name(bytes: &[u8]) -> String {
 }
 
 fn binary_name_from_digest(digest: &[u8]) -> String {
-    format!("flare-{}", super::hex(&digest[..12]))
+    format!("flare-{}", hex(&digest[..12]))
 }
 
 pub fn kind_directory(kind: &str) -> Result<&'static str, Failure> {
@@ -115,6 +187,9 @@ pub fn evict(directory: &Path, pins: &Pins) -> Result<Vec<PathBuf>, Failure> {
             .file_name()
             .is_none_or(|name| name.to_string_lossy().starts_with('.'));
         if !hidden && !pins.contains_key(&path) {
+            let Some(_lease) = Lease::evict(&path)? else {
+                continue;
+            };
             if path.is_dir() {
                 fs::remove_dir_all(&path)?;
             } else {
@@ -310,7 +385,7 @@ pub fn store_parallel<R: Read>(
             // it can enter the shared immutable blob store, including on a cache collision.
             let mut digest = Sha256::new();
             std::io::copy(&mut &output, &mut digest)?;
-            if format!("{}.safetensors", super::hex(&digest.finalize())) != blob {
+            if format!("{}.safetensors", hex(&digest.finalize())) != blob {
                 return Err(format!("{name}: payload digest mismatch").into());
             }
             output.set_permissions(fs::Permissions::from_mode(0o444))?;
@@ -363,7 +438,7 @@ fn store_entry(
                 }
                 let mut digest = Sha256::new();
                 std::io::copy(&mut source, &mut digest)?;
-                if format!("{}.safetensors", super::hex(&digest.finalize())) != blob {
+                if format!("{}.safetensors", hex(&digest.finalize())) != blob {
                     return Err("cached payload digest mismatch".into());
                 }
             }
@@ -412,7 +487,7 @@ fn store_partial(
         }
         fs::set_permissions(partial, fs::Permissions::from_mode(0o700))?;
     } else if let Some(blob) = blob_name(name) {
-        let found = format!("{}.safetensors", super::hex(&digest.finalize()));
+        let found = format!("{}.safetensors", hex(&digest.finalize()));
         if found != blob {
             return Err(format!("{name}: payload digest mismatch").into());
         }
@@ -466,6 +541,22 @@ impl Read for RangeReader<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_native_reader_lease_prevents_agent_eviction() {
+        let temporary = tempfile::tempdir().unwrap();
+        let directory = temporary.path().join("packages");
+        let package = directory.join("export-rank1");
+        fs::create_dir_all(&package).unwrap();
+        fs::write(package.join("model.safetensors"), b"held").unwrap();
+        let lease = Lease::shared(&package).unwrap();
+        let pins = Pins::default();
+        assert!(evict(&directory, &pins).unwrap().is_empty());
+        assert!(package.is_dir());
+        drop(lease);
+        assert_eq!(evict(&directory, &pins).unwrap(), vec![package.clone()]);
+        assert!(!package.exists());
+    }
 
     #[test]
     fn entries_are_bounded_components() {
@@ -706,7 +797,7 @@ mod tests {
     fn parallel_blobs_verify_the_assembled_bytes_before_publication() {
         let temp = tempfile::tempdir().unwrap();
         let bytes = b"a payload split over eight streams with a tail";
-        let blob = format!("{}.safetensors", super::super::hex(&Sha256::digest(bytes)));
+        let blob = format!("{}.safetensors", super::hex(&Sha256::digest(bytes)));
         let name = format!("rank/{blob}");
         let size = bytes.len() as u64;
         for corrupt in [true, false] {
@@ -754,7 +845,7 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let cache = temp.path();
         let bytes = b"immutable model payload";
-        let blob = format!("{}.safetensors", super::super::hex(&Sha256::digest(bytes)));
+        let blob = format!("{}.safetensors", super::hex(&Sha256::digest(bytes)));
         let first_name = format!("first/{blob}");
         let second_name = format!("second/{blob}");
         let size = bytes.len() as u64;

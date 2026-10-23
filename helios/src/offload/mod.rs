@@ -22,6 +22,7 @@ pub mod index;
 pub mod input;
 pub mod memory;
 pub mod record;
+pub mod shard;
 pub mod slab;
 pub mod transfer;
 
@@ -187,6 +188,9 @@ pub struct Prepared {
     pub staging_pool: Option<slab::SlabPool>,
     pub scanned: Vec<record::Scanned>,
     pub directory_lock: Option<record::DirectoryLock>,
+    /// Rank zero's record connection to each peer rank, ranks 1 onward, when the ranks run as
+    /// separate processes; see [`shard`].
+    pub(crate) shards: Vec<shard::Link>,
 }
 
 /// The loader's result: either prepared resources or the reason no store exists.
@@ -269,6 +273,18 @@ pub struct Shared {
     pub summary: String,
 }
 
+impl Shared {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<Prepared>> {
+        self.prepared
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn take(&self) -> Option<Prepared> {
+        self.lock().take()
+    }
+}
+
 /// A rank's handle on the shared prepared resources.
 #[derive(Clone)]
 pub struct Binding {
@@ -300,11 +316,15 @@ impl Binding {
 
     /// The prepared resources, once; later calls return `None`.
     pub fn take(&self) -> Option<Prepared> {
+        self.shared.take()
+    }
+
+    /// The store's records are mirrored onto peer rank processes; see [`shard`].
+    pub fn sharded(&self) -> bool {
         self.shared
-            .prepared
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take()
+            .as_ref()
+            .is_some_and(|prepared| !prepared.shards.is_empty())
     }
 }
 
@@ -331,7 +351,7 @@ pub fn prepare(
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
 ) -> Result<Preparation> {
-    prepare_with_inputs(options, package, identity, geometry, contexts, 0)
+    prepare_with_inputs(options, package, identity, geometry, contexts, 0, None)
 }
 
 pub fn prepare_with_inputs(
@@ -341,13 +361,20 @@ pub fn prepare_with_inputs(
     geometry: Vec<CacheGeometry>,
     contexts: Vec<(usize, i32)>,
     input_staging: u64,
+    shard: Option<(usize, usize)>,
 ) -> Result<Preparation> {
     if !options.enabled() {
         return Ok(Preparation::None("disabled".to_owned()));
     }
     let _ = package;
     let layout = Layout::new(&geometry)?;
-    let fingerprint = geometry::fingerprint(&geometry);
+    let fingerprint = match (shard, geometry.as_slice()) {
+        (None, _) => geometry::fingerprint(&geometry),
+        (Some((rank, world)), [local]) => geometry::shard_fingerprint(local, rank, world),
+        (Some(_), _) => {
+            return Err("a rank process of a multi-host package holds exactly one rank".into());
+        }
+    };
     let memory_bytes = options.memory_bytes.unwrap_or(0);
     let minimum = slab::SlabPool::minimum_bytes(&layout);
     if memory_bytes != 0 && memory_bytes < minimum {
@@ -457,6 +484,7 @@ pub fn prepare_with_inputs(
         staging_pool,
         scanned,
         directory_lock,
+        shards: Vec::new(),
     })))
 }
 
@@ -533,6 +561,7 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
         staging_pool,
         scanned,
         directory_lock,
+        shards,
     } = prepared;
     let transfers = std::sync::Arc::new(std::sync::Mutex::new(transfer::Transfers::start(
         &contexts,
@@ -555,12 +584,20 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
             } else {
                 transfers.clone()
             };
-            let transport = match resolved.transport {
-                Transport::Staged => disk_store::Staged::new(
+            let transport: Box<dyn disk_store::DiskTransport> = match resolved.transport {
+                Transport::Staged if !shards.is_empty() => {
+                    if memory_pool.is_some() {
+                        return Err(
+                            "a multi-host package keeps host prefix records on disk only".into(),
+                        );
+                    }
+                    shard::transport(staging_pool, disk_transfers, shards)?
+                }
+                Transport::Staged => Box::new(disk_store::Staged::new(
                     staging_pool,
                     disk_transfers,
                     disk::DiskThread::start("flare-offload-disk")?,
-                ),
+                )),
                 Transport::Direct => {
                     return Err("the direct prefix cache transport is not available".into());
                 }
@@ -572,7 +609,7 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
                 resolved.disk_limit,
                 geometry,
                 scanned,
-                Box::new(transport),
+                transport,
             )?;
             store.share_budget(disk_budget.clone());
             Ok::<_, crate::Error>(store)
@@ -654,6 +691,8 @@ pub enum StoreEvent {
     },
     /// The copy-in for an inbound ticket finished; the worker reports it to the scheduler.
     Fetched { key: PrefixKey, result: Result<u64> },
+    /// No copy still reads the GPU checkpoint; retry its publication after progress.
+    Deferred { checkpoint: CheckpointId },
 }
 
 /// Counters every store maintains; rates are bytes per second of completed transfers.
@@ -663,6 +702,8 @@ pub struct StoreStats {
     pub hits: u64,
     pub reused_tokens: u64,
     pub stored: u64,
+    pub row_refills: u64,
+    pub progress: u64,
     pub store_skipped: u64,
     pub store_failed: u64,
     pub fetched: u64,
@@ -679,21 +720,52 @@ pub struct StoreStats {
     pub inbound_rate: f64,
 }
 
+#[derive(Clone, Copy)]
+pub enum LookupOutcome {
+    NoMatch,
+    CostRejected,
+    CapacityRejected,
+    EnqueueRejected,
+    Admitted,
+}
+
+/// Immediate disposition of a publication; only Queued transfers keep a GPU pin.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreOutcome {
+    Queued,
+    Present,
+    Retry(StoreReason),
+    Oversize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StoreReason {
+    Inflight,
+    Slabs,
+    Queue,
+    Budget,
+}
+
 /// A host tier the model worker drives without waiting on it.
 ///
 /// `store` and `fetch` enqueue work and return. `poll` reports completions.
-/// The worker pins the GPU checkpoint before `store` and unpins it when `store`
-/// returns `Ok(false)` or an error, or when the matching `StoreEvent::Stored`
-/// arrives. Ticket ids belong to the scheduler until `StoreEvent::Fetched`.
+/// The worker pins queued copy-outs until Stored or Deferred, retaining only
+/// checkpoint IDs for retries. Ticket IDs belong to the scheduler until Fetched.
+///
+/// A store whose transfers can no longer be trusted reports the failure from
+/// `poll` and stops producing events. The worker then stops, so ids and pins
+/// held by transfers it cannot account for are never reused or released.
 pub trait PrefixStore {
-    /// Deepest record chain extending the GPU checkpoint at `resident` tokens.
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64) -> Option<HostHit>;
-    /// Copy a published checkpoint out. `Ok(false)` means the key is already
-    /// present or in flight, or no slabs could be freed, and no event follows.
-    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<bool>;
+    /// Deepest record chain extending `resident` and strictly below `before`.
+    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit>;
+    /// Only Queued promises an event and retains a GPU copy-out pin.
+    fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome>;
     /// Copy a looked-up chain into the ticket's ids. An error means no event follows.
     fn fetch(&mut self, hit: HostHit, ticket: InboundTicket) -> Result<()>;
-    fn poll(&mut self, events: &mut Vec<StoreEvent>);
+    /// Report completed work. `Err` means the store can no longer report
+    /// completions: transfers may still be running, and the worker must stop
+    /// rather than free the ids and pins they hold.
+    fn poll(&mut self, events: &mut Vec<StoreEvent>) -> Result<()>;
     fn stats(&self) -> StoreStats;
     /// Drain transfers, join threads, and finish pending disk writes.
     /// On failure the caller must retain the store: transfer jobs may still

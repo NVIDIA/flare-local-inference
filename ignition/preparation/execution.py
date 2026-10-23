@@ -22,10 +22,11 @@ class GraphSignature:
     speculation_enabled: bool | None = None
     prefill_capacity: int = 0
     packed_token_capacity: int = 0
+    draft_tokens: int | None = None
 
     def __post_init__(self):
         if self.kind not in ("init", "restore", "snapshot", "prefill", "scored_prefill", "decode", "resume",
-                             "vision", "speculative", "mixed", "proposal", "verification"):
+                             "vision", "speculative", "mixed", "proposal", "verification", "packed_speculative"):
             raise ValueError("unknown prepared graph operation")
         if self.kind == "scored_prefill" and (self.batch_capacity != 1
                 or self.token_capacity < 64 or self.token_capacity % 64
@@ -37,13 +38,13 @@ class GraphSignature:
             raise ValueError("graphs use the general stochastic sampling path")
         if self.speculation_enabled is not None and type(self.speculation_enabled) is not bool:
             raise TypeError("graph speculation mode must be a boolean or None")
-        if self.kind == "speculative" and self.speculation_enabled is False:
+        if self.kind in ("speculative", "packed_speculative") and self.speculation_enabled is False:
             raise ValueError("speculative graphs require speculation")
         if self.kind == "decode" and self.speculation_enabled is True:
             raise ValueError("ordinary decode graphs require disabled speculation")
         if any(type(value) is not int or value <= 0 for value in (self.batch_capacity, self.token_capacity)):
             raise ValueError("graph capacities must be positive integers")
-        if self.kind in ("speculative", "proposal", "verification") and (
+        if self.kind in ("speculative", "proposal", "verification", "packed_speculative") and (
                 self.batch_capacity not in BATCH_CAPACITIES or not 1 <= self.token_capacity <= 8):
             raise ValueError("speculative graphs require power-of-two batch capacities through 64 and width 1 through 8")
         if type(self.prefill_capacity) is not int or self.prefill_capacity < 0:
@@ -61,14 +62,24 @@ class GraphSignature:
         elif self.prefill_capacity:
             raise ValueError("only mixed graphs declare a separate prefill capacity")
         if (type(self.packed_token_capacity) is not int or self.packed_token_capacity < 0
-                or (self.packed_token_capacity and (self.kind != "verification"
+                or (self.packed_token_capacity and (self.kind not in ("verification", "packed_speculative")
                     or not self.batch_capacity <= self.packed_token_capacity <= self.batch_capacity * self.token_capacity))):
             raise ValueError("packed verification capacity must fit the batch and per-request prefix bounds")
+        if self.kind == "packed_speculative":
+            if (type(self.draft_tokens) is not int or not 1 <= self.draft_tokens < self.token_capacity
+                    or not self.packed_token_capacity):
+                raise ValueError("packed speculative rounds require explicit draft depth and target-row capacity")
+            if "query_lengths" in self.inputs or "speculative_prefix_limits" not in self.inputs:
+                raise ValueError("packed speculative rounds bind prefix limits, not actual query lengths")
+        elif self.draft_tokens is not None:
+            raise ValueError("explicit draft depth belongs to packed speculative rounds")
         object.__setattr__(self, "inputs", tuple(self.inputs))
         if len(set(self.inputs)) != len(self.inputs):
             raise ValueError("graph input names must be unique")
         if any(name in self.inputs for name in ("frame_index", "submission_sequence", "completion_records",
-                                               "completion_logprobs", "logprob_requested", "readiness_timestamps")):
+                                               "completion_logprobs", "logprob_requested", "logprob_token_ids",
+                                               "logprob_token_id_counts", "readiness_timestamps",
+                                               "completion_speculative_survival")):
             raise ValueError("reserved execution buffers are bound automatically")
 
 
@@ -92,8 +103,8 @@ class PreparedExecution(PreparedGraphBundle):
         required = {"frame_index", "submission_sequence", "completion_records"}
         if not required <= self.buffers.keys():
             raise ValueError("execution requires frame index, submission sequence, and completion buffers")
-        if any(s.kind == "mixed" for s in signatures.values()) and self.buffers["completion_records"].shape[-1] != 24:
-            raise ValueError("mixed graphs require ABI3 completion vectors")
+        if any(s.kind in ("mixed", "packed_speculative") for s in signatures.values()) and self.buffers["completion_records"].shape[-1] != 24:
+            raise ValueError("mixed and packed speculative graphs require ABI3 completion vectors")
         for signature in signatures.values():
             if not set(signature.inputs) <= self.buffers.keys():
                 raise ValueError("graph signature references an unregistered input buffer")
@@ -116,7 +127,8 @@ class PreparedExecution(PreparedGraphBundle):
         cursor = 0
         reserved = ("frame_index", "submission_sequence")
         if "logprob_requested" in self.buffers:
-            reserved += ("logprob_requested",)
+            reserved += tuple(name for name in ("logprob_requested", "logprob_token_ids",
+                                                "logprob_token_id_counts") if name in self.buffers)
         input_names = set(reserved)
         for signature in self.signatures.values():
             input_names.update(signature.inputs)
@@ -129,7 +141,7 @@ class PreparedExecution(PreparedGraphBundle):
                 offsets[name] = (cursor, nbytes)
                 cursor += nbytes
         graphs = []
-        speculative = any(signature.kind in ("speculative", "proposal", "verification") for signature in self.signatures.values())
+        speculative = any(signature.kind in ("speculative", "proposal", "verification", "packed_speculative") for signature in self.signatures.values())
         for (name, _), handle in zip(self.graphs.items(), handles, strict=True):
             signature = self.signatures[name]
             if not all_variants and signature.speculation_enabled not in (None, speculative):
@@ -146,6 +158,9 @@ class PreparedExecution(PreparedGraphBundle):
                 graphs[-1]["speculation_enabled"] = signature.speculation_enabled
             if signature.packed_token_capacity:
                 graphs[-1]["packed_token_capacity"] = signature.packed_token_capacity
+            if signature.draft_tokens is not None:
+                graphs[-1].update(draft_tokens=signature.draft_tokens,
+                                  verify_tokens=signature.token_capacity, draft_source=1)
         abi_version = 3 if self.buffers["completion_records"].shape[-1] == 24 else 2
         return {"abi_version": abi_version, "context": context, "device": self.device,
                 "max_active": self.max_active, "input_frame_bytes": (cursor + 7) // 8 * 8,

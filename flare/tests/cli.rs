@@ -104,6 +104,7 @@ fn help_exits_successfully_before_accessing_files() {
         if arguments.contains(&"run") {
             assert!(help.contains("--embedding-table-storage"), "{help}");
             assert!(help.contains("--no-mtp-adaptive-verification"), "{help}");
+            assert!(help.contains("--mtp-adaptive-verification-alpha"), "{help}");
             assert!(help.contains("--prefix-cache-disk-transport"), "{help}");
             assert!(help.contains("--host"), "{help}");
             assert!(help.contains("--port"), "{help}");

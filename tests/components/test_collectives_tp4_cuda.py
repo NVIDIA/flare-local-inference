@@ -45,7 +45,7 @@ def _rank(rank, rendezvous):
                                               coordinator=coordinator, name=f"reduce.{rows}.{dtype}")
                         if rows != 4096:
                             expected_surface = ("PCIeTwoShotBF16.all_reduce"
-                                if dtype == torch.bfloat16 and 8 <= rows <= 64 else "OneshotAllReduce.all_reduce")
+                                if dtype == torch.bfloat16 and 8 <= rows <= 128 else "OneshotAllReduce.all_reduce")
                             assert operation.plan.query.surface == expected_surface
                         expected = torch.stack(peers).float().sum(0).to(dtype).to(device)
                         operations.append((source, output, expected, operation))

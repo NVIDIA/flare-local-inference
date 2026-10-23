@@ -18,27 +18,27 @@ from ignition.recipes.qwen38.state import HybridStatePool, StateTransferMetadata
 
 
 @pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="explicit CUDA assignment required")
+@pytest.mark.parametrize("capacity", [2, 32])
 @torch.no_grad()
-def test_noncontiguous_bindings_snapshot_normalization_and_runtime_bounds():
+def test_noncontiguous_bindings_snapshot_normalization_and_runtime_bounds(capacity):
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
     device = torch.device("cuda:0")
-    pool = HybridStatePool.allocate(7, device, speculative_tokens=7)
-    requests = DeviceRequestState.allocate(device, capacity=2, vocab_size=128)
-    inputs = DecoderInputs.allocate(device, context=256, tokens=128, capacity=2)
-    commands = StateTransferMetadata.allocate(2, device)
-    admission = AdmissionBuffers.allocate(device, vocab_size=128, capacity=2)
-    cache = {layer: QSAState.allocate(pages=8, slots=3, device=device, draft_tokens=7)
+    pool = HybridStatePool.allocate(max(7, capacity + 2), device, speculative_tokens=7)
+    requests = DeviceRequestState.allocate(device, capacity=capacity, vocab_size=128)
+    inputs = DecoderInputs.allocate(device, context=256, tokens=128, capacity=capacity)
+    commands = StateTransferMetadata.allocate(capacity, device)
+    admission = AdmissionBuffers.allocate(device, vocab_size=128, capacity=capacity)
+    cache = {layer: QSAState.allocate(pages=8, slots=capacity + 1, device=device, draft_tokens=7)
              for layer in (*range(3, 48, 4), 48)}
     speculation = SimpleNamespace(cache=cache, draft_tables=torch.full_like(inputs.page_tables, -1),
-        previous_accepted=torch.ones(2, dtype=torch.int32, device=device),
-        accepted_generation=torch.zeros(2, dtype=torch.int64, device=device))
-    records = torch.zeros((2, 2, 24), dtype=torch.int64, device=device)
+        previous_accepted=torch.ones(capacity, dtype=torch.int32, device=device))
+    records = torch.zeros((2, capacity, 24), dtype=torch.int64, device=device)
     frame = torch.zeros(1, dtype=torch.int32, device=device)
     sequence = torch.zeros(1, dtype=torch.int64, device=device)
     operations, graphs = [], {}
     for mode in ("init", "snapshot", "restore"):
         operation = PreparedMaintenance(mode, requests, pool, commands, completion_outputs(records), frame, sequence,
-            admission_buffers=admission, forward_inputs=inputs, capacity=2,
+            admission_buffers=admission, forward_inputs=inputs, capacity=capacity,
             qsa_states=tuple(cache[layer] for layer in range(3, 48, 4)), speculation=speculation)
         operation.prepare()
         graph = torch.cuda.CUDAGraph()
@@ -78,7 +78,7 @@ def test_noncontiguous_bindings_snapshot_normalization_and_runtime_bounds():
         admission.admission_count.fill_(1)
         command(1, 4, 4, reset=True)
         replay(0)
-        assert requests.consumed_tokens.tolist() == [0, 0]
+        assert not requests.consumed_tokens.count_nonzero()
         assert requests.ple_history[1].tolist() == [248044, 248044]
 
         requests.consumed_tokens[1] = 65
@@ -86,8 +86,8 @@ def test_noncontiguous_bindings_snapshot_normalization_and_runtime_bounds():
         pool.last_hidden[4].fill_(2)
         pool.rope_delta[4].fill_(7)
         for value in pool.gdn.values():
-            value.recurrent[4].fill_(-9)
-            value.recurrent[5].fill_(3)
+            value.recurrent[4].fill_(3)
+            value.recurrent[5].fill_(-9)
             value.convolution[4].copy_(torch.arange(10, device=device).expand_as(value.convolution[4]))
         pool.ple_convolution[4].copy_(torch.arange(16, device=device).expand_as(pool.ple_convolution[4]))
         speculation.previous_accepted[1] = 3

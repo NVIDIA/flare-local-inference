@@ -10,8 +10,7 @@
 
 pub mod agent;
 pub mod banner;
-pub mod cache;
-pub mod checkpoint;
+pub(crate) use crate::package_cache as cache;
 pub mod controller;
 pub mod dashboard;
 pub mod fabric;
@@ -29,7 +28,7 @@ pub type Failure = Box<dyn std::error::Error + Send + Sync>;
 /// The agent's default port on every host.
 pub const PORT: u16 = 29900;
 /// The agent protocol every node and controller of a orbit must share.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 6;
 
 /// Frame tags. A request receives OK with a body or ERROR with a message.
 pub mod frame {
@@ -54,8 +53,7 @@ pub mod frame {
     pub const REMOVE: u8 = 19;
     pub const DOWNLOAD: u8 = 20;
     pub const FABRIC: u8 = 21;
-    pub const FETCH_RING: u8 = 22;
-    pub const CHECKPOINT_OPEN: u8 = 23;
+    pub const FETCH_FABRIC: u8 = 22;
 }
 
 pub fn hex(bytes: &[u8]) -> String {

@@ -10,7 +10,7 @@ from b12x.preparation import PreparedCall
 from ignition.components import sm103
 from ignition.components.indexer import PreparedSparseIndexer
 from ignition.components.indexer_sm103 import Sm103SparseIndexer
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.linear import prepare_projection, UnquantizedProjection
 from ignition.preparation.tuning import declare
 
 
@@ -144,7 +144,7 @@ class PreparedGlmIndexer:
         module.k_norm.weight = torch.nn.Parameter(weights["indexer.k_norm.weight"], requires_grad=False)
         module.k_norm.bias = torch.nn.Parameter(weights["indexer.k_norm.bias"], requires_grad=False)
         self.ape = weights["indexer.index_kpool_compress_ape"]
-        self.query_projection = QuantizedProjection(query_residual, weights["indexer.wq_b"], scratch.query,
+        self.query_projection = prepare_projection(query_residual, weights["indexer.wq_b"], scratch.query,
             session=session, name=f"{name}.query", workspace=workspace, activation_mode="auto")
         self.gate_projection = UnquantizedProjection(source, weights["indexer.index_kpool_compress_gate"], scratch.gate,
             session=session, name=f"{name}.gate")

@@ -599,6 +599,7 @@ pub(crate) fn consumes(kind: GraphKind) -> bool {
             | GraphKind::Decode
             | GraphKind::Speculative
             | GraphKind::Verification
+            | GraphKind::PackedSpeculative
             | GraphKind::Mixed
     )
 }

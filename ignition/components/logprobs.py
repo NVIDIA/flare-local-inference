@@ -8,7 +8,7 @@ from ignition.preparation.triton import prepare_triton
 
 from .completion import (
     EMITTED_COUNT_FIELD, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS, MAX_OUTPUT_TOKENS,
-    MAX_TOP_LOGPROBS, TOKEN_FIELD, VECTOR_RECORD_FIELDS, VECTOR_TOKENS_FIELD,
+    MAX_LOGPROB_TOKEN_IDS, MAX_TOP_LOGPROBS, TOKEN_FIELD, VECTOR_RECORD_FIELDS, VECTOR_TOKENS_FIELD,
 )
 
 _VOCAB_TILE = 1024
@@ -103,24 +103,34 @@ def _candidates(Logits, Records, Frame, Requested, Slots, Epochs, Live, Lse, Key
 
 
 @triton.jit
-def _finish(Logits, Records, Frame, Requested, Slots, Epochs, Live, Lse, Keys, Output,
+def _finish(Logits, Records, Frame, Requested, Slots, Epochs, Live, Lse, Keys, Output, TokenIds, Counts,
             V: tl.constexpr, WIDTH: tl.constexpr, TILES: tl.constexpr,
             SLOTS: tl.constexpr, FIELDS: tl.constexpr, BLOCK: tl.constexpr,
-            CANDIDATES: tl.constexpr, TOP: tl.constexpr,
+            CANDIDATES: tl.constexpr, TOP: tl.constexpr, IDS: tl.constexpr,
             OUTPUT_TOKENS: tl.constexpr, OUTPUT_FIELDS: tl.constexpr, PAIR_FIELDS: tl.constexpr):
     row, col = tl.program_id(0), tl.program_id(1)
     slot, token, valid = _position(Records, Frame, Requested, Slots, Epochs, Live, row, col, SLOTS, FIELDS)
     if valid:
-        k = tl.arange(0, BLOCK)
-        keys = tl.load(Keys + (row * WIDTH + col) * TILES * CANDIDATES + k, k < TILES * CANDIDATES, other=0)
-        keys = tl.sort(keys, descending=True)
-        ids, values = _sort_pair(keys)
         out = Output + ((tl.load(Frame) * SLOTS + slot) * OUTPUT_TOKENS + col) * OUTPUT_FIELDS
         chosen = tl.load(Logits + (row * WIDTH + col) * V + token).to(tl.float32) - tl.load(Lse + row * WIDTH + col)
         tl.store(out, token.to(tl.int32))
         tl.store(out + 1, chosen.to(tl.int32, bitcast=True))
-        tl.store(out + (1 + k) * PAIR_FIELDS, ids, k < TOP)
-        tl.store(out + (1 + k) * PAIR_FIELDS + 1, values.to(tl.int32, bitcast=True), k < TOP)
+        count = tl.load(Counts + slot)
+        if count > 0:
+            selected = tl.arange(0, IDS)
+            requested_ids = tl.load(TokenIds + slot * IDS + selected, selected < count, other=-1)
+            requested_values = tl.load(Logits + (row * WIDTH + col) * V + requested_ids,
+                             (selected < count) & (requested_ids >= 0) & (requested_ids < V), other=float("nan")).to(tl.float32)
+            requested_values -= tl.load(Lse + row * WIDTH + col)
+            tl.store(out + (1 + selected) * PAIR_FIELDS, requested_ids, selected < count)
+            tl.store(out + (1 + selected) * PAIR_FIELDS + 1, requested_values.to(tl.int32, bitcast=True), selected < count)
+        else:
+            k = tl.arange(0, BLOCK)
+            keys = tl.load(Keys + (row * WIDTH + col) * TILES * CANDIDATES + k, k < TILES * CANDIDATES, other=0)
+            keys = tl.sort(keys, descending=True)
+            ids, values = _sort_pair(keys)
+            tl.store(out + (1 + k) * PAIR_FIELDS, ids, k < TOP)
+            tl.store(out + (1 + k) * PAIR_FIELDS + 1, values.to(tl.int32, bitcast=True), k < TOP)
 
 
 class PreparedLogprobs:
@@ -143,9 +153,10 @@ class PreparedLogprobs:
                 triton.next_power_of_2(tiles)), (batch, width, 1), _REDUCTION_WARPS),
             (_candidates, (*common, self.lse, self.keys, *dimensions, _VOCAB_TILE,
                 _TILE_CANDIDATES), (batch, width, tiles), _REDUCTION_WARPS),
-            (_finish, (*common, self.lse, self.keys, completion.logprobs, *dimensions,
+            (_finish, (*common, self.lse, self.keys, completion.logprobs, completion.token_ids,
+                completion.token_id_counts, *dimensions,
                 triton.next_power_of_2(tiles * _TILE_CANDIDATES), _TILE_CANDIDATES,
-                MAX_TOP_LOGPROBS, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS),
+                MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, MAX_OUTPUT_TOKENS, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS),
                 (batch, width, 1), _MERGE_WARPS),
         )
         self.statistics = self.normalization = self.candidates = self.finish = None
@@ -165,3 +176,19 @@ class PreparedLogprobs:
         self.normalization()
         self.candidates()
         self.finish()
+
+
+@triton.jit
+def _merge(Output, Prompt, Decode, Counts, PromptSlot, Frame,
+           SLOTS: tl.constexpr, FIELDS: tl.constexpr, TOKENS: tl.constexpr,
+           TOP: tl.constexpr, BLOCK: tl.constexpr):
+    slot, col = tl.program_id(0), tl.program_id(1)
+    field = tl.arange(0, BLOCK)
+    width = tl.maximum(TOP, tl.load(Counts + slot))
+    mask = field < 2 * (1 + width)
+    offset = ((tl.load(Frame) * SLOTS + slot) * TOKENS + col) * FIELDS + field
+    if slot == tl.load(PromptSlot):
+        value = tl.load(Prompt + offset, mask, other=0)
+    else:
+        value = tl.load(Decode + offset, mask, other=0)
+    tl.store(Output + offset, value, mask)

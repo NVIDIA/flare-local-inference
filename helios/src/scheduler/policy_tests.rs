@@ -44,7 +44,7 @@ fn equal_counts_from_different_cohorts_and_different_logical_prefixes_are_not_pr
     let mut s = engine(4, true);
     let handles = (0..2).map(|id| add(&mut s, id, 64, 128)).collect::<Vec<_>>();
     ready(&mut s, &handles);
-    let candidate = Candidate { kind: GraphKind::Speculative, mask: 1 << handles[0].slot,
+    let candidate = Candidate { draft_tokens: 0, kind: GraphKind::Speculative, mask: 1 << handles[0].slot,
         batch: 1, capacity: 1, packed_token_capacity: 0, prefill_capacity: 0, prefill_slot: None,
         work: 0, duration_ns: MS, rate: ValueRate::new(MS, 1.0, 0.0), feedback: true,
         verification_budget: None };
@@ -1119,7 +1119,7 @@ fn interactive_engine(active: usize, speculative: bool) -> RequestScheduler {
 }
 
 fn set_cost(s: &mut RequestScheduler, kind: GraphKind, batch: usize, capacity: usize, nanos: u64) {
-    let step = ScheduledStep { packed_token_capacity: 0,
+    let step = ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
         kind,
         batch_capacity: batch,
         token_capacity: capacity,
@@ -1189,7 +1189,7 @@ fn efficient_thirty_millisecond_speculation_beats_seventeen_millisecond_rounds()
     let h = add(&mut s, 1, 64, 2048);
     ready(&mut s, &[h]);
     for _ in 0..128 {
-        s.request_mut(h).unwrap().acceptance.observe(7, 7, true, 0);
+        s.request_mut(h).unwrap().acceptance.observe(speculation::ProposalSource::Mtp, 0, 7, 7, true, None);
     }
     let plan = s.plan().unwrap();
     assert_eq!(
@@ -1197,7 +1197,7 @@ fn efficient_thirty_millisecond_speculation_beats_seventeen_millisecond_rounds()
         (GraphKind::Speculative, 8, 30 * MS)
     );
     for _ in 0..256 {
-        s.request_mut(h).unwrap().acceptance.observe(7, 0, true, 0);
+        s.request_mut(h).unwrap().acceptance.observe(speculation::ProposalSource::Mtp, 0, 7, 0, true, None);
     }
     assert!(s.plan().unwrap().token_capacity < 8);
 }
@@ -1225,7 +1225,7 @@ fn speculative_cohorts_are_selected_by_expected_lane_value() {
         r.generated_tokens = 1;
         for _ in 0..128 {
             r.acceptance
-                .observe(7, if index >= 6 { 7 } else { 0 }, true, 0);
+                .observe(speculation::ProposalSource::Mtp, 0, 7, if index >= 6 { 7 } else { 0 }, true, None);
         }
     }
     for batch in [1, 2, 4, 8] {
@@ -1279,7 +1279,7 @@ fn long_prefill_and_low_acceptance_decode_both_make_progress() {
         s.request_mut(decode)
             .unwrap()
             .acceptance
-            .observe(7, 0, true, 0);
+            .observe(speculation::ProposalSource::Mtp, 0, 7, 0, true, None);
     }
     let prefill = add(&mut s, 2, 32768, 128);
     let mut last = s.now_ns;
@@ -1355,7 +1355,7 @@ fn decode_waiting_selects_a_smaller_prefill_at_the_efficiency_knee() {
         r.generated_tokens = 1;
         r.accounting.last_output_ns = Some(now);
         for _ in 0..128 {
-            r.acceptance.observe(7, 7, true, 0);
+            r.acceptance.observe(speculation::ProposalSource::Mtp, 0, 7, 7, true, None);
         }
     }
     let smaller = s.plan().unwrap();
@@ -1409,7 +1409,7 @@ fn five_and_sixteen_streams_receive_repeated_output_service() {
                     s.request_mut(h)
                         .unwrap()
                         .acceptance
-                        .observe(7, accepted, true, 0);
+                        .observe(speculation::ProposalSource::Mtp, 0, 7, accepted, true, None);
                 }
             }
         }
@@ -1495,7 +1495,7 @@ fn snapshot_enabling_a_shared_decode_batch_competes_by_the_complete_sequence_cos
     let handles: Vec<_> = (1..=16).map(|id| add(&mut s, id, 64, 4096)).collect();
     for &h in &handles {
         for _ in 0..128 {
-            s.request_mut(h).unwrap().acceptance.observe(7, 7, true, 0);
+            s.request_mut(h).unwrap().acceptance.observe(speculation::ProposalSource::Mtp, 0, 7, 7, true, None);
         }
     }
     for _ in 0..200 {
@@ -1604,7 +1604,7 @@ fn prerequisite_cohort_accounts_for_ready_batch_mates() {
             s.request_mut(handle)
                 .unwrap()
                 .acceptance
-                .observe(7, 7, true, 0);
+                .observe(speculation::ProposalSource::Mtp, 0, 7, 7, true, None);
         }
     }
     let decode = add(&mut s, 15, 64, 4096);
@@ -1680,7 +1680,7 @@ fn mixed_engine(
             .unwrap();
     }
     for &(batch, width, prefill, nanos) in shapes {
-        graphs.push(crate::execution::GraphDescriptor { packed_token_capacity: 0,
+        graphs.push(crate::execution::GraphDescriptor { draft_tokens: 0, packed_token_capacity: 0,
             name: format!("mixed-{batch}-{prefill}-{width}"),
             kind: GraphKind::Mixed,
             sampling_mode: SamplingMode::General,
@@ -1869,7 +1869,7 @@ fn mixed_cost_observations_and_expiry_are_specific_to_both_token_capacities() {
         true,
         &[(2, 1, 64, MS), (2, 8, 64, 2 * MS), (2, 8, 512, 3 * MS)],
     );
-    let make = |width, prefill| ScheduledStep { packed_token_capacity: 0,
+    let make = |width, prefill| ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
         kind: GraphKind::Mixed,
         batch_capacity: 2,
         token_capacity: width,
@@ -2193,16 +2193,16 @@ fn mixed_cancellation_keeps_other_rows_live_and_retires_pages_only_after_complet
 fn retained_cost_keys_keep_packed_mixed_and_ordinary_age_independent() {
     let base = super::tests::duration_graphs(2)[0].clone();
     let keys = [
-        cost::Key { kind: GraphKind::Decode, batch: 2, tokens: 1, prefill: 0, packed: 0 },
-        cost::Key { kind: GraphKind::Mixed, batch: 2, tokens: 8, prefill: 64, packed: 0 },
-        cost::Key { kind: GraphKind::Verification, batch: 2, tokens: 8, prefill: 0, packed: 10 },
+        cost::Key { drafts: 0, kind: GraphKind::Decode, batch: 2, tokens: 1, prefill: 0, packed: 0 },
+        cost::Key { drafts: 0, kind: GraphKind::Mixed, batch: 2, tokens: 8, prefill: 64, packed: 0 },
+        cost::Key { drafts: 0, kind: GraphKind::Verification, batch: 2, tokens: 8, prefill: 0, packed: 10 },
     ];
     let graphs: Vec<_> = keys.iter().enumerate().map(|(index, key)| crate::execution::GraphDescriptor {
         name: index.to_string(), kind: key.kind, batch_capacity: key.batch, token_capacity: key.tokens,
         prefill_capacity: key.prefill, packed_token_capacity: key.packed, ..base.clone()
     }).collect();
     let mut costs = cost::ActionCosts::prepared(&graphs).unwrap();
-    let make = |key: cost::Key| ScheduledStep { kind: key.kind, batch_capacity: key.batch,
+    let make = |key: cost::Key| ScheduledStep { draft_tokens: 0, kind: key.kind, batch_capacity: key.batch,
         token_capacity: key.tokens, packed_token_capacity: key.packed,
         mixed: (key.kind == GraphKind::Mixed).then_some(MixedStep {
             prefill_capacity: key.prefill, prefill_row: None, speculative: true,
@@ -2237,9 +2237,9 @@ fn refresh_skips_infeasible_ages_and_resolves_the_oldest_feasible_utility_group(
     let mut s = engine(1, true);
     let h = add(&mut s, 1, 64, 4096);
     ready(&mut s, &[h]);
-    let key = |width| cost::Key { kind: GraphKind::Speculative, batch: 1,
+    let key = |width| cost::Key { drafts: 0, kind: GraphKind::Speculative, batch: 1,
         tokens: width, prefill: 0, packed: 0 };
-    let infeasible = cost::Key { kind: GraphKind::Prefill, batch: 1,
+    let infeasible = cost::Key { drafts: 0, kind: GraphKind::Prefill, batch: 1,
         tokens: 64, prefill: 0, packed: 0 };
     let base = s.now_ns;
     s.advance_to(base + MS).unwrap();
@@ -2380,11 +2380,11 @@ fn saved_fresh_plans_gain_a_physical_staleness_feedback_barrier_at_commit() {
 #[test]
 fn proposal_episode_owns_generations_and_pays_all_verification_captures_in_debt() {
     let h = |slot, generation| RequestHandle { slot, generation };
-    let step = |kind, handles: &[RequestHandle]| ScheduledStep { kind, batch_capacity: 2,
+    let step = |kind, handles: &[RequestHandle]| ScheduledStep { draft_tokens: 0, kind, batch_capacity: 2,
         token_capacity: 8, packed_token_capacity: 0, mixed: None, requires_feedback: true,
         lanes: handles.iter().map(|&request| ScheduledLane { request, start_position: 65, tokens: 8 }).collect() };
     let p = step(GraphKind::Proposal, &[h(0, 1), h(1, 1)]);
-    let target = cost::Key { kind: GraphKind::Verification, batch: 2, tokens: 8, prefill: 0, packed: 0 };
+    let target = cost::Key { drafts: 0, kind: GraphKind::Verification, batch: 2, tokens: 8, prefill: 0, packed: 0 };
     let start = PlanOrigin::RefreshStart(target);
     let mut budget = refresh::RefreshState::default();
     budget.credit_ns = refresh::CREDIT_CAP_NS;
@@ -2520,7 +2520,7 @@ fn cancelling_all_inflight_proposal_owners_keeps_the_charge_and_releases_reused_
     s.split_speculation(2).unwrap();
     let owners = [add(&mut s, 1, 64, 4096), add(&mut s, 2, 64, 4096)];
     ready(&mut s, &owners);
-    let target = cost::Key { kind: GraphKind::Proposal, batch: 2, tokens: 2, prefill: 0, packed: 0 };
+    let target = cost::Key { drafts: 0, kind: GraphKind::Proposal, batch: 2, tokens: 2, prefill: 0, packed: 0 };
     s.advance_to(s.now_ns + s.policy.estimate_ttl_ns).unwrap();
     let others: Vec<_> = s.costs.stale_keys().filter(|key| *key != target)
         .map(|key| (key, s.costs.duration_key(key).unwrap())).collect();
@@ -2556,4 +2556,95 @@ fn cancelling_all_inflight_proposal_owners_keeps_the_charge_and_releases_reused_
     assert!(s.complete_proposal(fence, &records, gpu_time(8 * MS), &[[1.0; 7]; 2]).is_err());
     assert_eq!(s.refresh_credit_ns(), -3_000_000.0);
     assert!(!matches!(s.plan().unwrap().origin, PlanOrigin::RefreshContinuation(_)));
+}
+
+#[test]
+fn acceptance_learning_escapes_width_one_and_pays_for_complete_rounds() {
+    let mut s = engine(1, true);
+    let handle = add(&mut s, 1, 64, 4096);
+    ready(&mut s, &[handle]);
+    for width in 1..=8 { set_cost(&mut s, GraphKind::Speculative, 1, width, (9 + width as u64) * MS); }
+    let generated = s.request(handle).unwrap().generated_tokens;
+    for _ in 0..256 {
+        s.request_mut(handle).unwrap().acceptance.observe(speculation::ProposalSource::Mtp,
+            generated, 7, 0, true, None);
+    }
+    s.refresh.acceptance_credit_ns = 0.0;
+    assert_eq!(s.plan().unwrap().token_capacity, 1);
+    let mut ordinary_ns = 0;
+    let mut probe_ns = 0;
+    let mut recovered = false;
+    for _ in 0..1800 {
+        let plan = s.plan().unwrap();
+        let duration = plan.estimated_duration_ns();
+        if plan.origin.is_acceptance() { probe_ns += duration; }
+        else { ordinary_ns += duration; }
+        let accepted = if s.request(handle).unwrap().generated_tokens < generated + 512 { 0 } else { 7 };
+        if accepted == 7 && plan.origin == PlanOrigin::Ordinary && plan.token_capacity >= 6 {
+            recovered = true;
+        }
+        step(&mut s, accepted);
+        assert!(probe_ns as f64 <= ordinary_ns as f64 * 0.01 / 0.99 + 17.0 * MS as f64 + 1.0);
+        if recovered { break; }
+    }
+    assert!(recovered, "an improved request must escape width one");
+    assert!(probe_ns > 0);
+}
+
+#[test]
+fn acceptance_budget_does_not_double_charge_timing_or_forget_debt() {
+    let mut state = refresh::RefreshState::default();
+    state.complete(PlanOrigin::Ordinary, gpu_time(495 * MS));
+    assert!(state.acceptance_ready());
+    let timing_credit = state.credit_ns;
+    let handle = RequestHandle { slot: 0, generation: 1 };
+    let step = |kind| ScheduledStep { draft_tokens: 0, kind, batch_capacity: 1, token_capacity: 8,
+        packed_token_capacity: 0, mixed: None, requires_feedback: true,
+        lanes: vec![ScheduledLane { request: handle, start_position: 65, tokens: 8 }] };
+    state.commit(PlanOrigin::AcceptanceStart, Fence(7), &step(GraphKind::Proposal));
+    state.complete(PlanOrigin::AcceptanceStart, gpu_time(10 * MS));
+    assert_eq!(state.acceptance_credit_ns, -5.0 * MS as f64);
+    assert_eq!(state.credit_ns, timing_credit);
+    assert!(!state.ready());
+    assert!(!state.acceptance_ready());
+    assert!(state.validate(PlanOrigin::RefreshContinuation(7)).is_err());
+    let continuation = PlanOrigin::AcceptanceContinuation(7);
+    state.validate(continuation).unwrap();
+    state.commit(continuation, Fence(8), &step(GraphKind::Verification));
+    state.complete(continuation, gpu_time(20 * MS));
+    assert!(state.episode().is_none());
+    assert_eq!(state.acceptance_credit_ns, -25.0 * MS as f64);
+    assert_eq!(state.credit_ns, timing_credit);
+    state.idle();
+    assert_eq!(state.acceptance_credit_ns, -25.0 * MS as f64);
+    assert_eq!(state.credit_ns, 0.0);
+}
+
+#[test]
+fn survival_feedback_is_transactional_and_replaces_binary_acceptance() {
+    let mut s = engine(1, true);
+    s.fixed_speculative_width(Some(4)).unwrap();
+    let handle = add(&mut s, 1, 64, 128);
+    ready(&mut s, &[handle]);
+    let plan = s.plan().unwrap();
+    assert_eq!(plan.token_capacity, 4);
+    let fence = Fence(s.submitted.0 + 1);
+    s.commit(&plan, fence).unwrap();
+    let records = completion_records(&s, &plan, fence, 0);
+    let before = s.request(handle).unwrap().generated_tokens;
+    for row in [[0.75, -1., -1., -1., -1., -1., -1.],
+        [0.75, 0.8, 0.25, -1., -1., -1., -1.], [f32::NAN; 7]] {
+        assert!(s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row])).is_err());
+        assert_eq!(s.request(handle).unwrap().generated_tokens, before);
+        assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 0);
+        assert!(s.submissions.contains_key(&fence));
+    }
+    let row = [0.75, 0.5, 0.25, -1., -1., -1., -1.];
+    s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row])).unwrap();
+    let request = s.request(handle).unwrap();
+    assert_eq!(request.generated_tokens, before + 1);
+    assert_eq!(request.acceptance.rounds(), 1);
+    assert!(request.acceptance.prefix_probability(speculation::ProposalSource::Mtp, 0).unwrap() > 0.5);
+    assert!(s.complete_with_survival(fence, &records, gpu_time(MS), Some(&[row])).is_err());
+    assert_eq!(s.request(handle).unwrap().acceptance.rounds(), 1);
 }

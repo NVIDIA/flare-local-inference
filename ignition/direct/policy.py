@@ -1,4 +1,4 @@
-"""Helios's decode-round selection, mirrored for direct execution.
+"""Helios's rectangular decode-round selection, mirrored for direct execution.
 
 Direct execution keeps its own fixed choice of step kinds, but chooses every
 decode round's graph as Helios's `RequestScheduler::select_plan`
@@ -18,13 +18,17 @@ at startup and neglected shapes are tried again every 30 s.
 Prices follow Helios's service accounting (helios/src/scheduler/service.rs):
 initialized when a step is committed, charged the graph time of every completed
 step, and credited with committed tokens and published deliveries. Each
-function below names the Helios code it mirrors; floating-point operations
-follow the same order so both choose identically from identical inputs.
+rectangular selection function names the Helios code it mirrors; floating-point
+operations follow the same order so those paths choose identically from identical
+inputs. Packed candidates use the complete captured shape and causal prefix
+forecasts from the latest completed conditional confidence. They do not reproduce
+Helios's retained-proposal forecasts or regrouping.
 """
 
 from __future__ import annotations
 
 import math
+import heapq
 from dataclasses import dataclass, field
 
 # helios/src/scheduler/policy.rs PolicyConfig::default.
@@ -42,7 +46,7 @@ _KINDS = {"init": "init", "restore": "restore", "prefill": "prefill", "resume": 
 
 
 class GraphCosts:
-    """Expiring graph durations by (kind, batch, tokens); zero is indeterminate. Mirrors cost.rs `ActionCosts`."""
+    """Expiring durations by complete captured graph shape; zero is indeterminate."""
 
     def __init__(self, shapes, ttl_ns=ESTIMATE_TTL_NS):
         self.entries = {shape: [0, 0] for shape in shapes}
@@ -51,9 +55,10 @@ class GraphCosts:
     def _fresh(self, entry):
         return entry[0] != 0 and max(0, self.now_ns - entry[1]) < self.ttl_ns
 
-    def duration(self, kind, batch, tokens):
+    def duration(self, kind, batch, tokens, packed=0, drafts=0):
         """None for an unprepared shape, 0 for an unmeasured or expired one, else nanoseconds."""
-        entry = self.entries.get((kind, batch, tokens))
+        key = (kind, batch, tokens)
+        entry = self.entries.get(key + (packed, drafts) if packed else key)
         if entry is None:
             return None
         return entry[0] if self._fresh(entry) else 0
@@ -163,6 +168,14 @@ class DecodeRound:
     width: int
     requests: list
     duration_ns: int
+    kind: str = "speculative"
+    packed_tokens: int = 0
+    draft_tokens: int = 0
+
+    @property
+    def shape(self):
+        key = (self.kind, self.batch, self.width)
+        return key + (self.packed_tokens, self.draft_tokens) if self.packed_tokens else key
 
 
 @dataclass
@@ -192,6 +205,8 @@ class Policy:
                                      and (layout.fixed_width in (None, width)
                                           or (width == 1 and ("speculative", batch, layout.fixed_width) not in layout.graphs)))
                         for batch in self.batches}
+        self.packed_catalog = tuple(key for key in layout.packed_shapes
+                                    if key[1] <= self.capacity and layout.fixed_width in (None, key[2]))
         self.prefill_catalog = tuple(layout.capacities("prefill"))
         self.now_ns = 0
 
@@ -233,9 +248,9 @@ class Policy:
         token_rate = delivery_rate = 0.
         costs = self.costs
 
-        def consider(kind, batch, capacity, tokens, delivery):
+        def consider(kind, batch, capacity, tokens, delivery, packed=0, drafts=0):
             nonlocal token_rate, delivery_rate
-            ns = costs.duration(kind, batch, capacity)
+            ns = costs.duration(kind, batch, capacity, packed, drafts)
             if ns:
                 per_ms = 1e6 / ns
                 token_rate = max(token_rate, tokens * per_ms)
@@ -265,6 +280,11 @@ class Policy:
                             tokens = self.speculative_tokens(request, width)
                             if tokens > 0:
                                 consider("speculative", batch, width, expected(request, tokens), True)
+            if generated and generated < request.max_new_tokens:
+                for kind, batch, width, packed, drafts in self.packed_catalog:
+                    tokens = self.speculative_tokens(request, min(width, drafts + 1) if drafts else width)
+                    if tokens > 0:
+                        consider(kind, batch, width, expected(request, min(tokens, packed)), True, packed, drafts)
         return (token_rate if token_rate > 0. else None, delivery_rate if delivery_rate > 0. else None)
 
     def _family(self, request):
@@ -289,6 +309,11 @@ class Policy:
             for batch in self.batches:
                 for width in (self.catalog[batch] if kind == "speculative" else (1,)):
                     ns = self.costs.duration(kind, batch, width)
+                    if ns:
+                        per_delivery_ms = min(per_delivery_ms, ns / 1e6 / min(batch, streams))
+            if kind == "speculative":
+                for packed_kind, batch, width, packed, drafts in self.packed_catalog:
+                    ns = self.costs.duration(packed_kind, batch, width, packed, drafts)
                     if ns:
                         per_delivery_ms = min(per_delivery_ms, ns / 1e6 / min(batch, streams))
             if math.isfinite(per_delivery_ms):
@@ -421,5 +446,56 @@ class Policy:
                 key = (value_rate(duration_ns, value, age_price), len(members),
                        -sum(r.last_use for r in members), -batch, -width, -mask)
                 if best_key is None or key >= best_key:
-                    best, best_key = DecodeRound(batch, width, members, duration_ns), key
+                    best, best_key = DecodeRound(batch, width, members, duration_ns, kind), key
+        for packed_kind, batch, width, packed, drafts in self.packed_catalog:
+            duration_ns = self.costs.duration(packed_kind, batch, width, packed, drafts)
+            limit = min(width, drafts + 1) if drafts else width
+            cohort = self.packed_cohort(ready, batch, limit, packed, values, duration_ns, expected)
+            if cohort is None:
+                continue
+            members, value = cohort
+            mask = sum(1 << r.slot for r in members)
+            key = (value_rate(duration_ns, value, age_price), len(members),
+                   -sum(r.last_use for r in members), -batch, -width, -mask)
+            if best_key is None or key > best_key:
+                best, best_key = DecodeRound(batch, width, members, duration_ns, packed_kind, packed, drafts), key
+        return best
+
+    def packed_lengths(self, requests, width, capacity):
+        """Predict causal lengths using completed confidence; current proposals remain unread."""
+        limits = [self.speculative_tokens(r, width) for r in requests]
+        lengths = [1] * len(requests)
+        frontier = [(-r.acceptance.depths[0][0], 0, r.slot, row)
+                    for row, (r, limit) in enumerate(zip(requests, limits)) if limit > 1]
+        heapq.heapify(frontier)
+        for _ in range(min(capacity - len(requests), sum(limits) - len(requests))):
+            probability, depth, slot, row = heapq.heappop(frontier)
+            lengths[row] += 1
+            if lengths[row] < limits[row]:
+                heapq.heappush(frontier, (probability * requests[row].acceptance.depths[depth + 1][0],
+                                         depth + 1, slot, row))
+        return lengths
+
+    def packed_cohort(self, ready, batch, width, capacity, values, duration_ns, expected):
+        """Price complete physical rounds using bounded causal forecasts and immutable cohorts."""
+        if not ready:
+            return None
+        duration_ms = duration_ns / 1e6
+        base = {r.slot: values[r.slot].decode(1., duration_ms) for r in ready}
+        full = {r.slot: values[r.slot].decode(expected(r, min(self.speculative_tokens(r, width), capacity)),
+                                             duration_ms) for r in ready}
+        best = best_key = None
+        for ordering in range(3):
+            def priority(r):
+                return (full[r.slot] if ordering == 0 else base[r.slot] if ordering == 1
+                        else full[r.slot] / self.speculative_tokens(r, width))
+            ordered = sorted(ready, key=lambda r: (-priority(r), r.slot))
+            for count in range(1, min(batch, capacity, len(ordered)) + 1):
+                members = sorted(ordered[:count], key=lambda r: r.slot)
+                lengths = self.packed_lengths(members, width, capacity)
+                value = sum(values[r.slot].decode(expected(r, length), duration_ms)
+                            for r, length in zip(members, lengths))
+                key = (value, count, -sum(1 << r.slot for r in members))
+                if best_key is None or key > best_key:
+                    best, best_key = (members, value), key
         return best

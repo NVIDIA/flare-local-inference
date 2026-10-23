@@ -101,9 +101,15 @@ class RecurrentBenchmarkInputs:
         quotient, remainder = divmod(self.tokens, self.live_sequences)
         self.lengths = tuple(quotient + (index < remainder) for index in range(self.live_sequences))
         columns = original["state_indices"].shape[1] if "state_indices" in original else 1
-        rows = 1 if self.recording else columns
-        self.live_slots = tuple(1 + index * rows for index in range(self.live_sequences))
-        self.state_rows = self.live_sequences * rows + 1
+        # Padded verification columns address the null row; only live checkpoints need storage.
+        widths = self.lengths if "state_indices" in original and not self.recording else (1,) * self.live_sequences
+        if max(widths) > columns:
+            raise ValueError("benchmark sequence length exceeds its state-index columns")
+        self.live_slots, self.state_rows = [], 1
+        for width in widths:
+            self.live_slots.append(self.state_rows)
+            self.state_rows += width
+        self.live_slots = tuple(self.live_slots)
         if mode == "prefill" and "checkpoint_state_indices" in original:
             self.state_rows += self.live_sequences
         if self.state_rows > self.state.shape[0]:
@@ -152,7 +158,7 @@ class RecurrentBenchmarkInputs:
                 a["state_slot_ids"][row] = self.live_slots[row]
             if "state_indices" in a:
                 for column in range(columns):
-                    a["state_indices"][row, column] = (0 if self.recording and column
+                    a["state_indices"][row, column] = (0 if column >= length or (self.recording and column)
                                                        else self.live_slots[row] + column)
             if "final_state_indices" in a:
                 a["final_state_indices"][row] = self.live_slots[row]
@@ -187,9 +193,14 @@ def benchmark_call(prepared, *, arguments, session, name, mode, scratch_specs,
                    workspace, run_options, binding_plan=None, bind_method="bind"):
     template = arguments["conv_state"] if binding_plan is not None else arguments["recurrent_state"]
     key = _benchmark_state_key(template)
-    arena = benchmark_resource(session, key, lambda: BenchmarkStateArena(template))
-    operands = benchmark_resource(session, ("delta_inputs", name),
-        lambda: RecurrentBenchmarkInputs(arguments, mode=mode, arena=arena))
+
+    def create_inputs():
+        arena = benchmark_resource(session, key, lambda: BenchmarkStateArena(template))
+        return RecurrentBenchmarkInputs(arguments, mode=mode, arena=arena)
+
+    # Looking up the state on every candidate evicts the active input fixture when
+    # its arena is privately allocated. The input fixture owns that arena already.
+    operands = benchmark_resource(session, ("delta_inputs", name), create_inputs)
     scratch = planned_scratch(scratch_specs(prepared), workspace)
     binding = getattr(prepared, bind_method)(scratch=scratch, **operands.args,
                             **({"plan": binding_plan} if binding_plan is not None else {}))

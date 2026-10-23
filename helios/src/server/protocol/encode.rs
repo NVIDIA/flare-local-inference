@@ -219,7 +219,7 @@ impl Encoder {
     }
     pub fn start(&mut self) -> Vec<Frame> {
         match self.protocol {
-            Protocol::Chat => vec![self.chunk(0, json!({"role":"assistant"}), Value::Null)],
+            Protocol::Chat => vec![self.chunk(0, json!({"role":"assistant","content":""}), Value::Null)],
             Protocol::Completions => vec![],
             Protocol::Messages => {
                 let mut message = self.response();
@@ -440,7 +440,7 @@ impl Encoder {
                     if self.protocol != Protocol::Responses {
                         let (options, frontend) = self.logprob_format.as_ref().ok_or("unexpected logprob entries")?;
                         let entries = entries.iter().map(|e| {
-                            let mut value = crate::server::logprobs::format(e, *options, frontend)?;
+                            let mut value = crate::server::logprobs::format(e, options, frontend)?;
                             value.offset += self.echo_offsets.get(index).copied().unwrap_or(0);
                             Ok(value)
                         }).collect::<Result<Vec<_>>>()?;
@@ -458,7 +458,7 @@ impl Encoder {
                 Event::ContentLogprobs(entries) => {
                     if self.protocol == Protocol::Responses {
                         let (options, frontend) = self.logprob_format.as_ref().ok_or("unexpected content logprobs")?;
-                        content_logprobs = entries.iter().map(|e| crate::server::logprobs::format(e, *options, frontend).map(|e| e.entry))
+                        content_logprobs = entries.iter().map(|e| crate::server::logprobs::format(e, options, frontend).map(|e| e.entry))
                             .collect::<Result<_>>()?;
                     }
                     continue;

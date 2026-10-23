@@ -122,9 +122,9 @@ For serving-only Rust changes, rebuild Flare and load a compatible package.
 To exercise changes to prepared kernels, capacities, or the package format,
 export a package containing those changes. Previously exported packages must
 remain usable as required by [package compatibility](#model-package-compatibility).
-`ignition run` finds `flare` on `PATH` before `flare/target/release/flare`; check
-for stale installed executables when testing a local build. Stop Flare with
-Ctrl-C or SIGTERM so native replay drains before CUDA resources are released.
+Launch an exported package with `flare/target/release/flare run PACKAGE` when
+testing a local build. Stop Flare with Ctrl-C or SIGTERM so native replay drains
+before CUDA resources are released.
 
 For development without export, `ignition serve` requires Heliopause's
 `qualification` Cargo feature; follow the
@@ -203,8 +203,8 @@ architectural boundary before committing the change.
 
 - Python loads weights, resolves and autotunes kernels, plans storage, warms
   execution paths, and captures supported graph variants before serving starts.
-  Ignition exports a runtime package and closes the prepared model. `ignition run`
-  then replaces its Python process with the Rust Flare executable through `execv`.
+  `ignition export` writes a runtime package and closes the prepared model.
+  `flare run PACKAGE` loads that package in a separate Rust serving process.
 - Helios owns sockets, request processing, tokenization, chat templates,
   scheduling, cache operations, graph replay, and output streaming. Serving
   must not call back into Python.

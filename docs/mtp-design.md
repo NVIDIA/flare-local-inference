@@ -8,12 +8,23 @@ weights, kernels, storage and CUDA graphs; Rust schedules requests and launches
 graphs. Acceptance and token feedback remain on the device. Speculative serving uses a versioned token-vector completion contract.
 Ignition prepares the recipe's learned drafter unless `--no-mtp` is given. The advanced flags
 select the draft-token maximum, the default verification policy, and the
-proposal source. Draft continuations from request history are
-disabled by default and enabled on the Qwen recipe with `--history-drafts`,
-which sets `PreparationConfig(history_drafts=True)`.
+proposal source. Qwen's `--mtp-proposal-source copy` drafts from shared decoded
+history without loading an MTP module. `--history-drafts` adds those proposals
+to the learned MTP source and is disabled by default.
+
+With copying enabled, each loaded model retains the most recent 65,536 committed
+generated tokens across requests in a host-memory ring. Exact eight-token and four-token indexes
+match the active request's suffix, preferring eight-token matches and then the
+most recent occurrence. They return up to seven observed continuation tokens.
+Per-response links preserve sequence boundaries under interleaving and
+preemption. Prompt ingestion, prefix restores, and disk checkpoints do not
+populate the ring; only validated completion outputs, including accepted drafts
+and target samples, extend it. Rejected proposals and failed completions do not.
+The ring survives request completion and is discarded when the model unloads.
+Queries may use prompt context without inserting it into the shared corpus.
 
 The design combines adaptive verification budgets, native MTP proposals and
-continuations copied from request history. Compact recurrent commit and token
+continuations copied from shared decoded history. Compact recurrent commit and token
 trees are additional capabilities with explicit operator requirements. A
 separately trained parallel drafter is optional; it is not needed to use the
 checkpoint's MTP weights.
@@ -67,17 +78,20 @@ accepted next-token IDs.
 | Responsibility | Existing library interface | Bound or invariant |
 | --- | --- | --- |
 | MTP feedback | `b12x.sequence.mtp_feedback` prepared plan/bind/run | Four streams; caller-owned output and scratch |
-| Target recurrent verification | `b12x.sequence.gdn_decode` | At most eight state-index columns; each token writes its post-token state |
+| Target recurrent verification | `b12x.sequence.gdn_decode`, or Ignition `PreparedRecoveredRecurrence` with `PreparedGDNCommit` | At most eight inputs; checkpoint columns or per-token correction records followed by accepted-prefix commit |
 | Target sparse attention | Ordinary prepared `b12x.attention.qsa` | Exact accepted-count, raw-tag and compression-group semantics |
 | Draft selector reuse | QSA `DraftSelectionState`, `run(reuse=DraftSelectionReuse(...))` | Proposal-only; reset on round or request identity changes |
 | Convolution history | `b12x.sequence.short_conv` and PLE operators | Speculative history extent and accepted-token selection |
 | Stochastic chain verification | `flashinfer.sampling.chain_speculative_sampling` | Draft probabilities `[B,K,V]`, target probabilities `[B,K+1,V]`; explicit device RNG |
 
 GDN's ordinary checkpoint path supports Qwen's 16 key heads and 48 value heads.
-Its KDA recovery mode requires equal head counts. FlashInfer's separate
-ReplaySSM cache/commit implementation is restricted to SM100/103. Neither is
-a Qwen SM120 compact rollback implementation. Public QSA draft reuse omits
-selection work and must never be used in target verification.
+Ignition's [GDN recovery component](../ignition/components/gdn_recovery.py) also
+supports that geometry: verification retains correction vectors, normalized keys
+and decays, and commit replays only the accepted prefix into the live recurrent
+row. The Qwen recipe uses this path for wider rounds and updates the live state
+directly for width one. b12x's KDA recovery mode requires equal head counts;
+FlashInfer's separate ReplaySSM implementation is restricted to SM100/103.
+Public QSA draft reuse omits selection work and must never be used in target verification.
 
 Library kernels remain the compute implementation. Server-owned captured
 operations pack metadata, select committed state and update request records.
@@ -145,9 +159,12 @@ DSpark uses the shared token-vector completion and adaptive verification contrac
 Ignition captures verification widths one through six by default for every batch capacity;
 Flare can reduce draft count and concurrency when loading. Helios schedules and
 replays the selected graphs without interpreting DSpark layers or proposals.
-Adaptive selection uses observed acceptance and measured GPU round cost. The
-DSpark confidence head is computed inside the graph but does not drive the
-native controller.
+Every retained or packed proposal producer executes the full configured draft
+block. Cohort and verification-budget selection use historical joint prefix survival
+from the DSpark confidence head and measured proposal-plus-verification cost. After
+proposal completion, fresh confidence drives causal prefix selection using
+costs, service prices, and historical continuations frozen before submission.
+Verification outcomes remain separate from these confidence forecasts.
 
 ## A speculative round is a state transaction
 
@@ -232,12 +249,13 @@ by the draft model. Preparation reports exact persistent, graph-pool and scratch
 costs before allocating KV pages, preserving configured headroom and snapshot
 budgets.
 
-Compact recurrence would retain one committed matrix plus per-row K/V,
-normalization, and gate records, then apply accepted updates before the following
-round. A Qwen-compatible b12x contract must reproduce the recurrence arithmetic
-and materialize accepted updates before checkpoint publication. Full checkpoint
-columns provide the component reference. Capacity and write-traffic savings
-must be measured in complete rounds before replacing the representation.
+The current compact recurrence retains one committed matrix plus per-token
+correction vectors, normalized keys and decay records. `PreparedGDNCommit`
+applies accepted updates before the following round or checkpoint publication.
+The [recovery tests](../tests/recipes/test_qwen38_gdn_recovery_cuda.py) compare
+this arithmetic with b12x checkpointed decode. Full checkpoint columns remain
+the component reference; capacity and write-traffic savings still require
+complete-round measurements.
 
 ## Graph catalog, control and scheduling
 
@@ -316,8 +334,13 @@ capture.
 | Acceptance/cost statistics and bounded exploration policy | Rust, using completed-round records |
 | Grammar advancement, stop sequences, output presentation | Rust with ordered token-vector completions |
 
-Rust adapts among prepared widths from completed-round acceptance and measured full-round
-costs. The fixed-width catalog gives each active row the same maximum draft
+Rust adapts among prepared widths from request-local prefix survival and measured
+full-round costs. Combined graphs learn from emitted/offered/accepted records,
+or optional verification probabilities supplied by prepared graphs. Split graphs
+use proposal-confidence forecasts. A separate funded exploration budget can
+probe beyond the ordinary choice without replacing its historical mean;
+see [the scheduling policy](scheduling-runtime-design.md#funded-acceptance-learning).
+The fixed-width catalog gives each active row the same maximum draft
 count. Different logical counts under a shared row budget require matching
 verification and acceptance contracts; the selected graph's real padded cost
 is what the controller prices.

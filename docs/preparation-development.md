@@ -25,6 +25,12 @@ Recipe and execution-component changes also require
   transient and share the phase's Rich console. Use `DirectWeightLoader` for
   loading progress, including draft-model weights. Only the root TP rank
   renders progress.
+- Heliopause reports native export phases on stderr without the Flare banner,
+  including scanned, hashed, copied, installed, and reused byte counts. Capture
+  and frontend rows render only on rank zero. The enclosing Python export phase
+  uses `live=False` while native rows animate and retains its elapsed result.
+  Keep bulk export progress in native code so transfers do not call back into
+  Python.
 
 ## Complete-forward compilation and capture
 
@@ -37,6 +43,26 @@ Recipe and execution-component changes also require
   bind process-local kernel handles and caller-owned tensors at startup. Complete
   b12x preparation, tuning, binding refresh, and compiled warmup before capturing
   each serving graph. Retain compiled kernel owners until native replay has drained.
+
+## Runtime package export
+
+`ignition.preparation.runtime_package` hands live graph handles, typed storage
+and execution metadata, tensor-view roles, compiler signatures, frontend assets,
+and retained owners to `flare_heliopause`. Recipes describe file-backed table
+ranges and generated frontend text without creating package files or payload
+offsets. Heliopause records CUPTI resources, traverses graphs and pointer-bearing
+storage, downloads retained bytes, serializes resources, and owns asset writes,
+hashing, encryption, signing, conversion, rank payload transfer, and publication.
+Keep captured buffers, contexts, graph templates, and kernel owners alive until
+native work confirms a drain; an unsuccessful drain retains their owners.
+
+Native transfer pools bound file buffers and pinned CUDA download storage from
+available host memory and preparation rank count. Preserve direct bulk I/O,
+exact unaligned tails, cache verification before reuse, and hash-before-write
+publication. `--no-weights` must fail on any missing exact stored-data blob;
+correctness and cache checks remain required. See
+[runtime package transfers](runtime-package-design.md#native-export-transfers-and-progress)
+for the transfer budget and progress contract.
 
 ## Scratch storage and concurrent lifetimes
 
@@ -105,6 +131,14 @@ Recipe and execution-component changes also require
   or compile on a binding mismatch.
 
 ## Shape and graph-transition validation
+
+Packed verification catalogs declare physical row capacities independently of
+logical per-request widths. Use `packed_speculative_shapes` to distribute a
+graph-count budget across the request buckets while preserving each bucket's
+physical endpoints. Size target workspaces from the largest physical capacity
+and sampling/state workspaces from their declared logical widths. Validate
+capacities that are not multiples of batch size, including a single aggregate
+draft row, inactive lanes, and replay transitions between physical capacities.
 
 - **Prepare the whole serving shape range.** Include batch-one decode, packed
   decode, partial/inactive rows, and configurable chunked prefill through at

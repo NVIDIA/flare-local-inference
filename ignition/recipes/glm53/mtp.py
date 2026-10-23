@@ -226,7 +226,7 @@ class PreparedMTP:
                 runtime=runtime, coordinator=coordinator, session=session, name=f"{name}.mlp_reduce")
             self.local_logits = buffer(rows, 154880 // weights.shard.world_size)
             self.logits = buffer(rows, 154880)
-            head = weights.mtp.draft_head if weights.mtp.draft_head is not None else weights.tree.lm_head.weight
+            head = weights.mtp.draft_head if weights.mtp.draft_head is not None else weights.head
             self.head = PreparedVocabularyProjection(self.hidden, head,
                 self.local_logits, self.logits, runtime=vocabulary_runtime, coordinator=coordinator,
                 session=session, name=f"{name}.lm_head")

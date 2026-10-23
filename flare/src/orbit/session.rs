@@ -117,64 +117,6 @@ pub struct Session {
     incomplete_write: bool,
 }
 
-/// Independent encrypted directions after an agent admits a checkpoint channel.
-pub struct RecordReader {
-    stream: TcpStream,
-    direction: Direction,
-    pending: Vec<u8>,
-    position: usize,
-}
-
-pub struct RecordWriter {
-    stream: TcpStream,
-    direction: Direction,
-}
-
-impl Read for RecordReader {
-    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
-        if output.is_empty() {
-            return Ok(0);
-        }
-        if self.position == self.pending.len() {
-            let mut length = [0u8; 2];
-            if self.stream.read(&mut length[..1])? == 0 {
-                return Ok(0);
-            }
-            self.stream.read_exact(&mut length[1..])?;
-            let mut encrypted = vec![0; u16::from_be_bytes(length) as usize];
-            self.stream.read_exact(&mut encrypted)?;
-            self.pending = self.direction.open(encrypted).map_err(io::Error::other)?;
-            self.position = 0;
-            if self.pending.is_empty() {
-                return Err(io::Error::other("empty checkpoint transport record"));
-            }
-        }
-        let count = output.len().min(self.pending.len() - self.position);
-        output[..count].copy_from_slice(&self.pending[self.position..self.position + count]);
-        self.position += count;
-        Ok(count)
-    }
-}
-
-impl Write for RecordWriter {
-    fn write(&mut self, input: &[u8]) -> io::Result<usize> {
-        if input.is_empty() {
-            return Ok(0);
-        }
-        let count = input.len().min(RECORD_PLAINTEXT);
-        let encrypted = self
-            .direction
-            .seal(&input[..count])
-            .map_err(io::Error::other)?;
-        write_record(&mut self.stream, &encrypted).map_err(io::Error::other)?;
-        Ok(count)
-    }
-
-    fn flush(&mut self) -> io::Result<()> {
-        self.stream.flush()
-    }
-}
-
 fn io_error(context: &str, error: io::Error) -> Failure {
     format!("{context}: {error}").into()
 }
@@ -284,31 +226,6 @@ impl Session {
 
     pub fn addresses(&self) -> Result<(SocketAddr, SocketAddr), Failure> {
         Ok((self.stream.local_addr()?, self.stream.peer_addr()?))
-    }
-
-    /// Continue the authenticated record stream in both directions. Idle preparation
-    /// channels live until their checkpoint owner closes them, including during compilation.
-    pub fn checkpoint_parts(self) -> Result<(RecordReader, RecordWriter, TcpStream), Failure> {
-        if self.remaining != 0 || !self.pending.is_empty() || self.incomplete_write {
-            return Err("checkpoint channel begins inside an unfinished agent frame".into());
-        }
-        self.stream.set_read_timeout(None)?;
-        self.stream.set_write_timeout(None)?;
-        let writer = self.stream.try_clone()?;
-        let shutdown = self.stream.try_clone()?;
-        Ok((
-            RecordReader {
-                stream: self.stream,
-                direction: self.receive,
-                pending: Vec::new(),
-                position: 0,
-            },
-            RecordWriter {
-                stream: writer,
-                direction: self.send,
-            },
-            shutdown,
-        ))
     }
 
     /// Open a session to `address` as the initiator.
@@ -443,8 +360,7 @@ impl Session {
         Ok(())
     }
 
-    /// A second handle on the connection.
-    #[cfg(test)]
+    /// A shutdown handle for the connection; framed reads and writes stay with the session.
     pub fn try_clone_stream(&self) -> Result<TcpStream, Failure> {
         Ok(self.stream.try_clone()?)
     }
@@ -696,43 +612,6 @@ mod tests {
         client.write_frame(frame::EXIT, &[1, 2, 3]).unwrap();
         assert_eq!(server.read_frame().unwrap(), (frame::EXIT, vec![1, 2, 3]));
         assert!(server.read_body(FRAME_LIMIT + 1, FRAME_LIMIT).is_err());
-    }
-
-    #[test]
-    fn checkpoint_records_reject_replay_tampering_and_truncated_tails() {
-        for corrupt in [false, true] {
-            let (mut client, server) = pair();
-            let (mut reader, _, _) = server.checkpoint_parts().unwrap();
-            let record = client.send.seal(b"exact checkpoint bytes").unwrap();
-            write_record(&mut client.stream, &record).unwrap();
-            let mut bytes = [0; 22];
-            reader.read_exact(&mut bytes).unwrap();
-            assert_eq!(&bytes, b"exact checkpoint bytes");
-            let mut next = if corrupt {
-                client.send.seal(b"next bytes").unwrap()
-            } else {
-                record
-            };
-            if corrupt {
-                next[0] ^= 1;
-            }
-            write_record(&mut client.stream, &next).unwrap();
-            assert!(reader.read(&mut bytes).is_err());
-        }
-        for tail in [vec![0], vec![0, 32, 1, 2, 3]] {
-            let (mut client, server) = pair();
-            let (mut reader, _, _) = server.checkpoint_parts().unwrap();
-            client.stream.write_all(&tail).unwrap();
-            drop(client);
-            assert_eq!(
-                reader.read(&mut [0; 1]).unwrap_err().kind(),
-                io::ErrorKind::UnexpectedEof
-            );
-        }
-        let (client, server) = pair();
-        let (mut reader, _, _) = server.checkpoint_parts().unwrap();
-        drop(client);
-        assert_eq!(reader.read(&mut [0; 1]).unwrap(), 0);
     }
 
     #[test]

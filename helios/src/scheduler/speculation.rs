@@ -1,4 +1,4 @@
-//! Request-local speculative acceptance and observed copy proposals.
+//! Request-local speculative acceptance and copy proposal metadata.
 
 use crate::{Result, execution::BATCH_CAPACITIES};
 
@@ -60,103 +60,145 @@ pub fn validate_widths(widths: &[usize]) -> Result<()> {
     Ok(())
 }
 
-/// Conditional acceptance of one draft depth given that every shallower draft was accepted.
-/// Starts from a 0.5 prior worth two observations with bounded effective sample
-/// weight. After saturation, each outcome has weight `1 / DEPTH_MEMORY`.
-#[derive(Clone, Copy)]
-struct DepthAcceptance {
-    probability: f64,
+/// A bounded observation mean whose information ages as the request advances.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PrefixEstimate {
+    mean: f64,
     weight: f64,
+    observed_at: u32,
 }
-impl Default for DepthAcceptance {
-    fn default() -> Self {
-        Self {
-            probability: 0.5,
-            weight: 2.0,
-        }
+impl PrefixEstimate {
+    pub fn new(mean: f64, generated: u32) -> Self {
+        Self { mean, weight: 2.0, observed_at: generated }
+    }
+
+    pub fn weight_at(&self, generated: u32) -> f64 {
+        self.weight * (-f64::from(generated.saturating_sub(self.observed_at)) / 128.0).exp2()
+    }
+
+    pub fn mean(&self) -> f64 { self.mean }
+
+    pub fn upper(&self, generated: u32) -> f64 {
+        (self.mean + (20.0f64.ln() / (2.0 * self.weight_at(generated))).sqrt()).min(1.0)
+    }
+
+    pub fn observe(&mut self, value: f64, generated: u32) {
+        debug_assert!(value.is_finite() && (0.0..=1.0).contains(&value));
+        self.weight = (self.weight_at(generated) + 1.0).min(128.0);
+        self.mean += (value - self.mean) / self.weight;
+        self.observed_at = generated;
     }
 }
-impl DepthAcceptance {
-    fn observe(&mut self, accepted: bool) {
-        self.weight = (self.weight + 1.0).min(DEPTH_MEMORY);
-        self.probability += (if accepted { 1.0 } else { 0.0 } - self.probability) / self.weight;
-    }
-}
-const DEPTH_MEMORY: f64 = 128.0;
-/// Conditional acceptance belongs to one logical request and proposal source.
-#[derive(Clone, Copy, Default)]
+
+/// Prefix survival of the complete proposal program, including copy overrides.
+#[derive(Clone, Copy)]
 pub struct AcceptanceProfile {
-    depths: [[DepthAcceptance; 7]; 2],
+    prefixes: [[PrefixEstimate; 7]; 2],
     rounds: u64,
+}
+
+impl Default for AcceptanceProfile {
+    fn default() -> Self {
+        Self { prefixes: [std::array::from_fn(|i| PrefixEstimate::new(0.5f64.powi(i as i32 + 1), 0)); 2], rounds: 0 }
+    }
 }
 
 impl AcceptanceProfile {
     /// Depth zero is the first draft after the pending target token.
-    pub fn probability(&self, source: ProposalSource, depth: usize) -> Option<f64> {
-        self.depths[source as usize]
+    pub fn prefix_probability(&self, source: ProposalSource, depth: usize) -> Option<f64> {
+        self.prefixes[source as usize]
             .get(depth)
-            .map(|d| d.probability)
+            .map(|_| self.curve(source, 0, false)[depth])
+    }
+
+    pub(super) fn curve(&self, source: ProposalSource, generated: u32, optimistic: bool) -> [f64; 7] {
+        let mut bound = 1.0f64;
+        self.prefixes[source as usize].map(|p| {
+            bound = bound.min(if optimistic { p.upper(generated) } else { p.mean() });
+            bound
+        })
     }
 
     pub fn expected_tokens(&self, source: ProposalSource, width: usize) -> f64 {
-        let mut chain = 1.0;
-        let mut total = f64::from(width != 0);
-        for depth in &self.depths[source as usize][..width.saturating_sub(1).min(7)] {
-            chain *= depth.probability;
-            total += chain;
-        }
-        total
+        f64::from(width != 0) + self.curve(source, 0, false)[..width.saturating_sub(1).min(7)].iter().sum::<f64>()
     }
 
     pub fn rounds(&self) -> u64 {
         self.rounds
     }
 
-    /// Only the accepted prefix and an explicitly observed rejection are samples.
-    /// `copy_mask` identifies the proposal source at each evaluated draft depth.
+    pub(super) fn information(&self, source: ProposalSource, depth: usize, generated: u32) -> f64 {
+        self.prefixes[source as usize][depth].weight_at(generated)
+    }
+
+    /// Rejection falsifies every longer offered prefix; termination censors its suffix.
     pub(super) fn observe(
         &mut self,
+        source: ProposalSource,
+        generated: u32,
         offered: usize,
         accepted: usize,
         rejected: bool,
-        copy_mask: u8,
+        survival: Option<&[f32; 7]>,
     ) {
         debug_assert!(accepted <= offered && offered <= 7);
         if offered == 0 {
             return;
         }
-        for depth in 0..accepted {
-            self.depths[usize::from(copy_mask & (1 << depth) != 0)][depth].observe(true);
-        }
-        if rejected && accepted < offered {
-            self.depths[usize::from(copy_mask & (1 << accepted) != 0)][accepted].observe(false);
+        let observed = if rejected { offered } else { accepted };
+        for depth in 0..observed {
+            let value = survival.map_or(f64::from(depth < accepted), |p| f64::from(p[depth]));
+            self.prefixes[source as usize][depth].observe(value, generated);
         }
         self.rounds = self.rounds.saturating_add(1);
     }
 }
 
-/// Copies only observed continuation tokens; the device guards its consumed-position epoch.
-pub fn copy_proposal(history: &[u32], maximum: usize) -> ([i64; 7], usize) {
-    let mut output = [-1; 7];
-    let maximum = maximum.min(7);
-    for length in [8, 4] {
-        if history.len() <= length || maximum == 0 {
-            continue;
-        }
-        let suffix = history.len() - length;
-        for position in (suffix.saturating_sub(4096)..suffix).rev() {
-            if history[position..position + length] != history[suffix..] {
-                continue;
-            }
-            let continuation = &history[position + length..];
-            let count = maximum.min(continuation.len());
-            for (target, token) in output.iter_mut().zip(continuation.iter()).take(count) {
-                *target = i64::from(*token);
-            }
-            if count > 0 {
-                return (output, count);
-            }
-        }
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn context_ages_information_without_changing_the_mean() {
+        let mut estimate = PrefixEstimate::new(0.5, 0);
+        for _ in 0..256 { estimate.observe(0.0, 0); }
+        let mean = estimate.mean();
+        let upper = estimate.upper(0);
+        assert!(upper < 0.2);
+        assert_eq!(estimate.mean(), mean);
+        assert!(estimate.upper(128) > upper);
+        assert_eq!(estimate.upper(u32::MAX), 1.0);
+        estimate.observe(1.0, 4096);
+        assert!(estimate.mean() > 0.99);
     }
-    (output, 0)
+
+    #[test]
+    fn shallow_rounds_do_not_refresh_unobserved_suffixes() {
+        let mut profile = AcceptanceProfile::default();
+        for _ in 0..256 { profile.observe(ProposalSource::Mtp, 0, 7, 0, true, None); }
+        let before = profile.curve(ProposalSource::Mtp, 0, true);
+        for generated in 1..=1024 {
+            profile.observe(ProposalSource::Mtp, generated, 1, 1, true, None);
+        }
+        let means = profile.curve(ProposalSource::Mtp, 1024, false);
+        let upper = profile.curve(ProposalSource::Mtp, 1024, true);
+        assert!(means[0] > 0.99);
+        assert!(means[1] < 0.01);
+        assert!(upper[1] > before[1] + 0.5);
+        assert!(upper.windows(2).all(|p| p[0] >= p[1]));
+    }
+
+    #[test]
+    fn probability_feedback_replaces_the_binary_sample_and_respects_censoring() {
+        let mut profile = AcceptanceProfile::default();
+        let survival = [0.8, 0.4, 0.2, 0.1, 0.05, 0.025, 0.01];
+        profile.observe(ProposalSource::Mtp, 0, 7, 0, true, Some(&survival));
+        for depth in 0..7 {
+            let expected = (2.0 * 0.5f64.powi(depth as i32 + 1) + f64::from(survival[depth])) / 3.0;
+            assert!((profile.prefix_probability(ProposalSource::Mtp, depth).unwrap() - expected).abs() < 1e-12);
+        }
+        let before = profile.curve(ProposalSource::Mtp, 0, false);
+        profile.observe(ProposalSource::Mtp, 0, 7, 1, false, Some(&survival));
+        assert_eq!(profile.curve(ProposalSource::Mtp, 0, false)[1..], before[1..]);
+    }
 }

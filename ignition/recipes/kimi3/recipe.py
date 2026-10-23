@@ -26,7 +26,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
             drafting["draft_checkpoint"] = snapshot_download(DSPARK_REPOSITORY, revision=DSPARK_REVISION, cache_dir=plan.hub_cache,
                                                              allow_patterns=("config.json", "model.safetensors"))
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
+        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)), context=plan.context,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
@@ -61,8 +61,8 @@ RECIPE = Recipe(
         Checkpoint(alias="kimi-k3-dspark", repository="/data/kimi-k3-dspark", revision="local",
         architecture="KimiK3ForConditionalGeneration", stored_bytes=1_500_516_228_062,
         device_bytes=1_498_926_420_236, draft_bytes=7_900_000_000)),
-    context=1048576, page_tokens=128, concurrency=4, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=7), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
+    context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
+    speculation=Speculation(draft_tokens=7, token_capacity=128), max_draft_tokens=7, max_images=4, image_bytes=32 << 20,
     verification_rows=0,
     # KDA, MLA except batched key/value, shared experts, latent MoE projections, and the DSpark
     # draft's context projection, attention outputs and MLPs may load as MXFP8.

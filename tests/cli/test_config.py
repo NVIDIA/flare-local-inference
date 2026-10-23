@@ -60,12 +60,10 @@ speculative_token_capacity = 8
     assert configuration.model_setting("qwen3.8-flash", "speculative_token_capacity", None, 16).value == 16
 
 
-def test_prefix_cache_settings_validate_and_forward(tmp_path):
+def test_prefix_cache_settings_validate(tmp_path):
     configuration = load(tmp_path, "[prefix_cache]\nmemory = \"4G\"\ndisk_transport = \"direct\"\n")
     assert configuration.get("prefix_cache.memory") == Setting("4G", "[prefix_cache]")
     assert configuration.directory("prefix_cache") is None
-    assert configuration.prefix_cache_flags() == ["--prefix-cache-memory", "4G", "--prefix-cache-disk-transport", "direct"]
-    assert load(tmp_path, "").prefix_cache_flags() == []
     with pytest.raises(UsageError, match="prefix_cache disk_limit"):
         load(tmp_path, "[prefix_cache]\ndisk_limit = \"lots\"\n")
     with pytest.raises(UsageError, match="disk_transport"):
@@ -115,6 +113,9 @@ def test_compiler_worker_flag_overrides_configured_host_budget(tmp_path):
     ("[defaults]\nmax_concurrency = true\n", "must be int"),
     ("[defaults]\nmax_concurrency = 0\n", "at least 1"),
     ("[defaults]\nspeculative_token_capacity = 0\n", "at least 1"),
+    ("[defaults]\nspeculative_graph_budget = 0\n", "at least 1"),
+    ("[defaults]\nspeculative_graph_budget = true\n", "must be int"),
+    ('[models."deepseek-v4.1-flash"]\nspeculative_graph_budget = -1\n', "at least 1"),
     ("[memory]\nconversation_cache = 16\n", "unknown key conversation_cache"),
     ("[memory]\nreserve = \"lots\"\n", "memory size"),
     ("[memory]\nreserve = 16\n", "must be str"),
@@ -151,3 +152,16 @@ def test_shard_size_uses_binary_units_and_flags_override_configuration(tmp_path)
     assert config.shard_size('16M') == 16 << 20
     with pytest.raises(UsageError, match='shard size'):
         load(tmp_path, '[publishing]\nshard_size = "-1G"\n')
+
+
+@pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])
+def test_autotune_effort_configuration_and_flag_precedence(tmp_path, effort):
+    from ignition.cli.preparation import tuning_effort
+
+    assert tuning_effort(load(tmp_path, "")) == "medium"
+    config = load(tmp_path, f'[preparation]\nautotune_effort = "{effort}"\n')
+    assert tuning_effort(config) == effort
+    assert tuning_effort(config, "off") == "off"
+    assert tuning_effort(config, "max") == "max"
+    with pytest.raises(UsageError, match="autotune_effort"):
+        load(tmp_path, '[preparation]\nautotune_effort = "exhaustive"\n')

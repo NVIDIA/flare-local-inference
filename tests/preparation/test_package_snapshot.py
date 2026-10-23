@@ -5,14 +5,12 @@ import json
 import os
 from pathlib import Path
 import subprocess
-import tempfile
 
 import pytest
 
 from helios.tests.signing import publisher
-from ignition.preparation.package_file import PackageFiles, _publish, read_index
-from ignition.preparation.package_snapshot import (convert, export_options, read_container, read_at)
-from ignition.preparation.protection import Protection
+from ignition.preparation.package_file import PackageFiles, read_index
+from ignition.preparation.package_snapshot import (convert, export_options, read_container)
 from tests.preparation import test_package_protection as fixtures
 
 
@@ -31,9 +29,8 @@ def profile():
 
 
 def legacy(path, index, payload, *, publisher, shard_size=0):
-    with tempfile.TemporaryDirectory() as temporary:
-        protection = Protection(index, payload, publisher, temporary, shard_size=shard_size, basename=path.stem)
-        _publish(path, index, protection.payload, protection)
+    from helios.tests.signing import publish_legacy
+    return publish_legacy(path, index, payload, publisher=publisher, shard_size=shard_size)
 
 
 def assert_native(native, path):
@@ -51,7 +48,7 @@ def test_snapshot_primary_is_metadata_only_and_native_reads_payloads(native, tmp
         with PackageFiles(path, source, base, 0) as files:
             span = index.ranks[0].resources['weights']
             source, base, _ = files.get(span.filename)
-            assert read_at(source, span.nbytes, base + span.offset) == data['weights']
+            assert source.read_at(span.nbytes, base + span.offset) == data['weights']
     for parts in layout['files'].values():
         for _, name in parts:
             if name:
@@ -146,56 +143,112 @@ def test_converter_rejects_tampered_weights_and_unknown_publisher(tmp_path, monk
 
 
 def test_shard_limit_is_hard_and_primary_is_never_published_on_failure(tmp_path):
-    from ignition.preparation.package_snapshot import BlobStore, publish_snapshot
     from ignition.preparation import package_file
+    from ignition.preparation import runtime_package_pb2 as proto
     with pytest.raises(ValueError, match='shard limit'):
-        package_file.publish(tmp_path / 'bad.safetensors', None, [], publisher=publisher(), shard_size=0)
+        package_file.publish(tmp_path / 'bad.safetensors', proto.ModelIndex(version=4, ranks=[proto.BundleIndex()]),
+                             [], publisher=publisher(), shard_size=0)
 
 
-def test_allocation_cache_hit_writes_no_staging_weights(tmp_path):
-    from ignition.preparation.runtime_package import Allocation, FileSource, _write_allocation
-    from ignition.preparation.package_snapshot import BlobStore
-    from types import SimpleNamespace
+def test_native_logical_reads_cross_blob_boundaries_and_zero_padding(tmp_path):
+    path, _ = fixtures.fixture(tmp_path, size=100)
+    with path.open('rb') as primary:
+        _, base, _, layout = read_container(primary)
+        with PackageFiles(path, primary, base, 0) as files:
+            for name, parts in layout['files'].items():
+                expected = b''.join((path.parent / filename).read_bytes()[4096:]
+                                    if filename else bytes(size) for size, filename in parts)
+                source, start, length = files.get(name)
+                assert length == len(expected)
+                source.seek(start)
+                assert source.read() == expected
+                boundary = 0
+                for size, _ in parts:
+                    boundary += size
+                    offset = max(0, boundary - 7)
+                    source.seek(start + offset)
+                    assert source.read(14) == expected[offset:offset + 14]
 
-    contents = b'w' * 65536 + bytes(65536) + b'z' * 65536
-    cuda = SimpleNamespace(download=lambda address, count: contents[address - 4096:address - 4096 + count])
-    allocation = Allocation('weight-storage', 4096, len(contents))
-    store = BlobStore(tmp_path / 'cache')
-    first, spans = _write_allocation(cuda, allocation, tmp_path / 'first.bin', blob_store=store)
-    assert isinstance(first, FileSource)
-    assert spans == [[0, 65536], [131072, 65536]]
-    assert first.path.read_bytes()[4096:] == b'w' * 65536 + b'z' * 65536
-    written = store.written
-    second, repeated = _write_allocation(cuda, allocation, tmp_path / 'second.bin',
-                                         blob_store=store, require_cached=True)
-    assert second == first and repeated == spans
-    assert store.written == written
-    assert not (tmp_path / 'first.bin').exists() and not (tmp_path / 'second.bin').exists()
+
+def test_native_export_rejects_corrupt_cached_weight_without_replacement(tmp_path):
+    cache = tmp_path / 'cache'
+    first, second = tmp_path / 'first', tmp_path / 'second'
+    first.mkdir()
+    second.mkdir()
+    with export_options(cache):
+        path, _ = fixtures.fixture(first, size=100)
+    span = read_index(path)[0].ranks[0].resources['weights']
+    with path.open('rb') as source:
+        layout = read_container(source)[3]
+    name = next(filename for _, filename in layout['files'][span.filename] if filename)
+    blob = cache / 'blobs' / name
+    blob.chmod(0o644)
+    with blob.open('r+b') as source:
+        source.seek(4096)
+        source.write(b'corrupt')
+    contents = blob.read_bytes()
+    with export_options(cache), pytest.raises(ValueError, match='cached blob'):
+        fixtures.fixture(second, size=100)
+    assert not (second / 'model.safetensors').exists()
+    assert blob.read_bytes() == contents
 
 
-def test_converter_checks_relocated_bytes_before_publishing(tmp_path, monkeypatch):
-    from ignition.preparation.package_snapshot import BlobStore
-    monkeypatch.setattr(fixtures, 'publish', legacy)
+def test_native_snapshot_segment_budget_rejects_metadata_before_payload_io(tmp_path):
+    import struct
+    from ignition.preparation.package_file import align
+
     source, _ = fixtures.fixture(tmp_path, size=100)
-    index, base = read_index(source)
-    original = BlobStore.put
-    changed = False
-
-    def mutate(self, size, blocks, **kwargs):
-        nonlocal changed
-        if not changed:
-            changed = True
-            span = index.ranks[0].resources['weights']
-            with source.open('r+b') as file:
-                file.seek(base + span.offset)
-                file.write(b'bad')
-        return original(self, size, blocks, **kwargs)
-
-    monkeypatch.setattr(BlobStore, 'put', mutate)
+    with source.open('rb') as primary:
+        _, _, envelope, _ = read_container(primary)
+    filename = 'a' * 64 + '.safetensors'
+    layout = json.dumps({'version': 1, 'files': {'': [[1, filename]] * 65537}}).encode()
+    header = json.dumps({'__metadata__': {'format': 'flare-snapshot'},
+        'flare.payload': {'dtype': 'U8', 'shape': [0], 'data_offsets': [0, 0]},
+        'flare.metadata': {'dtype': 'U8', 'shape': [len(envelope)], 'data_offsets': [0, len(envelope)]},
+        'flare.layout': {'dtype': 'U8', 'shape': [len(layout)],
+                         'data_offsets': [len(envelope), len(envelope) + len(layout)]}},
+        separators=(',', ':')).encode()
+    header = header.ljust(align(8 + len(header)) - 8, b' ')
+    invalid = tmp_path / 'invalid.safetensors'
+    invalid.write_bytes(struct.pack('<Q', len(header)) + header + envelope + layout)
     destination = tmp_path / 'converted' / 'model.safetensors'
-    with pytest.raises(ValueError, match='relocated stored-data digest mismatch'):
-        convert(source, destination, profiles=[profile()])
+    with pytest.raises(ValueError, match='segment'):
+        convert(invalid, destination, profiles=[profile()])
     assert not destination.exists()
+
+
+@pytest.mark.parametrize('stage', ['payload', 'primary'])
+def test_native_publication_failure_preserves_unrelated_files(tmp_path, stage):
+    import shutil
+    import sys
+
+    tracer = shutil.which('strace')
+    if tracer is None:
+        pytest.skip('requires strace to inject a native link failure')
+    code = ('from pathlib import Path; import sys; '
+            'from tests.preparation.test_package_protection import fixture; '
+            'fixture(Path(sys.argv[1]),size=100)')
+    baseline, failing = tmp_path / 'baseline', tmp_path / 'failing'
+    baseline.mkdir()
+    failing.mkdir()
+    trace = tmp_path / 'links.txt'
+    completed = subprocess.run([tracer, '-e', 'trace=link,linkat', '-o', str(trace), sys.executable,
+        '-c', code, str(baseline)], capture_output=True, text=True, timeout=30)
+    assert completed.returncode == 0, completed.stderr
+    links = [line for line in trace.read_text().splitlines() if line.startswith(('link(', 'linkat('))]
+    assert links and 'model.safetensors' in links[-1]
+    foreign = failing / 'unrelated.safetensors'
+    foreign.write_bytes(b'keep')
+    occurrence = 1 if stage == 'payload' else len(links)
+    operation = links[-1].split('(', 1)[0]
+    assert all(line.startswith(operation + '(') for line in links)
+    result = subprocess.run([tracer, '-e', f'inject={operation}:error=EIO:when={occurrence}',
+        '-o', str(tmp_path / 'failed-links.txt'), sys.executable, '-c', code, str(failing)],
+        capture_output=True, text=True, timeout=30)
+    assert result.returncode != 0 and 'Input/output error' in result.stderr
+    assert not (failing / 'model.safetensors').exists()
+    assert not list(failing.glob('.snapshot-*'))
+    assert foreign.read_bytes() == b'keep'
 
 
 def test_snapshot_transfers_only_selected_rank_blobs(native, tmp_path):
@@ -227,189 +280,6 @@ def test_snapshot_rejects_swapped_payload_and_wrong_blob_length(native, tmp_path
     assert result.returncode != 0
 
 
-def test_cached_blob_corruption_is_rejected_without_replacement(tmp_path):
-    from ignition.preparation.package_snapshot import BlobStore
-    store = BlobStore(tmp_path)
-    name = store.put(4, lambda: [b'data'])
-    path = store.root / name
-    path.chmod(0o644)
-    with path.open('r+b') as file:
-        file.seek(4096)
-        file.write(b'nope')
-    with pytest.raises(ValueError, match='cached blob content'):
-        store.put(4, lambda: [b'data'], required=True)
-    assert path.read_bytes()[4096:] == b'nope'
-    with pytest.raises(ValueError, match='64G'):
-        store.put(64 << 30, lambda: [])
-
-
-def test_blob_verification_retries_metadata_changes_from_a_concurrent_link(tmp_path, monkeypatch):
-    from ignition.preparation.package_snapshot import BlobStore
-
-    store = BlobStore(tmp_path)
-    name = store.put(4, lambda: [b'data'])
-    path = store.root / name
-    original = hashlib.file_digest
-    calls = []
-
-    def digest(source, algorithm):
-        result = original(source, algorithm)
-        calls.append(1)
-        if len(calls) == 1:
-            os.link(path, tmp_path / 'rank-payload')
-        return result
-
-    monkeypatch.setattr(hashlib, 'file_digest', digest)
-    BlobStore.verify(path, bytes.fromhex(name[:-12]), path.stat().st_size)
-    assert len(calls) == 2
-
-
-def test_blob_verification_retry_still_rejects_changed_content(tmp_path, monkeypatch):
-    from ignition.preparation.package_snapshot import BlobStore
-
-    store = BlobStore(tmp_path)
-    name = store.put(4, lambda: [b'data'])
-    path = store.root / name
-    path.chmod(0o644)
-    original = hashlib.file_digest
-    calls = []
-
-    def digest(source, algorithm):
-        result = original(source, algorithm)
-        calls.append(1)
-        if len(calls) == 1:
-            with path.open('r+b') as output:
-                output.seek(4096)
-                output.write(b'nope')
-        return result
-
-    monkeypatch.setattr(hashlib, 'file_digest', digest)
-    with pytest.raises(ValueError, match='cached blob content'):
-        BlobStore.verify(path, bytes.fromhex(name[:-12]), path.stat().st_size)
-    assert len(calls) == 2
-
-
-def test_blob_verification_retries_are_bounded(tmp_path, monkeypatch):
-    from ignition.preparation.package_snapshot import BlobStore
-
-    store = BlobStore(tmp_path)
-    name = store.put(4, lambda: [b'data'])
-    path = store.root / name
-    original = hashlib.file_digest
-    calls = []
-
-    def digest(source, algorithm):
-        result = original(source, algorithm)
-        calls.append(1)
-        os.link(path, tmp_path / f'rank-payload-{len(calls)}')
-        return result
-
-    monkeypatch.setattr(hashlib, 'file_digest', digest)
-    with pytest.raises(ValueError, match='cached blob changed during verification'):
-        BlobStore.verify(path, bytes.fromhex(name[:-12]), path.stat().st_size)
-    assert len(calls) == 3
-
-
-def test_logical_reads_seek_to_overlapping_blobs_and_preserve_padding(tmp_path):
-    from ignition.preparation.package_snapshot import LogicalFile
-
-    class Parts(list):
-        reads = 0
-
-        def __getitem__(self, index):
-            self.reads += 1
-            return super().__getitem__(index)
-
-    path = tmp_path / 'payload'
-    path.write_bytes(b'abcdefgh')
-    with path.open('rb') as source:
-        parts = Parts([[8, 'payload'], [3, '']] * 5000)
-        logical = LogicalFile(parts, lambda _: (source, 0, 8))
-        parts.reads = 0
-        assert logical.read_at(9, 4999 * 11 + 3) == b'defgh' + bytes(3)
-        assert parts.reads == 2
-        assert logical.read_at(3, 5000 * 11) == b''
-        assert logical.read_at(0, 3) == b''
-        assert logical.seek(-8, 2) == 5000 * 11 - 8
-        assert logical.read() == b'defgh' + bytes(3)
-        assert logical.complete_blob(4999 * 11, 8) == (source, 0)
-        assert logical.complete_blob(4999 * 11 + 1, 7) is None
-
-
-def test_cached_snapshot_signing_hashes_unchanged_weight_inode_once(tmp_path, monkeypatch):
-    from ignition.preparation.package_snapshot import BlobStore
-    from ignition.preparation.resign import resign
-
-    signer = fixtures.development_publisher()
-    cache = tmp_path / 'cache'
-    with export_options(cache):
-        source, _ = fixtures.fixture(tmp_path, signer=signer)
-        with source.open('rb') as file:
-            layout = read_container(file)[3]
-        span = read_index(source)[0].ranks[0].resources['weights']
-        weight_name = layout['files'][span.filename][0][1]
-        original = BlobStore.verify
-
-        def verify(path, *args):
-            assert Path(path).name != weight_name, 'weight bytes were already hashed from this inode'
-            return original(path, *args)
-
-        monkeypatch.setattr(BlobStore, 'verify', staticmethod(verify))
-        destination = tmp_path / 'production.safetensors'
-        resign(source, destination, publisher=publisher(), development_profile=fixtures.development_profile(signer))
-    assert destination.is_file()
-
-
-def test_blob_link_rechecks_an_inode_changed_after_verification(tmp_path):
-    from ignition.preparation.package_snapshot import BlobStore
-
-    store = BlobStore(tmp_path / 'cache')
-    name = store.put(4, lambda: [b'data'])
-    source = store.root / name
-    store.link(name, tmp_path)
-    source.chmod(0o644)
-    with source.open('r+b') as file:
-        file.seek(4096)
-        file.write(b'nope')
-    with pytest.raises(ValueError, match='cached blob content'):
-        store.link(name, tmp_path)
-
-
-def test_snapshot_syncs_blob_directory_once_before_primary(tmp_path, monkeypatch):
-    from ignition.preparation import package_file
-
-    synced = []
-    original = package_file._sync_directory
-
-    def sync(path):
-        synced.append(Path(path))
-        original(path)
-
-    monkeypatch.setattr(package_file, '_sync_directory', sync)
-    source, _ = fixtures.fixture(tmp_path)
-    cache = tmp_path / '.flare-cache' / 'blobs'
-    assert synced.count(cache) == 1
-    assert synced.index(cache) < synced.index(tmp_path)
-    assert source.is_file()
-
-
-def test_snapshot_segment_budget_fails_before_payload_io(tmp_path, monkeypatch):
-    from ignition.preparation import package_snapshot
-
-    source, _ = fixtures.fixture(tmp_path)
-    read = package_snapshot.read_at
-    monkeypatch.setattr(package_snapshot, 'MAX_BLOBS', 1)
-    monkeypatch.setattr(package_snapshot, 'read_at', lambda *args: pytest.fail('payload read before layout validation'))
-    monkeypatch.setattr(package_snapshot.BlobStore, 'put', lambda *args, **kwargs:
-                        pytest.fail('payload write before layout validation'))
-    with pytest.raises(ValueError, match='too many payload segments'):
-        convert(source, tmp_path / 'converted' / 'model.safetensors', profiles=[profile()])
-    monkeypatch.setattr(package_snapshot, 'read_at', read)
-    (tmp_path / 'new').mkdir()
-    with pytest.raises(ValueError, match='too many payload segments'):
-        fixtures.fixture(tmp_path / 'new')
-
-
 def test_snapshot_signing_rejects_weight_corruption(tmp_path):
     from ignition.preparation.resign import resign
 
@@ -429,43 +299,8 @@ def test_snapshot_signing_rejects_weight_corruption(tmp_path):
     assert not destination.exists()
 
 
-def test_cached_source_does_not_bypass_a_different_corrupt_cache_inode(tmp_path):
-    from ignition.preparation.package_snapshot import BlobStore
-
-    store = BlobStore(tmp_path / 'cache')
-    name = store.put(4, lambda: [b'data'])
-    cached = store.root / name
-    source = tmp_path / 'source'
-    source.write_bytes(cached.read_bytes())
-    cached.chmod(0o644)
-    with cached.open('r+b') as file:
-        file.seek(4096)
-        file.write(b'nope')
-    with source.open('rb') as file, pytest.raises(ValueError, match='cached blob content'):
-        store.put(4, lambda: [b'data'], source_blob=(file, 4096))
-
-
-def test_rank_packing_preserves_interleaved_ownership_and_shard_limit():
-    from ignition.preparation.package_snapshot import _resource_groups
-    from ignition.preparation import runtime_package_pb2 as proto
-
-    roles = [(kind, rank, proto.Span(offset=i * 4096, nbytes=31))
-             for i, (kind, rank) in enumerate([(2, 0), (3, 0), (2, 1), (3, 0),
-                                               (2, 0), (4, 0), (4, 0), (2, None)])]
-    groups = list(_resource_groups(roles, 12288))
-    assert [[(kind, rank) for kind, rank, _ in group] for group in groups] == [
-        [(2, 0), (3, 0)], [(2, 1)], [(3, 0), (2, 0)], [(4, 0), (4, 0)], [(2, None)]]
-    assert all(group[-1][2].offset + group[-1][2].nbytes - group[0][2].offset + 4096 <= 12288
-               for group in groups)
-
-
-def test_packing_caps_published_files_without_rejecting_legacy_layouts():
-    from ignition.preparation.package_snapshot import _resource_groups, validate_layout
-    from ignition.preparation import runtime_package_pb2 as proto
-
-    size = 32_000_000_000
-    roles = [(4, 0, proto.Span(offset=i * size, nbytes=size)) for i in range(2)]
-    assert len(list(_resource_groups(roles, 64 << 30))) == 2
+def test_snapshot_layout_preserves_64_gib_read_limit():
+    from ignition.preparation.package_snapshot import validate_layout
     validate_layout({'version': 1, 'files': {'': [[(64 << 30) - 4096, 'a' * 64 + '.safetensors']]}})
 
 

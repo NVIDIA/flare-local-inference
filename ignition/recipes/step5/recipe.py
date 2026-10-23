@@ -22,7 +22,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         raise ValueError("Step-5 preparation requires GPUs on one host")
     speculation = plan.speculation
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
+        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)), context=plan.context,
         max_active=plan.concurrency, image_concurrency=plan.image_concurrency, prefill_chunk_size=plan.prefill_chunk,
         snapshot_budget_bytes=plan.snapshots * plan.costs.state_row_bytes,
@@ -53,8 +53,8 @@ RECIPE = Recipe(name="step5", served_model_name="Step-5-Preview", prepare=prepar
         scale_compressed_device_bytes={"csf": 345_326_999_491},
         # Replicated MTP projections add up to fifteen copies of three BF16 4096x8192 matrices.
         expansion_bytes=(2 << 30) + 3 * (4096 * 8192 * 2) * 15),),
-    context=1048576, page_tokens=128, concurrency=4, max_concurrency=64, prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=3), max_draft_tokens=3, max_images=4, image_bytes=32 << 20,
+    context=1048576, page_tokens=128, concurrency=32, max_concurrency=64, prefill_chunk=4096,
+    speculation=Speculation(draft_tokens=3, token_capacity=128), max_draft_tokens=3, max_images=4, image_bytes=32 << 20,
     verification_rows=0, stream_overlap=True,
     ranks=MappingProxyType({world: RankCosts(15_667_968, 1_224_704, 8 << 30) for world in (4, 8, 16)}),
     plain_ranks=MappingProxyType({world: RankCosts(14_987_520, 1_224_704, 8 << 30) for world in (4, 8, 16)}))

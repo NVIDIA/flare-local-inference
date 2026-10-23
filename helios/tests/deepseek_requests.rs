@@ -1,5 +1,8 @@
 #![cfg(all(feature = "server", feature = "runtime-package"))]
 
+#[path = "support/native_prefix.rs"]
+mod native_prefix;
+
 use flare_helios::{frontend, model, scheduler};
 #[path = "support/frontend.rs"]
 mod support;
@@ -81,7 +84,7 @@ impl Fixture {
     fn new(encoder: PromptEncoder) -> Self {
         let asset = tokenizer_asset();
         let template = (encoder == PromptEncoder::Jinja).then(|| {
-            let text = "{{ messages | tojson }}\n{{ tools | default([]) | tojson }}\n{{ tool_choice | default('auto') }}";
+            let text = "{% mark %}{{ messages | tojson }}\n{{ tools | default([]) | tojson }}\n{{ tool_choice | default('auto') }}";
             let path = asset.path.with_extension("jinja");
             std::fs::write(&path, text).unwrap();
             Asset { path, range: None, sha256: format!("{:x}", Sha256::digest(text.as_bytes())) }
@@ -210,11 +213,41 @@ fn native_encoders_checkpoint_each_message_prefix() {
         ]);
         let prepared = fixture.prepare(json!({"messages":messages})).unwrap();
         for count in 1..=messages.as_array().unwrap().len() {
-            let prefix = fixture.frontend.render_boundary(
-                &messages.as_array().unwrap()[..count], &Map::new()).unwrap();
+            let prefix = native_prefix::without_generation(&fixture.frontend,
+                &messages.as_array().unwrap()[..count], &Map::new());
             assert!(prepared.prompt.tokens.starts_with(&prefix.token_ids));
             assert!(prepared.prompt.message_boundaries.contains(&prefix.token_ids.len()),
                 "{encoder:?}, message {count}");
+        }
+    }
+}
+
+#[test]
+fn native_boundaries_follow_merged_users_and_sorted_tool_results() {
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let fixture = Fixture::new(encoder);
+        let messages = json!([
+            {"role":"system","content":"Policy"},
+            {"role":"user","content":"First user"},
+            {"role":"user","content":"Second user"},
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"a","type":"function","function":{"name":"lookup","arguments":"{}"}},
+                {"id":"b","type":"function","function":{"name":"lookup","arguments":"{}"}}
+            ]},
+            {"role":"tool","tool_call_id":"b","content":"Result B"},
+            {"role":"tool","tool_call_id":"a","content":"Result A"}
+        ]);
+        let prepared = fixture.prepare(json!({"messages":messages})).unwrap();
+        let text = &prepared.rendered_prompt;
+        assert!(text.contains("First user\n\nSecond user"));
+        assert!(text.find("Result A").unwrap() < text.find("Result B").unwrap());
+        let token_end = |suffix: &str| {
+            let byte = text.find(suffix).unwrap() + suffix.len();
+            fixture.frontend.encode(&text[..byte], false).unwrap().len()
+        };
+        assert!(!prepared.prompt.message_boundaries.contains(&token_end("First user")));
+        for suffix in ["Policy", "Second user", "Result A</tool_result>", "Result B</tool_result>"] {
+            assert!(prepared.prompt.message_boundaries.contains(&token_end(suffix)), "{encoder:?}: {suffix}");
         }
     }
 }
@@ -421,10 +454,40 @@ fn base64_images_follow_the_rendered_placeholder_order() {
     assert_eq!(actual.pixel_values, expected.pixel_values);
     assert_eq!(actual.geometry.len(), 2);
     assert_eq!(request.rendered_prompt, rendered.text);
-    let complete_message = f.frontend.render_boundary(messages.as_array().unwrap(), &Map::new()).unwrap();
+    let complete_message = native_prefix::without_generation(&f.frontend, messages.as_array().unwrap(), &Map::new());
     let complete_message = flare_helios::model::prepare_input(&f.config, &f.frontend,
         Some(&processor), &complete_message,
         vec![processor.decode_png(&green).unwrap(), processor.decode_png(&red).unwrap()]).unwrap();
     assert!(request.prompt.tokens.starts_with(&complete_message.tokens));
     assert!(request.prompt.message_boundaries.contains(&complete_message.tokens.len()));
+}
+
+#[test]
+fn decision_generation_prompt_prepares_a_nonthinking_first_assistant_token() {
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let mut fixture = Fixture::new(encoder);
+        fixture.config.max_top_logprobs = 1;
+        let prepared = fixture
+            .prepare(json!({
+                "messages":[
+                    {"role":"system","content":"Select one label."},
+                    {"role":"user","content":"State: charged twice"},
+                    {"role":"assistant","content":"State received."},
+                    {"role":"user","content":"Question: refund? A: false B: true\nAnswer:"}
+                ],
+                "chat_template_kwargs":{"enable_thinking":false,"add_generation_prompt":true},
+                "max_tokens":1,"ignore_eos":true,"logprobs":true
+            }))
+            .unwrap();
+        assert!(prepared.rendered_prompt.contains("Answer:"));
+        assert!(prepared.rendered_prompt.ends_with("</think>"));
+        assert_eq!(
+            prepared.prompt.tokens,
+            fixture
+                .frontend
+                .encode(&prepared.rendered_prompt, false)
+                .unwrap()
+        );
+        assert_eq!(prepared.output.content.start, OutputStart::Content);
+    }
 }

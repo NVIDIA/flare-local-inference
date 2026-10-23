@@ -334,7 +334,7 @@ pub struct Rates {
     pub verify: f64,
     /// Accepted drafts per draft-offering request round; `None` without such rounds.
     pub acceptance: Option<f64>,
-    /// Verified draft positions per verification graph; `None` without verification.
+    /// Allocated draft positions per progressing decode or verification request round.
     pub depth: Option<f64>,
     /// Weight bytes read per second: verification graphs per second times the bytes one decode
     /// step reads, as the package declares; zero when it declares none.
@@ -377,7 +377,7 @@ impl History {
             }
         };
         let rounds = snapshot.draft_rounds.saturating_sub(before.draft_rounds);
-        let verifications = snapshot.verify_steps.saturating_sub(before.verify_steps);
+        let verifications = snapshot.verification_rounds.saturating_sub(before.verification_rounds);
         self.rates = Rates {
             prefill: per_second(snapshot.prefill_tokens, before.prefill_tokens),
             generated: per_second(snapshot.generated_tokens, before.generated_tokens),
@@ -531,7 +531,7 @@ fn render_overview(frame: &mut Frame, history: &History, area: Rect) {
     let rows = Layout::vertical([
         Constraint::Min(8),
         Constraint::Min(8),
-        Constraint::Length(5),
+        Constraint::Length(4),
     ])
     .split(area);
     let top =
@@ -580,16 +580,6 @@ fn render_overview(frame: &mut Frame, history: &History, area: Rect) {
                 s.prefill_tokens, s.generated_tokens, s.reused_tokens
             ))
             .style(Style::default().fg(MUTED)),
-            Line::from(format!(
-                " WEIGHTS {}   {} per decode step",
-                weight_bandwidth(s, r),
-                if s.decode_weight_bytes == 0 {
-                    "undeclared bytes".to_owned()
-                } else {
-                    gibibytes(s.decode_weight_bytes)
-                }
-            ))
-            .style(Style::default().fg(MUTED)),
             kv_tokens,
             Line::from(format!(
                 " HOST CACHE {} hits   {} reused   {} in memory / {} on disk   {} out / {} in",
@@ -610,7 +600,8 @@ fn render_overview(frame: &mut Frame, history: &History, area: Rect) {
 pub type Series = (&'static str, Color, fn(Rates) -> f64);
 
 /// Draws `series` from the history's rate points as Braille lines over the last
-/// 120 seconds in a rounded block titled `title`, scaled to 115% of the peak.
+/// 120 seconds in a rounded block titled `title`, with 15% headroom.
+/// The upper label shows the observed maximum across the series.
 pub fn plot(frame: &mut Frame, area: Rect, title: &str, history: &History, series: &[Series]) {
     let now = history.points.back().map_or(0.0, |(time, _)| *time);
     let points: Vec<Vec<_>> = series
@@ -627,8 +618,12 @@ pub fn plot(frame: &mut Frame, area: Rect, title: &str, history: &History, serie
         .iter()
         .flatten()
         .map(|(_, value)| *value)
-        .fold(1.0, f64::max)
-        * 1.15;
+        .fold(0.0, f64::max);
+    // Borders, the x-axis and its labels occupy four rows outside the plot.
+    let label_rows = area.height.saturating_sub(4).max(2) as usize;
+    let mut labels = vec![Line::default(); label_rows];
+    labels[label_rows - 1] = rate(peak).into();
+    labels[label_rows - 2] = "max".into();
     let datasets = series
         .iter()
         .zip(&points)
@@ -663,8 +658,8 @@ pub fn plot(frame: &mut Frame, area: Rect, title: &str, history: &History, serie
             )
             .y_axis(
                 Axis::default()
-                    .bounds([0.0, peak])
-                    .labels(["0".to_owned(), rate(peak)])
+                    .bounds([0.0, peak.max(1.0) * 1.15])
+                    .labels(labels)
                     .style(Style::default().fg(MUTED)),
             ),
         area,
@@ -761,7 +756,8 @@ mod tests {
             generated_tokens: 8,
             draft_steps: 7,
             verify_steps: 1,
-            verification_drafts: 5,
+            verification_drafts: 7,
+            verification_rounds: 3,
             accepted_drafts: 6,
             draft_rounds: 2,
             ..Default::default()
@@ -772,7 +768,8 @@ mod tests {
             generated_tokens: 10,
             draft_steps: 8,
             verify_steps: 2,
-            verification_drafts: 8,
+            verification_drafts: 10,
+            verification_rounds: 5,
             accepted_drafts: 7,
             draft_rounds: 3,
             ..Default::default()
@@ -780,7 +777,7 @@ mod tests {
         history.sample(start + Duration::from_secs(2), last);
         assert_eq!(history.rates.prefill, 150.0);
         assert_eq!(history.rates.generated, 5.0);
-        assert_eq!(history.rates.depth, Some(4.0));
+        assert_eq!(history.rates.depth, Some(2.0));
         assert_eq!(history.rates.verify, 1.0);
         assert_eq!(history.rates.acceptance, Some(7.0 / 3.0));
         for tick in 3..=130 {
@@ -795,6 +792,7 @@ mod tests {
             start + Duration::from_secs(131),
             Snapshot {
                 verify_steps: last.verify_steps + 1,
+                verification_rounds: last.verification_rounds + 2,
                 ..last
             },
         );
@@ -822,6 +820,7 @@ mod tests {
                     draft_steps: tick * 12,
                     verify_steps: tick * 3,
                     verification_drafts: tick * 12,
+                    verification_rounds: tick * 6,
                     accepted_drafts: tick * 7,
                     draft_rounds: tick * 3,
                     ..cache

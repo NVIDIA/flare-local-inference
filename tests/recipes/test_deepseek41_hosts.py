@@ -25,7 +25,8 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
 
     gpus = tuple(planning.Gpu(i, "GB10", f"GPU-{i}", 128 << 30, 120 << 30, (12, 1)) for i in range(4))
     plan = planning.fit(recipe.RECIPE, recipe.RECIPE.checkpoints[0], gpus, concurrency=16,
-        reserve_bytes=6 << 30, speculation=Speculation(draft_tokens=draft_tokens, token_capacity=128),
+        reserve_bytes=6 << 30, speculation=Speculation(draft_tokens=draft_tokens, token_capacity=128,
+            packed_verification=True, draft_prefix_selection="gpu"),
         expert_scale_compression="csf")
     ranks = SimpleNamespace(hosts=("hertz", "faraday", "ampere", "maxwell")) if remote else None
     calls, result, storage = [], object(), object()
@@ -37,7 +38,7 @@ def test_recipe_dispatches_the_complete_plan_to_the_rank_group(monkeypatch, remo
     assert config.devices == ((0,) * 4 if remote else (0, 1, 2, 3))
     assert config.hosts == (ranks.hosts if remote else None)
     assert config.max_active == 16 and config.draft_tokens == draft_tokens
-    assert (16, draft_tokens + 1) in config.speculative_shapes
+    assert (16, 16 * (draft_tokens + 1)) in config.packed_speculative_shapes
     assert config.expert_scale_compression == "csf" and config.split_speculation
     assert kwargs["ranks"] is ranks and kwargs["checkpoint"] is plan.checkpoint
     assert kwargs["package_storage"] is storage
@@ -69,5 +70,5 @@ def test_remote_channels_cover_vocab_and_sampling_results_without_pcie(monkeypat
         from ignition.components.speculation import SpeculativeAcceptance
 
         layouts = (PreparedDraftDistribution.broadcast_layout(16),
-                   SpeculativeAcceptance.storage_layout(16, draft_tokens + 1))
+                   SpeculativeAcceptance.broadcast_layout(16, draft_tokens + 1))
         assert calls[0]["gather_bytes"] >= max(packed_broadcast_layout(layout.values())[1] for layout in layouts)

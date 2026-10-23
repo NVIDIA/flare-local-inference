@@ -21,7 +21,8 @@ MODELS = {
 
 @pytest.mark.parametrize("model", MODELS)
 @pytest.mark.parametrize("operation", ["pre", "post_pre"])
-def test_composed_mhc_matches_reference(operation, model):
+@pytest.mark.parametrize("norm_dtype", [torch.bfloat16, torch.float32])
+def test_composed_mhc_matches_reference(operation, model, norm_dtype):
     from b12x.preparation import PreparationSession
     from b12x.testing.mhc import post_reference, pre_reference
 
@@ -36,7 +37,7 @@ def test_composed_mhc_matches_reference(operation, model):
     rows, (hidden, eps) = 1024, MODELS[model]
     weights = MHCWeights(torch.randn(24, 4 * hidden, device="cuda") * 0.02, torch.rand(3, device="cuda") * 0.5,
                          torch.randn(24, device="cuda") * 0.3,
-                         (torch.rand(hidden, device="cuda") + 0.5).to(torch.bfloat16))
+                         (torch.rand(hidden, device="cuda") + 0.5).to(norm_dtype))
     residual = torch.randn(rows, 4, hidden, device="cuda").to(torch.bfloat16)
     inputs = (residual,)
     if operation == "post_pre":

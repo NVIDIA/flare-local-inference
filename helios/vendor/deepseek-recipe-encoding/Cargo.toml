@@ -1,0 +1,16 @@
+[package]
+name = "deepseek-recipe-encoding"
+version = "0.1.0"
+edition = "2024"
+description = "Conversation rendering and token encoding for DeepSeek V4 and V4.1 prompts."
+documentation = "https://docs.rs/deepseek-recipe-encoding"
+license = "MIT"
+repository = "https://github.com/deepseek-ai/deepseek-recipe"
+
+[dependencies]
+deepseek-recipe-core = { git = "https://github.com/deepseek-ai/deepseek-recipe", rev = "8cadfede7063c896b944e7bae05daa3549ae97ea" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["preserve_order"] }
+thiserror = "2.0"
+tokenizers = { version = "=0.23.2", features = ["http"] }
+tracing = "0.1"

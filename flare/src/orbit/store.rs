@@ -199,6 +199,10 @@ pub struct GroupSpec {
     pub roce_ring: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transfer_streams: Option<u8>,
+    /// Serve over a chain in rank order; exclusive with `roce_ring`. A record without the field
+    /// loads as not a chain.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub roce_chain: bool,
     /// Controller-local executable override; absent sends the controller's running binary.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub executable: Option<PathBuf>,
@@ -409,6 +413,7 @@ mod tests {
             gpus: vec![0],
             roce_ring: true,
             transfer_streams: Some(8),
+            roce_chain: false,
             executable: Some("/bin/flare-pinned".into()),
             publisher_keys: vec!["/keys/publisher.json".into()],
             trust_store: Some("/keys/trust.toml".into()),

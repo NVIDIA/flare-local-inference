@@ -19,14 +19,19 @@ pub struct StartupProgress {
 
 impl StartupProgress {
     pub fn stderr() -> Self {
-        let mut progress = Self {
+        let mut progress = Self::stderr_rows();
+        progress.animate_banner();
+        progress
+    }
+
+    /// Displays progress rows without the Flare startup banner.
+    pub fn stderr_rows() -> Self {
+        Self {
             enabled: true,
             terminal: std::io::stderr().is_terminal(),
             output: Arc::new(Mutex::new(Output::default())),
             animation: None,
-        };
-        progress.animate_banner();
-        progress
+        }
     }
 
     pub fn silent() -> Self {

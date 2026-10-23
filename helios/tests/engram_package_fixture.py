@@ -22,6 +22,7 @@ def prepare(root, shard_size=64 << 30, table_world=1):
         from ignition.components.engram import EngramInputs, PreparedEngramLookup
         from ignition.components.parallel import TensorParallelShard
         from ignition.components.ngram_delivery import publish_requests
+        from ignition.components.readiness import ReadinessTimings
         from ignition.preparation.execution import PreparedExecution, GraphSignature
         from ignition.recipes.deepseek41.engram import Tables
 
@@ -39,11 +40,11 @@ def prepare(root, shard_size=64 << 30, table_world=1):
         warmup = torch.ones((32, 32), device=device)
         torch.mm(warmup, warmup)
         torch.cuda.synchronize()
-        inputs = EngramInputs.allocate(4, device)
+        frame = torch.zeros(1, dtype=torch.int32, device=device)
+        inputs = EngramInputs.allocate(4, device, timings=ReadinessTimings.allocate(frame, 1))
         output = torch.empty((4, 6144), dtype=torch.bfloat16, device=device)
         count = torch.full((1,), 4, dtype=torch.int32, device=device)
         source = torch.zeros(1, dtype=torch.int32, device=device)
-        frame = torch.zeros(1, dtype=torch.int32, device=device)
         sequence = torch.zeros(1, dtype=torch.int64, device=device)
         transfer_source = torch.zeros(1 << 20, dtype=torch.uint8, device=device)
         transfer_target = torch.empty_like(transfer_source)

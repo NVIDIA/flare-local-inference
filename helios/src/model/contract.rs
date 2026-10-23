@@ -50,15 +50,15 @@ contract_enum!(ValueSource {
     EosTokenIds = 26, EosCount = 27, PromptHistogram = 28, GrammarMask = 29,
     GrammarEnabled = 30, CopyTokenIds = 31, CopyTokenCount = 32,
     CopyConsumedTokens = 33, CopyGeneration = 34, CopyGrammarMask = 35,
-    CopyGrammarCount = 36, ImageTensor = 37, ImageFeatureSlot = 38, PromptTargetToken = 39,
+    CopyGrammarCount = 36, ImageTensor = 37, ImageFeatureSlot = 38, PromptTargetToken = 39, SpeculativePrefixLimit = 40,
 });
 contract_enum!(InputIndexing { Scalar = 1, SubmissionRow = 2, RequestRow = 3, PackedToken = 4, ActiveRow = 5 });
 contract_enum!(StateAccessKind { Read = 1, Write = 2, ReadWrite = 3 });
-contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4 });
-contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2 });
-contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7 });
-contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7 });
-contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, Proposal = 10, Verification = 11, ScoredPrefill = 12 });
+contract_enum!(ToolParserKind { QwenCoder = 1, GlmArgumentTags = 2, Dsml = 3, Xtml = 4, MiniMaxXml = 5 });
+contract_enum!(ReasoningParserKind { ThinkTags = 1, XtmlThink = 2, MmThink = 3 });
+contract_enum!(ImagePreparationKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, PatchMerge = 9 });
+contract_enum!(ImageLayoutKind { Qwen = 1, Mimo = 2, Deepseek = 3, Moonvit = 4, Step = 5, Radio = 6, DeepseekRowMajor = 7, Glm = 8, Bracketed = 9 });
+contract_enum!(GraphOperation { Init = 1, Restore = 2, Snapshot = 3, Prefill = 4, Decode = 5, Resume = 6, Vision = 7, Speculative = 8, Mixed = 9, Proposal = 10, Verification = 11, ScoredPrefill = 12, PackedSpeculative = 13 });
 
 impl TryFrom<GraphKind> for GraphOperation {
     type Error = crate::Error;
@@ -77,6 +77,7 @@ impl TryFrom<GraphKind> for GraphOperation {
             GraphKind::Mixed => Self::Mixed,
             GraphKind::Proposal => Self::Proposal,
             GraphKind::Verification => Self::Verification,
+            GraphKind::PackedSpeculative => Self::PackedSpeculative,
         })
     }
 }
@@ -440,6 +441,17 @@ impl PreparedContract {
                     return Err("host input bindings require contiguous prepared storage".into());
                 }
             }
+            let prefix: Vec<_> = graph.inputs.iter().filter(|input| input.source == ValueSource::SpeculativePrefixLimit).collect();
+            if descriptor.kind == GraphKind::PackedSpeculative {
+                if prefix.len() != 1 || graph.inputs.iter().any(|b| b.source == ValueSource::QueryLength)
+                    || prefix[0].indexing != InputIndexing::SubmissionRow
+                    || prefix[0].value_offset != 0 || prefix[0].padding != 0
+                    || manifest.buffer(&prefix[0].buffer)?.dtype != crate::execution::Dtype::Int32 {
+                    return Err("packed combined graph requires one int32 submission prefix ceiling and device-owned query lengths".into());
+                }
+            } else if !prefix.is_empty() {
+                return Err("speculative prefix ceilings require a packed combined operation".into());
+            }
             for access in &graph.state {
                 access.view.validate(manifest)?;
             }
@@ -505,6 +517,7 @@ impl PreparedContract {
                     | GraphKind::Speculative
                     | GraphKind::Proposal
                     | GraphKind::Verification
+                    | GraphKind::PackedSpeculative
                     | GraphKind::Mixed
             ) && !graph.inputs.iter().any(|b| {
                 matches!(
@@ -574,6 +587,7 @@ impl FrontendContract {
             let (open, close) = match reasoning.kind {
                 ReasoningParserKind::ThinkTags => ("<think>", "</think>"),
                 ReasoningParserKind::XtmlThink => ("<|open|>think<|sep|>", "<|close|>think<|sep|>"),
+                ReasoningParserKind::MmThink => ("<mm:think>", "</mm:think>"),
             };
             if reasoning.open != open
                 || reasoning.close != close

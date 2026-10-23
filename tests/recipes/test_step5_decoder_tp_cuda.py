@@ -45,7 +45,7 @@ def _rank(rank, world, rendezvous, snapshot):
     try:
         with PackageStorage(rank=rank, world=world, device=rank) as storage:
             coordinator = CollectivePreparation(dist.group.WORLD)
-            runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=36,
+            runtime = create_all_reduce_runtime(dist.group.WORLD, device, max_tokens=49,
                 hidden_size=config.hidden, element_bytes=4, ipc=storage.peer_storage)
             graph = torch.cuda.CUDAGraph()
             try:
@@ -53,11 +53,11 @@ def _rank(rank, world, rendezvous, snapshot):
                 pools = [ContinuationPool.for_model(config, shard, 2, 1, device, mtp=False) for _ in range(2)]
                 with RecordedPreparationSession(device=device, checkpoint="step5-dense-decoder",
                         workload_schema="bf16-transport", numerical_policy="fp32-residual",
-                        coordinator=coordinator) as session:
+                        coordinator=coordinator, compile_workers=4) as session:
                     session.register_scratch(arena)
                     common = {"runtime": runtime, "coordinator": coordinator, "session": session, "workspace": arena}
                     pairs = []
-                    for rows in (1, 4, 7, 36):
+                    for rows in (1, 4, 7, 36, 48, 49):
                         metadata = Metadata.allocate(rows, 1, 1, device)
                         metadata.positions.copy_(torch.arange(rows, device=device))
                         metadata.state_rows.fill_(1)

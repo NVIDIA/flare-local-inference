@@ -18,7 +18,7 @@ class PreparedResume:
         self.local_logits = torch.empty((rows, 154880 // weights.shard.world_size),
             dtype=torch.bfloat16, device=self.state.hidden.device)
         self.logits = torch.empty((rows, 154880), dtype=torch.bfloat16, device=self.state.hidden.device)
-        self.projection = PreparedVocabularyProjection(self.state.hidden, weights.tree.lm_head.weight,
+        self.projection = PreparedVocabularyProjection(self.state.hidden, weights.head,
             self.local_logits, self.logits, runtime=vocabulary_runtime, coordinator=coordinator,
             session=session, name=f"{name}.lm_head")
         arguments = (requests, inputs.row_slot_ids[:rows], inputs.row_generations[:rows], inputs.live_rows,

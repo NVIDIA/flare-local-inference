@@ -27,7 +27,7 @@ def layout(**overrides):
                   widths=(1, 2, 3), state_rows_per_request=1, draft_pages=1, record_fields=24)
     values.update(overrides)
     from ignition.preparation import contract as c, runtime_package_pb2 as p
-    bindings = {name: list(c.text_inputs(kind).values()) for (kind, _, _), name in values["graphs"].items()}
+    bindings = {name: list(c.text_inputs(key[0]).values()) for key, name in values["graphs"].items()}
     specs = {}
     for fields in bindings.values():
         for b in fields:
@@ -356,9 +356,10 @@ def test_acceptance_follows_helios_depth_estimates():
 
 
 def test_layout_selects_the_serving_variant_of_each_graph():
-    class Signature:
-        def __init__(self, kind, batch, tokens, enabled):
-            self.kind, self.batch_capacity, self.token_capacity, self.speculation_enabled = kind, batch, tokens, enabled
+    from ignition.preparation.execution import GraphSignature
+
+    def Signature(kind, batch, tokens, enabled):
+        return GraphSignature(kind, batch, tokens, speculation_enabled=enabled)
 
     class Tensor:
         def __init__(self, *shape):
@@ -412,3 +413,196 @@ def test_native_confidence_uses_conditional_survival_without_observed_acceptance
     assert acceptance.expected(4) == pytest.approx(1 + .8 + .8 * .25 + .8 * .25 * .5)
     acceptance.observe(3, 0, True)
     assert acceptance.expected(4) == pytest.approx(2.1)
+
+
+def packed_layout(*, combined=True):
+    kind = "packed_speculative" if combined else "speculative"
+    graphs = {("speculative", batch, 1): f"width-one-{batch}" for batch in (1, 2, 4)}
+    graphs.update({(kind, 4, 6, capacity, 5 if combined else 0): f"packed-{capacity}"
+                   for capacity in (4, 8, 16, 24)})
+    return layout(graphs=graphs, widths=(1, 6),
+                  paired_graphs=frozenset() if combined else frozenset(f"packed-{p}" for p in (4, 8, 16, 24)),
+                  completion_cursors={f"packed-{p}": 1 for p in (4, 8, 16, 24)})
+
+
+def ready_packed(*, combined=True, capacity=4, remaining=(20, 20, 20)):
+    scheduler = Scheduler(packed_layout(combined=combined), prefix_cache=False)
+    requests = [request(i, [10, 11], limit=n + 1) for i, n in enumerate(remaining)]
+    for current in requests:
+        scheduler.submit(current)
+    scheduler._admit()
+    for current in requests:
+        current.phase, current.consumed, current.generated = "decode", 2, [42]
+    for shape in scheduler.layout.graphs:
+        scheduler.policy.costs.observe(shape, 1_000_000 if len(shape) == 5 and shape[3] == capacity else 100_000_000)
+    return scheduler, requests
+
+
+def packed_records(scheduler, step, offers=(1, 0, 0)):
+    rows = records(scheduler, step, {
+        lane.request: (1, lane.start + offered + 1, [43] * (offered + 1), 0, offered, offered)
+        for lane, offered in zip(step.lanes, offers)})
+    return rows
+
+
+def test_packed_round_selects_each_physical_capacity_and_uploads_immutable_ceilings():
+    from dataclasses import FrozenInstanceError
+    for capacity in (4, 8, 16, 24):
+        scheduler, requests = ready_packed(capacity=capacity)
+        step = scheduler.plan()
+        assert (step.kind, step.graph, step.batch, step.width, step.packed_tokens, step.draft_tokens) == (
+            "packed_speculative", f"packed-{capacity}", 4, 6, capacity, 5)
+        assert step.sequence == 1 and tuple(lane.tokens for lane in step.lanes) == (6, 6, 6)
+        packed = uploads(scheduler, step)
+        assert packed["speculative_prefix_limits"] == {0: [6, 6, 6, 0]}
+        assert "query_lengths" not in packed
+        with pytest.raises(FrozenInstanceError):
+            step.lanes[0].tokens = 1
+        assert all(len(r.pages) >= scheduler._pages_needed(r, 0) for r in requests)
+
+
+def test_packed_round_commits_ragged_terminal_feedback_and_confidence_once():
+    scheduler, requests = ready_packed()
+    step = scheduler.plan()
+    rows = packed_records(scheduler, step)
+    confidence = [[.8] * 5, [.4] * 5, [.2] * 5, [float('nan')] * 5]
+    scheduler.complete(step, rows, 2_000_000, confidence=confidence)
+    assert [len(r.generated) for r in requests] == [3, 2, 2]
+    assert [r.consumed for r in requests] == [4, 3, 3]
+    assert [r.rounds for r in requests] == [1, 1, 1]
+    assert requests[0].acceptance.expected(3) == pytest.approx(1 + .8 + .8 ** 2)
+    assert scheduler.policy.costs.duration(*step.shape) > 1_000_000
+    with pytest.raises(CompletionError, match="stale"):
+        scheduler.complete(step, rows, confidence=confidence)
+    assert [len(r.generated) for r in requests] == [3, 2, 2]
+
+
+@pytest.mark.parametrize('damage', ['generation', 'sequence', 'status', 'negative-offer', 'ceiling', 'accepted',
+                                   'physical', 'width', 'token', 'tail', 'reserved', 'base-reserved', 'model-reserved', 'copy-mask',
+                                   'cursor', 'output', 'confidence', 'sidecar'])
+def test_invalid_packed_terminal_batch_changes_no_request_or_cost(damage):
+    scheduler, requests = ready_packed()
+    step = scheduler.plan()
+    rows = packed_records(scheduler, step)
+    confidence = np.full((4, 5), .75)
+    row = rows[requests[-1].slot]
+    if damage == 'generation': row[0] += 1
+    elif damage == 'sequence': row[1] += 1
+    elif damage == 'status': row[5] = 0
+    elif damage == 'negative-offer': row[9] = -1
+    elif damage == 'ceiling': row[9] = 6
+    elif damage == 'accepted': row[10] = 1
+    elif damage == 'physical': row[9] = 1
+    elif damage == 'width': row[15] = 5
+    elif damage == 'token': row[4] = row[16] = VOCABULARY
+    elif damage == 'tail': row[17] = 0
+    elif damage == 'reserved': row[14] = 1
+    elif damage == 'base-reserved': row[7] = 1
+    elif damage == 'model-reserved': row[12] = 0
+    elif damage == 'copy-mask':
+        rows = packed_records(scheduler, step, (0, 0, 1))
+        rows[requests[-1].slot, 11] = 1
+    elif damage == 'cursor': row[13] += 1
+    elif damage == 'output': row[3] = requests[-1].max_new_tokens + 1
+    elif damage == 'confidence': confidence[2, 4] = float('nan')
+    elif damage == 'sidecar': confidence = None
+    before = [(r.consumed, list(r.generated), r.rounds, r.acceptance.expected(6)) for r in requests]
+    costs = scheduler.policy.costs.estimates()
+    with pytest.raises(CompletionError):
+        scheduler.complete(step, rows, 7_000_000, confidence=confidence)
+    assert before == [(r.consumed, r.generated, r.rounds, r.acceptance.expected(6)) for r in requests]
+    assert scheduler.policy.costs.estimates() == costs
+    assert not scheduler.rounds and not scheduler.steps
+
+
+def test_packed_ceilings_bound_output_context_and_device_errors_remain_visible():
+    scheduler, requests = ready_packed(remaining=(1, 2, 20))
+    requests[2].consumed = scheduler.layout.context - 2
+    step = scheduler.plan()
+    assert step.kind == 'packed_speculative'
+    assert [lane.tokens for lane in step.lanes] == [1, 2, 2]
+    rows = packed_records(scheduler, step, (0, 0, 0))
+    rows[requests[0].slot, 5] = 2
+    row = rows[requests[1].slot]
+    row[:8] = (requests[1].generation, step.sequence, requests[1].consumed, len(requests[1].generated), -1, 3, 256, 0)
+    row[8:16] = (0, 0, 0, 0, -1, -1, 0, 1)
+    row[16:] = -1
+    confidence = np.full((4, 5), .75)
+    confidence[1] = float('nan')
+    retired = scheduler.complete(step, rows, confidence=confidence)
+    assert retired == requests[:2]
+    assert requests[0].finish_reason == 'length' and requests[1].error == 256
+    assert scheduler.device_errors[256] == 1
+
+
+def test_separate_packed_verification_keeps_capacity_and_allocates_host_lengths():
+    scheduler, _ = ready_packed(combined=False)
+    step = scheduler.plan()
+    assert (step.kind, step.graph, step.sequence, step.packed_tokens) == ('speculative', 'packed-4', 2, 4)
+    assert sum(lane.tokens for lane in step.lanes) == 4
+    packed = uploads(scheduler, step)
+    assert packed['query_lengths'] == {0: [2, 1, 1, 0]}
+    assert 'speculative_prefix_limits' not in packed
+
+
+def test_layout_reads_real_combined_catalog_and_retains_all_c32_p128_shapes():
+    from types import SimpleNamespace
+    import torch
+    from ignition.components.capacity import speculative_shapes
+    from ignition.preparation.execution import GraphSignature
+
+    shapes = speculative_shapes(32, (1, 2, 3, 4, 5, 6), 128)
+    graphs = {('speculative', batch, 1): f'width-one-{batch}' for batch, width in shapes if width == 1}
+    graphs.update({('packed_speculative', batch, 6, batch * width, 5): f'packed-{batch}-{batch * width}'
+                   for batch, width in shapes if width > 1})
+    fixture = layout(capacity=32, max_active=32, widths=(1, 2, 3, 4, 5, 6), graphs=graphs)
+    signatures = {name: GraphSignature(*key[:3], tuple(fixture.bindings[name][i]['buffer']
+                  for i in range(len(fixture.bindings[name]))), speculation_enabled=True,
+                  packed_token_capacity=key[3] if len(key) == 5 else 0,
+                  draft_tokens=key[4] if len(key) == 5 else None)
+                  for key, name in graphs.items()}
+    buffers = {name: torch.from_numpy(np.zeros(shape, dtype=dtype))
+               for name, (dtype, shape) in fixture.buffer_specs.items()}
+    buffers['completion_records'] = torch.zeros((2, 32, 24), dtype=torch.int64)
+    config = dict(max_sequence_tokens=4096, pages=64, snapshots=2, prefill_chunk_size=512,
+                  speculative_widths=[1, 2, 3, 4, 5, 6], frontend=dict(eos_token_ids=[7]),
+                  model_contract=dict(vocabulary=VOCABULARY,
+                    cache=dict(page_tokens=256, page_tables=[dict(buffer=name, page_offset=offset)
+                               for name, offset in fixture.page_views.items()]),
+                    graphs=[dict(graph=name, inputs=bindings, state_rows_per_request=1, draft_cursor=dict(lag_tokens=1))
+                            for name, bindings in fixture.bindings.items()]))
+    actual = Layout.of(SimpleNamespace(server_config=config, buffers=buffers,
+                                       signatures=signatures, max_active=32))
+    assert actual.graphs == graphs and len(actual.packed_shapes) == 28
+    assert all(lag == 1 for lag in actual.completion_cursors.values())
+    assert len(actual.paired_graphs) == 0
+    scheduler = Scheduler(actual, prefix_cache=False)
+    requests = [request(i, [10, 11], limit=20) for i in range(32)]
+    for current in requests:
+        scheduler.submit(current)
+    scheduler._admit()
+    for current in requests:
+        current.phase, current.consumed, current.generated = 'decode', 2, [42]
+    step = scheduler.plan()
+    assert (step.kind, step.batch, step.width, step.packed_tokens, step.draft_tokens) == (
+        'packed_speculative', 32, 6, 128, 5)
+    assert len(step.lanes) == 32 and sum(lane.tokens for lane in step.lanes) == 192
+    assert uploads(scheduler, step)['speculative_prefix_limits'] == {0: [6] * 32}
+
+
+@pytest.mark.parametrize('bad_cursor', [False, True])
+def test_packed_completion_honors_explicit_absence_of_a_draft_cursor(bad_cursor):
+    scheduler, requests = ready_packed()
+    step = scheduler.plan()
+    scheduler.layout.completion_cursors[step.graph] = None
+    rows = packed_records(scheduler, step)
+    for lane in step.lanes:
+        rows[lane.request.slot, 13] = -1
+    if bad_cursor:
+        rows[requests[-1].slot, 13] = 0
+        with pytest.raises(CompletionError, match='history cursor'):
+            scheduler.complete(step, rows, confidence=np.full((4, 5), .75))
+        assert all(r.generated == [42] for r in requests)
+    else:
+        scheduler.complete(step, rows, confidence=np.full((4, 5), .75))
+        assert [len(r.generated) for r in requests] == [3, 2, 2]

@@ -1,5 +1,9 @@
 """Admission limits and power-of-two capacities for prepared request batches."""
 
+from fractions import Fraction
+import heapq
+from math import isqrt
+
 MAX_CONCURRENCY = 64
 BATCH_CAPACITIES = (1, 2, 4, 8, 16, 32, 64)
 
@@ -65,12 +69,52 @@ def speculative_shapes(concurrency, widths, token_capacity=None):
                  if width == 1 or batch * width <= capacity)
 
 
+def packed_speculative_shapes(concurrency, width, token_capacity=None, graph_budget=64):
+    """Refine physical row capacities with a bounded, nested packed graph catalog.
+
+    Every eligible batch retains its smallest positive draft budget and largest
+    physical capacity. Additional graphs split the largest multiplicative row
+    gap at its integer geometric midpoint, minimizing the remaining padding ratio.
+    Width-one graphs are separate and do not consume this budget. Budgets beyond
+    the complete integer capacity range saturate without duplicate graphs.
+    """
+    batches = batch_capacities(concurrency)
+    if type(width) is not int or not 2 <= width <= 8:
+        raise ValueError("packed verification width must be an integer in [2, 8]")
+    capacity = speculative_token_capacity(concurrency, width, token_capacity)
+    shapes, intervals = set(), []
+    total = 0
+
+    def interval(batch, lower, upper):
+        if upper - lower > 1:
+            heapq.heappush(intervals, (-Fraction(upper, lower), batch, lower, upper))
+
+    for batch in batches:
+        lower, upper = batch + 1, min(capacity, batch * width)
+        if lower <= upper:
+            shapes.update(((batch, lower), (batch, upper)))
+            total += upper - lower + 1
+            interval(batch, lower, upper)
+    if type(graph_budget) is not int or graph_budget < len(shapes):
+        raise ValueError(f"speculative graph budget must be an integer of at least {len(shapes)} "
+                         "to cover packed capacity endpoints")
+    while len(shapes) < min(graph_budget, total):
+        _, batch, lower, upper = heapq.heappop(intervals)
+        root = isqrt(lower * upper)
+        candidates = (value for value in (root, root + 1) if lower < value < upper)
+        middle = min(candidates, key=lambda value:
+                     (max(Fraction(value, lower), Fraction(upper, value)), value))
+        shapes.add((batch, middle))
+        interval(batch, lower, middle)
+        interval(batch, middle, upper)
+    return tuple(sorted(shapes))
+
+
 def proposal_shapes(concurrency, drafts):
-    """Proposal blocks cover every request batch and selectable draft depth."""
+    """Full configured proposal blocks cover every request batch."""
     if type(drafts) is not int or not 1 <= drafts <= 7:
         raise ValueError("proposal depth must be in [1, 7]")
-    return tuple((batch, depth) for batch in batch_capacities(concurrency)
-                 for depth in range(drafts, 0, -1))
+    return tuple((batch, drafts) for batch in batch_capacities(concurrency))
 
 
 def mixed_shapes(concurrency, chunk_size, widths=(1,), token_capacity=None):

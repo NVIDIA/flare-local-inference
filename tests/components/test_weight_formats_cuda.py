@@ -235,6 +235,10 @@ def test_ordinary_fp4_experts_graph(tmp_path, monkeypatch, fmt, mode, compressio
     probabilities = torch.ones((2, 1), dtype=torch.float32, device="cuda")
     with PreparationSession(device=x.device, autotune=False, compile_workers=0) as session:
         operation = PreparedRoutedExperts(x, experts, ids, probabilities, out, session=session, name="moe")
+        assert operation.plan.query.a4_prefill is False
+        with pytest.raises(ValueError, match="a4_prefill differs from the prepared numerical contract"):
+            fused_moe.bind(operation.plan, a=x, topk_ids=ids, topk_weights=probabilities,
+                output=out, scratch=operation.scratch, a4_prefill=True)
         graph = torch.cuda.CUDAGraph()
         with torch.cuda.graph(graph):
             operation()

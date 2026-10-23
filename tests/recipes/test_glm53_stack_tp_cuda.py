@@ -94,8 +94,9 @@ def _rank(rank, world, rendezvous, snapshot, capacity, generate=False, sockets=(
     manifest = inspect_indexed_checkpoint(Path(snapshot))
     weights = ModelWeights.load(manifest, device, shard=shard, progress=progress)
     assert len(weights.layers) == 45
-    assert weights.tree.lm_head.weight.shape == (154880 // world, 4096)
-    assert not weights.tree.lm_head.weight.is_meta
+    head = weights.head if isinstance(weights.head, torch.Tensor) else weights.head.weight.values
+    assert head.shape == (154880 // world, 4096)
+    assert not head.is_meta
     dist.init_process_group("gloo", init_method=rendezvous, rank=rank, world_size=world,
                             timeout=timedelta(minutes=15))
     group = dist.group.WORLD

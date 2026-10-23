@@ -8,7 +8,7 @@ impl<T> OwnerLease<T> {
 
 impl<T> Drop for OwnerLease<T> {
     fn drop(&mut self) {
-        // An unconfirmed drain must never free memory still referenced by CUDA.
+        // An unconfirmed drain must never release resources still used by native work.
         if let Some(owner) = self.0.take() {
             std::mem::forget(owner);
         }

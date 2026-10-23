@@ -11,7 +11,7 @@ from ignition.errors import UsageError
 from ignition.recipes import aliases, recipes, resolve
 
 
-@pytest.mark.parametrize("command", ["run", "export", "serve"])
+@pytest.mark.parametrize("command", ["export", "serve"])
 def test_mla_arithmetic_flag_defaults_and_override(command):
     arguments = [command, "deepseek-v4.1-flash", *(["--output", "model.safetensors"] if command == "export" else [])]
     default = _parser().parse_args(arguments)
@@ -20,7 +20,7 @@ def test_mla_arithmetic_flag_defaults_and_override(command):
     assert explicit.mla_compute_mode == "bf16"
 
 
-@pytest.mark.parametrize("command", [[], ["run"], ["export"], ["serve"]])
+@pytest.mark.parametrize("command", [[], ["export"], ["serve"]])
 def test_help_lists_every_recipe(command, capsys):
     with pytest.raises(SystemExit) as error:
         main([*command, "--help"])
@@ -31,9 +31,11 @@ def test_help_lists_every_recipe(command, capsys):
     for alias in aliases():
         assert alias in output
     assert "Drafts (default/max)" in output
+    assert "--packed-verification" not in output
+    assert "--draft-prefix-selection" not in output
 
 
-@pytest.mark.parametrize("command", ["run", "export", "serve"])
+@pytest.mark.parametrize("command", ["export", "serve"])
 def test_model_help_explains_step5_limits_and_compression(command, capsys):
     with pytest.raises(SystemExit) as error:
         main([command, "step5-preview-nvfp4", "--help"])
@@ -42,7 +44,7 @@ def test_model_help_explains_step5_limits_and_compression(command, capsys):
     output = captured.out
     assert "--gpus: select 4, 8, 16 GPUs" in output
     assert "--mtp-draft-tokens: 0..3; default 3" in output
-    assert "--max-concurrency: 1..64; recipe default 4" in output
+    assert "--max-concurrency: 1..64; recipe default 32" in output
     assert "--expert-scale-compression [MODE]" in output
     assert "estimated 6% less resident weight storage" in output
     assert "MODE: csf" in output
@@ -72,6 +74,36 @@ assert not {'torch', 'transformers', 'flare_heliopause', 'huggingface_hub', 'pyn
     assert result.returncode == 0, result.stderr
 
 
+@pytest.mark.parametrize("command", ["export", "serve"])
+def test_deepseek41_help_reports_packed_gpu_recipe_defaults(command, capsys):
+    with pytest.raises(SystemExit) as error:
+        main([command, "deepseek-v4.1-flash", "--help"])
+    assert error.value.code == 0
+    output = capsys.readouterr().out
+    assert "--max-concurrency: 1..64; recipe default 32" in output
+    assert "--prefill-chunk-size: 64..1048576, multiple of 64; default 4096" in output
+    assert "--mtp-draft-tokens: 0..7; default 5" in output
+    assert "--speculative-token-capacity: at least drafts + 1; default 128" in output
+    assert "--speculative-graph-budget: positive integer; default 64" in output
+    assert "excludes mandatory width-one and ordinary graphs" in output
+    assert "Prepared verification: packed rows with GPU prefix selection" in output
+    assert "--packed-verification" not in output
+    assert "--draft-prefix-selection" not in output
+    assert "Target rows are shared across retained request prefixes" in output
+    assert "Packed rounds need more target rows than active requests" in output
+
+
+@pytest.mark.parametrize("command", ["export", "serve"])
+def test_qwen_help_reports_concurrency_and_target_row_defaults(command, capsys):
+    with pytest.raises(SystemExit) as error:
+        main([command, "qwen3.8-flash", "--help"])
+    assert error.value.code == 0
+    output = capsys.readouterr().out
+    assert "--max-concurrency: 1..64; recipe default 32" in output
+    assert "--speculative-token-capacity: at least drafts + 1; default 128" in output
+    assert "Prepared verification: rectangular rows" in output
+
+
 def test_optional_features_follow_the_selected_recipe(capsys):
     for recipe in recipes():
         checkpoint = recipe.checkpoints[0]
@@ -84,6 +116,21 @@ def test_optional_features_follow_the_selected_recipe(capsys):
         assert ("--expert-scale-compression" in details) == bool(checkpoint.scale_compressed_device_bytes)
 
 
+@pytest.mark.parametrize("command", ["export", "serve"])
+def test_all_recipe_help_reports_concurrency_and_speculative_capacity_defaults(command, capsys):
+    for recipe in recipes():
+        for checkpoint in recipe.checkpoints:
+            with pytest.raises(SystemExit) as error:
+                main([command, checkpoint.alias, "--help"])
+            assert error.value.code == 0
+            output = capsys.readouterr().out
+            assert "--max-concurrency: 1..64; recipe default 32" in output
+            if recipe.speculation is None:
+                assert "Multi-token speculation: unavailable" in output
+            else:
+                assert "--speculative-token-capacity: at least drafts + 1; default 128" in output
+
+
 @pytest.mark.parametrize("flag", [["--expert-scale-compression"], ["--expert-scale-compression", "csf"],
                                   ["--expert-scale-compression=csf"]])
 def test_export_command_accepts_bare_and_explicit_compression(flag):
@@ -94,7 +141,7 @@ def test_export_command_accepts_bare_and_explicit_compression(flag):
     assert args.expert_scale_compression == "csf"
     assert (args.prefill_chunk_size, args.mtp_draft_tokens, args.speculative_token_capacity,
             args.max_concurrency) == (4096, 3, 16, 16)
-    assert _parser().parse_args(["run", "step5-preview-nvfp4"]).expert_scale_compression is None
+    assert _parser().parse_args(["export", "step5-preview-nvfp4"]).expert_scale_compression is None
 
 
 def test_invalid_compression_is_rejected_with_the_supported_encoding(capsys):
@@ -107,3 +154,13 @@ def test_invalid_compression_is_rejected_with_the_supported_encoding(capsys):
 def test_mistyped_alias_suggests_step5():
     with pytest.raises(UsageError, match="did you mean 'step5-preview-nvfp4'"):
         resolve("step4-preview-nvfp4")
+
+
+@pytest.mark.parametrize("command", ["export", "serve"])
+@pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])
+def test_autotune_effort_flag(command, effort):
+    args = [command, "deepseek-v4.1-flash"]
+    assert _parser().parse_args(args).autotune_effort is None
+    assert _parser().parse_args([*args, "--autotune-effort", effort]).autotune_effort == effort
+    with pytest.raises(SystemExit):
+        _parser().parse_args([*args, "--autotune-effort", "exhaustive"])

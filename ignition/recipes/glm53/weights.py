@@ -1,4 +1,4 @@
-"""GLM checkpoint weights partitioned for b12x TP2 and TP4 execution."""
+"""GLM checkpoint weights preserving per-projection precision across TP partitions."""
 
 from __future__ import annotations
 
@@ -40,7 +40,7 @@ class MTPWeights:
     attention: dict[str, object]
     mlp: MoEWeights
     tensors: dict[str, torch.Tensor]
-    # NVFP4 copy of this rank's vocabulary shard for draft proposals; None keeps the BF16 head.
+    # Proposal head; None uses the target vocabulary projection at checkpoint precision.
     draft_head: object | None = None
 
 
@@ -51,7 +51,7 @@ class ModelWeights:
     Embeddings and normalization are replicated. Vocabulary weights partition
     their output rows. Routed layers either share one scale-expansion workspace
     and execute serially, or hold their CSF block scales expanded once at load.
-    Vision weights are outside this text stack.
+    Vision weights are replicated when image graphs are prepared.
     """
 
     tree: torch.nn.Module
@@ -59,11 +59,13 @@ class ModelWeights:
     layers: tuple[LayerWeights, ...]
     expert_scale_scratch: tuple[torch.Tensor, torch.Tensor] | None
     allocated_bytes: int
+    head: object
     mtp: MTPWeights | None = None
+    vision: object | None = None
 
     @classmethod
     def load(cls, manifest, device, *, shard, progress=None, mtp=False, expert_activation="a4",
-             expand_expert_scales=False):
+             expand_expert_scales=False, language_model_only=False):
         import torch
 
         from .model import create_model_tree
@@ -85,20 +87,29 @@ class ModelWeights:
                 path, attribute = name.rsplit(".", 1)
                 setattr(tree.get_submodule(path), attribute,
                         torch.nn.Parameter(loader.load_tensor(name), requires_grad=False))
-            tree.lm_head.weight = torch.nn.Parameter(loader.load_tensor("lm_head.weight",
-                extent=slice(*shard.partition(tree.lm_head.out_features, alignment=64))), requires_grad=False)
-            tree.lm_head.out_features = tree.lm_head.weight.shape[0]
+            head = loader.load_linear("lm_head", rows=shard.partition(tree.lm_head.out_features, alignment=64))
+            if isinstance(head, torch.Tensor):
+                tree.lm_head.weight = torch.nn.Parameter(head, requires_grad=False)
+            tree.lm_head.out_features = head.shape[0] if isinstance(head, torch.Tensor) else head.out_features
             scales = None if expand_expert_scales else loader.allocate_expert_scale_scratch()
             for index in range(len(tree.model.language_model.layers)):
                 layers.append(LayerWeights(loader.load_attention(index), loader.load_mlp(index, scale_scratch=scales),
                                            loader.load_residual(index)))
             draft = loader.load_mtp(scales) if mtp else None
-            if draft is not None:
+            if draft is not None and isinstance(head, torch.Tensor):
                 from ignition.components.vocabulary import nvfp4_draft_head
 
-                draft = replace(draft, draft_head=nvfp4_draft_head(tree.lm_head.weight))
+                draft = replace(draft, draft_head=nvfp4_draft_head(head))
+        vision = None
+        if not language_model_only:
+            from .vision import VisionWeights
+
+            with DirectWeightLoader(manifest, device, prefixes=("model.visual.",),
+                                    progress=progress if shard.rank == 0 else None,
+                                    progress_label="Load vision weights") as loader:
+                vision = VisionWeights.load(tree.model.visual, loader)
         torch.cuda.synchronize(device)
-        return cls(tree, shard, tuple(layers), scales, torch.cuda.memory_allocated(device) - before, draft)
+        return cls(tree, shard, tuple(layers), scales, torch.cuda.memory_allocated(device) - before, head, draft, vision)
 
 
 class GlmWeightLoader(DirectWeightLoader):
@@ -123,7 +134,9 @@ class GlmWeightLoader(DirectWeightLoader):
         if (config.get("model_type") != "glm5_next"
                 or config.get("architectures") != ["Glm5NextForConditionalGeneration"]):
             raise ValueError("GLM weights require Glm5NextForConditionalGeneration")
-        text = config["text_config"]
+        from transformers.models.glm5_next.configuration_glm5_next import Glm5NextConfig
+
+        text = Glm5NextConfig.from_dict(config).text_config.to_dict()
         for key, expected in {
             "hidden_size": 4096, "num_hidden_layers": 45, "intermediate_size": 12288,
             "moe_intermediate_size": 2048, "n_routed_experts": 288, "n_shared_experts": 1,
@@ -138,7 +151,7 @@ class GlmWeightLoader(DirectWeightLoader):
 
     def _selected_names(self):
         return {name for name in super()._selected_names()
-                if name.startswith(TEXT_PREFIX + ".") or name == "lm_head.weight"}
+                if name.startswith((TEXT_PREFIX + ".", "lm_head."))}
 
     def _layer(self, layer):
         if type(layer) is not int or not 0 <= layer <= 45:
@@ -154,14 +167,12 @@ class GlmWeightLoader(DirectWeightLoader):
             return self._load_kda(prefix)
         head_channels = self.shard.partition(64 * 256, alignment=256)
         result = {"indexer.wq_b": self._projection(f"{prefix}.indexer.wq_b")}
-        # Every projection of the layer input shares one GEMM: low-rank query, latent, index key and head weights.
-        result["qkv_a_proj"] = self.load_linear_group(
+        # Adjacent projections share a GEMM only when their stored precision is compatible.
+        result["qkv_a_proj"] = self.load_mixed_linear_group(
             tuple(f"{prefix}.{name}" for name in ("q_a_proj", "kv_a_proj_with_mqa", "indexer.wk", "indexer.weights_proj")))
         result["q_b_proj"] = self._projection(f"{prefix}.q_b_proj", rows=head_channels)
-        from ignition.preparation.quantization import linear_format
-
-        if linear_format(self.quantization, f"{prefix}.kv_b_proj") != "mxfp8":
-            raise ValueError(f"{prefix}.kv_b_proj: MLA absorption requires MXFP8 weights")
+        if self.linear_format(f"{prefix}.kv_b_proj") not in ("mxfp8", "bfloat16"):
+            raise ValueError(f"{prefix}.kv_b_proj: MLA absorption requires BF16 or MXFP8 weights")
         result["kv_b_proj"] = self.load_linear_group(
             (f"{prefix}.kv_b_proj",), row_ranges=(self.shard.partition(64 * 512, alignment=512),))
         result["o_proj"] = self._projection(f"{prefix}.o_proj", columns=head_channels)
@@ -177,7 +188,7 @@ class GlmWeightLoader(DirectWeightLoader):
         heads = self.shard.partition(64)
         result = {name: self._projection(f"{prefix}.{name}", rows=channels)
                   for name in ("f_b_proj", "g_b_proj")}
-        result["input_proj"] = self.load_linear_group(
+        result["input_proj"] = self.load_mixed_linear_group(
             tuple(f"{prefix}.{name}" for name in ("q_proj", "k_proj", "v_proj", "b_proj", "f_a_proj")),
             row_ranges=(channels,) * 3 + (heads, None))
         result["g_a_proj"] = self._projection(f"{prefix}.g_a_proj")
@@ -192,16 +203,12 @@ class GlmWeightLoader(DirectWeightLoader):
         return result
 
     def load_mlp(self, layer, *, scale_scratch=None):
-        import torch
-
         prefix = self._layer(layer) + ".mlp"
         if layer < 3:
             extent = self.shard.partition(12288)
-            gate_up = torch.cat([self.load_tensor(f"{prefix}.{name}.weight", extent=slice(*extent))
-                                 for name in ("gate_proj", "up_proj")])
-            down = self.load_tensor(f"{prefix}.down_proj.weight", extent=(slice(None), slice(*extent)))
-            if gate_up.dtype != torch.bfloat16 or down.dtype != torch.bfloat16:
-                raise ValueError("GLM dense MLPs require stored BF16 weights")
+            gate_up = self.load_linear_group(tuple(f"{prefix}.{name}" for name in ("gate_proj", "up_proj")),
+                                            row_ranges=(extent, extent))
+            down = self._projection(f"{prefix}.down_proj", columns=extent)
             return MLPWeights(gate_up, down)
         extent = self.shard.partition(2048, alignment=128)
         shared_prefix = prefix + ".shared_experts"

@@ -85,9 +85,9 @@ endpoint and published as a checkpoint that owns the prompt's complete pages;
 later identical prompts share those pages and restore the partial page into a
 private one, as in Helios.
 
-**Decode rounds** (`ignition/direct/policy.py`) are chosen as Helios chooses
-among its decode candidates (`select_plan` in `helios/src/scheduler/policy.rs`,
-described in [scheduling-runtime-design.md](scheduling-runtime-design.md)),
+**Decode rounds** (`ignition/direct/policy.py`) for rectangular catalogs are
+chosen as Helios chooses among its decode candidates (`select_plan` in
+`helios/src/scheduler/policy.rs`, described in [scheduling-runtime-design.md](scheduling-runtime-design.md)),
 so a fault that depends on particular graphs meets them as often as under
 Helios. Every prepared batch capacity up to the concurrency's power of two
 competes at every loaded verification width, or at the fixed width without
@@ -115,6 +115,18 @@ The diagnostic scheduler does not retain proposals across steps or regroup
 requests using fresh confidence. Those behaviors are exercised through native
 Helios serving.
 
+For combined packed-round catalogs, a candidate retains its graph operation,
+request capacity, logical verification width, physical target-row capacity, and
+proposal depth. Timing and cost estimates identify that complete shape. Cohort scoring uses conditional
+confidence from completed rounds; width-one graphs compete independently. The
+host freezes each request's prefix ceiling from its pending input, captured
+width and depth, remaining output, and context budget. The combined graph
+generates proposals and allocates actual prefixes on the GPU within those
+ceilings and its aggregate physical capacity. Before committing a successful
+batch, direct execution validates terminal completion and confidence for all
+submitted requests. It does not retain proposals across steps or regroup requests
+using fresh confidence.
+
 The scheduling clock, which ages requests and expires estimates, advances by
 each step's graph time, and by wall time only while the loop waits for
 requests. Helios's clock is wall time, but its host work between rounds is
@@ -125,9 +137,11 @@ would otherwise age every request and expire estimates sooner than under Helios.
 as in Helios's shared packer: state-row indices, row slots and
 generations, page and draft page tables, token IDs, query lengths, sampling
 flags, state-transfer commands and admission rows. Bytes it does not write
-keep their resident values, as with native partial uploads. Completion records
-are validated against the step before any state changes; a record that
-contradicts it stops execution.
+keep their resident values, as with native partial uploads. Combined packed
+rounds bind `SPECULATIVE_PREFIX_LIMIT` and leave query lengths to the captured
+GPU allocator.
+Completion records are validated against the step before any state changes;
+a record that contradicts it stops execution.
 
 **Execution** (`ignition/direct/executor.py`). A rank copies each upload through
 pinned staging on one stream, writes the frame index and submission sequence,

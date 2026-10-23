@@ -27,8 +27,9 @@ def fp32_reference_precision():
 
 
 @pytest.mark.parametrize("tf32_exact_weights", (False, True))
+@pytest.mark.parametrize("norm_dtype", (torch.bfloat16, torch.float32))
 @torch.no_grad()
-def test_row_bounded_post_pre_alternates_native_capacities(tf32_exact_weights):
+def test_row_bounded_post_pre_alternates_native_capacities(tf32_exact_weights, norm_dtype):
     device = torch.device("cuda", 0)
     residual, branch, fn, scale, bias = make_inputs(
         tokens=8192, hidden_size=4096, seed=6811, device=device)
@@ -37,7 +38,7 @@ def test_row_bounded_post_pre_alternates_native_capacities(tf32_exact_weights):
         # retaining FP32 values that a BF16 weight copy would lose.
         fn.copy_(fn.view(torch.int32).bitwise_and(-8192).view(torch.float32))
         assert not torch.equal(fn, fn.bfloat16().float())
-    norm = torch.linspace(.5, 1.5, 4096, device=device).bfloat16()
+    norm = torch.linspace(.5, 1.5, 4096, device=device).to(norm_dtype)
     post = torch.ones((8192, 4), device=device)
     comb = torch.eye(4, device=device).expand(8192, -1, -1).contiguous()
     inputs = branch, residual, post, comb

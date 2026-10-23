@@ -7,6 +7,15 @@ from ignition.preparation.package_file import DEFAULT_SHARD_SIZE
 
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from ignition.preparation.protection import Publisher
+if __package__:
+    from . import legacy_package
+else:
+    import legacy_package
+
+publish_legacy = legacy_package.publish_legacy
+extend_cluster_legacy = legacy_package.extend_cluster
+resource_key = legacy_package.resource_key
+chunk_aad = legacy_package.chunk_aad
 
 
 def publisher():
@@ -14,28 +23,9 @@ def publisher():
                      'flare-tests', 'https://huggingface.co/flare-tests/fixture')
 
 
-def publish_legacy(path, index, payload, *, publisher=None, shard_size=64 << 30):
-    """Create version 4/5 containers for compatibility and corruption fixtures."""
-    from pathlib import Path
-    from tempfile import TemporaryDirectory
-    from ignition.preparation.package_file import _publish
-    from ignition.preparation.protection import Protection
-
-    if publisher is None:
-        return _publish(path, index, payload)
-    with TemporaryDirectory() as stage:
-        copied = type(index)()
-        copied.CopyFrom(index)
-        protection = Protection(copied, payload, publisher, stage,
-                                shard_size=shard_size, basename=Path(path).stem)
-        return _publish(path, copied, protection.payload, protection)
-
-
 def export_cluster_package(prepared, images, storage, path, *, peer_files, options, export_id, world,
                            publisher, peer_inventories, progress=None, shard_size=DEFAULT_SHARD_SIZE):
     """Create signed cluster containers for version 4/5 compatibility fixtures."""
-    from ignition.preparation.package_file import extend_cluster, publish, read_index
-    from ignition.preparation.protection import resource_roles
 
     if publisher is None:
         raise ValueError("final model publication requires a signing publisher")
@@ -49,11 +39,11 @@ def export_cluster_package(prepared, images, storage, path, *, peer_files, optio
 
     try:
         package = export_model(prepared, images, storage, partial, options=options, progress=progress)
-        extend_cluster(partial, peer_files, (world, export_id))
-        index, start = read_index(partial)
+        extend_cluster_legacy(partial, peer_files, (world, export_id))
+        index, start = legacy_package.read_index(partial)
         payload = sorted((span.offset, partial, start + span.offset, span.nbytes)
-                         for _, _, span in resource_roles(index))
-        publish(path, index, payload, publisher=publisher, shard_size=shard_size)
+                         for _, _, span in legacy_package.resource_roles(index))
+        publish_legacy(path, index, payload, publisher=publisher, shard_size=shard_size)
         print_inventory([package.memory_inventory, *peer_inventories], console=getattr(progress, "console", None))
     finally:
         partial.unlink(missing_ok=True)

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import partial
 
 import torch
 from b12x.attention import paged_kv_write, qsa
@@ -13,6 +14,7 @@ from transformers.models.qwen4_exp.modeling_qwen4_exp import apply_rotary_pos_em
 from ignition.components import sm103
 from ignition.components.sm103_sparse_attention import PARTIAL_ROWS, SPLIT_ROWS, PreparedSparseAttention
 from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.preparation.fixtures import qsa as qsa_fixtures
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
 
@@ -261,7 +263,10 @@ class PreparedAttention:
             return PreparedCall(run=lambda: materialized.run_for_preparation(binding, **self.dynamic()),
                                 owners=prime_owners(workspace, storage, binding))
 
-        declare(session, (self.plan.request(name=f"{name}.qsa", prepare_call=prepare),))
+        benchmark_inputs = qsa_fixtures.input_factory(caps, self.binding_kwargs, self.dynamic(),
+            storage=getattr(session, "benchmark_storage", None))
+        declare(session, (self.plan.request(name=f"{name}.qsa", prepare_call=prepare,
+            benchmark_call=partial(qsa_fixtures.benchmark_call, inputs=benchmark_inputs, workspace=workspace)),))
         def refresh():
             self.workspace = planned_scratch(self.plan.scratch_specs(), workspace)
             self.binding = qsa.bind(self.plan, scratch=self.workspace, **self.binding_kwargs)

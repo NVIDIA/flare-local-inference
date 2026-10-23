@@ -5,7 +5,7 @@ from time import monotonic
 
 import torch
 
-from ignition.progress import phase
+from ignition.progress import graph_catalog, phase
 
 from .aot import ForwardCache
 from .compilation import _defer_full_collection
@@ -15,7 +15,7 @@ from .compilation import _defer_full_collection
 def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
                      progress=None, label="Prepare serving graphs", cache_root=None, retain_graphs=False,
-                     warmup_storage=None,
+                     warmup_storage=None, capture_names=None,
                      compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
     """Retain compiled callables and capture with an optional b12x IPC runtime.
 
@@ -23,6 +23,13 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     Only graph-local intermediates may use the shared graph memory pool;
     serving replays variants serially and may choose them in any order.
     """
+    if (progress is not None and not getattr(session, "_graph_catalog_reported", False)
+            and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)):
+        graph_catalog(progress, (signatures[name] for name in functions))
+        session._graph_catalog_reported = True
+    names = tuple(functions) if capture_names is None else tuple(capture_names)
+    if len(set(names)) != len(names) or not set(names) <= functions.keys():
+        raise ValueError("capture selection must name distinct prepared forwards")
     graphs, compiled = {}, {}
     warmup = nullcontext if warmup_storage is None else warmup_storage.transient
     if compile_decoder:
@@ -30,7 +37,7 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                              headroom_bytes=getattr(session, "headroom_bytes", 0),
                              compile_workers=getattr(session, "requested_compile_workers", None))
         forwards = {name: function for name, function in functions.items()
-                    if signatures[name].kind in compile_kinds}
+                    if name in names and signatures[name].kind in compile_kinds}
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
             compiled = cache.prepare_many(forwards, signatures, progress=progress,
@@ -38,8 +45,9 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
         stream.synchronize()
     elif materialize is not None:
         materialize()
-    with phase(progress, label, total=len(functions)) as stage:
-        for name, function in functions.items():
+    with phase(progress, label, total=len(names)) as stage:
+        for name in names:
+            function = functions[name]
             started = monotonic()
             stream.wait_stream(torch.cuda.current_stream(device))
             with warmup(), torch.cuda.stream(stream):

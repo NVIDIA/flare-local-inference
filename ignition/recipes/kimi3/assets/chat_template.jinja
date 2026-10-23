@@ -83,7 +83,7 @@
     {{- raise_exception('Kimi K3 reasoning effort must be low, high, or max') -}}
 {%- endif -%}
 {{- internal('thinking-effort', '`thinking_effort` guides on how much to think in your thinking channel (not including the response channel), supported values include `low`, `medium`, `high`, and `max`.\nNow the system is invoked with `thinking_effort=' + effort + '`.') -}}
-{%- for m in messages -%}
+{%- mark ns.segments | length -%}{%- for m in messages -%}
     {%- if loop.index0 >= ns.next_message -%}
         {%- if m.role == 'tool' -%}
             {%- set run = namespace(items=[], matched=true, done=false) -%}
@@ -103,8 +103,8 @@
             {%- endfor -%}
             {%- set ns.next_message = loop.index0 + run.items | length -%}
             {%- set ordered = run.items | sort(attribute='position') if run.matched else run.items -%}
-            {%- for item in ordered -%}{{- message(item.message, item.name if run.matched else none) -}}{%- endfor -%}
-        {%- else -%}{{- message(m) -}}{%- endif -%}
+            {%- for item in ordered -%}{{- message(item.message, item.name if run.matched else none) -}}{%- mark ns.segments | length -%}{%- endfor -%}
+        {%- else -%}{{- message(m) -}}{%- mark ns.segments | length -%}{%- endif -%}
     {%- endif -%}
 {%- endfor -%}
 {%- if tool_choice == 'required' -%}
@@ -121,7 +121,7 @@
     {%- endif -%}
     {{- internal('response-format', body) -}}
 {%- endif -%}
-{%- if add_generation_prompt -%}
+{%- mark ns.segments | length -%}{%- if add_generation_prompt -%}
     {{- open('message', [('role', 'assistant')]) -}}{{- open('think') -}}
 {%- endif -%}
 {{- ns.segments | tojson(ensure_ascii=false) -}}

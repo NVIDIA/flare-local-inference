@@ -5,8 +5,8 @@ the same checkpoint storage runs through FlashInfer:
 
 * NVFP4 experts with NVFP4 activations, including CSF-encoded scales, use
   trtllm-gen's routed FP4 MoE. Compressed scales are expanded losslessly once
-  during loading and stay resident per layer. FC1 inputs are quantized once
-  with the checkpoint's shared FC1 input scale; FC2 inputs are quantized per
+  during loading and stay resident per layer. FC1 inputs retain each expert's
+  checkpoint scale, quantizing separate routed rows when scales differ. FC2 inputs are quantized per
   expert in trtllm-gen's FC1 epilogue with each expert's FC2 input scale.
 * W4A16 NVFP4 experts use FlashInfer's CuTe-DSL NVFP4xBF16 grouped GEMMs.
 
@@ -175,9 +175,7 @@ def prepare_trtllm_nvfp4_experts(w13, s13, w2, s2, scale_vectors, *, swiglu_limi
     ``s13``/``s2`` are expanded row-major E4M3 scales. ``scale_vectors`` holds
     the FC1 and FC2 weight global scales followed by the FC1 and FC2
     activation global scales (reciprocal checkpoint input scales). FC1 inputs
-    are quantized once for every route, with the largest checkpoint input scale
-    when experts differ (as vLLM's trtllm-gen path does); each expert's FC1
-    dequantization uses that shared scale.
+    are quantized once for shared scales, or once per route for distinct scales.
     """
     from flashinfer.fused_moe.core import (
         _maybe_get_cached_w3_w1_permute_indices,
@@ -193,8 +191,7 @@ def prepare_trtllm_nvfp4_experts(w13, s13, w2, s2, scale_vectors, *, swiglu_limi
         _vector(v, experts, w13.device, name) for v, name in zip(scale_vectors, (
             "FC1 weight global scales", "FC2 weight global scales",
             "FC1 activation global scales", "FC2 activation global scales"), strict=True))
-    # The smallest activation global scale is the largest input scale: no expert's inputs clip.
-    a1 = a1.min().expand_as(a1)
+    shared_input_scale = bool((a1 == a1[0]).all())
     cache = {}
     w13_rows = _maybe_get_cached_w3_w1_permute_indices(cache, w13[0], 128, is_gated_act_gemm=True)
     s13_rows = _maybe_get_cached_w3_w1_permute_indices(
@@ -211,7 +208,7 @@ def prepare_trtllm_nvfp4_experts(w13, s13, w2, s2, scale_vectors, *, swiglu_limi
     as_device = partial(torch.as_tensor, dtype=torch.float32, device=device)
     return TrtllmNvfp4Experts(
         w13=w13, w13_scale=scales13, w2=w2, w2_scale=scales2,
-        input_global_scale=as_device(a1[:1]),
+        input_global_scale=as_device(a1[:1] if shared_input_scale else a1),
         output1_scale=as_device(a2 * gate),
         output1_gate_scale=as_device(gate),
         output2_scale=as_device(w2_global / a2),
@@ -258,6 +255,7 @@ class RoutedExpertsQuery:
     hidden_size: int
     intermediate_size: int
     top_k: int
+    routed_inputs: bool = False
 
 
 @cache
@@ -266,9 +264,9 @@ def _trtllm_tactics(query: RoutedExpertsQuery):
 
     configs = _trtllm().trtllm_get_valid_moe_configs(
         int(DtypeTrtllmGen.E2m1), int(DtypeTrtllmGen.E2m1), int(Fp8QuantizationType.NoneFp8),
-        query.top_k, query.hidden_size, query.hidden_size, query.intermediate_size,
+        1 if query.routed_inputs else query.top_k, query.hidden_size, query.hidden_size, query.intermediate_size,
         query.num_experts, int(ActivationType.Swiglu), True, int(WeightLayout.MajorK), False,
-        query.num_tokens, False)
+        query.num_tokens * (query.top_k if query.routed_inputs else 1), False)
     return tuple((int(tile), int(config)) for tile, config in configs)
 
 
@@ -297,7 +295,7 @@ def _w4a16_tactics(query: RoutedExpertsQuery):
 
 TRTLLM_CONTRACT = native_contract(component_id="flare.moe.sm103_trtllm_nvfp4",
                                   query_type=RoutedExpertsQuery, tactics=_trtllm_tactics,
-                                  semantic_version=2)
+                                  semantic_version=3)
 # Bump a contract's semantic version whenever its tactic space or launch semantics change,
 # so cached selections from earlier spaces are never looked up.
 W4A16_CONTRACT = native_contract(component_id="flare.moe.sm103_cute_w4a16",
@@ -313,7 +311,7 @@ def _scratch_bytes(query):
     """NVFP4 activations and their row-major scales, padded to 16 rows as FlashInfer writes them."""
     if query.kind != "trtllm_nvfp4":
         return 0
-    tokens, hidden = query.num_tokens, query.hidden_size
+    tokens, hidden = query.num_tokens * (query.top_k if query.routed_inputs else 1), query.hidden_size
     return _aligned(tokens * hidden // 2) + _aligned((tokens + 15) // 16 * 16 * hidden // 16)
 
 
@@ -321,8 +319,51 @@ _REDUCE_BLOCK = 512
 
 
 @triton.jit
+def _quantize_routes(Source, Ids, Globals, Values, Scales, ROWS: tl.constexpr,
+                     HIDDEN: tl.constexpr, TOP_K: tl.constexpr):
+    """NVFP4 rows in token/route order, preserving each routed expert's FC1 scale."""
+    rows = tl.program_id(0) * 4 + tl.arange(0, 4)
+    columns = tl.program_id(1) * 512 + tl.arange(0, 512)
+    valid = rows < ROWS
+    expert = tl.load(Ids + rows, valid, 0)
+    global_scale = tl.load(Globals + expert)
+    reciprocal = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", constraints="=f,f",
+        args=[global_scale], dtype=tl.float32, is_pure=True, pack=1)
+    a = tl.load(Source + (rows // TOP_K)[:, None] * HIDDEN + columns[None, :] * 2,
+        valid[:, None] & (columns[None, :] * 2 < HIDDEN), 0).to(tl.float32).reshape(4, 64, 8)
+    b = tl.load(Source + (rows // TOP_K)[:, None] * HIDDEN + columns[None, :] * 2 + 1,
+        valid[:, None] & (columns[None, :] * 2 < HIDDEN), 0).to(tl.float32).reshape(4, 64, 8)
+    maximum = tl.max(tl.maximum(tl.abs(a), tl.abs(b)), 2)
+    scale = tl.minimum(global_scale[:, None] * (maximum * (1.0 / 6.0)), 448.).to(tl.float8e4nv)
+    effective = scale.to(tl.float32) * reciprocal[:, None]
+    multiplier = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", constraints="=f,f",
+        args=[effective], dtype=tl.float32, is_pure=True, pack=1)
+    multiplier = tl.where(maximum == 0, 0., multiplier)
+    a, b = (a * multiplier[:, :, None]).reshape(4, 512), (b * multiplier[:, :, None]).reshape(4, 512)
+    packed = tl.inline_asm_elementwise(
+        "{ .reg .b8 v; cvt.rn.satfinite.e2m1x2.f32 v, $2, $1; cvt.u32.u8 $0, v; }",
+        constraints="=r,f,f", args=[a, b], dtype=tl.uint32, is_pure=True, pack=1)
+    tl.store(Values + rows[:, None] * (HIDDEN // 2) + columns[None, :], packed.to(tl.uint8),
+        valid[:, None] & (columns[None, :] * 2 < HIDDEN))
+    groups = tl.program_id(1) * 64 + tl.arange(0, 64)
+    tl.store(Scales + rows[:, None] * (HIDDEN // 16) + groups[None, :],
+        scale.to(tl.uint8, bitcast=True), valid[:, None] & (groups[None, :] < HIDDEN // 16))
+
+
+_NATIVE_JITS.add(_quantize_routes)
+
+
+@program_cache(scope="preparation")
+def compile_route_quantization(tokens, hidden, top_k, ordinal):
+    with torch.cuda.device(ordinal):
+        return _quantize_routes.warmup(torch.bfloat16, torch.int32, torch.float32,
+            torch.uint8, torch.uint8, ROWS=tokens * top_k, HIDDEN=hidden, TOP_K=top_k,
+            grid=(1, 1, 1), num_warps=4)
+
+
+@triton.jit
 def _reduce_routes(Rows, Permuted, Weights, Shared, Out, HIDDEN: tl.constexpr, TOP_K: tl.constexpr,
-                   BLOCK: tl.constexpr):
+                   BLOCK: tl.constexpr, ADD_SHARED: tl.constexpr):
     """Out = BF16(BF16(sum_k weight * FC2 row) + shared), routes summed in trtllm-gen's order."""
     token = tl.program_id(0).to(tl.int64)
     columns = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
@@ -332,8 +373,9 @@ def _reduce_routes(Rows, Permuted, Weights, Shared, Out, HIDDEN: tl.constexpr, T
         weight = tl.load(Weights + token * TOP_K + route)
         total += weight * tl.load(Rows + row * HIDDEN + columns).to(tl.float32)
     routed = total.to(tl.bfloat16).to(tl.float32)
-    shared = tl.load(Shared + token * HIDDEN + columns).to(tl.float32)
-    tl.store(Out + token * HIDDEN + columns, (routed + shared).to(tl.bfloat16))
+    if ADD_SHARED:
+        routed += tl.load(Shared + token * HIDDEN + columns).to(tl.float32)
+    tl.store(Out + token * HIDDEN + columns, routed.to(tl.bfloat16))
 
 
 # b12x evicts compile-planning placeholders only from the Triton functions it tracks, which by
@@ -342,12 +384,12 @@ _NATIVE_JITS.add(_reduce_routes)
 
 
 @program_cache(scope="preparation")
-def compile_route_reduction(tokens, hidden, top_k, ordinal):
+def compile_route_reduction(tokens, hidden, top_k, ordinal, add_shared=True):
     """Warm the routed-row reduction that folds trtllm-gen's finalize into the shared-expert sum."""
     with torch.cuda.device(ordinal):
         return _reduce_routes.warmup(torch.bfloat16, torch.int32, torch.float32, torch.bfloat16,
                                      torch.bfloat16, HIDDEN=hidden, TOP_K=top_k, BLOCK=_REDUCE_BLOCK,
-                                     grid=(tokens, hidden // _REDUCE_BLOCK), num_warps=4)
+                                     ADD_SHARED=add_shared, grid=(tokens, hidden // _REDUCE_BLOCK), num_warps=4)
 
 
 def _route_reduction_job(query, ordinal):
@@ -380,8 +422,17 @@ class _TrtllmNvfp4State:
         # Load the compiled reduction while preparing; serving freezes kernel resolution.
         self.reduction = load_programs(compile_route_reduction(query.num_tokens, query.hidden_size,
                                                                query.top_k, ordinal))
+        self.routed_quantize = self.routed_reduction = self.unit_weights = None
+        tokens = query.num_tokens
+        if query.routed_inputs:
+            tokens *= query.top_k
+            self.routed_quantize = load_programs(compile_route_quantization(
+                query.num_tokens, query.hidden_size, query.top_k, ordinal))
+            self.routed_reduction = load_programs(compile_route_reduction(
+                query.num_tokens, query.hidden_size, query.top_k, ordinal, False))
+            self.unit_weights = torch.ones((tokens, 1), dtype=torch.float32, device=experts.device)
         # trtllm-gen takes a zero-width output when it leaves FC2 rows unfinalized.
-        self.unfinalized = torch.empty((query.num_tokens, 0), dtype=torch.bfloat16, device=experts.device)
+        self.unfinalized = torch.empty((tokens, 0), dtype=torch.bfloat16, device=experts.device)
         self.staged = None
 
     def scratch_bytes(self):
@@ -390,21 +441,35 @@ class _TrtllmNvfp4State:
     def _launch(self, a, topk_ids, topk_weights, output, scratch, finalize):
         e, q = self.experts, self.query
         tokens, hidden = a.shape
+        if q.routed_inputs:
+            tokens *= q.top_k
         values = scratch[:tokens * hidden // 2].view(tokens, hidden // 2)
         offset = _aligned(tokens * hidden // 2)
         scales = scratch[offset:offset + (tokens + 15) // 16 * 16 * hidden // 16]
-        self.quantize(a, e.input_global_scale, values, scales, 16, False, False, False, False, True, 0)
+        if q.routed_inputs:
+            self.routed_quantize[(triton.cdiv(tokens, 4), triton.cdiv(hidden, 1024), 1)](
+                a, topk_ids, e.input_global_scale, values, scales, tokens, hidden, q.top_k)
+            topk_ids, topk_weights = topk_ids.view(tokens, 1), self.unit_weights
+        else:
+            self.quantize(a, e.input_global_scale, values, scales, 16, False, False, False, False, True, 0)
         scales = scales[:tokens * hidden // 16].view(torch.float8_e4m3fn).view(tokens, hidden // 16)
         routing, method, activation = self.enums
         return self.moe(routing, None, topk_ids, topk_weights, None, values, scales,
                         e.w13, e.w13_scale, None, None, e.gate_alpha, e.gate_beta, e.clamp_limit,
                         e.w2, e.w2_scale, None, e.output1_scale, e.output1_gate_scale, e.output2_scale,
-                        None, q.num_experts, q.top_k, 0, None, None, q.intermediate_size, 0,
+                        None, q.num_experts, 1 if q.routed_inputs else q.top_k, 0, None, None, q.intermediate_size, 0,
                         q.num_experts, None, method, finalize, True, activation, output, self.tactic,
                         True, None, [], [], False, None, None)
 
     def run(self, a, topk_ids, topk_weights, output, scratch):
-        self._launch(a, topk_ids, topk_weights, output, scratch, True)
+        if not self.query.routed_inputs:
+            self._launch(a, topk_ids, topk_weights, output, scratch, True)
+            return
+        self.stage_rows(a, topk_ids, topk_weights, scratch)
+        (rows, permuted), self.staged = self.staged, None
+        tokens, hidden = output.shape
+        self.routed_reduction[(tokens, hidden // _REDUCE_BLOCK, 1)](
+            rows, permuted, topk_weights, output, output, hidden, self.query.top_k, _REDUCE_BLOCK, False)
 
     def stage_rows(self, a, topk_ids, topk_weights, scratch):
         """Run quantization, routing, FC1 and FC2, keeping the unreduced FC2 rows for ``reduce``."""
@@ -424,7 +489,7 @@ class _TrtllmNvfp4State:
         (rows, permuted), self.staged = self.staged, None
         tokens, hidden = output.shape
         self.reduction[(tokens, hidden // _REDUCE_BLOCK, 1)](
-            rows, permuted, topk_weights, shared, output, hidden, self.query.top_k, _REDUCE_BLOCK)
+            rows, permuted, topk_weights, shared, output, hidden, self.query.top_k, _REDUCE_BLOCK, True)
 
 
 class _CuteW4A16State:
@@ -466,9 +531,17 @@ def plan_routed_experts(experts: Sm103Experts, *, tokens: int, top_k: int):
     """Declare one exact-shape native routed-expert operator for ``experts``."""
     contract, state_type = _state_type(experts)
     query = RoutedExpertsQuery(experts.kind, int(tokens), experts.num_experts, experts.hidden_size,
-                               experts.intermediate_size, int(top_k))
+                               experts.intermediate_size, int(top_k),
+                               isinstance(experts, TrtllmNvfp4Experts) and experts.input_global_scale.numel() > 1)
     jobs = ((lambda tactic, detected: (_route_reduction_job(query, detected.ordinal),))
             if state_type is _TrtllmNvfp4State else (lambda tactic, detected: ()))
+    if query.routed_inputs:
+        jobs = lambda tactic, detected: (
+            _route_reduction_job(query, detected.ordinal),
+            CompileJob.create("ignition.components.moe_sm103:compile_route_reduction",
+                query.num_tokens, query.hidden_size, query.top_k, detected.ordinal, False),
+            CompileJob.create("ignition.components.moe_sm103:compile_route_quantization",
+                query.num_tokens, query.hidden_size, query.top_k, detected.ordinal))
     return native_plan(contract=contract, query=query, device=experts.device,
                        scratch_bytes=lambda tactic: _scratch_bytes(query),
                        materialize=lambda tactic: state_type(experts, query, tactic), compile_jobs=jobs)
@@ -605,7 +678,7 @@ class Sm103RoutedExperts:
 
     def __init__(self, source, experts: Sm103Experts, ids, weights, output, *, session, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None,
-                 router_plan=None, a4_prefill=False):
+                 router_plan=None, a4_prefill=False, router=None, route_output=None):
         from ignition.components.moe import RouterScratch
 
         if a4_prefill:
@@ -618,7 +691,9 @@ class Sm103RoutedExperts:
             tensor = getattr(experts, field, None)
             if tensor is not None:
                 record_numeric_tensor(tensor)
+        self.router = router
         self.source, self.output, self.scratch = source, output, None
+        self.output_source = output
         self.plan = plan_routed_experts(experts, tokens=source.shape[0], top_k=ids.shape[1])
         plan = self.plan
 
@@ -644,6 +719,9 @@ class Sm103RoutedExperts:
     def reduces_into_shared(self) -> bool:
         """Whether ``stage_rows``/``reduce`` can replace the finalized output plus a shared add."""
         return self.plan.contract is TRTLLM_CONTRACT
+
+    def route(self, logits: torch.Tensor) -> None:
+        self.router(logits)
 
     def __call__(self) -> torch.Tensor:
         return self.binding.run()

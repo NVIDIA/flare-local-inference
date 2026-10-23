@@ -17,18 +17,19 @@ how the prepared state leaves the Python process and how it is reconstructed.
 | Component | Role | Implementation |
 |---|---|---|
 | ignition | Internal preparation command: plans, exports, and prepares cached packages for native serving | The Python command line under `ignition/cli/` |
-| heliopause | CPython extension imported by Ignition. It supplies the native preparation allocator and resource lifetime hooks | The `heliopause/` Rust crate; Python distribution `flare-heliopause`, import `flare_heliopause` |
+| heliopause | CPython extension imported by Ignition. It owns preparation storage, export recording, graph serialization, payload transfer, and signed package publication | The `heliopause/` Rust crate; Python distribution `flare-heliopause`, import `flare_heliopause` |
 | Helios | Rust runtime library. It rebuilds a package into a live CUDA context and serves it | The `helios/` crate, including `src/runtime_package/` and the server |
 | flare | Public serving command. It links Helios to load a package and run the server | The `flare/` Rust crate; section 5 |
 
 Preparation knowledge, recipes, planning, hub access, the kernel cache,
 compilation, tuning, and capture stay on the preparation host. Ignition imports
-`flare_heliopause` and exports through `ignition/preparation/runtime_package.py`
-in its own Python process. `ignition run` exports a cached package when needed,
-closes the prepared model, and calls `execv` to replace its entire address space
-with the Rust `flare` executable. A cache hit goes directly to `execv`.
-`ignition export` writes the package and exits. Graphs and Python resource owners
-do not cross the executable boundary. Helios has no CPython dependency;
+`flare_heliopause` and passes graph handles, allocation declarations, tensor-view
+metadata, and resource owners through `ignition/preparation/runtime_package.py`.
+The Rust exporter in `heliopause/src/export/` reads the graph and storage,
+records the package resources, and publishes the files while releasing the GIL.
+`ignition export` writes the package, closes the
+prepared model, and exits. `flare run PACKAGE` loads it in a separate Rust
+process. Graph handles and Python resource owners do not cross the process boundary. Helios has no CPython dependency;
 heliopause owns the CPython hooks and preparation allocator and uses Helios's
 CUDA interfaces. Heliopause has no executable or embedded interpreter. `flare` and Helios are
 the public deployment surface. Ignition and heliopause are internal preparation
@@ -55,6 +56,18 @@ verification-profile section.
 
 Ignition records four things while preparing a model, and refuses to
 write a package when any of them is incomplete.
+
+Ignition supplies captured graph handles, allocation and cache declarations,
+tensor shapes, strides and numeric roles, compiler parameter signatures,
+frontend metadata, and resource owners. File-backed embedding tables supply
+checkpoint ranges; generated tokenizer and template assets supply text.
+Heliopause owns CUPTI callbacks, graph introspection, pointer reachability,
+device-to-host transfers, graph and package serialization, asset materialization,
+cubin redaction, hashing, encryption, signing, conversion, rank payload channels,
+and publication. Export retains graph templates, storage, contexts, and their
+Python owners until native CUDA work has drained. A failed drain retains those
+owners. Final assembly consumes rank indexes and open source file ranges
+independently of the prepared model.
 
 **Storage.** PyTorch's persistent device allocations come from one address range
 reserved before model loading: 1 TiB per rank from `0x0800_0000_0000` on Linux or
@@ -94,8 +107,10 @@ numeric by their execution contract. These spans are leaves in the traversal:
 their storage is retained when referenced, but their values are not interpreted
 as addresses.
 
-Numeric-span discovery skips zero-initialized allocations, which have no
-payload to scan, and deduplicates identical live tensor views. Strided layouts
+Numeric-span discovery merges overlapping allocation coverage, excludes
+zero-initialized storage, and deduplicates identical live tensor views. Integer
+aliases crossing coverage boundaries still suppress floating-view inference in
+their covered bytes. Strided layouts
 retain their holes; fragmented persistent views without bounded span metadata
 remain conservative rather than expanding an unbounded interval catalog.
 
@@ -150,6 +165,21 @@ attention-history storage, page-table views, graph value sources and dependencie
 completion cursors, and frontend syntax. Field 4 is reserved; arbitrary Protobuf
 `Struct` configuration is not accepted. Execution ABI 2/3 and protected envelope
 version 4 are versioned separately from model-index versions 4 and 5.
+
+Two prepared-contract fields fail validation when absent or out of
+range. `vision` must decode to a well-formed `VisionCapabilities`: a
+text-only package encodes the explicit all-zero value (`feature_slots`,
+`features_per_request`, `max_images`, and `patches_per_feature` of 0
+with empty `patch_capacities`), and an absent or null `vision` fails
+the contract decode (a null submessage raises `invalid type: null,
+expected struct VisionCapabilities`). Every graph contract also carries
+`embedding_tables`, whose entries index the package's embedding-table
+catalog and are validated against the catalog size at package
+validation: a package that ships no embedding-table resources must
+give every graph an empty `embedding_tables`, and any entry outside
+the catalog fails with `graph requires an absent embedding-table
+resource`.
+
 
 Semantic bindings name a destination buffer and an enum-selected value source.
 Indexing distinguishes scalar, submission row, active row, physical request row,
@@ -240,13 +270,61 @@ and their indexes. N-gram table payloads are appended directly from checkpoint
 file ranges during rank export, without materializing their contents in
 preparation memory.
 
+### Native export transfers and progress
+
+The exporter in `heliopause/src/export/` performs bulk I/O while the GIL is
+released. CUDA downloads and storage commits each use a two-slot pinned ring
+with 8 MiB per slot, reserving 32 MiB per preparation rank.
+File transfer workers share bounded pools of 8 MiB buffers with 4 KiB alignment
+padding, including a reserved scratch pool for unaligned source ranges.
+Each transfer pool budget starts from the smaller of 1 GiB and one sixteenth
+of available host RAM. Capture divides this budget across preparation ranks and
+reserves both pinned rings before sizing file buffers. Capture releases its
+storage-transfer pool and pinned rings before materializing frontend assets.
+Publication after model closure uses the full file-transfer budget. Concurrent
+preparation and rank-transfer processes budget their pools independently.
+Metadata and cubin images occupy separate retained storage.
+
+Rank transfers borrow established control and fabric sockets. The binding retains
+their Python owners until all native workers have joined, including cancellation
+and error paths. Callers lend these sockets exclusively: they must not close them
+or perform other reads and writes until the transfer returns. Native export
+returns authenticated channel sequence counters for Python to restore before
+resuming use.
+
+Linux bulk reads and writes use `O_DIRECT` with `io_uring`; Windows uses
+unbuffered overlapped I/O. Aligned bulk transfers bypass the filesystem page
+cache. Unaligned source ranges use aligned scratch reads, and small headers,
+leading bytes, and trailing bytes use positioned I/O where needed. Output files
+retain their exact declared lengths. Direct-I/O errors fail the operation.
+
+A blob's complete safetensors bytes are hashed before opening a temporary output
+for it. An existing cache entry is pinned and verified before reuse. A cache miss
+streams the bytes to a temporary file and hashes them again; changed content
+fails publication. Synchronized immutable blobs are installed without replacing
+existing entries, then hardlinked beside the primary. `--no-weights` requires
+both captured allocation blobs and final stored-data shards to exist with their
+exact contents. It still scans and hashes source bytes, creates no missing
+stored-data blob, and publishes no primary if any required blob is absent.
+Executable resources may produce additional blobs.
+
+Native stderr rows omit the Flare banner and report disposable-storage
+clearing, graph inspection and serialization, module and global capture,
+reachable-storage scanning, frontend assets, executable hashing and encryption,
+blob publication, and metadata signing. Capture and frontend rows render only on
+rank zero; coordinators report aggregate rank-transfer receive progress. Ignition
+pauses its enclosing export activity while native rows animate and retains the
+elapsed result. Byte counters distinguish source reads, hashes, copies, installed
+bytes, and cache reuse. Rank transfers report send and receive bytes; conversion reports
+source verification, relocation, and publication separately.
+
 ### File placement and addressing
 
-`ignition export`, `ignition run`, `ignition sign`, and `ignition convert` pack
+`ignition export`, `ignition sign`, and `ignition convert` pack
 published payloads to at most 64 GB (64,000,000,000 bytes), including the
 4096-byte header. The reader retains its 64 GiB limit for existing packages. The
 `[publishing] shard_size` setting or `--shard-size SIZE` can select a smaller limit.
-Zero is invalid. The package cache key includes the resolved byte count. An
+Zero is invalid. An
 indivisible resource exceeding the limit fails publication; no oversized file is
 published. All model payloads reside outside the primary.
 
@@ -266,9 +344,9 @@ rejects resources spanning multiple blobs or padding. Hosts need sufficient open
 file descriptors for their selected blobs and runtime resources.
 
 Ignition stores blobs under `paths.package_cache/blobs` and hardlinks them into
-snapshot directories. Existing blobs are checked before reuse; new blobs are
-hashed while written, synchronized, installed without overwriting, and made
-read-only. Snapshot and cache must share a filesystem. Publication installs all
+snapshot directories. Existing blobs are checked before reuse; missing blobs
+are hashed before writing and again while written, synchronized, installed
+without overwriting, and made read-only. Snapshot and cache must share a filesystem. Publication installs all
 payload links before atomically publishing the metadata primary. A failed export
 can leave reusable blobs and links, but never a primary naming incomplete payloads.
 
@@ -395,8 +473,10 @@ the driver loads, from the driver-API load calls and from the resource
 callback that also covers modules loaded internally by CUDA libraries. Each
 kernel node's function maps to its image through `cuFuncGetModule`. Resource
 callbacks during lazy loading are associated with the driver call that
-materializes the module, including launches using context-independent
-`CUkernel` handles. A unique symbol-name match is a fallback. The exporter records
+materializes the module, including attribute and occupancy queries and launches
+using context-independent `CUkernel` handles. Occupancy queries retain their
+input-function association even when they reject the launch configuration.
+A unique symbol-name match is a fallback. The exporter records
 each function's parameter layout from `cuFuncGetParamInfo` and its dynamic
 shared-memory, carveout, and cluster attributes. ELF symbol enumeration and
 `cuModuleGetGlobal` capture initialized module globals and constants; native
@@ -440,7 +520,7 @@ them and relies on identical addresses instead.
 
 ### Preparation rebuild metadata
 
-Exports through `ignition export` and `ignition run` record an optional
+Exports through `ignition export` record an optional
 `ModelIndex.rebuild` manifest in the signed metadata of the primary shard.
 It identifies the recipe, preparation source identity, qualified checkpoint
 repository and revision, tensor-parallel size, concurrency, chunk size,
@@ -453,7 +533,8 @@ owner paths, packing-owner types, dtypes, shapes, element strides, and
 allocation-relative byte offsets. The containing bundle identifies the rank.
 Allocation resource spans and the package layout locate those bytes in the
 payload shards; repacking and re-signing preserve the references. Aliased views
-share storage. Catalog creation reads tensor metadata and creates no weight copy.
+share storage. Ignition describes live tensor metadata; Heliopause resolves its
+addresses against retained allocations and creates no weight copy.
 Meta tensors, discarded storage, and disposable scratch are listed as
 unavailable rather than treated as recoverable weights.
 
@@ -612,8 +693,12 @@ then rebased onto the live addresses and validated, and the server starts
 from this reconstructed contract. `flare run PACKAGE` in
 `flare/src/main.rs` starts the shared server directly from the typed contract.
 
-Before any CUDA initialization or worker threads, Flare restricts
+Before CUDA initialization or serving worker threads, Flare restricts
 `CUDA_VISIBLE_DEVICES` to `--gpus`, resolving indices within an inherited mask.
+When omitted, the list contains the first N visible GPUs for the package's N
+local ranks, or one GPU per host for a multi-host package. Package loading finishes
+its progress threads before setting visibility. Hub revision detection queries
+NVML in a separate process without initializing CUDA.
 Rank order follows the selected list; Helios receives contiguous device ordinals
 starting at zero, while loading progress retains the CLI's GPU labels. Flare
 sets `CUDA_FORCE_PRELOAD_LIBRARIES=0` and `CUDA_DISABLE_JIT=1`. The loader requires
@@ -625,7 +710,7 @@ every power-of-two request bucket through the padded concurrency maximum.
 Width one covers every bucket; wider speculative and verification graphs require
 `batch_capacity * token_capacity <= speculative_token_capacity`. The capacity
 defaults to the larger of padded concurrency and maximum verification width.
-Proposal graphs independently cover every bucket and selectable draft depth. Mixed graph coverage is sparse over prompt capacity
+Proposal graphs independently cover every bucket at the configured draft depth. Mixed graph coverage is sparse over prompt capacity
 and verification width; see [mixed execution](scheduling-runtime-design.md).
 Execution metadata
 identifies graph kind, sampling mode, batch capacity, token capacity, draft
@@ -638,11 +723,11 @@ intermediate capacities are optional and need not follow a generated sequence.
 Draft count and verification count are independent declaration fields.
 Verification count includes the pending input token. Proposal graphs declare
 only draft count and source; verification graphs declare only verification count.
-A split catalog in adaptive mode retains every captured proposal depth up to the
-loaded limit. The scheduler chooses the cheapest available proposal shape that
-covers its planned verification prefix and reuses verification graphs across
-depths. Packages containing only the maximum proposal depth remain supported.
-Fixed mode retains the selected proposal depth. Combined graphs declare both
+A split catalog retains one configured proposal depth in both adaptive and fixed
+verification modes. Packages containing several producer depths load only the
+selected depth; shorter producers never enter scheduling or probe selection.
+Verification prefixes and packed target capacities remain adaptive. Packages
+containing only the maximum proposal depth remain supported. Combined graphs declare both
 counts. For a selected combined batch and width, the loader chooses one permitted draft count;
 it never loads duplicate MTP alternatives for that shape. The index lists
 each graph's function dependencies, so kernel selection also precedes graph

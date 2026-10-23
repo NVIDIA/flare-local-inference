@@ -10,11 +10,12 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::roce_fabric::Topology;
+use super::roce_fabric::Shape;
 use crate::runtime_package::RoceSpec;
 use crate::{ExecutionError, Failure, Result};
 
 /// The proxy ABI compiled into this runtime; packages record the one their kernels use.
-pub const PROXY_ABI: u32 = 9;
+pub const PROXY_ABI: u32 = 10;
 /// Control word 7 after a variable-length all-gather met a byte count it cannot send.
 const INVALID_VARLEN_COUNT: u32 = 1;
 
@@ -49,6 +50,7 @@ unsafe extern "C" {
         err_len: u64,
     ) -> *mut Context;
     fn roce_enable_ring(c: *mut Context) -> c_int;
+    fn roce_enable_ring_open(c: *mut Context) -> c_int;
     fn roce_local_blob(c: *mut Context, out: *mut c_void, out_len: u64) -> c_int;
     fn roce_connect(
         c: *mut Context,
@@ -65,6 +67,25 @@ unsafe extern "C" {
 
 fn failure(message: impl Into<String>) -> crate::Error {
     ExecutionError::Poisoned(Failure::new(message.into())).into()
+}
+
+fn peer_blobs(records: &[Vec<u8>], world: usize) -> Result<Vec<u8>> {
+    // ABI 10 changes startup-owned ring mailboxes, not the captured kernel region.
+    // Older packages can use the new proxy, but all live peers must use its wire layout.
+    let size = unsafe { roce_blob_bytes() } as usize;
+    if records.len() != world
+        || records
+            .iter()
+            .any(|record| record.len() != size + 4 || record[..4] != PROXY_ABI.to_le_bytes())
+    {
+        return Err(failure(
+            "RoCE queue-pair records must cover every rank with the same native proxy ABI",
+        ));
+    }
+    Ok(records
+        .iter()
+        .flat_map(|record| record[4..].iter().copied())
+        .collect())
 }
 
 /// One rank's connected transport. Dropping it stops the proxy and releases the HCAs; the region
@@ -92,7 +113,9 @@ impl RoceTransport {
     /// before `connect` returns.
     pub unsafe fn open(spec: &RoceSpec, topology: &Topology) -> Result<Self> {
         let abi = unsafe { roce_abi_version() } as u32;
-        if spec.proxy_abi != PROXY_ABI || abi != PROXY_ABI {
+        // ABI 9 and 10 have identical kernel-visible layouts and control operations.
+        // ABI 10's wider CPU ring window is allocated by this runtime at startup.
+        if !matches!(spec.proxy_abi, 9 | 10) || abi != PROXY_ABI {
             return Err(failure(format!(
                 "package RoCE kernels use proxy ABI {}, this runtime provides {abi}",
                 spec.proxy_abi
@@ -113,22 +136,34 @@ impl RoceTransport {
                 "package RoCE region differs from the proxy's layout for its geometry",
             ));
         }
-        if (topology.ring && !(2..=16).contains(&spec.world))
+        if (topology.shape.relays() && !(2..=16).contains(&spec.world))
             || topology.routes.len() != spec.world
             || !(1..=super::roce_fabric::MAX_RAILS).contains(&topology.rails)
-            || topology.routes.iter().enumerate().any(|(peer, links)| {
-                let absent = peer == spec.rank
-                    || topology.ring
-                        && peer != (spec.rank + 1) % spec.world
-                        && peer != (spec.rank + spec.world - 1) % spec.world;
-                absent != links.is_empty()
-                    || (!absent && links.len() != topology.rails)
-                    || links
-                        .iter()
-                        .any(|(local, _)| *local as usize >= topology.hcas.len())
-            })
         {
-            return Err(failure("RoCE topology does not match the package's ranks"));
+            return Err(failure(format!(
+                "RoCE topology does not match the package's ranks: {} routes and {} rails for {} ranks",
+                topology.routes.len(),
+                topology.rails,
+                spec.world
+            )));
+        }
+        for (peer, links) in topology.routes.iter().enumerate() {
+            let absent = !topology.shape.linked(spec.rank, peer, spec.world);
+            if absent != links.is_empty()
+                || (!absent && links.len() != topology.rails)
+                || links
+                    .iter()
+                    .any(|(local, _)| *local as usize >= topology.hcas.len())
+            {
+                return Err(failure(format!(
+                    "RoCE topology does not match the package's ranks: rank {} has {} links to rank {peer},                      expected {} ({} rails, {} HCAs)",
+                    spec.rank,
+                    links.len(),
+                    if absent { 0 } else { topology.rails },
+                    topology.rails,
+                    topology.hcas.len()
+                )));
+            }
         }
         let names = topology
             .hcas
@@ -162,7 +197,12 @@ impl RoceTransport {
             let text = unsafe { CStr::from_ptr(message.as_ptr()) }.to_string_lossy();
             return Err(failure(format!("RoCE transport setup failed: {text}")));
         }
-        if topology.ring && unsafe { roce_enable_ring(context) } != 0 {
+        let enabled = match topology.shape {
+            Shape::Mesh => 0,
+            Shape::Ring => unsafe { roce_enable_ring(context) },
+            Shape::Chain => unsafe { roce_enable_ring_open(context) },
+        };
+        if enabled != 0 {
             let message = unsafe { CStr::from_ptr(roce_error(context)) }
                 .to_string_lossy()
                 .into_owned();
@@ -198,22 +238,21 @@ impl RoceTransport {
         if status != 0 {
             return Err(failure("RoCE queue-pair record does not fit its buffer"));
         }
-        Ok(record)
+        let mut versioned = Vec::with_capacity(record.len() + 4);
+        versioned.extend_from_slice(&PROXY_ABI.to_le_bytes());
+        versioned.extend_from_slice(&record);
+        Ok(versioned)
     }
 
     /// Connect every peer's rails from all ranks' records, in rank order, and start posting.
     pub fn connect(&mut self, records: &[Vec<u8>]) -> Result<()> {
-        let size = unsafe { roce_blob_bytes() } as usize;
-        if records.len() != self.spec.world || records.iter().any(|r| r.len() != size) {
-            return Err(failure("RoCE queue-pair records must cover every rank"));
-        }
-        let joined: Vec<u8> = records.concat();
+        let joined = peer_blobs(records, self.spec.world)?;
         let rails = self.topology.rails;
         let mut routes = Vec::with_capacity(self.spec.world * rails * 2);
         for (peer, links) in self.topology.routes.iter().enumerate() {
             for rail in 0..rails {
                 let (local, remote) =
-                    if peer == self.spec.rank || self.topology.ring && links.is_empty() {
+                    if peer == self.spec.rank || self.topology.shape.relays() && links.is_empty() {
                         (0, 0)
                     } else {
                         links[rail]
@@ -332,7 +371,7 @@ mod tests {
             traffic_class: 0,
             rails: 2,
             routes: vec![vec![], vec![(0, 0), (1, 1)], vec![], vec![(0, 0), (1, 1)]],
-            ring: true,
+            shape: Shape::Ring,
         };
         (region, spec, topology)
     }
@@ -341,6 +380,54 @@ mod tests {
     fn native_proxy_abi_matches_package_contract() {
         // SAFETY: This query has no arguments, device access, or allocation.
         assert_eq!(unsafe { roce_abi_version() } as u32, PROXY_ABI);
+    }
+
+    #[test]
+    fn compatible_package_abis_still_validate_the_captured_region() {
+        let (region, spec, topology) = specification();
+        for abi in [8, 9, 10, 11] {
+            let mut spec = spec.clone();
+            spec.proxy_abi = abi;
+            spec.ctrl_offset += 128;
+            // SAFETY: ABI or layout validation rejects this before touching the live region.
+            let error = unsafe { RoceTransport::open(&spec, &topology) }
+                .err()
+                .expect("invalid layout must fail")
+                .to_string();
+            assert!(
+                error.contains(if matches!(abi, 9 | 10) {
+                    "region differs"
+                } else {
+                    "proxy ABI"
+                }),
+                "ABI {abi}: {error}"
+            );
+            assert!(region.iter().all(|byte| *byte == 0x5a));
+        }
+    }
+
+    #[test]
+    fn peer_records_require_one_native_ring_protocol() {
+        // SAFETY: This query has no arguments, device access, or allocation.
+        let size = unsafe { roce_blob_bytes() } as usize;
+        let record = |abi: u32, value: u8| {
+            let mut bytes = abi.to_le_bytes().to_vec();
+            bytes.extend(vec![value; size]);
+            bytes
+        };
+        let records = vec![record(PROXY_ABI, 0x12), record(PROXY_ABI, 0x34)];
+        let expected = [vec![0x12; size], vec![0x34; size]].concat();
+        assert_eq!(peer_blobs(&records, 2).unwrap(), expected);
+        assert!(peer_blobs(&records, 3).is_err());
+        let mut foreign = records.clone();
+        foreign[1] = record(9, 0x34);
+        assert!(peer_blobs(&foreign, 2).is_err());
+        let mut unversioned = records.clone();
+        unversioned[1] = vec![0; size];
+        assert!(peer_blobs(&unversioned, 2).is_err());
+        let mut truncated = records;
+        truncated[1].truncate(3);
+        assert!(peer_blobs(&truncated, 2).is_err());
     }
 
     #[test]

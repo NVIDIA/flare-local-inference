@@ -8,7 +8,9 @@ import torch
 from b12x.attention import sparse_mla
 from flashinfer.triton.norm import rms_norm
 
-from ignition.components.linear import BatchedQuantizedProjection, QuantizedProjection
+from ignition.components.linear import (
+    BatchedQuantizedProjection, BatchedUnquantizedProjection, QuantizedProjection, prepare_projection,
+)
 from ignition.components import sm103
 from ignition.components.sparse_mla import PreparedLatentCacheWriter, PreparedSparseMLA
 from ignition.components.sparse_mla_sm103 import Sm103PrefillSparseMLA, Sm103SparseMLA
@@ -142,16 +144,19 @@ class QueryChain:
     one ordered transport channel with the model's other collectives.
     """
 
-    def __init__(self, projection: QuantizedProjection, absorb: BatchedQuantizedProjection, source, query,
+    def __init__(self, projection, absorb, source, query,
                  absorbed, gather=None, gathered=None, *, session, workspace, parallel_plans):
         from b12x.gemm.blockscaled._a16 import _weight_parts
 
-        values, scales, gain, fp4 = _weight_parts(projection.weight)
-        if values.dtype not in (torch.float8_e4m3fn, torch.uint8) or gain is not None or fp4 or projection.bias is not None:
-            raise ValueError("the query chain requires an unbiased MXFP8 or MXFP4 query projection")
+        if projection.bias is not None:
+            raise ValueError("the query chain requires an unbiased query projection")
         self.projection, self.absorb, self.gather = projection, absorb, gather
         self.gather_on_main = gather is not None and not gather.single and gather.roce
-        self.values, self.scales = values, scales.view(torch.uint8)
+        if isinstance(projection, QuantizedProjection):
+            values, scales, gain, fp4 = _weight_parts(projection.weight)
+            if gain is not None or fp4:
+                raise ValueError("the query chain requires BF16, block-FP8, MXFP8 or MXFP4 weights")
+            self.values, self.scales = values, scales.view(torch.uint8)
         self.source, self.query, self.absorbed = source, query, absorbed
         self.gathered = gathered if gathered is not None else absorbed
         self.arena, self.parallel_plans = workspace, tuple(parallel_plans)
@@ -170,8 +175,11 @@ class QueryChain:
     def run(self, source, workspace):
         from ignition.components.sm103_projection import packed_out_workspace
 
-        packed_out_workspace(source, self.values, self.scales, None, None, self.projection.output, workspace, "none",
-                             None, self.projection.plan.handle, "any")
+        if isinstance(self.projection, QuantizedProjection):
+            packed_out_workspace(source, self.values, self.scales, None, None, self.projection.output, workspace, "none",
+                                 None, self.projection.plan.handle, "any")
+        else:
+            self.projection(source)
         rows = self.absorbed.shape[0]
         self.absorb(self.query[:rows].transpose(0, 1))
         if self.gather is not None and not self.gather_on_main:
@@ -192,7 +200,7 @@ class PreparedGlmMLA:
 
     Each rank holds identical low-rank projections, latent records, and C4
     indexing state. Query and value expansion partition the 64 heads. Packed
-    KV weights remain MXFP8 and supply strided key/value views to native BMMs.
+    KV weights retain BF16 or MXFP8 storage and supply key/value views to native BMMs.
     Physical model pages contain 256 tokens, or four 64-record latent pages.
     """
 
@@ -210,7 +218,8 @@ class PreparedGlmMLA:
             raise ValueError("GLM MLA requires a full indexer and TP1, TP2 or TP4 head partitions")
         if (state.cache.shape != (state.index.cache.shape[0] * 4, 64, 528)
                 or weights["q_b_proj"].out_features != heads * 256
-                or weights["kv_b_proj"].out_features != heads * 512):
+                or (weights["kv_b_proj"].shape[0] if isinstance(weights["kv_b_proj"], torch.Tensor)
+                    else weights["kv_b_proj"].out_features) != heads * 512):
             raise ValueError("GLM MLA cache or head partition geometry mismatch")
         self.module, self.scratch, self.state, self.metadata = module, scratch, state, metadata
         # Decode projects and absorbs queries while records are selected; shared RoCE gathers follow the join.
@@ -223,17 +232,23 @@ class PreparedGlmMLA:
             ("q_b_proj", scratch.query_residual, scratch.query.view(rows, -1)),
             ("o_proj", scratch.expanded.view(rows, -1), scratch.output),
         ):
-            self.projections[key] = QuantizedProjection(input, weights[key], output,
+            self.projections[key] = prepare_projection(input, weights[key], output,
                 session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
-        packed = weights["kv_b_proj"].weight
-        values, scales = packed.values.view(heads, 512, 512), packed.scale_rows.view(heads, 512, 16)
-        self.absorb_weights, self.expand_weights = (values[:, :256], scales[:, :256]), (values[:, 256:], scales[:, 256:])
+        if isinstance(weights["kv_b_proj"], torch.Tensor):
+            values = weights["kv_b_proj"].view(heads, 512, 512)
+            self.absorb_weights, self.expand_weights = values[:, :256], values[:, 256:]
+            batched_projection = BatchedUnquantizedProjection
+        else:
+            packed = weights["kv_b_proj"].weight
+            values, scales = packed.values.view(heads, 512, 512), packed.scale_rows.view(heads, 512, 16)
+            self.absorb_weights, self.expand_weights = (values[:, :256], scales[:, :256]), (values[:, 256:], scales[:, 256:])
+            batched_projection = BatchedQuantizedProjection
         self.mode = mode
         if context is None:
-            self.query_absorption = BatchedQuantizedProjection(scratch.query.transpose(0, 1),
+            self.query_absorption = batched_projection(scratch.query.transpose(0, 1),
                 self.absorb_weights, scratch.absorbed_query.transpose(0, 1), major="n",
                 session=session, name=f"{name}.absorb_query")
-            self.value_expansion = BatchedQuantizedProjection(scratch.attended.transpose(0, 1),
+            self.value_expansion = batched_projection(scratch.attended.transpose(0, 1),
                 self.expand_weights, scratch.expanded.transpose(0, 1), major="k",
                 session=session, name=f"{name}.expand_value")
         self.indexer = PreparedGlmIndexer(module.indexer, weights, source, scratch.query_residual,
@@ -299,13 +314,13 @@ class PreparedGlmMLA:
                 end = min(start + step, rows)
                 count = end - start
                 absorbed, attended = scratch.absorbed_query[:count], scratch.attended[:count]
-                absorb = BatchedQuantizedProjection(scratch.query[start:end].transpose(0, 1), self.absorb_weights,
+                absorb = batched_projection(scratch.query[start:end].transpose(0, 1), self.absorb_weights,
                     absorbed.transpose(0, 1), major="n", session=session, name=f"{name}.absorb_query{start}")
                 attention = PreparedSparseMLA(absorbed, scratch.slab.view(-1, 64, 528),
                     scratch.index.physical[start:end], scratch.visible[start:end],
                     scratch.index.selected_lengths[start:end], attended, caps=slab_caps, session=session,
                     name=f"{name}.attention{start}", workspace=workspace)
-                expand = BatchedQuantizedProjection(attended.transpose(0, 1), self.expand_weights,
+                expand = batched_projection(attended.transpose(0, 1), self.expand_weights,
                     scratch.expanded[start:end].transpose(0, 1), major="k", session=session,
                     name=f"{name}.expand_value{start}")
                 self.slices.append((start, end, absorb, attention, expand))
@@ -318,9 +333,9 @@ class PreparedGlmMLA:
             count = end - start
             gathered, partial, lse = scratch.gathered[:count], scratch.partial[:count], scratch.lse[:count]
             absorbed, attended = scratch.absorbed_query[:count], scratch.attended[:count]
-            absorb = BatchedQuantizedProjection(scratch.query[start:end].transpose(0, 1), self.absorb_weights,
+            absorb = batched_projection(scratch.query[start:end].transpose(0, 1), self.absorb_weights,
                 absorbed.transpose(0, 1), major="n", session=session, name=f"{name}.absorb_query{start}")
-            expand = BatchedQuantizedProjection(attended.transpose(0, 1), self.expand_weights,
+            expand = batched_projection(attended.transpose(0, 1), self.expand_weights,
                 scratch.expanded[start:end].transpose(0, 1), major="k", session=session,
                 name=f"{name}.expand_value{start}")
             gather = PreparedAllGather(absorbed.view(count, -1), gathered.view(count, -1),

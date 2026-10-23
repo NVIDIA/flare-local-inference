@@ -57,7 +57,7 @@ impl Fixture {
                     tokenizer.to_string(false).unwrap().as_bytes(),
                 ),
                 tokens: Default::default(),
-                chat_template: Some(asset("chat.jinja", b"{{ messages[0].content }}")),
+                chat_template: Some(asset("chat.jinja", b"{% mark %}{{ messages[0].content }}")),
             },
             Default::default(),
         )
@@ -66,6 +66,7 @@ impl Fixture {
         Self {
             config: ModelConfig {
                 max_top_logprobs: 0,
+                logprob_token_id_capacity: 0,
                 prepared_sequence_tokens: 128,
                 contract: crate::model::testing::metadata(),
                 identity: [23; 32],
@@ -118,7 +119,7 @@ impl Fixture {
                 GraphKind::Prefill,
             ] {
                 for width in 1..=if kind == GraphKind::Speculative { 8 } else { 1 } {
-                    graphs.push(crate::execution::GraphDescriptor {
+                    graphs.push(crate::execution::GraphDescriptor { draft_tokens: 0,
                         packed_token_capacity: 0,
                         name: format!("{kind:?}-{batch}-{width}"),
                         kind,
@@ -138,6 +139,11 @@ impl Fixture {
             }
         }
         scheduler.measured_graph_durations(&graphs).unwrap();
+        if self.config.history_drafts
+            || self.config.speculative_proposal_source == crate::scheduler::speculation::ProposalSource::Copy
+        {
+            scheduler.enable_history_drafts().unwrap();
+        }
         let mut worker = Worker::new(
             &self.config,
             &self.frontend,
@@ -175,6 +181,7 @@ impl Fixture {
     ) -> (Incoming, Generation) {
         let (events, receiver) = async_mpsc::channel(64);
         let (admission, admitted) = oneshot::channel();
+        let (first_token, first_token_ready) = oneshot::channel();
         let cancelled = Arc::new(AtomicBool::new(false));
         let failure = Arc::new(Mutex::new(None));
         (
@@ -193,12 +200,14 @@ impl Fixture {
                     stop_sequences: vec![],
                     stop_strings: vec![],
                     logprobs: false,
+                    logprob_token_ids: vec![],
                     prompt_logprobs: false,
                     ignore_eos: false,
                     grammar: None,
                 },
                 events,
                 admission: Mutex::new(Some(admission)),
+                first_token: std::cell::Cell::new(Some(first_token)),
                 cancelled: cancelled.clone(),
                 failure: failure.clone(),
                 metrics: self.metrics.clone(),
@@ -212,6 +221,7 @@ impl Fixture {
             Generation {
                 events: receiver,
                 admission: admitted,
+                first_token: first_token_ready,
                 cancelled,
                 failure,
                 enqueue_ns: None,
@@ -335,6 +345,7 @@ fn completion(
         logprobs: None,
         prompt_logprobs: None,
         proposal_confidence: None,
+        speculative_survival: None,
         fence: Fence(sequence),
         graph_index: 0,
         timing: Default::default(),
@@ -421,6 +432,9 @@ fn worker_observes_prefill_decode_and_prerequisite_timings() {
         frame.timing.wall_ns = 350;
         worker.complete(kind, frame).unwrap();
         assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(619));
+        let metrics = fixture.metrics.snapshot(false);
+        assert_eq!(metrics.verification_drafts, 0);
+        assert_eq!(metrics.verification_rounds, u64::from(kind == GraphKind::Decode));
     }
 }
 
@@ -770,8 +784,17 @@ fn disabled_host_store_preserves_decode_prefix_reuse_and_cancellation() {
         (request.phase, request.reused_prompt_tokens()),
         (RequestPhase::Restore, 13)
     );
+    assert!(matches!(
+        generation.first_token.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
     advance(&mut worker, GraphKind::Restore, 4, None);
+    assert!(matches!(
+        generation.first_token.try_recv(),
+        Err(oneshot::error::TryRecvError::Empty)
+    ));
     advance(&mut worker, GraphKind::Resume, 5, Some(2));
+    assert!(generation.first_token.try_recv().unwrap().is_ok());
     assert!(matches!(
         generation.events.try_recv().unwrap(),
         GenerationEvent::ObservedToken { token: 2, .. }
@@ -877,6 +900,7 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
                         logprobs: None,
                         prompt_logprobs: None,
                         proposal_confidence: None,
+                        speculative_survival: None,
                         records: invalid,
                         ..frame
                     }
@@ -884,6 +908,8 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
                 .is_err()
         );
         assert_eq!(fixture.metrics.snapshot(!copy).generated_tokens, 1);
+        assert_eq!(fixture.metrics.snapshot(!copy).verification_rounds, 0);
+        assert_eq!(fixture.metrics.snapshot(!copy).verification_drafts, 0);
         worker.complete(GraphKind::Speculative, frame).unwrap();
         let profile = worker
             .scheduler
@@ -891,14 +917,169 @@ fn speculative_dashboard_counts_live_rounds_and_batched_forward_passes() {
             .unwrap()
             .acceptance();
         let source = fixture.config.speculative_proposal_source;
-        assert!(profile.probability(source, 0).unwrap() > 0.5);
-        assert!(profile.probability(source, 2).unwrap() < 0.5);
+        assert!(profile.prefix_probability(source, 0).unwrap() > 0.5);
+        assert!(profile.prefix_probability(source, 2).unwrap() < 0.125);
         assert_eq!(worker.scheduler.estimated_duration_ns(&step), Some(1063));
         let metrics = fixture.metrics.snapshot(!copy);
         assert_eq!((metrics.prefill_tokens, metrics.generated_tokens), (13, 4));
         assert_eq!((metrics.accepted_drafts, metrics.draft_rounds), (2, 1));
+        assert_eq!((metrics.verification_drafts, metrics.verification_rounds), (3, 1));
         assert_eq!(metrics.verify_steps, 1);
         assert_eq!(metrics.draft_steps, if copy { 0 } else { 3 });
+    }
+}
+
+#[test]
+fn packed_dashboard_depth_uses_allocated_prefixes_and_live_request_count() {
+    use crate::model::contract::{GraphOperation, ValueSource};
+    let mut fixture = Fixture::new();
+    fixture.config.speculative_widths = (1..=8).collect();
+    let mut manifest = crate::model::testing::manifest(&fixture.config);
+    let name = "Speculative-4-8";
+    let graph = manifest.graphs.iter_mut().find(|g| g.name == name).unwrap();
+    graph.kind = GraphKind::PackedSpeculative;
+    graph.draft_tokens = 7;
+    graph.packed_token_capacity = 9;
+    let contract = fixture.config.contract.graphs.iter_mut().find(|g| g.graph == name).unwrap();
+    contract.kind = GraphOperation::PackedSpeculative;
+    for input in &mut contract.inputs {
+        if input.source == ValueSource::QueryLength {
+            input.source = ValueSource::SpeculativePrefixLimit;
+        }
+    }
+    let mut scheduler = RequestScheduler::new(fixture.config.identity, fixture.config.limits,
+        crate::model::scheduler_capabilities(&fixture.config)).unwrap();
+    let graphs: Vec<_> = manifest.graphs.iter().filter(|g|
+        g.kind != GraphKind::Speculative || g.token_capacity == 1).cloned().map(|mut g| {
+            g.estimated_duration_ns = match g.kind {
+                GraphKind::Speculative | GraphKind::Decode => 100_000,
+                GraphKind::PackedSpeculative => 10_000,
+                _ => 100,
+            };
+            g
+        }).collect();
+    scheduler.measured_graph_durations(&graphs).unwrap();
+    scheduler.enable_speculation(&(1..=8).collect::<Vec<_>>()).unwrap();
+    scheduler.split_speculation(8).unwrap();
+    let (sender, receiver) = mpsc::channel();
+    let mut generations = Vec::new();
+    for token in 0..3 {
+        let (incoming, generation) = fixture.incoming(vec![token; 13], 16);
+        sender.send(vec![incoming]).unwrap();
+        generations.push(generation);
+    }
+    let mut worker = Worker::new(&fixture.config, &fixture.frontend, &fixture.stop,
+        &fixture.metrics, scheduler, receiver, 4);
+    worker.inputs = Some(crate::model::Inputs::new(&fixture.config, &manifest).unwrap());
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let mut sequence = 0;
+    let step = loop {
+        sequence += 1;
+        assert!(sequence < 20);
+        let (plan, _) = worker.plan(0).unwrap();
+        let step = plan.unwrap();
+        worker.reserve_and_pack(&step, Fence(sequence)).unwrap();
+        if step.kind == GraphKind::PackedSpeculative { break step; }
+        let frame = completion(&worker, &step, sequence, step.kind.is_prefill().then_some(0));
+        worker.complete(step.kind, frame).unwrap();
+    };
+    assert_eq!((step.batch_capacity, step.token_capacity, step.lanes.len()), (4, 8, 3));
+    let mut frame = completion(&worker, &step, sequence, Some(1));
+    frame.proposal_confidence = Some([[0.5; 7]; crate::execution::REQUEST_LANES]);
+    for (lane, offered) in step.lanes.iter().zip([5, 1, 0]) {
+        let record = &mut frame.records[lane.request.slot as usize];
+        record.consumed_tokens = lane.start_position as i64 + 1;
+        record.vector = Some(crate::execution::TokenVector {
+            emitted_count: 1, offered_drafts: offered, accepted_drafts: 0,
+            verification_width: 8, draft_cache_consumed: lane.start_position as i64,
+            tokens: [1, -1, -1, -1, -1, -1, -1, -1], ..Default::default()
+        });
+    }
+    worker.complete(GraphKind::PackedSpeculative, frame).unwrap();
+    let metrics = fixture.metrics.snapshot(true);
+    assert_eq!((metrics.verification_drafts, metrics.verification_rounds), (6, 3));
+    assert_eq!((metrics.accepted_drafts, metrics.draft_rounds), (0, 2));
+    assert_eq!((metrics.draft_steps, metrics.verify_steps), (7, 1));
+    let start = std::time::Instant::now();
+    let mut history = super::super::dashboard::History::new(start, Default::default());
+    history.sample(start + std::time::Duration::from_secs(1), metrics);
+    assert_eq!(history.rates().depth, Some(2.0));
+    assert_eq!(history.rates().acceptance, Some(0.0));
+}
+
+#[test]
+fn shared_decoded_history_reaches_copy_and_mtp_uploads_after_response_completion() {
+    use crate::model::contract::{GraphOperation, InputIndexing, ValueSource};
+    use crate::scheduler::speculation::ProposalSource;
+    for source in [ProposalSource::Copy, ProposalSource::Mtp] {
+        let mut fixture = Fixture::new();
+        fixture.config.speculative_widths = vec![1, 8];
+        fixture.config.speculative_fixed_width = Some(8);
+        fixture.config.speculative_proposal_source = source;
+        fixture.config.history_drafts = source == ProposalSource::Mtp;
+        for graph in &mut fixture.config.contract.graphs {
+            if graph.kind != GraphOperation::Speculative { continue; }
+            if source == ProposalSource::Copy { graph.draft_cursor = None; }
+            for (name, value) in [
+                ("copy_ids", ValueSource::CopyTokenIds),
+                ("copy_count", ValueSource::CopyTokenCount),
+                ("copy_consumed", ValueSource::CopyConsumedTokens),
+                ("copy_generation", ValueSource::CopyGeneration),
+                ("copy_masks", ValueSource::CopyGrammarMask),
+                ("copy_mask_count", ValueSource::CopyGrammarCount),
+            ] {
+                graph.inputs.push(crate::model::testing::binding(name, value, InputIndexing::RequestRow, 0, 0));
+            }
+        }
+        let (sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        worker.scheduler.enable_speculation(&[1, 8]).unwrap();
+        worker.scheduler.fixed_speculative_width(Some(8)).unwrap();
+        worker.scheduler.proposal_source(source).unwrap();
+        let (incoming, _first_output) = fixture.incoming(vec![0, 1, 2, 3], 6);
+        sender.send(vec![incoming]).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        assert_eq!(worker.scheduler.history_proposal(&[0, 1, 2, 3], 7).1, 0);
+        advance(&mut worker, GraphKind::Init, 1, None);
+        advance(&mut worker, GraphKind::Prefill, 2, Some(0));
+        advance(&mut worker, GraphKind::Snapshot, 3, None);
+        for (index, token) in [1, 2, 3, 4, 2].into_iter().enumerate() {
+            let sequence = index as u64 + 4;
+            let step = planned(&mut worker, GraphKind::Speculative, sequence);
+            let live = worker.scheduler.request(step.lanes[0].request).unwrap();
+            let mut frame = completion(&worker, &step, sequence, Some(token));
+            let record = &mut frame.records[live.handle.slot as usize];
+            record.consumed_tokens = live.consumed_tokens as i64 + 1;
+            record.vector = Some(crate::execution::TokenVector {
+                verification_width: step.token_capacity as i64,
+                offered_drafts: step.lanes[0].tokens as i64 - 1,
+                emitted_count: 1,
+                accepted_drafts: 0,
+                draft_cache_consumed: if source == ProposalSource::Copy { -1 } else { record.consumed_tokens - 1 },
+                tokens: [i64::from(token), -1, -1, -1, -1, -1, -1, -1],
+                ..Default::default()
+            });
+            worker.complete(GraphKind::Speculative, frame).unwrap();
+        }
+        advance(&mut worker, GraphKind::Snapshot, 9, None);
+        worker.publish().unwrap();
+        assert!(worker.active.iter().all(Option::is_none));
+        let (incoming, _second_output) = fixture.incoming(vec![4, 0, 1, 2], 16);
+        sender.send(vec![incoming]).unwrap();
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        advance(&mut worker, GraphKind::Init, 10, None);
+        advance(&mut worker, GraphKind::Prefill, 11, Some(3));
+        advance(&mut worker, GraphKind::Snapshot, 12, None);
+        let step = planned(&mut worker, GraphKind::Speculative, 13);
+        let live = worker.scheduler.request(step.lanes[0].request).unwrap();
+        let uploads = worker.inputs.as_ref().unwrap().uploads();
+        let bytes = |name| uploads.iter().find(|u| u.buffer == name).unwrap().bytes;
+        assert_eq!(i32::from_le_bytes(bytes("copy_count").try_into().unwrap()), 2);
+        assert_eq!(bytes("copy_ids").chunks_exact(8)
+            .map(|b| i64::from_le_bytes(b.try_into().unwrap())).collect::<Vec<_>>(),
+            [4, 2, -1, -1, -1, -1, -1]);
+        assert_eq!(i64::from_le_bytes(bytes("copy_consumed").try_into().unwrap()), live.consumed_tokens as i64);
+        assert_eq!(i64::from_le_bytes(bytes("copy_generation").try_into().unwrap()), live.handle.generation as i64);
     }
 }
 
@@ -992,10 +1173,13 @@ fn fatal_broadcast_preserves_first_failure_and_reaches_pending_and_ingress() {
 struct FakeStore {
     hit: Option<crate::offload::HostHit>,
     reject_fetch: bool,
+    store_outcomes: VecDeque<crate::offload::StoreOutcome>,
+    progress: u64,
     stored: Vec<crate::offload::PublishedCheckpoint>,
     fetched: Vec<(crate::offload::HostHit, crate::offload::InboundTicket)>,
     events: VecDeque<crate::offload::StoreEvent>,
     close_error: Option<Error>,
+    poll_error: Option<Error>,
     close_panics: bool,
     close_calls: Arc<AtomicUsize>,
     drops: Arc<AtomicUsize>,
@@ -1006,10 +1190,13 @@ impl FakeStore {
         Self {
             hit,
             reject_fetch: false,
+            store_outcomes: VecDeque::new(),
+            progress: 0,
             stored: Vec::new(),
             fetched: Vec::new(),
             events: VecDeque::new(),
             close_error: None,
+            poll_error: None,
             close_panics: false,
             close_calls: Arc::new(AtomicUsize::new(0)),
             drops: Arc::new(AtomicUsize::new(0)),
@@ -1022,14 +1209,24 @@ impl crate::offload::PrefixStore for FakeStore {
         &mut self,
         history: &crate::cache::PrefixHistory,
         resident: u64,
+        before: u64,
     ) -> Option<crate::offload::HostHit> {
         self.hit.clone().filter(|hit| {
-            hit.consumed_tokens > resident && hit.consumed_tokens <= history.token_count()
+            history.key_at(hit.consumed_tokens) == Some(hit.key)
+                && hit.consumed_tokens > resident
+                && hit.consumed_tokens <= history.token_count()
+                && hit.consumed_tokens < before
         })
     }
-    fn store(&mut self, checkpoint: &crate::offload::PublishedCheckpoint) -> Result<bool> {
+    fn store(
+        &mut self,
+        checkpoint: &crate::offload::PublishedCheckpoint,
+    ) -> Result<crate::offload::StoreOutcome> {
         self.stored.push(checkpoint.clone());
-        Ok(true)
+        Ok(self
+            .store_outcomes
+            .pop_front()
+            .unwrap_or(crate::offload::StoreOutcome::Queued))
     }
     fn fetch(
         &mut self,
@@ -1042,11 +1239,18 @@ impl crate::offload::PrefixStore for FakeStore {
         self.fetched.push((hit, ticket));
         Ok(())
     }
-    fn poll(&mut self, events: &mut Vec<crate::offload::StoreEvent>) {
+    fn poll(&mut self, events: &mut Vec<crate::offload::StoreEvent>) -> Result<()> {
+        if let Some(error) = &self.poll_error {
+            return Err(error.clone());
+        }
         events.extend(self.events.drain(..));
+        Ok(())
     }
     fn stats(&self) -> crate::offload::StoreStats {
-        crate::offload::StoreStats::default()
+        crate::offload::StoreStats {
+            progress: self.progress,
+            ..Default::default()
+        }
     }
     fn close(&mut self) -> Result<()> {
         self.close_calls.fetch_add(1, Ordering::Relaxed);
@@ -1164,6 +1368,27 @@ fn shutdown_retains_the_store_when_its_drain_panics() {
     assert_eq!(drops.load(Ordering::Relaxed), 0);
 }
 
+/// A store that cannot account for its transfers stops the worker, so ids and
+/// pins held by those transfers are never reused or released.
+#[test]
+fn a_store_that_cannot_report_completions_stops_the_worker() {
+    let fixture = Fixture::new();
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store.poll_error = Some("rank 1's prefix record connection failed".into());
+    worker.attach_store(Some(Box::new(store)));
+    let error = worker.service_store().unwrap_err();
+    assert!(
+        error.to_string().contains("prefix record connection"),
+        "{error}"
+    );
+    assert!(
+        worker.store.is_some(),
+        "the worker keeps the store it cannot drain"
+    );
+}
+
 fn host_hit(history: &crate::cache::PrefixHistory, consumed: u64) -> crate::offload::HostHit {
     let key = history.key_at(consumed).unwrap();
     crate::offload::HostHit {
@@ -1236,10 +1461,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
         (RequestPhase::Restore, 1)
     );
     let restored = live.prefix().unwrap();
-    // The restored checkpoint became ready during this pass; the next pass
-    // drains its publication and copies it out under its own pin.
-    assert_eq!(fake_store(&mut worker).stored.len(), 0);
-    assert!(worker.service_store().unwrap());
+    // Polling the restore publishes it and admits its copy-out in the same pass.
     assert_eq!(fake_store(&mut worker).stored.len(), 1);
     let publication = fake_store(&mut worker).stored[0].clone();
     assert_eq!(
@@ -1440,6 +1662,7 @@ fn exercise_text_preemption(
     evict_checkpoint: bool,
 ) {
     let mut fixture = Fixture::new();
+    fixture.config.history_drafts = true;
     fixture.config.contract = metadata;
     fixture.config.prepared_sequence_tokens = 4096;
     fixture.config.limits.max_sequence_tokens = 4096;
@@ -1490,6 +1713,8 @@ fn exercise_text_preemption(
     assert!(worker.scheduler.stats().preemptions > 0);
     let (incoming, parked) = worker.parked.front_mut().unwrap();
     assert!(parked.carried.generated_tokens > 0);
+    let decoded_sequence = parked.carried.decoded_sequence;
+    assert_ne!(decoded_sequence, Default::default());
     let history_len = incoming.prompt.tokens.len();
     assert_eq!(history_len, 60 + parked.carried.generated_tokens as usize);
     assert_eq!(
@@ -1530,6 +1755,7 @@ fn exercise_text_preemption(
     assert!(worker.parked.is_empty());
     let resumed = worker.active.iter().flatten().next().unwrap().request;
     let live = worker.scheduler.request(resumed).unwrap();
+    assert_eq!(live.decoded_sequence, decoded_sequence);
     if evict_checkpoint {
         assert!(live.consumed_tokens < history_len as u64 - 1);
     } else {
@@ -1745,6 +1971,23 @@ async fn http_generation(
     tokio::task::JoinHandle<axum::response::Response>,
     Vec<Incoming>,
 ) {
+    http_generation_request(
+        "/v1/completions",
+        serde_json::json!({
+            "model": "qwen-worker-phases", "prompt": "a", "max_tokens": 2,
+            "stream": stream, "n": choices,
+        }),
+    )
+    .await
+}
+
+async fn http_generation_request(
+    path: &str,
+    body: serde_json::Value,
+) -> (
+    tokio::task::JoinHandle<axum::response::Response>,
+    Vec<Incoming>,
+) {
     use super::super::http;
     use axum::{Extension, extract::State};
     let (sender, receiver) = mpsc::sync_channel(4);
@@ -1752,15 +1995,9 @@ async fn http_generation(
     let ingress = Arc::new(state.ingress_slots.clone().acquire_owned().await.unwrap());
     let request = axum::http::Request::builder()
         .method("POST")
-        .uri("/v1/completions")
+        .uri(path)
         .header("content-type", "application/json")
-        .body(axum::body::Body::from(
-            serde_json::json!({
-                "model": "qwen-worker-phases", "prompt": "a", "max_tokens": 2,
-                "stream": stream, "n": choices,
-            })
-            .to_string(),
-        ))
+        .body(axum::body::Body::from(body.to_string()))
         .unwrap();
     let response = tokio::spawn(http::generate(State(state), Extension(ingress), request));
     let incoming = tokio::task::spawn_blocking(move || {
@@ -1774,7 +2011,7 @@ async fn http_generation(
 }
 
 #[tokio::test]
-async fn http_waits_for_admission_and_rejects_before_stream_headers() {
+async fn http_admission_rejections_use_json_or_terminal_stream_errors() {
     use axum::http::StatusCode;
     for stream in [false, true] {
         for (error, status, code) in [
@@ -1795,11 +2032,34 @@ async fn http_waits_for_admission_and_rejects_before_stream_headers() {
             ),
         ] {
             let (mut response, incoming) = http_generation(stream, 1).await;
-            assert!(futures_util::poll!(&mut response).is_pending());
+            let streaming_response = if stream {
+                Some(
+                    tokio::time::timeout(std::time::Duration::from_secs(5), &mut response)
+                        .await
+                        .unwrap()
+                        .unwrap(),
+                )
+            } else {
+                assert!(futures_util::poll!(&mut response).is_pending());
+                None
+            };
             incoming[0].reject_admission(error);
-            let response = response.await.unwrap();
-            assert_eq!(response.status(), status);
-            assert_eq!(response.headers()["content-type"], "application/json");
+            let response = match streaming_response {
+                Some(response) => response,
+                None => response.await.unwrap(),
+            };
+            assert_eq!(
+                response.status(),
+                if stream { StatusCode::OK } else { status }
+            );
+            assert_eq!(
+                response.headers()["content-type"],
+                if stream {
+                    "text/event-stream"
+                } else {
+                    "application/json"
+                }
+            );
             assert!(
                 response.headers()["x-request-id"]
                     .to_str()
@@ -1809,7 +2069,18 @@ async fn http_waits_for_admission_and_rejects_before_stream_headers() {
             let bytes = axum::body::to_bytes(response.into_body(), 65536)
                 .await
                 .unwrap();
-            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let body = std::str::from_utf8(&bytes).unwrap();
+            let body: serde_json::Value = if stream {
+                assert!(!body.contains("[DONE]"), "{body}");
+                serde_json::from_str(
+                    body.lines()
+                        .find_map(|line| line.strip_prefix("data: "))
+                        .unwrap(),
+                )
+                .unwrap()
+            } else {
+                serde_json::from_str(body).unwrap()
+            };
             assert_eq!(body["error"]["code"], code);
             assert!(body["error"]["param"].is_null());
             assert!(incoming[0].cancelled.load(Ordering::Acquire));
@@ -1818,9 +2089,8 @@ async fn http_waits_for_admission_and_rejects_before_stream_headers() {
 }
 
 #[tokio::test]
-async fn http_stream_starts_on_one_admission_and_late_failure_has_no_success_terminal() {
+async fn http_stream_headers_precede_admission_and_late_failure_has_no_success_terminal() {
     let (response, incoming) = http_generation(true, 2).await;
-    incoming[0].notify_admission(Ok(()));
     let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
         .await
         .unwrap()
@@ -1828,6 +2098,7 @@ async fn http_stream_starts_on_one_admission_and_late_failure_has_no_success_ter
     assert_eq!(response.status(), axum::http::StatusCode::OK);
     assert_eq!(response.headers()["content-type"], "text/event-stream");
     assert!(!incoming[1].cancelled.load(Ordering::Acquire));
+    incoming[0].notify_admission(Ok(()));
     incoming[0].emit_token(1);
     incoming[1].reject_admission(Error::admission(
         AdmissionError::Unavailable,
@@ -1845,10 +2116,212 @@ async fn http_stream_starts_on_one_admission_and_late_failure_has_no_success_ter
 }
 
 #[tokio::test]
+async fn chat_stream_role_waits_for_final_prefill_even_when_stop_matching_hides_tokens() {
+    use futures_util::StreamExt;
+    for (hidden, eos) in [(false, false), (true, false), (false, true)] {
+        let mut request = serde_json::json!({
+            "messages": [{"role": "user", "content": "a".repeat(70)}],
+            "max_tokens": 4, "stream": true,
+        });
+        if hidden {
+            request["stop_token_sequences"] = serde_json::json!([[1, 2]]);
+        }
+        let (response, mut incoming) = http_generation_request("/v1/chat/completions", request).await;
+        let response = tokio::time::timeout(std::time::Duration::from_secs(5), response)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let mut body = response.into_body().into_data_stream();
+        assert!(futures_util::poll!(body.next()).is_pending());
+
+        let fixture = Fixture::new();
+        // The fixture's graph bindings include an image-index view for text rows.
+        incoming[0].prompt.data.vision_token_indices = vec![-1; incoming[0].prompt.tokens.len()];
+        let (sender, receiver) = mpsc::channel();
+        sender.send(incoming).unwrap();
+        let mut worker = fixture.worker(receiver);
+        assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+        assert!(futures_util::poll!(body.next()).is_pending());
+        advance(&mut worker, GraphKind::Init, 1, None);
+        advance(&mut worker, GraphKind::Prefill, 2, None);
+        assert!(futures_util::poll!(body.next()).is_pending());
+        let step = planned(&mut worker, GraphKind::Prefill, 3);
+        let mut frame = completion(&worker, &step, 3, Some(if eos { 5 } else { 1 }));
+        if eos {
+            frame.records[0].status = 2;
+        }
+        worker.complete(GraphKind::Prefill, frame).unwrap();
+
+        let role = tokio::time::timeout(std::time::Duration::from_secs(5), body.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let role: serde_json::Value = serde_json::from_str(
+            std::str::from_utf8(&role)
+                .unwrap()
+                .trim()
+                .strip_prefix("data: ")
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            role["choices"][0]["delta"],
+            serde_json::json!({"role":"assistant","content":""})
+        );
+        if hidden || eos {
+            assert!(futures_util::poll!(body.next()).is_pending());
+        } else {
+            let text = body.next().await.unwrap().unwrap();
+            assert!(
+                std::str::from_utf8(&text)
+                    .unwrap()
+                    .contains("\"content\":\"b\"")
+            );
+        }
+        let cancelled = worker.active[0]
+            .as_ref()
+            .unwrap()
+            .incoming
+            .cancelled
+            .clone();
+        drop(body);
+        assert!(cancelled.load(Ordering::Acquire));
+    }
+}
+
+#[tokio::test]
+async fn chat_stream_failure_before_first_token_emits_only_error() {
+    for admission in [false, true] {
+        let (response, incoming) = http_generation_request(
+            "/v1/chat/completions",
+            serde_json::json!({
+                "messages": [{"role": "user", "content": "a"}],
+                "max_tokens": 2, "stream": true,
+            }),
+        )
+        .await;
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        if admission {
+            incoming[0].reject_admission(Error::admission(
+                AdmissionError::Unavailable,
+                "worker stopped",
+            ));
+        } else {
+            incoming[0].notify_admission(Ok(()));
+            incoming[0].fail(Error::execution(ExecutionError::Worker, "worker stopped"));
+        }
+        let bytes = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            axum::body::to_bytes(response.into_body(), 65536),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        assert!(body.contains("worker stopped"), "{body}");
+        assert_eq!(
+            body.lines()
+                .filter(|line| line.starts_with("data:"))
+                .count(),
+            1
+        );
+        assert!(!body.contains("\"role\""), "{body}");
+        assert!(!body.contains("[DONE]"), "{body}");
+        assert!(incoming[0].cancelled.load(Ordering::Acquire));
+    }
+}
+
+#[tokio::test]
+async fn chat_stream_disconnect_before_first_token_cancels_generation() {
+    use futures_util::StreamExt;
+    let (response, incoming) = http_generation_request(
+        "/v1/chat/completions",
+        serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}], "max_tokens": 2, "stream": true,
+        }),
+    )
+    .await;
+    let mut body = response.await.unwrap().into_body().into_data_stream();
+    assert!(futures_util::poll!(body.next()).is_pending());
+    drop(body);
+    assert!(incoming[0].cancelled.load(Ordering::Acquire));
+}
+
+#[tokio::test]
+async fn chat_stream_flushes_headers_over_tcp_before_admission_or_tokens() {
+    use std::io::{Read, Write};
+    let (sender, receiver) = mpsc::sync_channel(4);
+    let state = http_state(sender, None);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let router = super::super::router(state, &[], 65536);
+    let server = tokio::spawn(async move { axum::serve(listener, router).await });
+    let client = tokio::task::spawn_blocking(move || {
+        let mut socket = std::net::TcpStream::connect(address).unwrap();
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let body = serde_json::json!({
+            "messages": [{"role": "user", "content": "a"}], "max_tokens": 2, "stream": true,
+        })
+        .to_string();
+        write!(socket, "POST /v1/chat/completions HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}", body.len()).unwrap();
+        let mut headers = Vec::new();
+        while !headers.ends_with(b"\r\n\r\n") {
+            let mut byte = [0];
+            socket.read_exact(&mut byte).unwrap();
+            headers.push(byte[0]);
+        }
+        let headers = std::str::from_utf8(&headers).unwrap();
+        assert!(headers.starts_with("HTTP/1.1 200 OK\r\n"), "{headers}");
+        assert!(headers.contains("text/event-stream"), "{headers}");
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let error = socket.read(&mut [0]).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
+        socket
+    });
+    let incoming = tokio::task::spawn_blocking(move || {
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    let mut socket = client.await.unwrap();
+    incoming[0].notify_admission(Ok(()));
+    incoming[0].observe_token(1);
+    incoming[0].emit_token(1);
+    tokio::task::spawn_blocking(move || {
+        socket
+            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+            .unwrap();
+        let mut body = String::new();
+        while !body.contains("\"content\":\"b\"") {
+            let mut bytes = [0; 4096];
+            let length = socket.read(&mut bytes).unwrap();
+            assert_ne!(length, 0, "{body}");
+            body.push_str(std::str::from_utf8(&bytes[..length]).unwrap());
+        }
+        let role = body.find("\"role\":\"assistant\"").unwrap();
+        assert!(role < body.find("\"content\":\"b\"").unwrap(), "{body}");
+    })
+    .await
+    .unwrap();
+    server.abort();
+}
+
+#[tokio::test]
 async fn http_disconnect_while_waiting_cancels_queued_generation() {
     let (response, incoming) = http_generation(true, 1).await;
-    response.abort();
-    assert!(response.await.unwrap_err().is_cancelled());
+    drop(response.await.unwrap());
     assert!(incoming[0].cancelled.load(Ordering::Acquire));
 }
 
@@ -1857,7 +2330,7 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     use std::io::{Read, Write};
     let (sender, _receiver) = mpsc::sync_channel(4);
     let state = http_state(sender, Some("serving-key".into()));
-    state.model.metrics().progress(10, 3, 0, 0);
+    state.model.metrics().progress(10, 3, 0, 0, 0, 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = super::super::router(state, &[], 65536);
@@ -2058,6 +2531,7 @@ fn failed_host_restore_replans_all_images_from_the_shallower_prefix() {
     let _ = worker.admit().unwrap();
     assert_eq!(worker.active[0].as_ref().unwrap().selected_images.len(), 0);
     worker.active[0].as_mut().unwrap().carried = Carried {
+        decoded_sequence: Default::default(),
         prompt_tokens: Some(90),
         reused_prompt_tokens: Some(56),
         generated_tokens: 7,
@@ -2277,7 +2751,7 @@ fn worker_restores_conditioned_windows_with_fresh_generation_and_unchanged_sampl
         embedding_tables: vec![],
         pending_token: None,
     });
-    manifest.graphs.push(GraphDescriptor {
+    manifest.graphs.push(GraphDescriptor { draft_tokens: 0,
         name: "Vision-1-256".into(),
         kind: GraphKind::Vision,
         handle: 1,
@@ -2435,4 +2909,172 @@ fn zero_output_budget_requires_prompt_scoring_at_both_admission_checks() {
         &incoming.prompt, false).unwrap();
     admission.prompt_logprobs = false;
     assert!(admission.validate(config).is_err());
+}
+
+#[test]
+fn publication_retries_wait_for_progress_and_pin_only_admitted_copies() {
+    use crate::offload::{StoreOutcome, StoreReason};
+    let mut fixture = Fixture::new();
+    fixture.config.limits.snapshots = 1;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store
+        .store_outcomes
+        .push_back(StoreOutcome::Retry(StoreReason::Slabs));
+    worker.attach_store(Some(Box::new(store)));
+    let spec = RequestSpec {
+        prompt: vec![0; 70],
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 1,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let key = plan.history().key_at(64).unwrap();
+    let admitted = worker
+        .scheduler
+        .admit_planned(
+            spec.clone(),
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: 64,
+                pages: 1,
+            }),
+        )
+        .unwrap();
+    worker.scheduler.finish_inbound(key, true).unwrap();
+    let id = worker
+        .scheduler
+        .request(admitted.handle)
+        .unwrap()
+        .prefix()
+        .unwrap();
+    assert!(worker.service_store().unwrap());
+    assert_eq!(worker.deferred_stores, [id]);
+    assert_eq!(
+        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
+        1
+    );
+    assert!(!worker.service_store().unwrap());
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    fake_store(&mut worker).progress += 1;
+    assert!(worker.service_store().unwrap());
+    assert!(worker.deferred_stores.is_empty());
+    assert_eq!(fake_store(&mut worker).stored.len(), 2);
+    assert_eq!(
+        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
+        2
+    );
+    assert_eq!(
+        fixture.metrics.host_retry_success.load(Ordering::Relaxed),
+        1
+    );
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Deferred { checkpoint: id });
+    worker.service_store().unwrap();
+    assert_eq!(worker.deferred_stores, [id]);
+    worker.scheduler.cancel(admitted.handle).unwrap();
+    let mut other = spec;
+    other.prompt.fill(1);
+    let plan = worker.scheduler.plan_admission(&other).unwrap();
+    let key = plan.history().key_at(64).unwrap();
+    worker
+        .scheduler
+        .admit_planned(
+            other,
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: 64,
+                pages: 1,
+            }),
+        )
+        .unwrap();
+    assert!(worker.scheduler.cache().checkpoint(id).is_err());
+    worker.service_store().unwrap();
+    assert!(worker.deferred_stores.is_empty());
+    assert_eq!(
+        fixture.metrics.host_retry_abandoned.load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 2;
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 1);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 64))))));
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let handle = worker.active[0].as_ref().unwrap().request;
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Fetched {
+            key: history.key_at(64).unwrap(),
+            result: Ok(4096),
+        });
+    worker.service_store().unwrap();
+    let publication = fake_store(&mut worker).stored[0].clone();
+    worker.scheduler.cancel(handle).unwrap();
+    worker.active[0] = None;
+    let (incoming, _other_generation) = fixture.incoming(vec![1; 64], 1);
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].blocked.is_some());
+    let fence = worker.scheduler.completed();
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Stored {
+            checkpoint: publication.id,
+            key: publication.key,
+            result: Ok(4096),
+        });
+    worker.service_store().unwrap();
+    assert_eq!(worker.scheduler.completed(), fence);
+    assert!(worker.pending[0].blocked.is_none());
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.pending.is_empty());
+    assert_eq!(worker.scheduler.stats().active_requests, 1);
+}
+
+#[test]
+fn native_prompt_rejects_invalid_requested_logprob_ids() {
+    let mut fixture = Fixture::new();
+    let (mut incoming, _generation) = fixture.incoming(vec![0, 1], 1);
+    incoming.prompt.logprobs = true;
+    incoming.prompt.logprob_token_ids = vec![0, 1];
+    let validate = |config: &ModelConfig, prompt: &Prompt| {
+        crate::model::admission::validate_prompt(config, prompt)
+    };
+    assert!(
+        validate(&fixture.config, &incoming.prompt)
+            .unwrap_err()
+            .to_string()
+            .contains("re-export")
+    );
+    fixture.config.logprob_token_id_capacity = crate::execution::MAX_LOGPROB_TOKEN_IDS;
+    validate(&fixture.config, &incoming.prompt).unwrap();
+    for ids in [
+        vec![0, 0],
+        vec![fixture.config.contract.vocabulary as u32],
+        vec![0; 129],
+    ] {
+        incoming.prompt.logprob_token_ids = ids;
+        assert!(validate(&fixture.config, &incoming.prompt).is_err());
+    }
+    incoming.prompt.logprob_token_ids = vec![0];
+    incoming.prompt.logprobs = false;
+    assert!(validate(&fixture.config, &incoming.prompt).is_err());
 }

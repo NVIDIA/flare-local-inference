@@ -6,7 +6,7 @@ use crate::{
     execution::{ExecutionTiming, GraphDescriptor, GraphKind},
 };
 
-pub(super) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
+pub(crate) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
     timing
         .gpu_ns
         .into_iter()
@@ -16,8 +16,9 @@ pub(super) fn observed_duration_ns(timing: ExecutionTiming) -> Option<u64> {
         .map(|ns| if timing.queued { ns } else { ns.max(timing.wall_ns) })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(super) struct Key {
+    pub drafts: usize,
     pub kind: GraphKind,
     pub batch: usize,
     pub tokens: usize,
@@ -27,7 +28,7 @@ pub(super) struct Key {
 
 impl Key {
     pub fn from_step(step: &ScheduledStep) -> Self {
-        Self { kind: step.kind, batch: step.batch_capacity, tokens: step.token_capacity,
+        Self { drafts: step.draft_tokens, kind: step.kind, batch: step.batch_capacity, tokens: step.token_capacity,
             prefill: step.prefill_capacity(), packed: step.packed_token_capacity }
     }
 }
@@ -35,6 +36,14 @@ impl Key {
 #[derive(Clone, Copy, Debug)]
 pub(super) struct PackedShape {
     pub batch: usize,
+    pub width: usize,
+    pub tokens: usize,
+    pub nanos: u64,
+}
+
+pub(super) struct PackedRoundShape {
+    pub batch: usize,
+    pub drafts: usize,
     pub width: usize,
     pub tokens: usize,
     pub nanos: u64,
@@ -83,38 +92,50 @@ impl Estimate {
 #[derive(Default)]
 pub(super) struct ActionCosts {
     entries: Vec<(Key, Estimate)>,
+    index: std::collections::HashMap<Key, usize>,
+    pub proposal_width: Option<usize>,
+    packed_round_durations: [[Option<u64>; 9]; 7],
+    packed_verification_durations: [[Option<u64>; 9]; 7],
     now_ns: u64,
     ttl_ns: u64,
 }
 
 impl ActionCosts {
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
     #[cfg(test)]
     pub fn set_measured(&mut self, step: &ScheduledStep, nanos: u64) {
         let key = Key {
+            drafts: step.draft_tokens,
             kind: step.kind,
             batch: step.batch_capacity,
             tokens: step.token_capacity,
             prefill: step.prefill_capacity(),
             packed: step.packed_token_capacity,
         };
-        let estimate = &mut self.entries.iter_mut().find(|(k, _)| *k == key).unwrap().1;
+        let estimate = &mut self.entries[self.index[&key]].1;
         estimate.nanos = nanos;
         estimate.replays.observe(nanos, false);
         estimate.handoff_ns = 0;
         estimate.observed_at_ns = self.now_ns;
+        self.refresh_packed_durations();
     }
 
     pub fn prepared(graphs: &[GraphDescriptor]) -> Result<Self> {
         let mut entries = Vec::with_capacity(graphs.len());
+        let mut index = std::collections::HashMap::with_capacity(graphs.len());
         for graph in graphs {
             let key = Key {
+                drafts: graph.draft_tokens,
                 kind: graph.kind,
                 batch: graph.batch_capacity,
                 tokens: graph.token_capacity,
                 prefill: graph.prefill_capacity,
                 packed: graph.packed_token_capacity,
             };
-            if entries.iter().any(|(k, _)| *k == key) {
+            if index.insert(key, entries.len()).is_some() {
                 return Err("prepared graphs require unique shapes".into());
             }
             entries.push((
@@ -128,11 +149,22 @@ impl ActionCosts {
                 },
             ));
         }
-        Ok(Self {
-            entries,
-            now_ns: 0,
-            ttl_ns: super::PolicyConfig::default().estimate_ttl_ns,
-        })
+        let proposal_width = entries.iter().filter_map(|(key, _)| match key.kind {
+            GraphKind::Proposal => Some(key.tokens),
+            GraphKind::PackedSpeculative => Some(key.drafts + 1),
+            _ => None,
+        }).max();
+        // Only the full producer participates in scheduling, including timing and acceptance probes.
+        entries.retain(|(key, _)| match key.kind {
+            GraphKind::Proposal => Some(key.tokens) == proposal_width,
+            GraphKind::PackedSpeculative => Some(key.drafts + 1) == proposal_width,
+            _ => true,
+        });
+        let index = entries.iter().enumerate().map(|(index, (key, _))| (*key, index)).collect();
+        let mut costs = Self { entries, index, proposal_width,
+            ttl_ns: super::PolicyConfig::default().estimate_ttl_ns, ..Default::default() };
+        costs.refresh_packed_durations();
+        Ok(costs)
     }
 
     pub fn advance_to(&mut self, now_ns: u64, ttl_ns: u64) {
@@ -142,16 +174,48 @@ impl ActionCosts {
 
     pub fn duration(&self, kind: GraphKind, batch: usize, tokens: usize) -> Option<u64> {
         self.shape_duration(kind, batch, tokens, 0).or_else(|| {
-            (kind == GraphKind::Verification).then(|| self.packed_shapes()
-                .filter(|shape| shape.batch == batch && shape.width >= tokens && shape.tokens >= batch * tokens)
-                .map(|shape| shape.nanos).min()).flatten()
+            (kind == GraphKind::Verification && batch.is_power_of_two() && batch <= super::REQUEST_LANES)
+                .then(|| self.packed_verification_durations
+                .get(batch.trailing_zeros() as usize)?.get(tokens).copied().flatten()).flatten()
         })
+    }
+
+    fn refresh_packed_durations(&mut self) {
+        self.packed_round_durations = Default::default();
+        self.packed_verification_durations = Default::default();
+        for (key, estimate) in &self.entries {
+            let durations = match key.kind {
+                GraphKind::PackedSpeculative => &mut self.packed_round_durations,
+                GraphKind::Verification if key.packed != 0 => &mut self.packed_verification_durations,
+                _ => continue,
+            };
+            let maximum = if key.kind == GraphKind::PackedSpeculative {
+                (key.drafts + 1).min(key.tokens)
+            } else { key.tokens }.min(key.packed / key.batch);
+            let nanos = estimate.nanos.saturating_add(estimate.handoff_ns);
+            for duration in durations[key.batch.trailing_zeros() as usize].iter_mut().take(maximum + 1).skip(1) {
+                *duration = Some(duration.map_or(nanos, |old| old.min(nanos)));
+            }
+        }
+    }
+
+    pub fn packed_round_duration(&self, batch: usize, width: usize) -> Option<u64> {
+        if !batch.is_power_of_two() || batch > super::REQUEST_LANES { return None; }
+        self.packed_round_durations.get(batch.trailing_zeros() as usize)?.get(width).copied().flatten()
     }
 
     pub fn packed_shapes(&self) -> impl Iterator<Item = PackedShape> + '_ {
         self.entries.iter().filter(|(key, _)| key.kind == GraphKind::Verification && key.packed != 0)
             .map(|(key, estimate)| PackedShape { batch: key.batch, width: key.tokens, tokens: key.packed,
                 nanos: estimate.nanos.saturating_add(estimate.handoff_ns) })
+    }
+
+    pub fn packed_round_shapes(&self) -> impl Iterator<Item = PackedRoundShape> + '_ {
+        self.entries.iter().filter(|(key, _)| key.kind == GraphKind::PackedSpeculative)
+            .map(|(key, estimate)| PackedRoundShape {
+                batch: key.batch, drafts: key.drafts, width: key.tokens, tokens: key.packed,
+                nanos: estimate.nanos.saturating_add(estimate.handoff_ns),
+            })
     }
 
     pub fn shape_duration(
@@ -166,6 +230,7 @@ impl ActionCosts {
 
     fn exact_duration(&self, kind: GraphKind, batch: usize, tokens: usize, prefill: usize, packed: usize) -> Option<u64> {
         self.entry(Key {
+            drafts: 0,
             kind,
             batch,
             tokens,
@@ -193,7 +258,8 @@ impl ActionCosts {
     }
 
     pub fn record_attempt(&mut self, key: Key) {
-        if let Some((_, estimate)) = self.entries.iter_mut().find(|(shape, _)| *shape == key) {
+        if let Some(&index) = self.index.get(&key) {
+            let estimate = &mut self.entries[index].1;
             estimate.last_attempt_ns = self.now_ns;
         }
     }
@@ -205,20 +271,11 @@ impl ActionCosts {
     }
 
     fn entry(&self, key: Key) -> Option<&Estimate> {
-        self.entries
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, estimate)| estimate)
+        self.index.get(&key).map(|&index| &self.entries[index].1)
     }
 
     pub fn get(&self, step: &ScheduledStep) -> Option<u64> {
-        self.exact_duration(
-            step.kind,
-            step.batch_capacity,
-            step.token_capacity,
-            step.prefill_capacity(),
-            step.packed_token_capacity,
-        )
+        self.duration_key(Key::from_step(step))
     }
 
     pub fn observe(&mut self, step: &ScheduledStep, timing: ExecutionTiming) {
@@ -230,13 +287,15 @@ impl ActionCosts {
             return;
         }
         let key = Key {
+            drafts: step.draft_tokens,
             kind: step.kind,
             batch: step.batch_capacity,
             tokens: step.token_capacity,
             prefill: step.prefill_capacity(),
             packed: step.packed_token_capacity,
         };
-        if let Some((_, estimate)) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+        if let Some(&index) = self.index.get(&key) {
+            let estimate = &mut self.entries[index].1;
             let fresh = estimate.fresh(self.now_ns, self.ttl_ns);
             if !timing.queued {
                 let handoff = timing.wall_ns.saturating_sub(raw_sample);
@@ -248,6 +307,7 @@ impl ActionCosts {
             }
             estimate.nanos = estimate.replays.observe(sample, fresh);
             estimate.observed_at_ns = self.now_ns;
+            self.refresh_packed_durations();
         }
     }
 }

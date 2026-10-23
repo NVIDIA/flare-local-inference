@@ -33,7 +33,12 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
         FrontendAssets {
             tokenizer: asset("tokenizer.json"),
             tokens: support::tokens(&asset("tokenizer_config.json")).unwrap(),
-            chat_template: Some(asset("chat_template.jinja")),
+            chat_template: Some({
+                let path=PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../ignition/recipes/glm53/assets/chat_template.jinja");
+                let contents=fs::read_to_string(&path).unwrap();
+                assert_eq!(contents.replace("{%- mark -%}",""),fs::read_to_string(snapshot.join("chat_template.jinja")).unwrap());
+                Asset {range:None,sha256:format!("{:x}",Sha256::digest(contents.as_bytes())),path}
+            }),
         },
         json!({"add_generation_prompt":true})
             .as_object()
@@ -43,6 +48,7 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
     .unwrap();
     let config = ModelConfig {
         max_top_logprobs: 0,
+        logprob_token_id_capacity: 0,
         prepared_sequence_tokens: 1048576,
         contract: support::contract("glm53"),
         identity: [9; 32],
@@ -72,6 +78,42 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
         &fs::read(std::env::var_os("FLARE_GLM_FRONTEND_REFERENCE").unwrap()).unwrap(),
     )
     .unwrap();
+    use flare_helios::frontend::images::{ImageLimits, ImageProcessor, ImageSettings};
+    use flare_helios::model::contract::{ImageLayoutKind, ImagePreparationKind, ImageTokenLayout};
+    let mut image_config = config.clone();
+    image_config.contract.vision = serde_json::from_value(json!({
+        "feature_slots": 1, "features_per_request": 8192, "max_images": 4,
+        "patches_per_feature": 4, "patch_capacities": [64, 256, 1024, 4096, 16384, 32768]
+    })).unwrap();
+    image_config.contract.frontend.rejected_tokens = (154832..=154835).chain([154855]).collect();
+    image_config.contract.frontend.image_layout = Some(ImageLayoutKind::Glm);
+    image_config.contract.frontend.image_preparation = Some(ImagePreparationKind::Glm);
+    image_config.contract.frontend.image_tokens = Some(ImageTokenLayout { feature_token: 154854, span: None });
+    let processor = ImageProcessor::load(ImageSettings::Glm {}, ImageLimits {
+        max_patches_per_image: 32768, max_total_patches: 128000, patches_per_feature: 4,
+        ..ImageLimits::default()
+    }).unwrap();
+    for case in reference["image_cases"].as_array().unwrap() {
+        let prepared = prepare_request(&frontend, Some(&processor), &compiler, &image_config, case["body"].clone()).unwrap();
+        model::admission::validate_prompt(&image_config, &prepared.prompt).unwrap();
+        assert_eq!(serde_json::to_value(&prepared.prompt.tokens).unwrap(), case["token_ids"]);
+        let images = &prepared.prompt.conditioned_inputs;
+        assert_eq!(serde_json::to_value(images.iter().map(|image| image.geometry.grid_thw).collect::<Vec<_>>()).unwrap(), case["grid_thw"]);
+        assert_eq!(prepared.prompt.conditioning.len(), images.len());
+        let indices = &prepared.prompt.data.vision_token_indices;
+        let features = images.iter().map(|image| image.geometry.tokens).sum::<usize>();
+        assert_eq!(indices.iter().copied().filter(|i| *i >= 0).collect::<Vec<_>>(), (0..features as i32).collect::<Vec<_>>());
+        for (token, index) in prepared.prompt.tokens.iter().zip(indices) {
+            assert_eq!(*token == 154854, *index >= 0);
+        }
+        for image in images {
+            let pixels = image.materialize().unwrap();
+            assert_eq!(pixels.pixel_values.len(), image.geometry.patches * 1176);
+            assert!(pixels.interpolation_indices.is_empty());
+        }
+        let repeated = prepare_request(&frontend, Some(&processor), &compiler, &image_config, case["body"].clone()).unwrap();
+        assert_eq!(prepared.prompt.conditioning, repeated.prompt.conditioning);
+    }
     for case in reference["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let prepared = prepare_request(&frontend, None, &compiler, &config, case["body"].clone())

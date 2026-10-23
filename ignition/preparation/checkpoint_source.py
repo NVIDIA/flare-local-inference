@@ -312,7 +312,7 @@ class SourceServer:
 class RemoteSource:
     """A scoped source directory containing real metadata and no tensor files."""
 
-    def __init__(self, connection, key, rank, identity, checkpoint, *, directory=None, on_created=None):
+    def __init__(self, connection, key, rank, identity, checkpoint, *, directory=None, on_created=None, fabric=None):
         self.channel, digest = authenticate(connection, key, rank=rank, identity=identity)
         admission, payload = self.channel.receive("catalog")
         if hashlib.sha256(payload).hexdigest() != digest:
@@ -347,7 +347,7 @@ class RemoteSource:
         self.stats = dict(payload_bytes=0, metadata_bytes=0, requests=0)
         self.control_stats = self.stats
         self.channels = None
-        self.ring_connections = []
+        self.fabric_connections = []
         self.channel_stats = []
         self.stats_lock = threading.Lock()
         self.streams = 1
@@ -369,40 +369,34 @@ class RemoteSource:
                     target.parent.mkdir(parents=True, exist_ok=True)
                     target.write_bytes(content)
             if admission.get("transport") is not None:
-                self._connect_ring(admission["transport"], key, rank, identity, digest)
+                self._connect_fabric(fabric, admission["transport"], key, rank, identity, digest)
             self.channel.send("ready")
             self.channel.receive("ready")
         except BaseException:
             self.close()
             raise
 
-    def _connect_ring(self, grant, key, rank, identity, digest):
-        from .checkpoint_ring import RingConnection
-
-        # The native helper verifies the controller signature and paired node identity.
-        route = json.loads(grant["body"])
-        if route["catalog_sha256"] != digest or route["identity"] != identity:
-            raise ValueError("checkpoint fabric route differs from its source admission")
-        streams = route["streams"]
-        if type(streams) is not int or not 1 <= streams <= 64:
-            raise ValueError("checkpoint transfer streams must be between 1 and 64")
+    def _connect_fabric(self, fabric, transport, key, rank, identity, digest):
+        streams = transport["streams"]
+        if fabric is None or streams != fabric.streams:
+            raise ValueError("checkpoint fabric differs from its admitted stream count")
         self.control_stats = dict(self.stats)
         self.channels = queue.Queue()
         self.streams = streams
         for stream in range(streams):
-            connection = RingConnection(self.temporary.name, grant, rank, stream)
-            self.ring_connections.append(connection)
+            connection = fabric.connect(stream)
+            self.fabric_connections.append(connection)
             try:
-                channel, actual = authenticate(connection.connection, key, rank=rank, identity=identity)
+                channel, actual = authenticate(connection, key, rank=rank, identity=identity)
                 _, payload = channel.receive("catalog")
                 if actual != digest or hashlib.sha256(payload).hexdigest() != digest:
                     raise ValueError("checkpoint fabric catalog differs from its admitted source")
                 channel.send("ready")
                 channel.receive("ready")
             except BaseException:
-                self.ring_connections.pop().close(check=True)
+                self.fabric_connections.pop().close()
                 raise
-            connection.connection.settimeout(None)
+            connection.settimeout(None)
             stats = dict(payload_bytes=0, metadata_bytes=0, requests=0)
             self.channel_stats.append((channel, stats))
             self.channels.put((channel, stats))
@@ -461,12 +455,12 @@ class RemoteSource:
             self.close_transport()
 
     def close_transport(self):
-        while self.ring_connections:
-            self.ring_connections.pop().close(check=True)
+        while self.fabric_connections:
+            self.fabric_connections.pop().close()
 
     def report(self):
         seconds = 0 if self.read_started is None else self.read_finished - self.read_started
-        return dict(self.stats, transport="agent-ring-tcp" if self.channels is not None else "rendezvous-tcp",
+        return dict(self.stats, transport="fabric-tcp" if self.channels is not None else "rendezvous-tcp",
                     streams=self.streams, payload_seconds=seconds,
                     payload_gbps=self.stats["payload_bytes"] * 8 / seconds / 1e9 if seconds else 0)
 
@@ -481,8 +475,8 @@ class RemoteSource:
                 pass
 
     def close(self):
-        while getattr(self, "ring_connections", []):
-            self.ring_connections.pop().close()
+        while getattr(self, "fabric_connections", []):
+            self.fabric_connections.pop().close()
         self.temporary.cleanup()
 
 

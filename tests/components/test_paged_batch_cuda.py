@@ -15,33 +15,51 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires an explicitly assigned CUDA device")
 
 
+@pytest.mark.parametrize("rows,capacity,length_cases", [
+    (2, 8, ((6, 2), (2, 6))),
+    (2, 7, ((5, 2), (2, 5))),
+    (4, 5, ((2, 1, 1, 1), (1, 1, 2, 1))),
+    (4, 13, ((6, 3, 2, 1), (1, 0, 6, 4))),
+])
 @torch.no_grad()
-def test_packed_prefixes_keep_individual_lengths_and_total_rows_independent():
+def test_packed_prefixes_keep_individual_lengths_and_total_rows_independent(rows, capacity, length_cases):
     device = torch.device("cuda", 0)
-    metadata = Metadata.allocate(8, 2, 2, device, samples=12, max_query_tokens=6)
-    lengths = torch.tensor([6, 2], dtype=torch.int32, device=device)
-    starts = torch.tensor([126, 254], dtype=torch.int64, device=device)
-    states = torch.tensor([1, 2], dtype=torch.int64, device=device)
-    pages = torch.tensor([[0, 1], [2, 3]], dtype=torch.int32, device=device)
-    tokens = torch.arange(12, dtype=torch.int64, device=device).reshape(2, 6)
-    live = torch.tensor([2], dtype=torch.int32, device=device)
+    metadata = Metadata.allocate(capacity, rows, 2, device, samples=rows * 6, max_query_tokens=6)
+    lengths = torch.tensor(length_cases[0], dtype=torch.int32, device=device)
+    starts = torch.arange(rows, dtype=torch.int64, device=device) * 128 + 126
+    states = torch.arange(1, rows + 1, dtype=torch.int64, device=device)
+    pages = torch.arange(rows * 2, dtype=torch.int32, device=device).reshape(rows, 2)
+    tokens = torch.arange(rows * 6, dtype=torch.int64, device=device).reshape(rows, 6)
+    live = torch.tensor([rows], dtype=torch.int32, device=device)
     compiled = compile_forward(lambda: metadata.set(starts, lengths, states, pages, tokens, live))
     compiled()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         compiled()
-    graph.replay()
-    torch.cuda.synchronize()
-    assert metadata.max_query_tokens == 6
-    assert metadata.token_ids.tolist() == list(range(8))
-    assert metadata.query_start_loc.tolist() == [0, 6, 8]
-    assert metadata.positions.tolist() == [126, 127, 128, 129, 130, 131, 254, 255]
-    lengths.copy_(torch.tensor([2, 6], dtype=torch.int32, device=device))
-    graph.replay()
-    torch.cuda.synchronize()
-    assert metadata.token_ids.tolist() == [0, 1, 6, 7, 8, 9, 10, 11]
-    assert metadata.query_start_loc.tolist() == [0, 2, 8]
-    graph.reset()
+    try:
+        for values in length_cases:
+            lengths.copy_(torch.tensor(values, dtype=torch.int32, device=device))
+            torch.cuda.synchronize()
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            expected_tokens = [row * 6 + column for row, count in enumerate(values) for column in range(count)]
+            expected_positions = [126 + row * 128 + column
+                                  for row, count in enumerate(values) for column in range(count)]
+            padding = capacity - sum(values)
+            ends = [sum(values[:row + 1]) for row in range(rows)]
+            sample_indices = [min(sum(values[:row]) + column, capacity - 1)
+                              for row in range(rows) for column in range(6)]
+            assert metadata.max_query_tokens == 6
+            assert metadata.token_ids.tolist() == expected_tokens + [0] * padding
+            assert metadata.positions.tolist() == expected_positions + [-1] * padding
+            assert metadata.query_start_loc.tolist() == [0, *ends]
+            assert metadata.sample_indices.tolist() == sample_indices
+            assert metadata.state_rows.tolist() == [row + 1 if count else 0 for row, count in enumerate(values)]
+            assert metadata.live_counts.tolist() == [sum(values), rows]
+    finally:
+        graph.reset()
 
 
 @torch.no_grad()

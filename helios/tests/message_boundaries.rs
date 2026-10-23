@@ -2,13 +2,16 @@
 
 use flare_helios::{
     frontend::{Asset, Frontend, FrontendAssets, TemplateEncoding},
-    model::message_boundaries,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn frontend(template: &str, encoding: TemplateEncoding) -> Frontend {
+    frontend_with_merges(template,encoding,vec![])
+}
+
+fn frontend_with_merges(template: &str, encoding: TemplateEncoding, merges: Vec<(String,String)>) -> Frontend {
     static SERIAL: AtomicUsize = AtomicUsize::new(0);
     let directory = std::env::temp_dir().join(format!(
         "flare-message-boundaries-{}-{}",
@@ -16,14 +19,15 @@ fn frontend(template: &str, encoding: TemplateEncoding) -> Frontend {
         SERIAL.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir(&directory).unwrap();
-    let vocabulary = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
+    let mut vocabulary = tokenizers::pre_tokenizers::byte_level::ByteLevel::alphabet()
         .into_iter()
         .enumerate()
         .map(|(i, c)| (c.to_string(), i as u32))
         .collect::<tokenizers::models::bpe::Vocab>();
+    for (a,b) in &merges {vocabulary.insert(format!("{a}{b}"),vocabulary.len() as u32);}
     let mut tokenizer = tokenizers::Tokenizer::new(
         tokenizers::models::bpe::BPE::builder()
-            .vocab_and_merges(vocabulary, vec![])
+            .vocab_and_merges(vocabulary, merges)
             .build()
             .unwrap(),
     );
@@ -31,6 +35,7 @@ fn frontend(template: &str, encoding: TemplateEncoding) -> Frontend {
         tokenizers::pre_tokenizers::byte_level::ByteLevel::new(false, true, false),
     ));
     tokenizer.with_decoder(Some(tokenizers::decoders::byte_level::ByteLevel::default()));
+    tokenizer.with_post_processor(Some(tokenizers::processors::byte_level::ByteLevel::new(false,true,false)));
     tokenizer
         .add_special_tokens(
             ["<|open|>", "<|close|>", "<|sep|>", "<|end_of_msg|>"]
@@ -63,20 +68,39 @@ fn frontend(template: &str, encoding: TemplateEncoding) -> Frontend {
     frontend
 }
 
+#[test]
+fn bpe_crossings_and_unicode_offsets_use_the_complete_encoding() {
+    for (source,merges,expected) in [
+        ("a{% mark %}b{% mark %}c",vec![("a".into(),"b".into())],vec![1]),
+        ("a {% mark %}b",vec![("Ġ".into(),"b".into())],vec![]),
+        ("é{% mark %}x",vec![],vec![2]),
+    ] {
+        let frontend=frontend_with_merges(source,TemplateEncoding::Text,merges);
+        let rendered=frontend.render_chat(&[json!({"role":"user","content":"unused"})],&Map::new()).unwrap();
+        assert_eq!(rendered.message_boundaries,expected, "{source}");
+        assert_eq!(rendered.token_ids,frontend.encode(&rendered.text,false).unwrap());
+    }
+}
+
+#[test]
+fn continuation_clips_marks_and_segments_before_mapping() {
+    let frontend=frontend("{% for m in messages %}{{m.content}}{% mark %}|{% endfor %}",TemplateEncoding::Text);
+    let rendered=frontend.render_chat(&[json!({"role":"user","content":"A"}),json!({"role":"assistant","content":"café  "})],
+        json!({"continue_final_message":true}).as_object().unwrap()).unwrap();
+    assert_eq!(rendered.text,"A|café  ");
+    assert_eq!(rendered.message_boundaries,vec![1]);
+    assert_eq!(rendered.token_ids,frontend.encode(&rendered.text,false).unwrap());
+}
+
 fn check_messages(frontend: &Frontend, messages: &[Value]) -> (Vec<u32>, Vec<usize>) {
     let options = json!({"add_generation_prompt":true});
     let rendered = frontend
         .render_chat(messages, options.as_object().unwrap())
         .unwrap();
-    let boundaries = message_boundaries(
-        frontend,
-        &rendered.token_ids,
-        messages,
-        options.as_object().unwrap(),
-    );
+    let boundaries = rendered.message_boundaries;
     for count in 1..=messages.len() {
         let prefix = frontend
-            .render_boundary(&messages[..count], &Map::new())
+            .render_chat(&messages[..count], &Map::new())
             .unwrap();
         assert!(
             boundaries.contains(&prefix.token_ids.len()),
@@ -95,7 +119,7 @@ fn check_messages(frontend: &Frontend, messages: &[Value]) -> (Vec<u32>, Vec<usi
 fn every_role_transition_and_empty_message_has_a_boundary() {
     let frontend = frontend(
         concat!(
-            "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% endfor %}",
+            "{% for m in messages %}<{{ m.role }}>{{ m.content }}</{{ m.role }}>{% mark %}{% endfor %}",
             "{% if add_generation_prompt %}<assistant>{% endif %}"
         ),
         TemplateEncoding::Text,
@@ -112,26 +136,14 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
     ]);
     let (tokens, boundaries) = check_messages(&frontend, messages.as_array().unwrap());
     assert_eq!(boundaries.len(), 8);
-    let mut changed = tokens.clone();
-    changed[boundaries[2] - 1] ^= 1;
-    assert_eq!(
-        message_boundaries(
-            &frontend,
-            &changed,
-            messages.as_array().unwrap(),
-            &Map::new()
-        ),
-        boundaries[..2]
-    );
-    assert_eq!(
-        message_boundaries(
-            &frontend,
-            &tokens[..boundaries[2]],
-            messages.as_array().unwrap(),
-            &Map::new()
-        ),
-        boundaries[..2]
-    );
+    let mut changed = messages.as_array().unwrap().clone();
+    changed[2]["content"] = "Different question".into();
+    let (other, other_boundaries) = check_messages(&frontend, &changed);
+    assert_eq!(&boundaries[..2], &other_boundaries[..2]);
+    assert_eq!(&tokens[..boundaries[1]], &other[..other_boundaries[1]]);
+    let complete = frontend.render_chat(messages.as_array().unwrap(), &Map::new()).unwrap();
+    assert!(complete.message_boundaries.iter().all(|&end| end < complete.token_ids.len()));
+
 }
 
 #[test]

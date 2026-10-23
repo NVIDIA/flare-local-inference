@@ -43,6 +43,12 @@ pub fn prepare_image_inputs(
         return Err("prompt contains an input token outside the prepared frontend contract".into());
     }
     let mut prepared = match config.contract.frontend.image_layout {
+        Some(ImageLayoutKind::Bracketed) => crate::frontend::images::layouts::bracketed::prepare_input(
+            frontend, processor, rendered, &images,
+        )?,
+        Some(ImageLayoutKind::Glm) => crate::frontend::images::layouts::glm::prepare_input(
+            frontend, processor, rendered, &images,
+        )?,
         Some(ImageLayoutKind::Qwen) => crate::frontend::images::layouts::qwen::prepare_input(
             frontend, processor, rendered, &images,
         )?,
@@ -160,30 +166,6 @@ pub(crate) fn validate_conditioned_inputs(
         return Err("prompt features are not owned by conditioned input spans".into());
     }
     Ok(())
-}
-
-pub fn message_boundaries(
-    frontend: &Frontend,
-    tokens: &[u32],
-    messages: &[Value],
-    options: &Map<String, Value>,
-) -> Vec<usize> {
-    let mut options = options.clone();
-    options.insert("add_generation_prompt".into(), false.into());
-    options.insert("continue_final_message".into(), false.into());
-    let mut boundaries = Vec::with_capacity(messages.len());
-    for count in 0..=messages.len() {
-        let Ok(prefix) = frontend.render_boundary(&messages[..count], &options) else {
-            continue;
-        };
-        let length = prefix.token_ids.len();
-        if length > 0 && length < tokens.len() && tokens.starts_with(&prefix.token_ids) {
-            boundaries.push(length);
-        }
-    }
-    boundaries.sort_unstable();
-    boundaries.dedup();
-    boundaries
 }
 
 pub fn prepare_output(
@@ -326,7 +308,7 @@ mod tests {
         };
         let frontend = Frontend::load(FrontendAssets {
             tokenizer: asset("tokenizer.json", tokenizer.to_string(false).unwrap().as_bytes()),
-            tokens: Default::default(), chat_template: Some(asset("chat_template.jinja", b"{{ messages[0].content }}")),
+            tokens: Default::default(), chat_template: Some(asset("chat_template.jinja", b"{% mark %}{{ messages[0].content }}")),
         }, Map::new()).unwrap();
         std::fs::remove_dir_all(root).unwrap();
         frontend
@@ -390,7 +372,7 @@ mod tests {
             };
             let processor = ImageProcessor::load(settings, limits).unwrap();
             let text = format!("a{placeholder}b{placeholder}c{placeholder}d");
-            let rendered = RenderedPrompt { token_ids: frontend.encode(&text, false).unwrap(),
+            let rendered = RenderedPrompt { message_boundaries: Vec::new(), token_ids: frontend.encode(&text, false).unwrap(),
                 text, image_sources: vec![] };
             let images = (0..3).map(|i| RgbImage::new(64, 64, vec![i; 64 * 64 * 3]).unwrap()).collect();
             let prepared = prepare_input(&config, &frontend, Some(&processor), &rendered, images).unwrap();
@@ -452,7 +434,7 @@ mod tests {
                     tokenizer.to_string(false).unwrap().as_bytes(),
                 ),
                 tokens: Default::default(),
-                chat_template: Some(asset("chat_template.jinja", b"{{ messages[0].content }}")),
+                chat_template: Some(asset("chat_template.jinja", b"{% mark %}{{ messages[0].content }}")),
             },
             Map::new(),
         )
@@ -492,7 +474,7 @@ mod tests {
             let prefix = config.contract.frontend.assistant_marker.clone() + protocol;
             let mut token_ids = frontend.encode(&prefix, false).unwrap();
             token_ids.extend(literal.bytes().map(u32::from));
-            let rendered = RenderedPrompt {
+            let rendered = RenderedPrompt { message_boundaries: Vec::new(),
                 image_sources: vec![],
                 text: prefix + literal,
                 token_ids,
@@ -541,7 +523,7 @@ mod tests {
                 .iter()
                 .find(|case| case["name"] == name)
                 .unwrap();
-            let rendered = RenderedPrompt {
+            let rendered = RenderedPrompt { message_boundaries: Vec::new(),
                 image_sources: vec![],
                 text: case["rendered"].as_str().unwrap().into(),
                 token_ids: vec![],
@@ -576,7 +558,7 @@ mod tests {
                     true,
                 ),
             ] {
-                let rendered = RenderedPrompt {
+                let rendered = RenderedPrompt { message_boundaries: Vec::new(),
                     image_sources: vec![],
                     text: format!("<|im_start|>{role}\nliteral <think><|im_end|>\n{suffix}"),
                     token_ids: vec![],
@@ -599,7 +581,7 @@ mod tests {
             }
         }
         let messages = vec![json!({"role":"user","content":"<think>"})];
-        let rendered = RenderedPrompt {
+        let rendered = RenderedPrompt { message_boundaries: Vec::new(),
             image_sources: vec![],
             text: "<|im_start|>user\n<think>".into(),
             token_ids: vec![],
@@ -649,7 +631,7 @@ mod tests {
                 ("<think>".into(), OutputStart::Reasoning),
                 ("</think>".into(), OutputStart::Content),
             ] {
-                let rendered = RenderedPrompt {
+                let rendered = RenderedPrompt { message_boundaries: Vec::new(),
                     image_sources: vec![],
                     text: format!("<｜User｜>Hello<｜Assistant｜>{suffix}"),
                     token_ids: vec![],

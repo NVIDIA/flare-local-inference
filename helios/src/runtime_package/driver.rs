@@ -145,6 +145,7 @@ driver! {
     function: "cuModuleGetFunction"(*mut Handle, Handle, *const c_char);
     parameter_info: "cuFuncGetParamInfo"(Handle, usize, *mut usize, *mut usize);
     function_attribute: "cuFuncSetAttribute"(Handle, c_int, c_int);
+    function_get_attribute: "cuFuncGetAttribute"(*mut c_int, c_int, Handle);
     function_load: "cuFuncLoad"(Handle);
     occupancy: "cuOccupancyMaxActiveBlocksPerMultiprocessor"(*mut c_int, Handle, c_int, usize);
     graph_upload: "cuGraphUpload"(Handle, Handle);

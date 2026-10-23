@@ -98,6 +98,7 @@ class PLETable:
     mailbox: object
     ready: object
     sources: tuple
+    global_scale: float
     sequence: torch.Tensor | None = None
     timings: object = None
 
@@ -133,7 +134,8 @@ class PLETable:
                 table = cls(config, layout, ple_embedding.allocate_geometry(layout.geometry, device=device),
                     scale.to(device), torch.zeros((tokens * heads, 80), dtype=torch.uint8, device=device),
                     torch.zeros((tokens * heads, 10), dtype=torch.uint8, device=device),
-                    torch.full((tokens, heads), -1, dtype=torch.int64, device=device), mailbox, ready, tuple(sources))
+                    torch.full((tokens, heads), -1, dtype=torch.int64, device=device), mailbox, ready, tuple(sources),
+                    float(scale.item()))
             except BaseException:
                 mailbox.close()
                 raise
@@ -147,31 +149,22 @@ class PLETable:
     def events(self):
         return {"ple_ready": self.ready.cuda_event}
 
-    def append(self, index, payload, cursor):
-        from ignition.preparation.package_file import align
-        from ignition.preparation import runtime_package_pb2 as proto
-
-        target = index.engram
-        target.pad_token_id = self.layout.caps.eos_token_id
-        target.compressed_vocabulary = self.config["vocab_size"]
-        table = target.tables.add(layer=1, rows=TABLE_ROWS, embedding_width=160, scale_block=16,
-            encoding=proto.EngramTable.NVFP4_E4M3_GLOBAL, weight_buffer="ple_weights",
-            scale_buffer="ple_scales", hash_buffer="ple_hashes", ready_event="ple_ready",
-            request_buffer="ple_requests", global_scale=float(self.scale.item()))
-        table.hash.method = proto.EngramHash.EOS_XOR_MODULO
-        table.hash.orders.extend(order for order in range(2, self.config["ngram_size"] + 1)
-                                 for _ in range(self.config["heads_per_ngram"]))
+    def export_metadata(self):
+        """Describe compact hash geometry and checkpoint spans for native publication."""
+        hashes = dict(method="EOS_XOR_MODULO", orders=[order for order in range(2, self.config["ngram_size"] + 1)
+                      for _ in range(self.config["heads_per_ngram"])])
         for name in ("multipliers", "prime_sizes", "table_offsets"):
-            target_name = {"prime_sizes": "primes", "table_offsets": "offsets"}.get(name, name)
-            getattr(table.hash, target_name).extend(getattr(self.geometry, name).flatten().cpu().tolist())
+            target = {"prime_sizes": "primes", "table_offsets": "offsets"}.get(name, name)
+            hashes[target] = list(getattr(self.layout.geometry, name))
+        table = dict(layer=1, rows=TABLE_ROWS, embedding_width=160, scale_block=16,
+            encoding="NVFP4_E4M3_GLOBAL", weight_buffer="ple_weights", scale_buffer="ple_scales",
+            hash_buffer="ple_hashes", ready_event="ple_ready", request_buffer="ple_requests",
+            global_scale=self.global_scale, hash=hashes)
         for name, sources in zip(("weights", "scales"), self.sources, strict=True):
-            cursor = align(cursor)
-            span = getattr(table, name)
-            span.offset, span.nbytes = cursor, sum(source.nbytes for source in sources)
-            for source in sources:
-                payload.append((cursor, source.path, source.offset, source.nbytes))
-                cursor += source.nbytes
-        return cursor
+            table[name] = [dict(path=str(source.path), offset=source.offset, nbytes=source.nbytes)
+                           for source in sources]
+        return dict(pad_token_id=self.layout.caps.eos_token_id,
+                    compressed_vocabulary=self.config["vocab_size"], tables=[table])
 
     def close(self):
         self.mailbox.close()

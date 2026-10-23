@@ -152,22 +152,27 @@ def _draft_scores(Logits, Histogram, Candidates, Slots, Params, GrammarMask, Gra
     token = block * BLOCK + tl.arange(0, BLOCK)
     inside = token < V
     score = tl.load(Logits + row * V + token, mask=inside, other=0.).to(tl.float32)
-    count = tl.load(Histogram + safe * hist_stride + token, mask=inside, other=0)
-    for index in tl.static_range(PREFIX):
-        draft = tl.load(Candidates + row * candidate_stride + index)
-        count += ((token == draft) & (draft >= 0) & (draft < V)).to(tl.int32)
     temperature = tl.load(Params + safe * 6)
     repetition = tl.load(Params + safe * 6 + 3)
     presence = tl.load(Params + safe * 6 + 4)
     frequency = tl.load(Params + safe * 6 + 5)
-    # IEEE division and no FMA contraction (see the launch) reproduce the unfused arithmetic exactly.
-    adjusted = tl.where(score > 0, tl.math.div_rn(score, repetition), score * repetition)
-    score = tl.where(count > 0, adjusted, score)
-    score = score - (count > 0).to(tl.float32) * presence - count.to(tl.float32) * frequency
+    # Nonnegative counts and positive-zero penalties leave signed logits unchanged.
+    # Prefix validity remains a separate check in _draft_scores_finish.
+    neutral = ((repetition == 1.) & (presence.to(tl.int32, bitcast=True) == 0)
+        & (frequency.to(tl.int32, bitcast=True) == 0))
+    if not neutral:
+        count = tl.load(Histogram + safe * hist_stride + token, mask=inside, other=0)
+        for index in tl.static_range(PREFIX):
+            draft = tl.load(Candidates + row * candidate_stride + index)
+            count += ((token == draft) & (draft >= 0) & (draft < V)).to(tl.int32)
+        # IEEE division and no FMA contraction preserve the unfused arithmetic.
+        adjusted = tl.where(score > 0, tl.math.div_rn(score, repetition), score * repetition)
+        score = tl.where(count > 0, adjusted, score)
+        score = score - (count > 0).to(tl.float32) * presence - count.to(tl.float32) * frequency
     score = tl.math.div_rn(score, tl.where(temperature > 0, temperature, 1.))
-    word = tl.load(GrammarMask + safe * mask_stride + token // 32, mask=inside, other=0)
-    allowed = (((word >> (token % 32)) & 1) != 0) | (tl.load(GrammarEnabled + safe) == 0)
-    score = tl.where(allowed, score, -float("inf"))
+    if tl.load(GrammarEnabled + safe) != 0:
+        word = tl.load(GrammarMask + safe * mask_stride + token // 32, mask=inside, other=0)
+        score = tl.where(((word >> (token % 32)) & 1) != 0, score, -float("inf"))
     tl.store(Scores + row * V + token, score, mask=inside)
     score = tl.where(inside, score, -float("inf"))
     maximum = tl.max(score, 0)

@@ -85,7 +85,10 @@ def test_autotuned_shared_routed_graph(expert_partition, rows, compiled, overlap
         if overlap:
             concurrent.defer_launch = defer_launch
             routed_bytes = moe.experts.plan.memory_requirements().scratch_nbytes
-            assert moe.experts.scratch.data_ptr() + routed_bytes <= concurrent.workspace.data_ptr()
+            if concurrent.workspace.numel():
+                assert moe.experts.scratch.data_ptr() + routed_bytes <= concurrent.workspace.data_ptr()
+            else:
+                assert all(p.plan.memory_requirements().scratch_nbytes == 0 for p in concurrent.projections)
         else:
             assert arena.parallel_nbytes(lambda plan: plan.memory_requirements().scratch_nbytes) == 0
 

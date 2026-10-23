@@ -86,6 +86,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         })
         .collect();
     let prompt = RenderedPrompt {
+        message_boundaries: Vec::new(),
         image_sources: Vec::new(),
         text: case["prompt"].as_str().unwrap().into(),
         token_ids: frontend.encode(case["prompt"].as_str().unwrap(), false)?,

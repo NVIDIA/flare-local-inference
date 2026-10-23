@@ -21,13 +21,15 @@ pub(crate) fn tensor_layout(
             ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor | ImageLayoutKind::Moonvit | ImageLayoutKind::Step,
             "vision_pixel_values",
         ) => (Float32, patches * 588),
+        (ImageLayoutKind::Bracketed, "vision_pixel_values") => (Float32, patches * 1176),
         (ImageLayoutKind::Radio, "vision_pixel_values") => (Float32, patches * 768),
+        (ImageLayoutKind::Glm, "vision_pixel_values") => (Float32, patches * 1176),
         (_, "vision_position_ids") => (Int64, patches * 2),
         (ImageLayoutKind::Step, "vision_cu_seqlens") => (Int32, super::step::MAX_VIEWS + 1),
         (_, "vision_cu_seqlens") => (Int32, 2),
         (_, "vision_num_patches" | "vision_feature_offset") => (Int32, 1),
         (
-            ImageLayoutKind::Mimo
+            ImageLayoutKind::Bracketed | ImageLayoutKind::Mimo
             | ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor
             | ImageLayoutKind::Moonvit
             | ImageLayoutKind::Step
@@ -77,7 +79,8 @@ pub(crate) fn prepare(
     i32::try_from(destination_feature_offset).map_err(|_| "vision feature offset exceeds int32")?;
     match config.contract.frontend.image_layout
         .ok_or("image layout is not prepared")? {
-        ImageLayoutKind::Qwen => qwen(config, handle, images, image, destination_feature_offset),
+        ImageLayoutKind::Bracketed => bracketed(config, handle, images, image, destination_feature_offset),
+        ImageLayoutKind::Qwen | ImageLayoutKind::Glm => qwen(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Mimo => mimo(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Deepseek | ImageLayoutKind::DeepseekRowMajor => deepseek(config, handle, images, image, destination_feature_offset),
         ImageLayoutKind::Moonvit | ImageLayoutKind::Radio => spatial_merge(config, handle, images, image, destination_feature_offset),
@@ -99,6 +102,8 @@ fn qwen(
         588
     } else if config.contract.frontend.image_layout == Some(ImageLayoutKind::Radio) {
         768
+    } else if config.contract.frontend.image_layout == Some(ImageLayoutKind::Glm) {
+        1176
     } else {
         1536
     };
@@ -139,29 +144,31 @@ fn qwen(
             .copied()
             .flat_map(f32::to_le_bytes),
     );
-    staging.i64(
-        "vision_interpolation_indices",
-        0,
-        images
-            .interpolation_indices
-            .get(start..end)
-            .ok_or("truncated vision interpolation indices")?
-            .iter()
-            .flatten()
-            .copied(),
-    );
-    staging.put(
-        "vision_interpolation_weights",
-        0,
-        images
-            .interpolation_weights
-            .get(start..end)
-            .ok_or("truncated vision interpolation weights")?
-            .iter()
-            .flatten()
-            .copied()
-            .flat_map(f32::to_le_bytes),
-    );
+    if config.contract.frontend.image_layout != Some(ImageLayoutKind::Glm) {
+        staging.i64(
+            "vision_interpolation_indices",
+            0,
+            images
+                .interpolation_indices
+                .get(start..end)
+                .ok_or("truncated vision interpolation indices")?
+                .iter()
+                .flatten()
+                .copied(),
+        );
+        staging.put(
+            "vision_interpolation_weights",
+            0,
+            images
+                .interpolation_weights
+                .get(start..end)
+                .ok_or("truncated vision interpolation weights")?
+                .iter()
+                .flatten()
+                .copied()
+                .flat_map(f32::to_le_bytes),
+        );
+    }
     staging.i64(
         "vision_position_ids",
         0,
@@ -441,5 +448,27 @@ fn step(
     staging.i32("vision_downsample1_indices", 0, first);
     staging.i32("vision_downsample2_indices", 0, second);
     staging.i32("vision_num_features", 0, [geometry.tokens as i32]);
+    Ok(staging)
+}
+
+fn bracketed(config: &ModelConfig, handle: RequestHandle, images: &ProcessedImages, image: usize, destination_feature_offset: usize) -> Result<UploadBatch> {
+    let geometry = images.geometry.get(image).ok_or("missing scheduled image")?;
+    let start: usize = images.geometry[..image].iter().map(|g| g.patches).sum();
+    let end = start + geometry.patches;
+    let [t, h, w] = geometry.grid_thw;
+    if t != 1 || h <= 0 || w <= 0 || h%2 != 0 || w%2 != 0
+        || (h as usize).checked_mul(w as usize) != Some(geometry.patches)
+        || geometry.tokens != geometry.patches/4 || config.contract.vision.patches_per_feature != 4
+        || geometry.patches > *config.contract.vision.patch_capacities.last().ok_or("missing vision capacities")?
+        || handle.slot as usize >= config.limits.max_active || handle.generation == 0 || handle.generation > i64::MAX as u64 {
+        return Err("invalid temporal patch-merge image extent".into());
+    }
+    let mut staging = UploadBatch::default();
+    staging.put("vision_pixel_values", 0, images.pixel_values.get(start*1176..end*1176).ok_or("truncated vision pixels")?.iter().copied().flat_map(f32::to_le_bytes));
+    staging.i64("vision_position_ids", 0, images.position_ids.get(start..end).ok_or("truncated vision positions")?.iter().flatten().copied());
+    staging.i32("vision_cu_seqlens", 0, [0, geometry.patches as i32]);
+    staging.i32("vision_num_patches", 0, [geometry.patches as i32]);
+    staging.i32("vision_num_features", 0, [geometry.tokens as i32]);
+    staging.i32("vision_feature_offset", 0, [destination_feature_offset as i32]);
     Ok(staging)
 }

@@ -125,7 +125,7 @@ pub(crate) fn download_with_token(
     let (id, given_revision) = repository(source)?;
     let revision = match options.revision.as_deref().or(given_revision) {
         Some(revision) => revision.to_owned(),
-        None => crate::hardware::detect(gpu_count)?.to_owned(),
+        None => crate::hardware::detect_isolated(gpu_count)?,
     };
     validate_relative(&revision)?;
     if let Some(filename) = &options.filename {

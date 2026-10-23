@@ -6,11 +6,13 @@ use super::*;
 pub(super) enum Normalization {
     Symmetric,
     Channel { mean: [f32; 3], std: [f32; 3] },
+    ScaledChannel { mean: [f32; 3], std: [f32; 3] },
 }
 
 #[derive(Clone)]
 pub(super) struct PatchProcessor {
     pub(super) limits: ImageLimits,
+    pub(super) patch_size: usize,
     pub(super) min_pixels: usize,
     pub(super) max_pixels: usize,
     pub(super) normalization: Normalization,
@@ -25,10 +27,10 @@ impl PatchProcessor {
                 "image aspect ratio exceeds 200",
             ))));
         }
-        let factor = (PATCH * MERGE) as f64;
+        let factor = (self.patch_size * MERGE) as f64;
         let (h, w) = (height as f64, width as f64);
-        let mut target_h = (h / factor).round_ties_even() * factor;
-        let mut target_w = (w / factor).round_ties_even() * factor;
+        let mut target_h = ((h / factor).round_ties_even() * factor).max(factor);
+        let mut target_w = ((w / factor).round_ties_even() * factor).max(factor);
         if target_h * target_w > self.max_pixels as f64 {
             let beta = (h * w / self.max_pixels as f64).sqrt();
             target_h = ((h / beta / factor).floor() * factor).max(factor);
@@ -39,12 +41,16 @@ impl PatchProcessor {
             target_w = (w * beta / factor).ceil() * factor;
         }
         let (height, width) = (target_h as usize, target_w as usize);
-        let patches = height / PATCH * (width / PATCH);
+        let patches = height / self.patch_size * (width / self.patch_size);
         check_image_patches(self.limits, patches)?;
         Ok(ImageGeometry {
             height,
             width,
-            grid_thw: [1, (height / PATCH) as i64, (width / PATCH) as i64],
+            grid_thw: [
+                1,
+                (height / self.patch_size) as i64,
+                (width / self.patch_size) as i64,
+            ],
             patches,
             tokens: patches / (MERGE * MERGE),
         })
@@ -72,11 +78,13 @@ impl PatchProcessor {
             })?;
         self.limits.check_batch(images.len(), total)?;
         let mut result = ProcessedImages {
-            pixel_values: Vec::with_capacity(total.checked_mul(FEATURES).ok_or(
-                Error::frontend(FrontendError::Input(Failure::new(
-                    "patch buffer extent overflow",
-                ))),
-            )?),
+            pixel_values: Vec::with_capacity(
+                total
+                    .checked_mul(3 * 2 * self.patch_size * self.patch_size)
+                    .ok_or(Error::frontend(FrontendError::Input(Failure::new(
+                        "patch buffer extent overflow",
+                    ))))?,
+            ),
             geometry,
             position_ids: Vec::with_capacity(total),
             interpolation_indices: Vec::new(),
@@ -88,6 +96,9 @@ impl PatchProcessor {
             (0..256)
                 .map(|value| match self.normalization {
                     Normalization::Symmetric => (value as f32 - 127.5) / 127.5,
+                    Normalization::ScaledChannel { mean, std } => {
+                        (value as f32 - mean[channel] * 255.) / (std[channel] * 255.)
+                    }
                     Normalization::Channel { mean, std } => {
                         (value as f32 * (1.0 / 255.0) - mean[channel]) / std[channel]
                     }
@@ -96,8 +107,8 @@ impl PatchProcessor {
         });
         for (image, geometry) in images.iter().zip(&result.geometry) {
             let pixels = (self.resize)(image, geometry.width, geometry.height);
-            let grid_h = geometry.height / PATCH;
-            let grid_w = geometry.width / PATCH;
+            let grid_h = geometry.height / self.patch_size;
+            let grid_w = geometry.width / self.patch_size;
             for by in 0..grid_h / MERGE {
                 for bx in 0..grid_w / MERGE {
                     for dy in 0..MERGE {
@@ -106,10 +117,11 @@ impl PatchProcessor {
                             result.position_ids.push([row as i64, col as i64]);
                             for channel in 0..3 {
                                 for _temporal in 0..2 {
-                                    for y in 0..PATCH {
-                                        for x in 0..PATCH {
-                                            let byte = pixels[((row * PATCH + y) * geometry.width
-                                                + col * PATCH
+                                    for y in 0..self.patch_size {
+                                        for x in 0..self.patch_size {
+                                            let byte = pixels[((row * self.patch_size + y)
+                                                * geometry.width
+                                                + col * self.patch_size
                                                 + x)
                                                 * 3
                                                 + channel];

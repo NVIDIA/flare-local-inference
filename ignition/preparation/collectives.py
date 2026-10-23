@@ -13,7 +13,7 @@ def host_identity():
 
 
 def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, gather_bytes, package_storage=None,
-                        varlen_bytes=0, ring=False):
+                        varlen_bytes=0, ring=False, ring_open=False):
     """Allocate RoCEnante for ranks on separate DGX Sparks: BF16 hidden reductions and logit gathers.
 
     One runtime serves every reduction and gather in rank-serial order. Reductions of up
@@ -43,7 +43,7 @@ def create_roce_runtime(group, device, *, max_tokens, pipe_tokens, hidden_size, 
         raise ValueError("variable-length gather capacity must be a nonnegative multiple of 16 bytes")
     runtime = roce.AllReduce(exchange_group=group, device=device, max_size=nbytes, max_gather_bytes=gather_bytes,
                              pipe_bytes=pipe_bytes, region_allocator=region,
-                             ring=ring,
+                             ring=ring, **({"ring_open": True} if ring_open else {}),
                              **({"max_varlen_bytes": varlen_bytes} if varlen_bytes else {}))
     if package_storage is not None:
         package_storage.transports.append(runtime)
@@ -91,10 +91,12 @@ def create_result_broadcast_runtime(group, device, *, layouts, ipc=None):
     sizes = [packed_broadcast_layout(layout.values())[1] for layout in layouts]
     if not sizes or min(sizes) <= 0:
         raise ValueError("result broadcasts require nonempty payload layouts")
-    # Each rank partition contains complete groups of 64 BF16 values.
-    local_columns = (max(sizes) + 127) // 128 * 64
-    return create_all_gather_runtime(group, device, max_rows=1,
-        columns=local_columns * dist.get_world_size(group), ipc=ipc)
+    # Gather warps copy 512-byte segments. Use one segment per rank per row
+    # so short results transfer fewer rows while large results keep every
+    # copying lane active. All payload sizes share the same channel storage.
+    max_rows = (max(sizes) + 511) // 512
+    return create_all_gather_runtime(group, device, max_rows=max_rows,
+        columns=256 * dist.get_world_size(group), ipc=ipc)
 
 
 def create_vocabulary_argmax_runtime(group, device, *, local_vocab_size, max_rows, ipc=None):
@@ -264,7 +266,15 @@ class CollectivePreparation:
                 if all(item[4] for item in states):
                     races = [sorted(contribution.key for contribution in item[4]) for item in states]
                     if any(keys != races[0] for keys in races[1:]):
-                        raise RuntimeError(f"tuning races differ across ranks: {races}")
+                        reference = set(races[0])
+                        counts = dict(zip(self.ranks, map(len, races), strict=True))
+                        differences = {}
+                        for rank, keys in zip(self.ranks[1:], races[1:], strict=True):
+                            missing, extra = reference - set(keys), set(keys) - reference
+                            if missing or extra:
+                                differences[rank] = {"missing": len(missing), "extra": len(extra),
+                                                     "examples": sorted(missing | extra)[:2]}
+                        raise RuntimeError(f"tuning races differ across ranks: counts={counts}, differences={differences}")
                     winners = _winners(contribution for item in states for contribution in item[4])
                     authorization = {"tuning": winners[0] if len(winners) == 1 else winners}
                     continue

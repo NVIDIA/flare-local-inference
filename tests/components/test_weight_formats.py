@@ -134,6 +134,27 @@ def test_quantization_config_requires_supported_schema():
         quantized_layers({"quantization_config": {"quant_method": "compressed-tensors"}})
 
 
+@pytest.mark.parametrize("entry,expected", [
+    ({"quant_algo": "MXFP8", "weight_block_size": [1, 32]}, "mxfp8"),
+    ({"quant_algo": "MXFP8", "group_size": 32, "weight_block_size": [1, 32]}, "mxfp8"),
+    ({"quant_algo": "FP8_PB_WO", "weight_block_size": [128, 128]}, "block_fp8"),
+])
+def test_modelopt_matrix_block_declarations(entry, expected):
+    assert projection_group_format({"a": entry, "b": entry}, ("a", "b")) == expected
+
+
+@pytest.mark.parametrize("entry", [
+    {"quant_algo": "MXFP8", "weight_block_size": [128, 32]},
+    {"quant_algo": "MXFP8", "group_size": 16, "weight_block_size": [1, 32]},
+    {"quant_algo": "MXFP8", "group_size": 32, "weight_block_size": [1, 16]},
+    {"quant_algo": "FP8_PB_WO", "weight_block_size": [32, 32]},
+    {"quant_algo": "FP8_PB_WO", "weight_block_size": [128, 128], "weight_scale_encoding": "csf"},
+])
+def test_modelopt_conflicting_block_declarations_are_rejected(entry):
+    with pytest.raises(ValueError, match="quantization"):
+        linear_format({"projection": entry}, "projection")
+
+
 @pytest.mark.parametrize("algo,group,encoding,expected", [
     ("NVFP4", 16, None, ("nvfp4", "a4")),
     ("NVFP4", 16, "csf_32x2_v1", ("nvfp4_csf", "a4")),
@@ -205,3 +226,69 @@ def test_ggml_projection_and_expert_declarations(algo, group, payload):
                          ("packing", "row"), ("weight_scale_encoding", "csf")):
         with pytest.raises(ValueError, match="block encoding"):
             linear_format({"proj": entry | {field: wrong}}, "proj")
+
+
+@pytest.mark.parametrize("invalid", [None, "gate_scale", "placeholder", "zero", "dtype"])
+def test_nvfp4_reciprocal_globals_and_token_outer_scales_preserve_packed_tp_slices(monkeypatch, invalid):
+    import torch
+    from b12x.moe import fused_moe as moe
+    from b12x._lib.intrinsics import reference
+
+    loader = DirectWeightLoader(SimpleNamespace(), "cpu")
+    loader._session = SimpleNamespace(flush=lambda: None)
+    monkeypatch.setattr(loader, "_copy", lambda destination, source: destination.copy_(source))
+    monkeypatch.setattr(reference, "swizzle_block_scale", lambda value: value)
+    monkeypatch.setattr(moe, "plan_weights", lambda **kwargs: SimpleNamespace(**kwargs))
+    monkeypatch.setattr(moe, "prepare_weights", lambda **kwargs: SimpleNamespace(**kwargs))
+    for index, projection in enumerate(("w1", "w3", "w2")):
+        shape = (128, 64) if projection == "w2" else (64, 128)
+        prefix = f"expert.{projection}"
+        loader._sources[prefix + ".weight_packed"] = torch.arange(shape[0] * shape[1] // 2).reshape(shape[0], -1).to(torch.uint8)
+        loader._sources[prefix + ".weight_scale"] = torch.full((shape[0], shape[1] // 16), index + 1.).to(torch.float8_e4m3fn)
+        loader._sources[prefix + ".weight_global_scale"] = torch.tensor(8. if index == 2 else 4.)
+        loader._sources[prefix + ".input_global_scale"] = torch.tensor(1.)
+    if invalid == "gate_scale":
+        loader._sources["expert.w3.weight_global_scale"].fill_(2.)
+    elif invalid == "placeholder":
+        loader._sources["expert.w2.input_global_scale"].fill_(2.)
+    elif invalid == "zero":
+        loader._sources["expert.w1.weight_global_scale"].zero_()
+    elif invalid == "dtype":
+        loader._sources["expert.w1.weight_global_scale"] = torch.tensor(4., dtype=torch.bfloat16)
+    options = dict(hidden_size=128, intermediate_size=64, intermediate_range=(32, 64),
+        format="nvfp4", activation_mode="a4", projection_names=("w1", "w3", "w2"),
+        weight_name="weight_packed", w13_layout="w31", global_scale_name="weight_global_scale",
+        global_scale_kind="reciprocal", input_scale_name="input_global_scale", activation_outer_scale="token",
+        swiglu_limit=7., swiglu_alpha=1.702, swiglu_beta=1.)
+    if invalid is not None:
+        with pytest.raises(ValueError):
+            loader.load_fp4_experts(["expert"], **options)
+        return
+    result = loader.load_fp4_experts(["expert"], **options)
+    assert torch.equal(result.weights.w13[0], torch.cat([
+        loader._sources[f"expert.{projection}.weight_packed"][32:64] for projection in ("w1", "w3")]))
+    assert torch.equal(result.weights.w2[0], loader._sources["expert.w2.weight_packed"][:, 16:32])
+    assert result.weights.w13_global_scales.tolist() == [.25]
+    assert result.weights.w2_global_scales.tolist() == [.125]
+    assert result.weights.input_scale is None and result.weights.intermediate_scale is None
+    assert result.plan.activation.outer_scale == "token"
+    assert result.plan.activation.swiglu_alpha == 1.702 and result.plan.activation.swiglu_beta == 1.
+
+
+def test_mxfp8_projection_fusion_preserves_unsigned_exponent_payload(monkeypatch):
+    import torch
+    from b12x.gemm import blockscaled
+
+    loader = DirectWeightLoader(SimpleNamespace(), "cpu")
+    loader._session = SimpleNamespace(flush=lambda: None)
+    loader.quantization = {name: {"quant_algo": "MXFP8", "group_size": 32} for name in ("q", "k")}
+    for name, gain in (("q", 1.), ("k", 2.)):
+        loader._sources[name + ".weight"] = torch.full((8, 64), gain).to(torch.float8_e4m3fn)
+        loader._sources[name + ".weight_scale_inv"] = torch.arange(16, dtype=torch.uint8).reshape(8, 2) + 121
+    monkeypatch.setattr(loader, "_copy", lambda destination, source: destination.copy_(source))
+    monkeypatch.setattr(blockscaled, "pack_weight", lambda weight, scales, **kwargs: (weight, scales, kwargs))
+    values, scales, _ = loader.load_linear_group(("q", "k"), row_ranges=((1, 5), (2, 6)),
+        column_range=(32, 64), scale_name="weight_scale_inv")
+    assert torch.equal(values.float(), torch.cat((torch.ones(4, 32), torch.full((4, 32), 2.))))
+    assert torch.equal(scales, torch.cat((loader._sources["q.weight_scale_inv"][1:5, 1:],
+                                         loader._sources["k.weight_scale_inv"][2:6, 1:])))

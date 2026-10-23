@@ -59,6 +59,7 @@ impl Fixture {
         .unwrap();
         let config = ModelConfig {
             max_top_logprobs: 0,
+            logprob_token_id_capacity: 0,
             prepared_sequence_tokens: 262144,
             contract: support::contract("qwen38"),
             model_id: "local-inference-lab/Qwen3.8-Flash-Next-NVFP4-MXFP8-CSF-QAD".into(),
@@ -213,11 +214,8 @@ fn exact_short_instruction_boundary_survives_changed_user_content() {
     assert!(decoded.starts_with("<|im_start|>system\nBe concise.<|im_end|>\n"));
     assert!(!decoded.contains("two plus two"));
     assert!(!decoded.contains("<|im_start|>user"));
-    let expected = fixture.frontend.render_boundary(
-        json!([{"role":"system","content":"Be concise."}]).as_array().unwrap(),
-        json!({"enable_thinking":false,"add_generation_prompt":false,"continue_final_message":false}).as_object().unwrap(),
-    ).unwrap();
-    assert_eq!(prefix, expected.token_ids);
+    let expected = fixture.frontend.encode("<|im_start|>system\nBe concise.<|im_end|>\n", false).unwrap();
+    assert_eq!(prefix, expected);
     let mut malformed = a;
     for boundary in [0, malformed.prompt.tokens.len(), usize::MAX] {
         malformed.prompt.message_boundaries = vec![boundary];
@@ -242,13 +240,17 @@ fn tool_instructions_are_rendered_without_explicit_system_and_disable_with_none(
         options("weather"),
     );
     let c = fixture.prepare(messages.clone(), options("other_weather"));
-    assert_ne!(fixture.prefix(&a), fixture.prefix(&b));
+    assert_eq!(fixture.prefix(&a), fixture.prefix(&b));
     assert_ne!(fixture.prefix(&a), fixture.prefix(&c));
     for prepared in [&a, &b, &c] {
-        assert_eq!(prepared.prompt.message_boundaries.len(), 1);
+        assert_eq!(prepared.prompt.message_boundaries.len(), 2);
         let prefix = fixture.frontend.decode(&fixture.prefix(prepared), false).unwrap();
-        assert!(prefix.contains("Weather in"));
+        assert!(!prefix.contains("Weather in"));
         assert!(prefix.ends_with("<|im_end|>\n"));
+        let user_end = prepared.prompt.message_boundaries[1];
+        let user_prefix = fixture.frontend.decode(&prepared.prompt.tokens[..user_end], false).unwrap();
+        assert!(user_prefix.contains("Weather in"));
+        assert!(user_prefix.ends_with("<|im_end|>\n"));
     }
     assert!(
         fixture
@@ -315,36 +317,14 @@ fn complete_user_and_empty_system_messages_have_checkpoints() {
 
 #[test]
 #[ignore = "requires FLARE_TEST_SNAPSHOT pointing to the pinned Qwen checkpoint"]
-fn token_prefix_mismatch_or_complete_prompt_match_suppresses_boundary() {
+fn completed_prompt_and_invalid_messages_do_not_produce_reusable_final_cuts() {
     let fixture = Fixture::load(Map::new());
     let messages = json!([{"role":"system","content":"Be concise."},{"role":"user","content":"Explain the sky."}]);
-    let options = json!({"enable_thinking":false});
-    let a = fixture.prepare(messages.clone(), options.clone());
-    let boundary = *a.prompt.message_boundaries.first().unwrap();
-    let mut mismatch = a.prompt.tokens.clone();
-    mismatch[boundary - 1] += 1;
-    for tokens in [&mismatch[..], &a.prompt.tokens[..boundary], &[]] {
-        assert_eq!(
-            flare_helios::model::message_boundaries(
-                &fixture.frontend,
-                tokens,
-                messages.as_array().unwrap(),
-                options.as_object().unwrap()
-            ),
-            Vec::<usize>::new()
-        );
-    }
-    let malformed =
-        json!([{"role":"system","content":{"not":"valid"}},{"role":"user","content":"Hello"}]);
-    assert_eq!(
-        flare_helios::model::message_boundaries(
-            &fixture.frontend,
-            &a.prompt.tokens,
-            malformed.as_array().unwrap(),
-            options.as_object().unwrap()
-        ),
-        Vec::<usize>::new()
-    );
+    let rendered = fixture.frontend.render_chat(messages.as_array().unwrap(),
+        json!({"enable_thinking":false,"add_generation_prompt":false}).as_object().unwrap()).unwrap();
+    assert!(rendered.message_boundaries.iter().all(|&end| end > 0 && end < rendered.token_ids.len()));
+    let malformed = json!([{"role":"system","content":{"not":"valid"}},{"role":"user","content":"Hello"}]);
+    assert!(fixture.frontend.render_chat(malformed.as_array().unwrap(), &Map::new()).is_err());
 }
 
 #[test]

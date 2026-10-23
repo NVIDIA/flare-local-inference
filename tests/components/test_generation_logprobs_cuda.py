@@ -57,19 +57,21 @@ def _snapshot(state):
     return restore
 
 
-def _assert_entry(output, logits, token, *, atol=2e-5):
+def _assert_entry(output, logits, token, *, atol=2e-5, ids=None):
     raw = logits.float()
     expected = raw - torch.logsumexp(raw, 0)
-    row = output.cpu()
+    count = 20 if ids is None else len(ids)
+    row = output.cpu()[:2 + 2 * count]
     assert row[0] == token
     torch.testing.assert_close(row[1:2].view(torch.float32), expected[token:token+1].cpu(), atol=atol, rtol=1e-5)
-    ids = torch.argsort(expected, descending=True, stable=True)[:20]
+    ids = torch.argsort(expected, descending=True, stable=True)[:20] if ids is None else torch.tensor(ids, device=logits.device)
     torch.testing.assert_close(row[2::2].long(), ids.cpu())
     torch.testing.assert_close(row[3::2].contiguous().view(torch.float32), expected[ids].cpu(), atol=atol, rtol=1e-5)
 
 
 @pytest.mark.parametrize('compiled', [False, True])
-def test_sampling_reports_raw_scores_before_every_sampler_transform(compiled):
+@pytest.mark.parametrize('count', [0, 128])
+def test_sampling_reports_raw_scores_before_every_sampler_transform(compiled, count):
     from ignition.components.completion import CompletionOutputs
     from ignition.components.sampling import DeviceRequestState, PreparedSampling, RequestAdmission
     from ignition.preparation.compilation import compile_forward
@@ -88,6 +90,9 @@ def test_sampling_reports_raw_scores_before_every_sampler_transform(compiled):
     frame = torch.tensor([0], dtype=torch.int32, device='cuda')
     sequence = torch.tensor([1], dtype=torch.int64, device='cuda')
     outputs.requested[2] = 1
+    ids = list(reversed(range(count)))
+    outputs.token_id_counts[2] = count
+    outputs.token_ids[2, :count] = torch.tensor(ids, dtype=torch.int32, device='cuda')
     sampler = PreparedSampling(logits, state, slots, epochs, live, outputs, frame, sequence)
     sampler.prepare()
     restore = _snapshot(state)
@@ -100,12 +105,13 @@ def test_sampling_reports_raw_scores_before_every_sampler_transform(compiled):
         restore()
         graph.replay()
         assert state.pending_token[2] == 32
-        _assert_entry(outputs.logprobs[0, 2, 0], logits[0], 32)
+        _assert_entry(outputs.logprobs[0, 2, 0], logits[0], 32, ids=ids or None)
 
 
 @pytest.mark.parametrize('width', [1, 3, 8])
 @pytest.mark.parametrize('compiled', [False, True])
-def test_speculative_logprobs_follow_committed_target_positions_and_token_limits(width, compiled):
+@pytest.mark.parametrize('count', [0, 21])
+def test_speculative_logprobs_follow_committed_target_positions_and_token_limits(width, compiled, count):
     from ignition.components.completion import CompletionOutputs
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
     from ignition.components.speculation import PreparedSpeculativeCommit, SpeculativeAcceptance
@@ -130,6 +136,9 @@ def test_speculative_logprobs_follow_committed_target_positions_and_token_limits
     limits = torch.tensor([width, 1, width, width], dtype=torch.int32, device=device)
     outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
     outputs.requested.fill_(1)
+    ids = list(reversed(range(count)))
+    outputs.token_id_counts.fill_(count)
+    outputs.token_ids[:, :count] = torch.tensor(ids, dtype=torch.int32, device=device)
     outputs.logprobs.fill_(-777)
     logits = torch.randn((4, width, 4096), dtype=torch.bfloat16, device=device)
     frame = torch.tensor([1], dtype=torch.int32, device=device)
@@ -152,8 +161,8 @@ def test_speculative_logprobs_follow_committed_target_positions_and_token_limits
         assert outputs.records[1, 2, 8] == width
         assert outputs.records[1, 1, 8] == 1
         for position in range(width):
-            _assert_entry(outputs.logprobs[1, 2, position], logits[0, position], 11+position)
-        _assert_entry(outputs.logprobs[1, 1, 0], logits[1, 0], 11)
+            _assert_entry(outputs.logprobs[1, 2, position], logits[0, position], 11+position, ids=ids or None)
+        _assert_entry(outputs.logprobs[1, 1, 0], logits[1, 0], 11, ids=ids or None)
         assert torch.all(outputs.logprobs[0] == -777)
         assert torch.all(outputs.logprobs[1, 1, 1:] == -777)
         assert torch.all(outputs.logprobs[1, [0, 3]] == -777)
@@ -183,10 +192,12 @@ def test_subtraction_rounding_ties_choose_lowest_ids_even_at_cutoff():
     reduction = PreparedLogprobs(logits, outputs, slot, epoch, live, frame)
     reduction.prepare()
     reduction()
-    torch.testing.assert_close(outputs.logprobs[0, 0, 0, 2::2].cpu(), torch.arange(20, dtype=torch.int32))
+    torch.testing.assert_close(outputs.logprobs[0, 0, 0, 2:42:2].cpu(), torch.arange(20, dtype=torch.int32))
 
 
-def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesting_lanes():
+@pytest.mark.parametrize('legacy_width', [None, 1, 7, 20])
+@pytest.mark.parametrize('mapped', [False, True])
+def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesting_lanes(legacy_width, mapped):
     import struct
     import time
     from ignition.components.completion import CompletionOutputs
@@ -203,16 +214,38 @@ def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesti
     live = torch.tensor([2], dtype=torch.int32, device=device)
     frame = torch.tensor([0], dtype=torch.int32, device=device)
     sequence = torch.tensor([1], dtype=torch.int64, device=device)
+    from b12x.sequence._shared.disk_table import MappedHostAllocation
+    from dataclasses import replace
+    mapping = None
+    if mapped:
+        shape = outputs.logprobs.shape if legacy_width is None else (2, 4, 8, 2 + 2 * legacy_width)
+        mapping = MappedHostAllocation(shape, torch.int32, torch.device('cuda', 0))
+        mapping.device_view.zero_()
+    if legacy_width is None:
+        if mapping is not None:
+            outputs = replace(outputs, logprobs=mapping.device_view)
+        legacy = None
+    else:
+        legacy = mapping.device_view if mapping is not None else torch.empty(
+            (2, 4, 8, 2 + 2 * legacy_width), dtype=torch.int32, device=device)
     sampler = PreparedSampling(logits, state, slots, epochs, live, outputs, frame, sequence)
     sampler.prepare()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         sampler()
         state.pending_token.fill_(-1)
+        if legacy is not None:
+            index = frame.long()
+            legacy.index_copy_(0, index, outputs.logprobs.index_select(0, index)[..., :legacy.shape[-1]])
+    buffers = outputs.buffers()
+    if legacy is not None:
+        buffers['completion_logprobs'] = legacy
+        del buffers['logprob_token_ids'], buffers['logprob_token_id_counts']
+
     bundle = PreparedExecution(device=0, max_active=4, graphs={'sample': graph},
         signatures={'sample': GraphSignature('decode', 2, 1)},
-        buffers={**outputs.buffers(), 'frame_index': frame, 'submission_sequence': sequence},
-        resources=(sampler, state, slots, epochs, live))
+        buffers={**buffers, 'frame_index': frame, 'submission_sequence': sequence},
+        resources=(sampler, state, slots, epochs, live, outputs, mapping))
     executor = bundle.start_executor()
     def poll():
         deadline = time.monotonic() + 30
@@ -222,19 +255,39 @@ def test_native_two_frame_readback_copies_requesting_frames_and_decodes_requesti
                 return value
         pytest.fail('native frame transfer did not complete')
     expected = float(torch.log_softmax(logits[0], -1)[0])
+    def submit(flags):
+        uploads = [('logprob_requested', 0, struct.pack('4i', *flags))]
+        if legacy is None:
+            uploads.append(('logprob_token_id_counts', 0, bytes(16)))
+        return executor.submit(0, uploads)
     try:
         allocated = torch.cuda.memory_stats()['allocation.all.allocated']
-        assert executor.submit(0, [('logprob_requested', 0, struct.pack('4i', 0, 0, 1, 0))]) == 1
-        assert executor.submit(0, [('logprob_requested', 0, struct.pack('4i', 1, 0, 0, 0))]) == 2
+        assert submit([0, 0, 1, 0]) == 1
+        assert submit([1, 0, 0, 0]) == 2
         for fence, slot in [(1, 2), (2, 0)]:
             result = poll()
             assert result.fence == fence
             assert result.logprobs[slot][0][0] == 0
             assert abs(result.logprobs[slot][0][1] - expected) < 2e-5
-            assert len(result.logprobs[slot][0][2]) == 20
+            assert len(result.logprobs[slot][0][2]) == (legacy_width or 20)
             assert all(entry is None for i, entries in enumerate(result.logprobs) if i != slot for entry in entries)
+        if legacy is None:
+            for fence, slot, ids in [(3, 2, list(reversed(range(1, 129)))), (4, 0, [0])]:
+                counts = [0] * 4
+                counts[slot] = len(ids)
+                flags = [int(i == slot) for i in range(4)]
+                assert executor.submit(0, [
+                    ('logprob_requested', 0, struct.pack('4i', *flags)),
+                    ('logprob_token_id_counts', 0, struct.pack('4i', *counts)),
+                    ('logprob_token_ids', slot * 512, struct.pack(f'{len(ids)}i', *ids)),
+                ]) == fence
+            for fence, slot, expected_ids in [(3, 2, list(reversed(range(1, 129))) + [0]), (4, 0, [0])]:
+                result = poll()
+                assert result.fence == fence
+                assert [id for id, _ in result.logprobs[slot][0][2]] == expected_ids
+                assert result.logprobs[1 - slot // 2][0] is None
         # Stale payloads remain resident but this frame must not copy or decode them.
-        assert executor.submit(0, [('logprob_requested', 0, struct.pack('4i', 0, 0, 0, 0))]) == 3
+        assert submit([0, 0, 0, 0]) == (5 if legacy is None else 3)
         assert poll().logprobs is None
         assert torch.cuda.memory_stats()['allocation.all.allocated'] == allocated
     finally:
@@ -250,8 +303,11 @@ def test_mixed_output_merge_preserves_the_inactive_frame_during_capture(compiled
     prompt, decode = outputs.private(cursor), outputs.private(cursor)
     prompt.records.fill_(11)
     prompt.logprobs.fill_(12)
+    prompt.speculative_survival.fill_(.875)
     decode.records.fill_(21)
     decode.logprobs.fill_(22)
+    decode.speculative_survival.fill_(.5)
+    outputs.token_id_counts.copy_(torch.tensor([1, 21, 128, 0], dtype=torch.int32, device='cuda'))
     frame = torch.tensor([1], dtype=torch.int32, device='cuda')
     slot = torch.tensor(2, device='cuda')
     def run():
@@ -262,23 +318,38 @@ def test_mixed_output_merge_preserves_the_inactive_frame_during_capture(compiled
         call()
     for _ in range(3):
         outputs.records[0].fill_(-7)
-        outputs.logprobs[0].fill_(-8)
+        outputs.logprobs.fill_(-8)
+        outputs.speculative_survival[0].fill_(.25)
         graph.replay()
         assert torch.all(outputs.records[0] == -7)
         assert torch.all(outputs.logprobs[0] == -8)
+        assert torch.all(outputs.speculative_survival[0] == .25)
         assert torch.all(outputs.records[1, 2] == 11)
-        assert torch.all(outputs.logprobs[1, 2] == 12)
-        assert torch.all(outputs.logprobs[1, [0, 1, 3]] == 22)
+        assert torch.all(outputs.logprobs[1, 2, :, :42] == 12)
+        for i, width in enumerate([20, 21, 128, 20]):
+            assert torch.all(outputs.logprobs[1, i, :, :2 + 2 * width] == (12 if i == 2 else 22))
+            assert torch.all(outputs.logprobs[1, i, :, 2 + 2 * width:] == -8)
+        assert torch.all(outputs.speculative_survival[1, 2] == -1)
+        assert torch.all(outputs.speculative_survival[1, [0, 1, 3]] == .5)
 
 
-def _tp_logprob_rank(rank, sockets):
+def _tp_logprob_rank(rank, world, sockets):
     from ignition.components.completion import CompletionOutputs
     from ignition.components.sampling import DeviceRequestState, PreparedSampling, RequestAdmission
     from ignition.preparation.execution import GraphSignature, PreparedExecution
     import struct
     import time
-    root, peer = sockets
-    (peer if rank == 0 else root).close()
+    peers = []
+    for index, (root, peer) in enumerate(sockets, start=1):
+        if rank == 0:
+            peers.append(root)
+            peer.close()
+        else:
+            root.close()
+            if rank == index:
+                connection = peer
+            else:
+                peer.close()
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
     outputs = CompletionOutputs.allocate((2, 4, 8), device=device)
@@ -304,33 +375,54 @@ def _tp_logprob_rank(rank, sockets):
         buffers={**outputs.buffers(), 'frame_index': frame, 'submission_sequence': sequence},
         resources=(sampler, state, slots, epochs, live))
     if rank:
-        bundle.serve_rank(peer, rank=1, world=2)
+        bundle.serve_rank(connection, rank=rank, world=world)
     else:
-        executor = bundle.start_executor(peers=[root])
+        executor = bundle.start_executor(peers=peers)
         try:
-            assert executor.submit(0, [('logprob_requested', 0, struct.pack('4i', 0, 0, 1, 0))]) == 1
-            result = None
-            deadline = time.monotonic() + 30
-            while result is None and time.monotonic() < deadline:
-                result = executor.poll()
-            assert result is not None
-            assert abs(result.logprobs[2][0][1] - expected) < 2e-5
-            assert result.gpu_ns[0] is not None and result.gpu_ns[1] is not None
+            with pytest.raises(RuntimeError, match='invalid logprob token ID count'):
+                executor.submit(0, [
+                    ('logprob_requested', 0, struct.pack('4i', 0, 0, 1, 0)),
+                    ('logprob_token_id_counts', 0, struct.pack('4i', 0, 0, 129, 0)),
+                ])
+            assert executor.outstanding == 0
+            for count in [0, 1, 20, 21, 127, 128, 0]:
+                ids = list(reversed(range(1, count + 1)))
+                uploads = [
+                    ('logprob_requested', 0, struct.pack('4i', 0, 0, 1, 0)),
+                    ('logprob_token_id_counts', 0, struct.pack('4i', 0, 0, count, 0)),
+                ]
+                if count:
+                    uploads.append(('logprob_token_ids', 2 * 512, struct.pack(f'{count}i', *ids)))
+                assert executor.submit(0, uploads) is not None
+                result = None
+                deadline = time.monotonic() + 30
+                while result is None and time.monotonic() < deadline:
+                    result = executor.poll()
+                assert result is not None
+                assert abs(result.logprobs[2][0][1] - expected) < 2e-5
+                assert all(result.gpu_ns[i] is not None for i in range(world))
+                if count:
+                    alternatives = result.logprobs[2][0][2]
+                    assert [id for id, _ in alternatives] == ids + [0]
+                    reference = logits[0].double().log_softmax(0).cpu()
+                    assert max(abs(lp - reference[id].item()) for id, lp in alternatives) < 2e-5
         finally:
             executor.close()
     torch.cuda.synchronize(device)
 
 
-@pytest.mark.skipif(os.environ.get('FLARE_RUN_TP_CUDA_TESTS') != '1', reason='requires two assigned GPUs')
-def test_native_tensor_parallel_reports_only_the_coordinating_ranks_values():
+@pytest.mark.skipif(os.environ.get('FLARE_RUN_TP_CUDA_TESTS') != '1', reason='requires assigned GPUs')
+@pytest.mark.parametrize('world', [2, 4])
+def test_native_tensor_parallel_reports_only_the_coordinating_ranks_values(world):
     import socket
     import torch.multiprocessing as mp
-    sockets = socket.socketpair()
+    sockets = [socket.socketpair() for _ in range(world - 1)]
     try:
-        mp.spawn(_tp_logprob_rank, args=(sockets,), nprocs=2, join=True)
+        mp.spawn(_tp_logprob_rank, args=(world, sockets), nprocs=world, join=True)
     finally:
-        for sock in sockets:
-            sock.close()
+        for pair in sockets:
+            for sock in pair:
+                sock.close()
 
 
 def test_packed_columns_beyond_a_short_request_never_read_another_requests_logits():
@@ -384,7 +476,8 @@ def test_packed_columns_beyond_a_short_request_never_read_another_requests_logit
 
 
 @pytest.mark.parametrize('compiled', [False, True])
-def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits(compiled):
+@pytest.mark.parametrize('count', [0, 128])
+def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits(compiled, count):
     from ignition.components.completion import CompletionOutputs
     from ignition.components.parallel_draft import prepare_sampling_scratch
     from ignition.components.sampling import DeviceRequestState, RequestAdmission
@@ -417,6 +510,9 @@ def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits
     assert target.scores.data_ptr() == verify.safe_draft_probs.data_ptr()
     outputs = CompletionOutputs.allocate((2, 4, 24), device=device)
     outputs.requested[2] = 1
+    ids = list(reversed(range(count)))
+    outputs.token_id_counts[2] = count
+    outputs.token_ids[2, :count] = torch.tensor(ids, dtype=torch.int32, device=device)
     frame = torch.tensor([0], dtype=torch.int32, device=device)
     sequence = torch.tensor([1], dtype=torch.int64, device=device)
     commit = PreparedSpeculativeCommit(state, verify.output, inputs, slots, epochs, live,
@@ -436,4 +532,65 @@ def test_verification_reuses_filtering_scratch_but_reports_the_raw_target_logits
     graph.replay()
     assert outputs.records[0, 2, 8] == 3
     for position in range(3):
-        _assert_entry(outputs.logprobs[0, 2, position], raw[0, position], 11 + position)
+        _assert_entry(outputs.logprobs[0, 2, position], raw[0, position], 11 + position, ids=ids or None)
+    restore()
+    raw[0, 0, 11] = -20
+    raw[0, 0, 101] = 20
+    graph.replay()
+    assert outputs.records[0, 2, 8] == 1
+    _assert_entry(outputs.logprobs[0, 2, 0], raw[0, 0], 101, ids=ids or None)
+
+
+@pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
+def test_explicit_ids_replay_changing_widths_against_fp64(dtype):
+    from ignition.components.completion import CompletionOutputs
+    from ignition.components.logprobs import PreparedLogprobs
+    device = 'cuda'
+    outputs = CompletionOutputs.allocate((2, 2, 24), device=device)
+    logits = torch.randn((2, 3, 4096), device=device, dtype=dtype) * 8
+    slots = torch.tensor([1, 0], dtype=torch.int32, device=device)
+    epochs = torch.tensor([9, 10], device=device)
+    live = torch.tensor([2], dtype=torch.int32, device=device)
+    frame = torch.tensor([0], dtype=torch.int32, device=device)
+    outputs.requested.fill_(1)
+    outputs.records[0, 1, 0] = 9
+    outputs.records[0, 1, 8] = 2
+    outputs.records[0, 1, 16:18] = 4000
+    # The other row has a stale epoch, despite a live gate and count.
+    outputs.records[0, 0, 0] = 9
+    outputs.records[0, 0, 8] = 3
+    outputs.token_id_counts[0] = 128
+    op = PreparedLogprobs(logits, outputs, slots, epochs, live, frame)
+    op.prepare()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        op()
+    for count in [128, 1, 20, 21, 127, 0, 128]:
+        ids = torch.arange(count, device=device, dtype=torch.int32).flip(0) * 7
+        outputs.token_id_counts[1] = count
+        outputs.token_ids[1, :count] = ids
+        outputs.logprobs.fill_(-777)
+        graph.replay()
+        result = outputs.logprobs.cpu()
+        assert torch.all(result[1] == -777)
+        assert torch.all(result[0, 0] == -777)
+        assert torch.all(result[0, 1, 2:] == -777)
+        for position in range(2):
+            row = result[0, 1, position]
+            raw = logits[0, position].double().cpu()
+            reference = raw - torch.logsumexp(raw, 0)
+            reported = row[1:2].view(torch.float32).double()
+            # FP32 subtraction and the two-stage FP32 logsumexp dominate error.
+            bound = 8 * torch.finfo(torch.float32).eps * (raw.abs().max() + torch.logsumexp(raw, 0).abs())
+            assert abs(reported[0] - reference[4000]) <= bound
+            if count:
+                torch.testing.assert_close(row[2:2 + 2 * count:2], ids.cpu())
+                values = row[3:2 + 2 * count:2].contiguous().view(torch.float32).double()
+                assert (values - reference[ids.long().cpu()]).abs().max() <= bound
+                assert torch.all(row[2 + 2 * count:] == -777)
+            else:
+                _assert_entry(row, logits[0, position], 4000)
+    outputs.requested.zero_()
+    outputs.logprobs.fill_(-777)
+    graph.replay()
+    assert torch.all(outputs.logprobs == -777)

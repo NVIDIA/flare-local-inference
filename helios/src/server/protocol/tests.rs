@@ -1510,3 +1510,84 @@ fn prompt_logprob_request_types_limits_streaming_and_endpoint_placement() {
     assert_eq!(decoded.request.options.prompt_logprobs, Some(2));
     assert_eq!(decoded.request.options.logprobs.unwrap().top, 2);
 }
+
+#[test]
+fn requested_logprob_ids_require_enablement_and_validate_before_deduplication() {
+    for (protocol, base, enable) in [
+        (
+            Protocol::Chat,
+            json!({"messages":[{"role":"user","content":"x"}]}),
+            json!({"logprobs":true}),
+        ),
+        (
+            Protocol::Completions,
+            json!({"prompt":"x"}),
+            json!({"logprobs":0}),
+        ),
+        (
+            Protocol::Responses,
+            json!({"input":"x"}),
+            json!({"include":["message.output_text.logprobs"]}),
+        ),
+    ] {
+        for empty in [Value::Null, json!([])] {
+            let mut body = base.clone();
+            body["logprob_token_ids"] = empty;
+            assert!(decode(protocol, body, false).is_ok());
+        }
+        let mut body = base.clone();
+        body["logprob_token_ids"] = json!([9, 2, 9, 1]);
+        assert!(decode(protocol, body.clone(), false).is_err());
+        body.as_object_mut()
+            .unwrap()
+            .extend(enable.as_object().unwrap().clone());
+        let options = decode(protocol, body.clone(), false)
+            .unwrap()
+            .request
+            .options
+            .logprobs
+            .unwrap();
+        assert_eq!(options.ids, [9, 2, 1]);
+        for count in [1, 20, 21, 127, 128] {
+            body["logprob_token_ids"] = json!((0..count).collect::<Vec<_>>());
+            assert_eq!(
+                decode(protocol, body.clone(), false)
+                    .unwrap()
+                    .request
+                    .options
+                    .logprobs
+                    .unwrap()
+                    .ids
+                    .len(),
+                count
+            );
+        }
+        for invalid in [
+            json!(true),
+            json!(1),
+            json!([true]),
+            json!([1.0]),
+            json!([1.5]),
+            json!([-1]),
+            json!([2147483648u64]),
+            json!([u64::MAX]),
+            json!(["1"]),
+            json!(vec![1; 129]),
+        ] {
+            body["logprob_token_ids"] = invalid;
+            assert!(decode(protocol, body.clone(), false).is_err(), "{body}");
+        }
+    }
+    let echoed = decode(
+        Protocol::Completions,
+        json!({"prompt":[1,2],"echo":true,"logprobs":20,"logprob_token_ids":[3],"max_tokens":0}),
+        false,
+    )
+    .unwrap();
+    assert_eq!(echoed.request.options.prompt_logprobs, Some(20));
+    assert_eq!(echoed.request.options.logprobs.unwrap().ids, [3]);
+    for ids in [Value::Null, json!([]), json!([1])] {
+        assert!(decode(Protocol::Messages,
+            json!({"messages":[{"role":"user","content":"x"}],"max_tokens":1,"logprob_token_ids":ids}), false).is_err());
+    }
+}

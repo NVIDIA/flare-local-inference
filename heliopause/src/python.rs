@@ -180,6 +180,7 @@ pub(crate) fn execution_manifest(value: &Bound<'_, PyAny>) -> PyResult<Execution
             });
         }
         graphs.push(GraphDescriptor {
+            draft_tokens: if field!(graph, "kind", String) == "packed_speculative" { field!(graph, "draft_tokens", usize) } else { 0 },
             name: field!(graph, "name", String),
             kind: GraphKind::try_from(field!(graph, "kind", String).as_str())
                 .map_err(|error| PyValueError::new_err(error.to_string()))?,
@@ -218,6 +219,8 @@ struct ExecutionCompletion {
     graph_index: usize,
     #[pyo3(get)]
     proposal_confidence: Option<Vec<[f32; 7]>>,
+    #[pyo3(get)]
+    speculative_survival: Option<Vec<[f32; 7]>>,
     #[pyo3(get)]
     records: Vec<Vec<i64>>,
     #[pyo3(get)]
@@ -316,8 +319,10 @@ impl PreparedGraphExecutor {
                     graph_index: completion.graph_index,
                     logprobs: completion.logprobs.map(|slots| slots.into_iter().map(|positions|
                         positions.into_iter().map(|entry| entry.map(|entry|
-                            (entry.token, entry.logprob, entry.top[..entry.top_count].to_vec()))).collect()).collect()),
+                            (entry.token, entry.logprob, entry.top))).collect()).collect()),
                     proposal_confidence: completion.proposal_confidence
+                        .map(|rows| rows[..completion.records.len()].to_vec()),
+                    speculative_survival: completion.speculative_survival
                         .map(|rows| rows[..completion.records.len()].to_vec()),
                     gpu_ns: completion.timing.gpu_ns,
                     readiness_wait_ns: completion.timing.readiness.map(|sample| sample.wait_ns()),
@@ -518,6 +523,7 @@ impl Drop for PreparedGraphExecutor {
 
 #[pymodule]
 fn flare_heliopause(module: &Bound<'_, PyModule>) -> PyResult<()> {
+    crate::export::binding::register(module)?;
     #[cfg(feature = "qualification")]
     {
         module.add_class::<GraphReplayWorker>()?;

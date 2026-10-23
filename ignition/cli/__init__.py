@@ -1,7 +1,6 @@
-"""The `ignition` preparation command line and development package launcher."""
+"""The `ignition` preparation and development serving command line."""
 
 import argparse
-import re
 from pathlib import Path
 
 from ignition.errors import FlareError
@@ -23,14 +22,13 @@ def _parser() -> argparse.ArgumentParser:
             name, help=summary, description=summary, allow_abbrev=False, add_help=False,
             formatter_class=argparse.RawDescriptionHelpFormatter)
         subparser.add_argument("-h", "--help",
-                               action=RecipeHelp if name in ("run", "export", "serve") else "help",
+                               action=RecipeHelp if name in ("export", "serve") else "help",
                                help="show this help message and exit")
         subparser.set_defaults(handler=handler)
         subparser.add_argument("--config", type=Path, metavar="PATH",
                                help="configuration file (default: ~/.config/flare/config.toml)")
         return subparser
 
-    running = command("run", serve.run, "cache a runtime package and launch Flare")
     exporting = command("export", serve.export, "prepare a native model package")
     exporting.add_argument("--output", type=Path, metavar="FILE",
                            help="destination .safetensors file (default: a snapshot in the package cache)")
@@ -38,53 +36,20 @@ def _parser() -> argparse.ArgumentParser:
                            help="require cached stored-data blobs; export execution resources and metadata")
     exporting.add_argument("--repo-id", metavar="NAMESPACE/REPOSITORY",
                            help="Hugging Face target used to organize local exports (default: recipe target)")
-    for preparing in (running, exporting):
-        _preparation_arguments(preparing)
-    running.add_argument("--publisher-keys", type=Path, action="append", default=[], metavar="PATH",
-                         help="additional publisher profiles passed to Flare; repeatable")
-    running.add_argument("--trust-store", type=Path, metavar="PATH",
-                         help="remembered execution trust passed to Flare (default: ~/.config/flare/trust.toml)")
-    running.add_argument("--verify-weights", action="store_true",
-                         help="verify stored allocation and table contents when Flare loads the package")
-
-    def served_model_name(value):
-        if not value.strip():
-            raise argparse.ArgumentTypeError("served model name must not be empty")
-        return value
-
-    running.add_argument("--served-model-name", type=served_model_name, metavar="ALIAS",
-                         help="replace the package's serving alias; the canonical model ID remains accepted")
-    from .config import parse_memory_limit
-
-    def memory_limit(value):
-        try:
-            return parse_memory_limit(value)
-        except FlareError as error:
-            raise argparse.ArgumentTypeError(str(error)) from error
-
-    # argparse normally recognizes only negative numbers as values. Signed sizes are values
-    # too, so `--memory-limit -30G` accepts the same syntax as `--memory-limit=-30G`.
-    running._negative_number_matcher = re.compile(r"^-\d+(?:\.\d+)?(?:[KMGT](?:iB|B)?)?$", re.IGNORECASE)
-    running.add_argument("--kv-cache-limit", choices=("concurrency", "context", "memory"), default="memory",
-                         help="limit shared KV storage by context times concurrency, one context, or available memory (default: memory)")
-    running.add_argument("--memory-limit", type=memory_limit, metavar="LIMIT",
-                         help="per-GPU serving memory: occupied size (30G), free reserve (-30G), or total fraction (0.8)")
+    _preparation_arguments(exporting)
     serving = command("serve", serve.serve, "prepare in this process and serve over HTTP, with peer ranks on other hosts")
-    for listening in (running, serving):
-        listening.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
-        listening.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
+    serving.add_argument("--host", metavar="ADDR", help="listening address (default: server.host, else 127.0.0.1)")
+    serving.add_argument("--port", type=int, metavar="N", help="listening port (default: server.port, else 8000)")
     _preparation_arguments(serving)
     for spanning in (serving, exporting):
         hosts = spanning.add_argument_group("multi-host tensor parallelism")
         hosts.add_argument("--roce-ring", action="store_true",
-                           help="ring collectives and checkpoint/export TCP through paired agents on the RoCE interfaces")
-        hosts.add_argument("--orbit-file", type=Path, metavar="PATH",
-                           help="checkpoint ring's Orbit cluster file (default: ~/.config/flare/orbit.toml)")
-        hosts.add_argument("--key-file", type=Path, metavar="PATH",
-                           help="checkpoint ring's controller key (default: ~/.config/flare/orbit/controller.key)")
-        hosts.add_argument("--cluster", metavar="NAME", help="checkpoint ring's Orbit cluster in rank order")
+                           help="route collectives and fabric TCP through neighbors in rank order")
+        hosts.add_argument("--roce-chain", action="store_true",
+                           help="like --roce-ring for hosts cabled as a chain, with no link between the first and"
+                                " last rank")
         hosts.add_argument("--transfer-streams", type=int, choices=range(1, 65), metavar="N",
-                           help="checkpoint and export TCP streams per peer through the ring, 1..64 (default: 8)")
+                           help="checkpoint and export fabric TCP streams per peer, 1..64 (default: 8)")
         hosts.add_argument("--ranks", type=int, default=1, choices=range(1, 17), metavar="N",
                            help="tensor-parallel ranks, one per host; this process is rank zero (default: 1);"
                                 " an export assembles all ranks at --output on rank zero")
@@ -135,7 +100,7 @@ def _parser() -> argparse.ArgumentParser:
             raise argparse.ArgumentTypeError(str(error)) from error
         return value
 
-    for publishing in (running, exporting, signing, converting):
+    for publishing in (exporting, signing, converting):
         publishing.add_argument("--shard-size", type=shard_size, metavar="SIZE",
                                 help="maximum payload file size including its header; at most 64G (default: 64G)")
     return parser
@@ -146,7 +111,7 @@ def _preparation_arguments(running):
 
     running.usage = "%(prog)s [MODEL] [options]"
     running.epilog = recipe_help()
-    running.set_defaults(roce_ring=False)
+    running.set_defaults(roce_ring=False, roce_chain=False)
     running.add_argument("--official-source", metavar="URL", help="published checkpoint repository URL")
     running.add_argument("model", nargs="?", metavar="MODEL",
                          help="recipe alias, repository id, or checkpoint directory (default: defaults.model)")
@@ -188,17 +153,28 @@ def _preparation_arguments(running):
                           help="default to the maximum verification width where captured, otherwise width one")
     speculative.add_argument("--speculative-token-capacity", type=int, metavar="N",
                           help="maximum target-token rows in wider speculative graphs; width one covers every"
-                               " request batch. Wider graphs require batch * width <= N, where width is drafts + 1"
-                               " (default: larger of padded concurrency and maximum verification width)")
+                               " request batch. Rectangular graphs require batch * width <= N, where width is"
+                               " drafts + 1; packed rounds share N rows across request prefixes"
+                               " (default: see MODEL --help)")
+    speculative.add_argument("--speculative-graph-budget", type=int, metavar="N",
+                          help="maximum captured packed round graphs, independently of target-token rows;"
+                               " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
+                               " learned speculation (default: see MODEL --help)")
     speculative.add_argument("--mtp-proposal-source", choices=("mtp", "copy"),
                           help="where drafts come from: the learned draft model, or copy for continuations"
-                               " of the request's own history, which loads no draft model (default: mtp)")
+                               " from shared decoded history, which loads no draft model (default: mtp)")
     speculative.add_argument("--history-drafts", action="store_true",
-                          help="also draft continuations copied from the request's own history")
+                          help="also draft continuations copied from shared decoded history")
     advanced = running.add_argument_group("advanced options")
     advanced.add_argument("--mla-compute-mode", choices=("auto", "bf16"), default="auto",
                           help="constrain MLA arithmetic while retaining packed KV storage and compatible"
                                " kernel tuning (default: auto; bf16 requires the preparation API)")
+    from .config import AUTOTUNE_EFFORTS
+
+    advanced.add_argument("--autotune-effort", choices=AUTOTUNE_EFFORTS,
+                          help="kernel search effort: off uses heuristics; low applies broad exclusions;"
+                               " medium balances search cost; high keeps conservative exclusions;"
+                               " max searches all legal candidates (default: medium)")
     advanced.add_argument("--compile-workers", type=int, metavar="N",
                           help="CPU compiler process budget per host, shared by local preparation ranks;"
                                " bounded by available RAM and device memory (default: automatic)")
@@ -214,9 +190,6 @@ def _preparation_arguments(running):
                                " (default: overlap)")
     advanced.add_argument("--no-compile", action="store_true",
                           help="development: capture graphs without compiling forwards")
-    advanced.add_argument("--packed-verification", action="store_true",
-                          help="share target-token rows across retained request prefixes"
-                               " (default: rectangular per-request capacities)")
     advanced.add_argument("--online-mxfp8", action="store_true",
                           help="store the recipe's eligible BF16 projections as MXFP8 while loading; faster"
                                " decode at reduced precision (Kimi K3 KDA, MLA except batched key/value, shared"

@@ -170,7 +170,7 @@ class PreparedLayer:
             s.shared.intermediate, s.shared.output, session=session, name=name + ".shared", workspace=workspace,
             swiglu_limit=text["swiglu_limit"], round_silu=False, activation_mode="auto")
         self.concurrent_shared = None
-        if mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 32 and workspace.overlap:
+        if mode in ("decode", "verify", "draft") and s.ffn_hc.normalized.shape[0] <= 128 and workspace.overlap:
             self.concurrent_shared = ConcurrentSharedExpert(self.shared,
                 parallel_plans=(self.router_projection.plan, self.router.plan, self.experts.plan),
                 session=session, workspace=workspace, defer_launch=True)

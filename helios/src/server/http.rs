@@ -61,7 +61,7 @@ fn rejection_details(state: &HttpState, failure: Error) -> (StatusCode, String) 
     };
     (status(&failure), message)
 }
-fn decode_body(
+pub(super) fn decode_body(
     bytes: &[u8],
     encoding: &str,
     limit: usize,
@@ -313,7 +313,9 @@ pub(super) async fn generate(
         Ok(g) => g,
         Err(e) => return rejection(&state, protocol, &id, "admission", e),
     };
-    if let Err(e) = runtime::await_admission(&mut generation).await {
+    if !decoded.stream
+        && let Err(e) = runtime::await_admission(&mut generation).await
+    {
         return rejection(&state, protocol, &id, "admission", e);
     }
     let enqueue_ns = generation.first().and_then(|g| g.enqueue_ns);
@@ -338,7 +340,11 @@ pub(super) async fn generate(
         observation.include_usage,
         decoded.metadata,
     );
-    encoder.set_logprobs(decoded.request.options.logprobs, state.frontend.clone(), decoded.stream);
+    encoder.set_logprobs(
+        decoded.request.options.logprobs.clone(),
+        state.frontend.clone(),
+        decoded.stream,
+    );
     if decoded.request.options.prompt_logprobs.is_some() {
         encoder.set_prompt_logprobs(decoded.request.options.prompt_logprobs, state.frontend.clone(),
             decoded.echo && decoded.request.options.logprobs.is_some(), echo_chars);
@@ -365,6 +371,17 @@ pub(super) async fn generate(
         let mut raw_tokens = Vec::new();
         let mut timestamps = Vec::new();
         let mut reused_total = 0;
+        if streaming && protocol == Protocol::Chat {
+            // Chat has one choice and rejects streamed prompt logprobs, so no
+            // output queue needs draining before the first raw token is ready.
+            if let Some(generation) = generations[0].as_mut()
+                && let Err(error) = generation.wait_for_first_token().await
+            {
+                let frame = encoder.failure(&error);
+                yield Delivery::Failed(error, frame);
+                return;
+            }
+        }
         for mut frame in encoder.start() {
             if let Some(ids) = &prompt_ids {
                 frame.data["prompt_token_ids"] = json!(ids);

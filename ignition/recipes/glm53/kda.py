@@ -8,7 +8,7 @@ from b12x.sequence import gdn_decode, kda_prefill, short_conv
 from ignition.components import sm103
 from ignition.components.kda_speculation import KDARecords, _record, register_recording
 from ignition.components.gated_norm import PreparedGatedRMSNorm
-from ignition.components.linear import QuantizedProjection
+from ignition.components.linear import prepare_projection
 from ignition.components.projection_overlap import ConcurrentProjectionChain
 from ignition.components.recurrent import (
     DeltaMetadata,
@@ -101,14 +101,18 @@ class PreparedGlmKDA:
             ("g_b_proj", scratch.gate_input, scratch.z),
             ("o_proj", scratch.gated, scratch.output),
         ):
-            self.projections[key] = QuantizedProjection(input, weights[key], output,
-                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto")
+            self.projections[key] = prepare_projection(input, weights[key], output,
+                session=session, name=f"{name}.{key}", workspace=workspace, activation_mode="auto",
+                # Convolution consumes the projected rows after this staging has been copied out.
+                staging=scratch.convolved_qkv if key == "input_proj" else None)
         # The output-gate chain runs beside the input projections, or after them on the main stream.
         self.gate_overlap = None
         if workspace.overlap:
             self.gate_overlap = ConcurrentProjectionChain(
                 (self.projections["g_a_proj"], self.projections["g_b_proj"]),
-                parallel_plans=(self.projections["input_proj"].plan, self.projections["f_b_proj"].plan),
+                parallel_plans=(*self.projections["input_proj"].plans, self.projections["f_b_proj"].plan)
+                    if hasattr(self.projections["input_proj"], "plans") else
+                    (self.projections["input_proj"].plan, self.projections["f_b_proj"].plan),
                 session=session, workspace=workspace)
         conv_args = {
             "x": scratch.projected_qkv, "conv_weight": weights["conv1d.weight"],

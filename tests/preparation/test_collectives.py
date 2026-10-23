@@ -21,7 +21,12 @@ def progress(key="reduce", ranks=(4, 7)):
         ready_collectives=(SimpleNamespace(key=key, ranks=ranks),))
 
 
-def test_result_broadcast_channel_uses_captured_payloads(monkeypatch):
+@pytest.mark.parametrize("batches,offsets,payload_bytes,transport_rows", [
+    ((1, 2, 4, 8), (0, 4096, 6144, 6208), 6216, 13),
+    ((1, 2, 4, 8, 16, 32), (0, 16384, 24576, 24832), 24864, 49),
+])
+def test_result_broadcast_channel_uses_captured_payloads(
+        monkeypatch, batches, offsets, payload_bytes, transport_rows):
     import torch
 
     from ignition.components.draft_sampling import PreparedDraftDistribution
@@ -29,27 +34,29 @@ def test_result_broadcast_channel_uses_captured_payloads(monkeypatch):
     from ignition.components.speculation import SpeculativeAcceptance
     from ignition.preparation import collectives
 
-    catalog = SimpleNamespace(batch_capacities=(1, 2, 4, 8), request_capacity=64)
+    catalog = SimpleNamespace(batch_capacities=batches, request_capacity=64)
     batch = max(catalog.batch_capacities)
     assert batch < catalog.request_capacity
     proposals = PreparedDraftDistribution.broadcast_layout(batch)
-    acceptance = SpeculativeAcceptance.storage_layout(batch, 6)
+    acceptance = SpeculativeAcceptance.broadcast_layout(batch, 6)
     actual = SpeculativeAcceptance.allocate(batch, 6, "meta")
-    assert acceptance == {name: (tuple(tensor.shape), tensor.dtype) for name, tensor in vars(actual).items()}
-    assert packed_broadcast_layout(proposals.values()) == ((0, 4096, 6144, 6208), 6216)
+    assert acceptance == {name: (tuple(tensor.shape), tensor.dtype) for name, tensor in vars(actual).items()
+                          if name != "survival"}
+    assert packed_broadcast_layout(proposals.values()) == (offsets, payload_bytes)
     calls = []
     group, device, ipc, result = object(), object(), object(), object()
     monkeypatch.setattr(dist, "get_world_size", lambda actual: 4)
     monkeypatch.setattr(collectives, "create_all_gather_runtime",
         lambda actual_group, actual_device, **kwargs: calls.append((actual_group, actual_device, kwargs)) or result)
     assert collectives.create_result_broadcast_runtime(group, device, layouts=(proposals, acceptance), ipc=ipc) is result
-    assert calls == [(group, device, dict(max_rows=1, columns=12544, ipc=ipc))]
+    assert calls == [(group, device, dict(max_rows=transport_rows, columns=1024, ipc=ipc))]
+    transport_bytes = transport_rows * 512
     for rows in catalog.batch_capacities:
-        assert packed_broadcast_layout(PreparedDraftDistribution.broadcast_layout(rows).values())[1] <= 6272
+        assert packed_broadcast_layout(PreparedDraftDistribution.broadcast_layout(rows).values())[1] <= transport_bytes
         for width in range(1, 7):
-            fields = SpeculativeAcceptance.storage_layout(rows, width)
-            assert packed_broadcast_layout(fields.values())[1] <= 6272
-    assert proposals["valid"] == ((8, 1), torch.bool)
+            fields = SpeculativeAcceptance.broadcast_layout(rows, width)
+            assert packed_broadcast_layout(fields.values())[1] <= transport_bytes
+    assert proposals["valid"] == ((batch, 1), torch.bool)
 
 
 @pytest.mark.parametrize("layouts", [(), ({},)])
@@ -256,3 +263,20 @@ def test_roce_setup_preserves_routing_and_package_transport_owner(monkeypatch, r
     assert runtime.options["max_size"] == 2 << 20
     assert runtime.options["pipe_bytes"] == 4096 * 4096 * 2
     assert callable(runtime.options["region_allocator"])
+
+
+def test_differing_tuning_races_report_bounded_counts_and_release_job(monkeypatch):
+    owner = coordinator(monkeypatch)
+    local = tuple(race(f"local-{index:064x}", 1., index) for index in range(1200))
+    peer = tuple(race(f"peer-{index:064x}", 1., index) for index in range(1200))
+    state = SimpleNamespace(done=False, ready_collectives=(), ready_cache=None, ready_tuning=local)
+    closed = []
+    job = SimpleNamespace(advance=lambda **kwargs: state, close=lambda: closed.append(True))
+    monkeypatch.setattr(dist, "all_gather_object",
+        lambda states, value, **kwargs: states.__setitem__(slice(None), [value, (False, (), None, None, peer)]))
+    with pytest.raises(RuntimeError, match="tuning races differ across ranks") as error:
+        owner.prepare(SimpleNamespace(begin=lambda *args, **kwargs: job), ())
+    assert "counts={4: 1200, 7: 1200}" in str(error.value)
+    assert "'missing': 1200, 'extra': 1200" in str(error.value)
+    assert len(str(error.value)) < 500
+    assert closed == [True]

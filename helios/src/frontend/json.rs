@@ -1,6 +1,8 @@
 use std::fmt::Write;
 
+#[cfg(test)]
 use minijinja::value::{Kwargs, ViaDeserialize};
+#[cfg(test)]
 use minijinja::{Error, ErrorKind, Value};
 use serde_json::Value as Json;
 
@@ -12,10 +14,67 @@ struct Formatting {
     sort_keys: bool,
 }
 
+pub(super) fn format_json(
+    value: &Json,
+    kwargs: &serde_json::Map<String, Json>,
+) -> Result<String, String> {
+    let indent = match kwargs.get("indent") {
+        None | Some(Json::Null) => None,
+        Some(Json::String(s)) => Some(s.clone()),
+        Some(v) => Some(
+            " ".repeat(
+                usize::try_from(
+                    v.as_i64()
+                        .ok_or("indent must be an integer or string")?
+                        .max(0),
+                )
+                .map_err(|_| "indent is too large")?,
+            ),
+        ),
+    };
+    let (item_separator, key_separator) = match kwargs.get("separators") {
+        None => (
+            if indent.is_some() { "," } else { ", " }.into(),
+            ": ".into(),
+        ),
+        Some(Json::Array(v)) if v.len() == 2 => (
+            v[0].as_str().ok_or("invalid separators")?.into(),
+            v[1].as_str().ok_or("invalid separators")?.into(),
+        ),
+        _ => return Err("invalid separators".into()),
+    };
+    for key in kwargs.keys() {
+        if !matches!(
+            key.as_str(),
+            "indent" | "separators" | "ensure_ascii" | "sort_keys"
+        ) {
+            return Err(format!("unknown keyword argument {key}"));
+        }
+    }
+    let formatting = Formatting {
+        ascii: kwargs
+            .get("ensure_ascii")
+            .and_then(Json::as_bool)
+            .unwrap_or(false),
+        indent,
+        item_separator,
+        key_separator,
+        sort_keys: kwargs
+            .get("sort_keys")
+            .and_then(Json::as_bool)
+            .unwrap_or(false),
+    };
+    let mut output = String::new();
+    formatting.write(value, 0, &mut output);
+    Ok(output)
+}
+
+#[cfg(test)]
 fn invalid(message: &str) -> Error {
     Error::new(ErrorKind::InvalidOperation, message.to_owned())
 }
 
+#[cfg(test)]
 pub(super) fn tojson(
     ViaDeserialize(value): ViaDeserialize<Json>,
     kwargs: Kwargs,

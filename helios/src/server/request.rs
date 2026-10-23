@@ -97,9 +97,19 @@ pub(super) fn prepare_inference_cached(
         }
         if top > crate::execution::MAX_TOP_LOGPROBS { return Err("prompt_logprobs exceeds 20".into()); }
     }
-    if let Some(logprobs) = opts.logprobs {
+    if let Some(logprobs) = &opts.logprobs {
+        if !logprobs.ids.is_empty() && config.logprob_token_id_capacity == 0 {
+            return Err("logprob_token_ids are not available in this model package; re-export to enable them".into());
+        }
         if config.max_top_logprobs == 0 {
             return Err("logprobs are not available in this model package".into());
+        }
+        if logprobs
+            .ids
+            .iter()
+            .any(|id| *id as usize >= config.contract.vocabulary)
+        {
+            return Err("logprob_token_ids contains an ID outside the model vocabulary".into());
         }
         if logprobs.top > config.max_top_logprobs {
             return Err(format!("top_logprobs exceeds this package's maximum of {}", config.max_top_logprobs).into());
@@ -222,6 +232,7 @@ pub(super) fn prepare_inference_cached(
         }
         (
             crate::frontend::RenderedPrompt {
+                message_boundaries: Vec::new(),
                 text: frontend.decode(&token_ids, false)?,
                 token_ids,
                 image_sources: Vec::new(),
@@ -260,11 +271,7 @@ pub(super) fn prepare_inference_cached(
         }
         None => None,
     };
-    let mut message_boundaries = if raw.is_some() {
-        Vec::new()
-    } else {
-        crate::model::message_boundaries(frontend, &rendered.token_ids, &normalized, &options)
-    };
+    let mut message_boundaries = rendered.message_boundaries.clone();
     let crate::model::PreparedInput {
         tokens,
         token_expansions,
@@ -272,12 +279,16 @@ pub(super) fn prepare_inference_cached(
         conditioning,
         conditioned_inputs,
     } = crate::model::prepare_image_inputs(config, frontend, processor, &rendered, images)?;
+    let mut expansions = token_expansions.iter().peekable();
+    let mut additional = 0;
     for boundary in &mut message_boundaries {
         let original = *boundary;
-        *boundary += token_expansions.iter()
-            .take_while(|(index, _)| *index < original)
-            .map(|(_, additional)| additional)
-            .sum::<usize>();
+        while let Some((index, count)) = expansions.peek() {
+            if *index >= original { break; }
+            additional += count;
+            expansions.next();
+        }
+        *boundary += additional;
     }
     let mut sampling = sampling_parameters(object, &config.sampling_defaults, &config.sampling_ranges)?;
     sampling.seed = sampling.seed.wrapping_add(index as u64);
@@ -331,6 +342,10 @@ pub(super) fn prepare_inference_cached(
             grammar,
             ignore_eos,
             logprobs: opts.logprobs.is_some(),
+            logprob_token_ids: opts
+                .logprobs
+                .as_ref()
+                .map_or_else(Vec::new, |options| options.ids.clone()),
             prompt_logprobs: opts.prompt_logprobs.is_some(),
         },
         output,

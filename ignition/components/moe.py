@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import partial
 
 import torch
@@ -65,6 +65,7 @@ class PreparedRouter:
                               (scratch.ids, torch.int32), (scratch.weights, torch.float32)):
             if tensor.shape != shape or tensor.dtype != dtype or tensor.device != logits.device or tensor.stride(1) != 1:
                 raise ValueError("router outputs require matched shapes, native dtypes/device, and contiguous top-k columns")
+        self.logits = logits
         self.scratch, self.device = scratch, logits.device
         self.dtype = logits.dtype
         self.options = {key: value for key, value in (
@@ -110,7 +111,7 @@ class PreparedRoutedExperts:
 
     def __init__(self, source, experts, ids, weights, output, *, session: PreparationSession, name: str,
                  workspace: ScratchArena | torch.Tensor | None = None, router_plan=None,
-                 a4_prefill=False, routing=None):
+                 a4_prefill=False, routing=None, router=None, route_output=None):
         # b12x owns the final weight/scale planes after repacking. Classify those
         # exact tensors, not opaque execution scratch or the discarded source.
         for field in ("w1_fp4", "w2_fp4", "w1_blockscale", "w2_blockscale",
@@ -136,11 +137,31 @@ class PreparedRoutedExperts:
             for plane in decoder.indexed_scales or ():
                 record_numeric_tensor(plane.storage)
         # A16 experts prepared with A4 capability run large prefill calls with quantized activations.
-        precision = {"a4_prefill": True} if a4_prefill else {}
+        precision = {} if experts.plan.activation.outer_scale == "token" else {"a4_prefill": a4_prefill}
         self.source = source
         self.output = output
+        self.output_source = output
+        if route_output is not None and experts.plan.activation.outer_scale == "token":
+            from ignition.components.collectives import WeightedGroupSource
+
+            output = route_output
+            self.output = output
+            self.output_source = WeightedGroupSource(output, weights, ids, experts.num_experts)
         self.scratch = None
-        invocation = FrozenMapping({"tuning_route_pattern": TUNING_WORKLOAD_VERSION,
+        self.router = router
+        self.route_inputs = {}
+        if router is not None and experts.plan.activation.outer_scale == "token":
+            query = router.plan.query
+            routing = replace(routing or fused_moe.RoutingSpec(),
+                logits_dtype=router.dtype, score_func=query.score_func,
+                renormalize=query.renormalize, routed_scaling_factor=query.routed_scaling_factor,
+                has_correction_bias=query.has_correction_bias,
+                has_image_correction_bias=query.has_image_correction_bias,
+                has_image_mask=query.has_image_mask, has_valid_tokens=query.has_valid_tokens)
+            self.route_inputs = dict(router_logits=router.logits,
+                selected_logits=router.scratch.selected_logits, **router.options)
+        integrated_query = router.plan.query if self.route_inputs else None
+        invocation = FrozenMapping({**precision, "tuning_route_pattern": TUNING_WORKLOAD_VERSION,
             "tuning_route_source": "b12x",
             **({"tuning_execution": "cuda_graph"} if experts.has_csf_blocks else {})})
         self.scale_plan = fused_moe.plan_scale_expansion(
@@ -149,15 +170,23 @@ class PreparedRoutedExperts:
         self.plan = fused_moe.plan_execution(
             experts=experts,
             capacity=fused_moe.ExecutionCapacity(
-                max_tokens=source.shape[0], top_k=ids.shape[1], route_num_experts=0),
+                max_tokens=source.shape[0], top_k=ids.shape[1],
+                route_num_experts=experts.num_experts if self.route_inputs else 0,
+                output_layout="routes" if output.ndim == 3 else "token"),
             scale_expansion=self.scale_plan, invocation=invocation, routing=routing,
         )
 
         def prepare_call(state):
             scratch = planned_scratch(state.scratch.scratch_specs(), workspace)
             self.scratch = scratch
+            route_inputs = dict(self.route_inputs)
+            if route_inputs:
+                route_inputs["router_logits"] = torch.zeros_like(router.logits)
+                route_inputs["selected_logits"] = torch.zeros_like(router.scratch.selected_logits)
+                if "num_valid_tokens" in route_inputs:
+                    route_inputs["num_valid_tokens"] = torch.full_like(route_inputs["num_valid_tokens"], source.shape[0])
             binding = state.bind(a=source, topk_ids=torch.zeros_like(ids), topk_weights=torch.full_like(weights, 1 / ids.shape[1]),
-                output=output, scratch=scratch, input_scales_static=True, **precision)
+                output=output, scratch=scratch, input_scales_static=True, **precision, **route_inputs)
             return PreparedCall(run=lambda: state.run(binding), owners=prime_owners(workspace, scratch, binding))
 
         scale_requests = () if self.scale_plan is None else (self.scale_plan.request(
@@ -165,19 +194,28 @@ class PreparedRoutedExperts:
             prepare_call=lambda state: moe_fixtures.scale_expansion_call(state, ids=torch.zeros_like(ids), experts=experts),
             benchmark_call=partial(moe_fixtures.scale_expansion_benchmark_call,
                 source=source, experts=experts, top_k=ids.shape[1], session=session, name=name,
-                allocate_router=RouterScratch.allocate, router_plan=router_plan)),)
+                allocate_router=RouterScratch.allocate, router_plan=router_plan,
+                integrated_query=integrated_query, output_template=output)),)
         declare(session, (*scale_requests, self.plan.request(name=name, prepare_call=prepare_call,
             dependencies=tuple(request.name for request in scale_requests),
             benchmark_call=partial(moe_fixtures.benchmark_call, source=source, experts=experts,
                 top_k=ids.shape[1], session=session, name=name, workspace=workspace,
-                allocate_router=RouterScratch.allocate, router_plan=router_plan, precision=precision)),))
+                allocate_router=RouterScratch.allocate, router_plan=router_plan, precision=precision,
+                integrated_query=integrated_query, output_template=output)),))
 
         def finalize():
             self.scratch = planned_scratch(self.plan.scratch_specs(), workspace)
             self.binding = fused_moe.bind(self.plan, a=source, topk_ids=ids, topk_weights=weights,
-                output=output, scratch=self.scratch, input_scales_static=True, **precision)
+                output=output, scratch=self.scratch, input_scales_static=True, **precision, **self.route_inputs)
 
         register_finalizer(session, finalize, workspace=workspace)
+
+    def route(self, logits: torch.Tensor) -> None:
+        if self.route_inputs:
+            if logits is not self.router.logits:
+                raise ValueError("integrated expert routing requires the prepared logit storage")
+        else:
+            self.router(logits)
 
     def __call__(self) -> torch.Tensor:
         fused_moe.run(binding=self.binding)

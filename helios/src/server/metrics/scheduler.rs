@@ -87,6 +87,8 @@ pub(in crate::server) struct SchedulerMetrics {
     enabled: AtomicBool,
     pub detail_requested: AtomicBool,
     pub dropped: AtomicU64,
+    pub execution_ns: [AtomicU64; 4],
+    pub executions: [AtomicU64; 4],
 }
 
 impl SchedulerMetrics {
@@ -159,6 +161,15 @@ impl SchedulerMetrics {
         selection: SubmittedTiming,
         credit_after_ns: f64,
     ) {
+        use crate::scheduler::TimingOrigin;
+        let reason = match selection.origin {
+            TimingOrigin::Ordinary => 0, TimingOrigin::Discovery => 1,
+            TimingOrigin::Refresh => 2, TimingOrigin::Acceptance => 3,
+        };
+        let duration = crate::scheduler::observed_duration_ns(timing)
+            .unwrap_or(if timing.queued { 0 } else { timing.wall_ns });
+        self.execution_ns[reason].fetch_add(duration, Ordering::Relaxed);
+        self.executions[reason].fetch_add(1, Ordering::Relaxed);
         self.write(|trace| {
             let mut generations = [0; REQUEST_LANES];
             for lane in &step.lanes {
@@ -219,7 +230,7 @@ mod tests {
     use super::*;
 
     fn step() -> ScheduledStep {
-        ScheduledStep { packed_token_capacity: 0,
+        ScheduledStep { draft_tokens: 0, packed_token_capacity: 0,
             kind: GraphKind::Decode,
             batch_capacity: 1,
             token_capacity: 1,
@@ -273,6 +284,24 @@ mod tests {
         metrics.completed(5000, Fence(5001), 3, &step, timing, SubmittedTiming::default(), 0.0);
         metrics.drain(&mut samples);
         assert!(samples.is_empty());
+    }
+
+    #[test]
+    fn selection_counters_include_raw_probe_cost_without_enabling_trace() {
+        use crate::scheduler::TimingOrigin;
+        let metrics = SchedulerMetrics::default();
+        let step = step();
+        for (index, origin) in [TimingOrigin::Ordinary, TimingOrigin::Discovery,
+            TimingOrigin::Refresh, TimingOrigin::Acceptance].into_iter().enumerate() {
+            let mut timing = ExecutionTiming { wall_ns: 100, ..Default::default() };
+            timing.gpu_ns[0] = Some(60);
+            metrics.completed(0, Fence(1), 0, &step, timing, SubmittedTiming { origin, ..Default::default() }, 0.);
+            timing.queued = true;
+            metrics.completed(0, Fence(2), 0, &step, timing, SubmittedTiming { origin, ..Default::default() }, 0.);
+            assert_eq!(metrics.execution_ns[index].load(Ordering::Relaxed), 160);
+            assert_eq!(metrics.executions[index].load(Ordering::Relaxed), 2);
+        }
+        assert!(metrics.buffer.get().is_none());
     }
 
     #[test]

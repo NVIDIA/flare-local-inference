@@ -51,3 +51,9 @@ def convert(snapshot):
         if tokenizer.token_to_id(token) != index:
             raise ValueError(f"K3 tokenizer does not preserve token ID {index}")
     return tokenizer
+
+
+def runtime_assets(tokenizer):
+    """Describe the converted vocabulary and bundled template without creating files."""
+    return {"tokenizer": {"text": tokenizer.to_str(pretty=True)},
+            "chat_template": {"path": str(Path(__file__).with_name("assets") / "chat_template.jinja")}}

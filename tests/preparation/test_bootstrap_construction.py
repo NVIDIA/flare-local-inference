@@ -599,7 +599,7 @@ def _install_boundaries(monkeypatch, checkpoint):
             torch.empty((tokens * heads, 80), dtype=torch.uint8, device=device),
             torch.empty((tokens * heads, 10), dtype=torch.uint8, device=device),
             torch.empty((tokens, heads), dtype=torch.int64, device=device),
-            mailbox, SimpleNamespace(cuda_event=1), ())
+            mailbox, SimpleNamespace(cuda_event=1), (), 1.0)
 
     monkeypatch.setattr(ple.PLETable, "load", classmethod(load_table))
     session = RecordingSession()

@@ -16,9 +16,11 @@ struct BoundInput {
     width: usize,
     elements: usize,
     page_view: Option<usize>,
+    cache_mask: bool,
 }
 
 struct BoundGraph {
+    drafts: usize,
     semantics: GraphContract,
     inputs: Vec<BoundInput>,
     kind: GraphKind,
@@ -36,6 +38,8 @@ pub struct Inputs {
     contract: BoundContract,
     staging: UploadBatch,
     pages: Vec<[(u64, usize); REQUEST_LANES]>,
+    /// Grammar-mask byte ranges (buffer, offset, length) that already hold an unconstrained mask.
+    unconstrained_masks: Vec<(String, usize, usize)>,
     integers: Vec<i64>,
     values: Vec<i64>,
 }
@@ -197,6 +201,13 @@ impl Inputs {
                             width,
                             elements,
                             page_view,
+                            cache_mask: binding.source == GrammarMask
+                                && buffer.dtype == Dtype::Int32
+                                && binding.value_offset == 0
+                                && matches!(binding.indexing, RequestRow | ActiveRow)
+                                && !semantics.state.iter().any(|state|
+                                    state.view.buffer == binding.buffer
+                                        && state.access != StateAccessKind::Read),
                         })
                     })
                     .collect::<Result<Vec<_>>>()?;
@@ -204,6 +215,7 @@ impl Inputs {
                     semantics: semantics.clone(),
                     inputs,
                     kind: graph.kind,
+                    drafts: graph.draft_tokens,
                     batch: graph.batch_capacity,
                     tokens: graph.token_capacity,
                     packed_tokens: graph.packed_token_capacity,
@@ -222,6 +234,7 @@ impl Inputs {
             contract: BoundContract { graphs },
             staging: UploadBatch::default(),
             pages: vec![[(0, 0); REQUEST_LANES]; config.contract.cache.page_tables.len()],
+            unconstrained_masks: Vec::new(),
             integers: Vec::with_capacity(maximum),
             values: Vec::with_capacity(maximum),
         })
@@ -240,6 +253,7 @@ impl Inputs {
             .iter()
             .find(|g| {
                 g.kind == step.kind
+                    && g.drafts == step.draft_tokens
                     && g.batch == step.batch_capacity
                     && g.tokens == step.token_capacity
                     && g.packed_tokens == step.packed_token_capacity
@@ -275,6 +289,11 @@ impl Inputs {
         )?;
         let tensors = tensors.uploads();
         self.staging.clear();
+        // Only retain cached bytes while this graph treats the same registered
+        // buffer as a read-only mask input. Other bindings, graph state writes,
+        // and graphs without that input may replace its contents.
+        self.unconstrained_masks.retain(|(name, _, _)|
+            graph.inputs.iter().any(|input| input.cache_mask && input.binding.buffer == *name));
         for input in &graph.inputs {
             match input.binding.source {
                 ValueSource::RequestSlot => {
@@ -310,12 +329,22 @@ impl Inputs {
     }
 
     pub fn pack(&mut self, frame: &InputStep<'_>) -> Result<()> {
+        let result = self.pack_step(frame);
+        if result.is_err() {
+            // A failed pack has not uploaded any of the staged mask bytes.
+            self.unconstrained_masks.clear();
+        }
+        result
+    }
+
+    fn pack_step(&mut self, frame: &InputStep<'_>) -> Result<()> {
         let graph = self
             .contract
             .graphs
             .iter()
             .find(|g| {
                 g.kind == frame.step.kind
+                    && g.drafts == frame.step.draft_tokens
                     && g.batch == frame.step.batch_capacity
                     && g.tokens == frame.step.token_capacity
                     && g.packed_tokens == frame.step.packed_token_capacity
@@ -323,6 +352,11 @@ impl Inputs {
             })
             .ok_or("submission has no resolved packing plan")?;
         self.staging.clear();
+        // Only retain cached bytes while this graph treats the same registered
+        // buffer as a read-only mask input. Other bindings, graph state writes,
+        // and graphs without that input may replace its contents.
+        self.unconstrained_masks.retain(|(name, _, _)|
+            graph.inputs.iter().any(|input| input.cache_mask && input.binding.buffer == *name));
         let mut history_proposals = [None; REQUEST_LANES];
         if frame.config.history_drafts
             && frame.config.speculative_proposal_source
@@ -331,7 +365,7 @@ impl Inputs {
             for (row, lane) in frame.step.lanes.iter().enumerate() {
                 let live = frame.scheduler.request(lane.request)?;
                 if frame.step.lane_kind(row) == GraphKind::Speculative && live.copy_allowed() {
-                    history_proposals[row] = Some(crate::scheduler::speculation::copy_proposal(
+                    history_proposals[row] = Some(frame.scheduler.history_proposal(
                         live.tokens(),
                         frame.step.token_capacity - 1,
                     ));
@@ -444,17 +478,25 @@ impl Inputs {
                         return Err("packed values exceed prepared input storage".into());
                     }
                     if let Some(mask) = &admission.grammar_mask {
+                        // A constrained mask may overlap any unconstrained range of this buffer.
+                        self.unconstrained_masks.retain(|(name, _, _)| *name != binding.buffer);
                         self.staging.i32(
                             &binding.buffer,
                             destination * 4,
                             mask.iter().copied(),
                         );
-                    } else {
+                    } else if !input.cache_mask || !self.unconstrained_masks.iter().any(|(name, offset, bytes)| {
+                        *name == binding.buffer && *offset == destination * 4 && *bytes == count * 4
+                    }) {
+                        // Cache only rows whose graph contract preserves the uploaded mask.
                         self.staging.put(
                             &binding.buffer,
                             destination * 4,
                             std::iter::repeat_n(0xff, count * 4),
                         );
+                        if input.cache_mask {
+                            self.unconstrained_masks.push((binding.buffer.clone(), destination * 4, count * 4));
+                        }
                     }
                     continue;
                 }
@@ -465,7 +507,7 @@ impl Inputs {
                     Constant => values.resize(input.width, 0),
                     RequestSlot => values.push(slot as i64),
                     RequestGeneration => values.push(lane.request.generation as i64),
-                    QueryLength => values.push(lane.tokens as i64),
+                    QueryLength | SpeculativePrefixLimit => values.push(lane.tokens as i64),
                     SampleEnabled => values.push(frame.samples[row] as i64),
                     PromptTargetToken => {
                         for position in lane.start_position as usize + 1..=lane.start_position as usize + lane.tokens {

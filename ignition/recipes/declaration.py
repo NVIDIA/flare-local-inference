@@ -100,7 +100,7 @@ class Speculation:
     widths from measured costs and conditional acceptance estimates when true, or use the fixed maximum when
     false. Flare can reduce both capacities when loading the package. Drafts
     come from the checkpoint's MTP module or, with the `copy` source, from
-    continuations of the request's own history; `history_drafts` adds those
+    continuations from shared decoded history; `history_drafts` adds those
     continuations to MTP drafts.
     """
 
@@ -110,6 +110,22 @@ class Speculation:
     history_drafts: bool = False
     token_capacity: int | None = None
     packed_verification: bool = False
+    draft_prefix_selection: str = "cpu"
+    graph_budget: int | None = None
+
+    def __post_init__(self):
+        if self.graph_budget is not None:
+            if type(self.graph_budget) is not int or self.graph_budget < 1:
+                raise ValueError("speculative graph budget must be a positive integer")
+            if (not self.packed_verification or not self.adaptive or self.draft_tokens < 1
+                    or self.proposal_source != "mtp" or self.history_drafts):
+                raise ValueError("speculative graph budget requires packed adaptive learned speculation")
+        if self.draft_prefix_selection not in ("cpu", "gpu"):
+            raise ValueError("draft prefix selection must be cpu or gpu")
+        if self.draft_prefix_selection == "gpu" and (
+                not self.packed_verification or not self.adaptive or self.draft_tokens < 1
+                or self.proposal_source != "mtp" or self.history_drafts):
+            raise ValueError("GPU draft prefix selection requires packed adaptive learned speculation")
 
     @property
     def learned(self) -> bool:
@@ -161,7 +177,7 @@ class Recipe:
     unless a plan overrides them, and `plain_ranks` holds its costs with
     speculation disabled. Each active request has one execution state row per
     selected verification position unless `verification_rows` gives another count
-    of extra rows. `history_copy` states that drafts can be copied from request history.
+    of extra rows. `history_copy` states that drafts can be copied from shared decoded history.
     `stream_overlap` states that captured graphs run independent branches on an
     auxiliary stream, which a plan can serialize onto the main stream.
     `online_mxfp8` states that the recipe names BF16 projections a plan may store as

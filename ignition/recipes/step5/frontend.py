@@ -6,7 +6,7 @@ from pathlib import Path
 from tokenizers import Tokenizer
 
 from ignition.preparation.frontend import prepare_frontend as _prepare_frontend
-from ignition.preparation.frontend import tokenizer_settings
+from ignition.preparation.frontend import annotated_template_asset, tokenizer_settings
 
 
 def prepare_frontend(snapshot, *, eos_token_ids):
@@ -24,8 +24,19 @@ def prepare_frontend(snapshot, *, eos_token_ids):
 
 
 def inference_template(snapshot):
-    source = (Path(snapshot) / "chat_template.jinja").read_text()
-    opening, closing = "{%- generation %}", "{%- endgeneration %}"
+    return Path(template_asset(snapshot)["path"]).read_text()
+
+
+def template_asset(snapshot):
+    source = (Path(snapshot) / "chat_template.jinja").read_bytes()
+    opening, closing = b"{%- generation %}", b"{%- endgeneration %}"
     if source.count(opening) != 1 or source.count(closing) != 1:
         raise ValueError("Step-5 chat template must contain one assistant generation span")
-    return source.replace(opening, "{%- if true %}").replace(closing, "{%- endif %}")
+    source = source.replace(opening, b"{%- if true %}").replace(closing, b"{%- endif %}")
+    return annotated_template_asset(source, Path(__file__).with_name("assets") / "chat_template.jinja")
+
+
+def runtime_assets(snapshot):
+    """Describe the checkpoint vocabulary and validated annotated template for native export."""
+    return {"tokenizer": {"path": str(Path(snapshot) / "tokenizer.json")},
+            "chat_template": template_asset(snapshot)}

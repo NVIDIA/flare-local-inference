@@ -23,12 +23,9 @@ ROOT = Path(__file__).resolve().parents[2]
 def legacy_container_fixtures(monkeypatch):
     """Retain coverage of published version 4/5 container bytes and signatures."""
     from helios.tests.signing import publish_legacy
-    from ignition.preparation import package_file, package_snapshot, resign as promotion
+    from ignition.preparation import package_file
     monkeypatch.setattr(package_file, 'publish', publish_legacy)
     monkeypatch.setattr(__import__(__name__, fromlist=['publish']), 'publish', publish_legacy)
-    monkeypatch.setattr(package_snapshot, 'publish_snapshot',
-                        lambda path, index, protection, **kwargs:
-                        promotion._publish(path, index, protection.payload, protection))
 
 
 @pytest.fixture(scope='module')
@@ -78,7 +75,9 @@ def envelope(path):
     start = 8 + struct.unpack_from('<Q', data)[0]
     header = json.loads(data[8:start])
     end = start + header['flare.payload']['shape'][0]
-    return proto.ProtectedIndex.FromString(data[end:]), data[start:end]
+    metadata_start, metadata_end = header['flare.metadata']['data_offsets']
+    return (proto.ProtectedIndex.FromString(data[start + metadata_start:start + metadata_end]),
+            data[start:end])
 
 
 def replace_envelope(path, value, payload):
@@ -173,6 +172,7 @@ def rank_bytes(path, rank):
 
 def overwrite(path, ranges, value=None):
     """Flip one byte of each range, or zero the ranges as a copy without them reads."""
+    path.chmod(path.stat().st_mode | 0o200)
     with path.open('r+b') as output:
         for offset, nbytes in ranges:
             output.seek(offset)
@@ -182,7 +182,7 @@ def overwrite(path, ranges, value=None):
 
 
 def test_multi_host_export_signs_cluster_metadata_and_each_ranks_resources(native, tmp_path, monkeypatch):
-    from ignition.preparation.package_file import extend_cluster
+    from helios.tests.signing import extend_cluster_legacy as extend_cluster
 
     path = cluster_package(tmp_path, monkeypatch)
     result = read(native, path, weights=True)
@@ -567,15 +567,27 @@ def test_tensor_parallel_assembly_authenticates_all_ranks(native, tmp_path):
     assert {digest for _, digest in json.loads(result.stdout)} == {
         hashlib.sha256(bytes([rank + 2]) * 41).hexdigest() for rank in range(3)}
     index, start = read_index(output)
-    with output.open('rb') as package:
+    from ignition.preparation.package_file import PackageFiles
+    with output.open('rb') as package, PackageFiles(output, package, start, 0) as files:
         for rank, bundle in enumerate(index.ranks):
             span = bundle.resources['scale']
-            package.seek(start + span.offset)
-            assert package.read(span.nbytes) == bytes(range(256)) * (rank * 70000 + 9)
+            source, base, _ = files.get(span.filename)
+            source.seek(base + span.offset)
+            assert source.read(span.nbytes) == bytes(range(256)) * (rank * 70000 + 9)
     # A stored-data byte flipped after publication fails the rank's weight scan.
     value, _ = envelope(output)
-    data = proto.RankProtection.FromString(value.ranks[1].body).data
-    overwrite(output, [(start + data.offset + data.nbytes - 1, 1)])
+    span = index.ranks[1].resources['scale']
+    from ignition.preparation.package_snapshot import read_container
+    with output.open('rb') as package:
+        layout = read_container(package)[3]
+    position = span.offset + span.nbytes - 1
+    for length, filename in layout['files'][span.filename]:
+        if position < length:
+            overwrite(output.parent / filename, [(4096 + position, 1)])
+            break
+        position -= length
+    else:
+        pytest.fail('stored resource is absent from the snapshot layout')
     assert read(native, output, weights=True).returncode != 0
 
 
@@ -614,13 +626,15 @@ def test_signed_assembly_stores_a_table_read_from_several_checkpoint_shards(nati
     assert result.returncode == 0, result.stderr
     combined, start = read_index(output)
     span = combined.engram.tables[0].weights
-    with output.open('rb') as package:
-        package.seek(start + span.offset)
-        assert package.read(span.nbytes) == b''.join(parts)
+    from ignition.preparation.package_file import PackageFiles
+    with output.open('rb') as package, PackageFiles(output, package, start, 0) as files:
+        source, base, _ = files.get(span.filename)
+        source.seek(base + span.offset)
+        assert source.read(span.nbytes) == b''.join(parts)
     # Executables are one range each.
     split = tmp_path / 'split.json'
     write_sources(split, index, [*payload[:-1], (cursor, graph, 0, 6), (cursor + 6, graph, 6, 7)])
-    with pytest.raises(ValueError, match='publication ranges differ from classified resources'):
+    with pytest.raises(ValueError, match='protected resources require one contiguous source'):
         combine(tmp_path / 'split.safetensors', [split], [], publisher=publisher())
 
 
@@ -716,9 +730,13 @@ def test_promote_development_package_preserves_resources(native, tmp_path):
     assert result.returncode == 0, result.stderr
     index, start = read_index(output)
     contents = output.read_bytes()
-    for name in ('weights', 'constant'):
-        span = index.ranks[0].resources[name]
-        assert contents[start + span.offset:start + span.offset + span.nbytes] == data[name]
+    from ignition.preparation.package_file import PackageFiles
+    with output.open('rb') as primary, PackageFiles(output, primary, start, 0) as files:
+        for name in ('weights', 'constant'):
+            span = index.ranks[0].resources[name]
+            reader, base, _ = files.get(span.filename)
+            reader.seek(base + span.offset)
+            assert reader.read(span.nbytes) == data[name]
     assert dict(json.loads(result.stdout)) == {
         index.ranks[0].resources[name].offset: hashlib.sha256(data[name]).hexdigest()
         for name in ('kernel', 'graph', 'constant')} | {
@@ -761,44 +779,6 @@ def test_promotion_rejects_tampering_without_publishing(tmp_path, corruption):
     assert not list(tmp_path.glob('.production.safetensors-*'))
 
 
-def test_promotion_checks_bytes_copied_from_open_source(native, tmp_path, monkeypatch):
-    import ignition.preparation.resign as promotion
-
-    original = development_publisher()
-    source, _ = fixture(tmp_path, size=41, signer=original)
-    publish_output = promotion._publish
-
-    def replace_path(*args):
-        source.rename(tmp_path / 'held-source')
-        source.write_bytes(b'unrelated replacement')
-        return publish_output(*args)
-
-    monkeypatch.setattr(promotion, '_publish', replace_path)
-    output = tmp_path / 'production.safetensors'
-    promotion.resign(source, output, publisher=publisher(), development_profile=development_profile(original))
-    result = read(native, output, weights=True)
-    assert result.returncode == 0, result.stderr
-
-
-def test_promotion_detects_in_place_weight_change_during_copy(tmp_path, monkeypatch):
-    import ignition.preparation.resign as promotion
-
-    original = development_publisher()
-    source, _ = fixture(tmp_path, size=41, signer=original)
-    _, start = read_index(source)
-    publish_output = promotion._publish
-
-    def change_weights(*args):
-        overwrite(source, [(start, 1)])
-        return publish_output(*args)
-
-    monkeypatch.setattr(promotion, '_publish', change_weights)
-    output = tmp_path / 'production.safetensors'
-    with pytest.raises(ValueError, match='stored-data digest mismatch'):
-        promotion.resign(source, output, publisher=publisher(), development_profile=development_profile(original))
-    assert not output.exists()
-
-
 def test_sign_cli_with_encrypted_key_and_tensor_parallel_package(native, tmp_path, monkeypatch):
     from ignition import signing
     from ignition.cli import main
@@ -829,7 +809,8 @@ def test_sign_cli_with_encrypted_key_and_tensor_parallel_package(native, tmp_pat
     monkeypatch.setattr(signing, 'passphrase', lambda prompt: password)
     config = tmp_path / 'config.toml'
     config.write_text('[publishing]\nnamespace = "example"\n'
-                      'official_source = "https://huggingface.co/example/default"\n')
+                      'official_source = "https://huggingface.co/example/default"\n'
+                      '[paths]\npackage_cache = ' + json.dumps(str(tmp_path / 'cache')) + '\n')
     output = tmp_path / 'production.safetensors'
     args = ['sign', str(source), '--output', str(output), '--config', str(config),
             '--signing-key', str(tmp_path / 'keys/signing-key.pem'),
@@ -851,10 +832,10 @@ def test_promotion_requires_development_source_and_production_target(tmp_path):
 
     source, _ = fixture(tmp_path, size=41)
     output = tmp_path / 'production.safetensors'
-    with pytest.raises(ValueError, match='source profile'):
+    with pytest.raises(ValueError, match='local-development'):
         promote(source, output, publisher=publisher(), development_profile=development_profile(publisher()))
     with pytest.raises(ValueError, match='production publisher'):
-        promote(source, output, publisher=development_publisher(), development_profile={})
+        promote(source, output, publisher=development_publisher(), development_profile=development_profile(publisher()))
     assert not output.exists()
 
 
@@ -974,7 +955,7 @@ def test_linked_companions_validate_targets_and_stored_data(native, tmp_path, re
     assert 'stored-data content verification failed' in read(native, path, weights=True).stderr
     target.write_bytes(target.read_bytes()[:-1])
     assert 'payload length' in read(native, path, weights=False).stderr
-    with pytest.raises(ValueError, match='payload length'):
+    with pytest.raises(ValueError, match='data length'):
         assert_shard_contents(path, expected)
 
 
@@ -1042,7 +1023,7 @@ def test_companion_validation_and_optional_weight_scan(native, tmp_path, corrupt
     assert (read(native, path, weights=False).returncode == 0) == (corruption == 'weights')
 
 
-@pytest.mark.parametrize('source_limit,destination_limit', [(0, 12288), (12288, 0), (12288, 24000)])
+@pytest.mark.parametrize('source_limit,destination_limit', [(0, 32768), (12288, 64 << 30), (12288, 65536)])
 def test_resigning_repacks_verified_resources(native, tmp_path, source_limit, destination_limit):
     from ignition.preparation.resign import resign as promote
     signer = development_publisher()
@@ -1053,23 +1034,6 @@ def test_resigning_repacks_verified_resources(native, tmp_path, source_limit, de
     assert_shard_contents(output, expected)
     result = read(native, output, weights=True)
     assert result.returncode == 0, result.stderr
-
-
-def test_sharded_promotion_rechecks_copied_bytes_and_cleans_outputs(tmp_path, monkeypatch):
-    import ignition.preparation.resign as promotion
-    signer = development_publisher()
-    path, _ = shard_fixture(tmp_path, signer=signer)
-    index, _ = read_index(path)
-    companion = path.with_name(index.ranks[0].resources['weight-2'].filename)
-    publish_output = promotion._publish
-    def mutate(*args):
-        overwrite(companion, [(4096, 1)])
-        return publish_output(*args)
-    monkeypatch.setattr(promotion, '_publish', mutate)
-    with pytest.raises(ValueError, match='stored-data digest mismatch'):
-        promotion.resign(path, tmp_path / 'production.safetensors', publisher=publisher(),
-                         development_profile=development_profile(signer), shard_size=12288)
-    assert not list(tmp_path.glob('production*.safetensors'))
 
 
 def test_publishing_does_not_overwrite_existing_companions(tmp_path):
@@ -1185,40 +1149,3 @@ def test_signed_shard_geometry_is_validated_without_scanning_weights(native, tmp
     resign(value, publisher())
     replace_envelope(path, value, payload)
     assert read(native, path, weights=False).returncode != 0
-
-
-def test_sharded_promotion_retains_companion_handles(native, tmp_path, monkeypatch):
-    import ignition.preparation.resign as promotion
-    signer = development_publisher()
-    path, expected = shard_fixture(tmp_path, signer=signer)
-    publish_output = promotion._publish
-    def replace_names(*args):
-        for companion in tmp_path.glob('model-data-*.safetensors'):
-            companion.rename(companion.with_suffix('.held'))
-            companion.write_bytes(b'replaced pathname')
-        return publish_output(*args)
-    monkeypatch.setattr(promotion, '_publish', replace_names)
-    output = tmp_path / 'production.safetensors'
-    promotion.resign(path, output, publisher=publisher(), development_profile=development_profile(signer),
-                     shard_size=12288)
-    assert_shard_contents(output, expected)
-    result = read(native, output, weights=True)
-    assert result.returncode == 0, result.stderr
-
-
-@pytest.mark.parametrize('stage', ['companion', 'primary'])
-def test_publish_failure_removes_only_its_outputs(tmp_path, monkeypatch, stage):
-    import ignition.preparation.package_file as packages
-    original_link = packages.os.link
-    foreign = tmp_path / 'unrelated.safetensors'
-    foreign.write_bytes(b'keep')
-    def link(source, destination):
-        if Path(destination).name == ('model-data-03-of-04.safetensors' if stage == 'companion' else 'model.safetensors'):
-            raise OSError('injected publication failure')
-        return original_link(source, destination)
-    monkeypatch.setattr(packages.os, 'link', link)
-    with pytest.raises(OSError, match='injected publication failure'):
-        shard_fixture(tmp_path)
-    assert not list(tmp_path.glob('model*.safetensors'))
-    assert not list(tmp_path.glob('.model*.safetensors-*'))
-    assert foreign.read_bytes() == b'keep'

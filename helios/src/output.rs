@@ -3,6 +3,8 @@
 #[cfg(feature = "server")]
 mod argument_tags;
 #[cfg(feature = "server")]
+mod minimax_xml;
+#[cfg(feature = "server")]
 pub mod chatml;
 #[cfg(feature = "server")]
 mod pipeline;

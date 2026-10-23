@@ -8,8 +8,7 @@ import torch
 from ignition.preparation import runtime_package_pb2 as proto
 from ignition.preparation.package_file import combine, read_index, write_sources
 from ignition.preparation.package_snapshot import convert, read_container
-from ignition.preparation.rebuild_manifest import describe_weights, validate_weights, weight_views
-from ignition.preparation.runtime_package import Allocation
+from ignition.preparation.rebuild_manifest import rebuild_weights_metadata, validate_weights, weight_views
 from helios.tests.signing import publisher
 from tests.preparation.test_package_snapshot import native, profile, assert_native
 from tests.preparation import test_package_protection as fixtures
@@ -30,43 +29,38 @@ def test_prepared_views_preserve_names_aliases_strides_and_packing_owner():
     matrix = storage.view(6, 8)
     weights = PackedWeight(matrix[1:4, ::2], matrix[4:, :4])
     roots = {'packed': weights, 'alias': weights.values}
-    allocations = [Allocation('weights', storage.data_ptr(), storage.nbytes)]
-    catalog = describe_weights(roots, allocations)
-    entries = {t.name: t for t in catalog.tensors}
-    assert entries['packed.values'].shape == [3, 4]
-    assert entries['packed.values'].stride == [8, 2]
-    assert entries['packed.values'].storage.offset == 8
-    assert entries['packed.values'].storage == entries['alias'].storage
-    assert entries['packed.scales'].storage.offset == 32
-    assert entries['packed.values'].layout_type.endswith('.PackedWeight')
-    assert entries['packed.values'].dtype == 'uint8'
-    assert not catalog.unavailable
-    bundle = proto.BundleIndex(allocations=[proto.Allocation(name='weights', nbytes=48)], rebuild_weights=catalog)
-    validate_weights(bundle)
-    bundle.rebuild_weights.tensors[0].storage.offset = 48
-    with pytest.raises(ValueError, match='exceeds fixed stored allocation'):
-        validate_weights(bundle)
+    catalog = rebuild_weights_metadata(roots)
+    entries = {t['name']: t for t in catalog['tensors']}
+    assert entries['packed.values']['shape'] == [3, 4]
+    assert entries['packed.values']['stride'] == [8, 2]
+    assert entries['packed.values']['address'] == storage.data_ptr() + 8
+    assert entries['packed.values']['address'] == entries['alias']['address']
+    assert entries['packed.values']['extent'] == 23
+    assert entries['packed.scales']['address'] == storage.data_ptr() + 32
+    assert entries['packed.values']['layout_type'].endswith('.PackedWeight')
+    assert entries['packed.values']['dtype'] == 'uint8'
+    assert not catalog['unavailable']
 
 
-def test_catalog_excludes_disposable_and_unreachable_storage_and_bounds_cycles():
+def test_tensor_metadata_bounds_cycles_and_defers_storage_resolution():
     stored = torch.ones(8)
     disposable = torch.zeros(8)
     roots = {'stored': stored, 'unused': torch.ones(3), 'scratch': disposable,
-             'meta': torch.empty(3, device='meta')}
+             'meta': torch.empty(3, device='meta'), 'empty': torch.empty(0)}
     roots['cycle'] = roots
-    allocations = [Allocation('stored', stored.data_ptr(), stored.nbytes),
-                   Allocation('scratch', disposable.data_ptr(), disposable.nbytes)]
-    catalog = describe_weights(roots, allocations, zero_ranges=[(disposable.data_ptr(), disposable.nbytes)])
-    assert any(t.name == 'stored' for t in catalog.tensors)
-    assert not any(t.name in ('scratch', 'meta', 'unused') for t in catalog.tensors)
-    assert {'scratch', 'meta', 'unused'} <= set(catalog.unavailable)
+    catalog = rebuild_weights_metadata(roots)
+    assert {entry['name'] for entry in catalog['tensors']} == {
+        'scratch', 'stored', 'unused', "cycle['scratch']", "cycle['stored']", "cycle['unused']"}
+    assert set(catalog['unavailable']) == {'meta', 'empty', "cycle['meta']", "cycle['empty']"}
     assert len(list(weight_views(roots))) < 20
 
 
 @pytest.mark.parametrize('change', ['version', 'dtype', 'shape', 'duplicate', 'dynamic', 'peer', 'missing'])
 def test_invalid_weight_catalog_cannot_be_used_for_preparation(change):
     tensor = torch.ones(4)
-    catalog = describe_weights({'w': tensor}, [Allocation('weights', tensor.data_ptr(), tensor.nbytes)])
+    catalog = proto.RebuildWeights(version=1)
+    catalog.tensors.add(name='w', dtype='float32', element_bytes=4, shape=[4], stride=[1],
+                        storage=proto.Reference(allocation='weights'))
     bundle = proto.BundleIndex(allocations=[proto.Allocation(name='weights', nbytes=tensor.nbytes)],
                               rebuild_weights=catalog)
     entry = bundle.rebuild_weights.tensors[0]

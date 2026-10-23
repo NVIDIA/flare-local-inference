@@ -1,14 +1,11 @@
 """Final numeric weight storage is an export leaf across preparation contracts."""
 
 import os
-import struct
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from ignition.preparation.reachability import Reachability
-from ignition.preparation.runtime_package import Allocation
 from ignition.preparation.tensor_metadata import NumericStorage, subtract_ranges, tensor_ranges
 
 
@@ -21,13 +18,8 @@ def assert_numeric(numeric, planes, *, opaque=()):
     for plane in planes:
         if plane is not None:
             assert not subtract_ranges(tensor_ranges(plane), spans)
-    # A real pointer table in an opaque library buffer must still be traversed.
-    target = Allocation("dependency", 0xee9f4a000000, 256)
     for plane in opaque:
-        owner = Allocation("opaque", plane.data_ptr(), plane.nbytes)
-        scan = Reachability([owner, target], numeric=spans, roots=("opaque",))
-        scan.contents(owner, 0, b"xx" + struct.pack("<Q", target.address))
-        assert scan.reached == {"opaque", "dependency"}
+        assert subtract_ranges(tensor_ranges(plane), spans) == tensor_ranges(plane)
 
 
 def session(device):

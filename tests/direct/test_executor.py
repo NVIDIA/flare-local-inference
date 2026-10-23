@@ -50,3 +50,14 @@ def test_a_step_takes_its_slowest_ranks_graph_time(monkeypatch):
     for connection in roots:
         connection.close()
     assert [peer.steps for peer in peers.values()] == [[1, 2], [1, 2]]
+
+
+def test_combined_round_reads_terminal_confidence_without_a_separate_proposal():
+    import torch
+    from ignition.direct.executor import RankSteps
+    steps = object.__new__(RankSteps)
+    values = torch.tensor([[.25, .5], [.75, 1.]])
+    steps.runner = SimpleNamespace(proposals={}, packed=frozenset({'combined'}),
+                                   model=SimpleNamespace(proposal_confidence=values))
+    assert steps.confidence('combined') == [[.25, .5], [.75, 1.]]
+    assert steps.confidence('width-one') is None

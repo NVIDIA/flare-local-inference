@@ -38,7 +38,7 @@ def prepare(signatures, buffers, pool, *, image_slots=4, page_tokens, draft_lag,
     graphs = c.graph_contracts(signatures, inputs, continuation=continuation, pending=pending,
         cursor=cursor, rows=rows, embedding_tables=embedding_tables)
     for graph in graphs:
-        if graph["kind"] in (p.PROPOSAL, p.VERIFICATION):
+        if graph["kind"] in (p.PROPOSAL, p.VERIFICATION, p.PACKED_SPECULATIVE):
             graph["state"].extend(dict(view=c.state_view(name, tensor.stride(0) * tensor.element_size()),
                 access=p.READ_WRITE) for name, tensor in buffers.items() if name.startswith("proposal_"))
     vision = any(s.kind == "vision" for s in signatures.values())

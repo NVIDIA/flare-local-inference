@@ -18,7 +18,7 @@ pub use contract::PreparedContract;
 pub use inputs::{InputStep, pack_inputs};
 pub use packing::Inputs;
 #[cfg(feature = "server")]
-pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, message_boundaries};
+pub use prompt::{prepare_image_inputs, prepare_input, prepare_output};
 #[cfg(feature = "server")]
 pub(crate) use prompt::validate_conditioned_inputs;
 
@@ -80,6 +80,7 @@ impl VisionCapabilities {
 #[derive(Clone, Debug)]
 pub struct ModelConfig {
     pub max_top_logprobs: usize,
+    pub logprob_token_id_capacity: usize,
     /// Context extent of captured page tables and workspaces; serving may use a smaller limit.
     pub prepared_sequence_tokens: usize,
     pub contract: PreparedContract,
@@ -353,7 +354,7 @@ pub fn validate_completion(
                 || v.tokens
                     .iter()
                     .any(|id| *id >= config.contract.vocabulary as i64)
-                || (matches!(kind, GraphKind::Speculative | GraphKind::Verification)
+                || (matches!(kind, GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative)
                     && record.status != 3
                     && v.draft_cache_consumed
                         != contract.draft_cursor.as_ref().map_or(-1, |cursor| {

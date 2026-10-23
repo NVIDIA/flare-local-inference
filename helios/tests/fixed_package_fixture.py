@@ -41,6 +41,13 @@ def pointer_table_argument(output, table):
     tl.store(output + index, tl.load(output + index) + tl.load(source + index))
 
 
+def allocation_reference(allocations, tensor):
+    address, nbytes = tensor.data_ptr(), tensor.nbytes
+    allocation = next(a for a in allocations
+                      if a.address <= address and address + nbytes <= a.address + a.nbytes)
+    return {"allocation": allocation.name, "offset": address - allocation.address}
+
+
 def global_kernel(root, storage, source):
     code = root / "globals.cu"
     code.write_text('''
@@ -157,18 +164,19 @@ def prepare(root, shard_size=64 << 30):
     assert any(a.address <= table_source.data_ptr() < a.address + a.nbytes for a in package.allocations)
     assert any(a.name.startswith("external-") and a.address <= external.value < a.address + a.nbytes
                for a in package.allocations)
-    zero_reference = package._reference(transient.data_ptr(), transient.nbytes)
+    zero_reference = allocation_reference(package.allocations, transient)
     document = read_index(root / "package")[0].ranks[0]
     allocation = next(a for a in document.allocations if a.name == zero_reference["allocation"])
     start, end = zero_reference["offset"], zero_reference["offset"] + transient.nbytes
     assert all(span.offset + span.nbytes <= start or span.offset >= end for span in allocation.data_spans)
     (root / "expected.json").write_text(json.dumps({
-        "reference": package._reference(output.data_ptr(), output.nbytes), "bytes": list(expected),
+        "reference": allocation_reference(package.allocations, output), "bytes": list(expected),
         "addresses": {allocation.name: allocation.address for allocation in package.allocations},
         "zero_reference": zero_reference,
         "zero_bytes": transient.nbytes,
     }))
-    print(f"exported fixed-address graph with {len(package.allocations)} allocations and {len(package.modules)} cubins", flush=True)
+    print(f"exported fixed-address graph with {len(package.allocations)} allocations and "
+          f"{package.export_counts['modules']} cubins", flush=True)
     storage.cuda.call("cuMemFree_v2", external)
 
 

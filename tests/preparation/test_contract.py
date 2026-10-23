@@ -55,6 +55,29 @@ def test_device_pending_token_has_read_and_producer_declarations():
         assert any(s["view"] == pending and s["access"] in (p.WRITE, p.READ_WRITE) for s in graph["state"])
 
 
+def test_glm_vision_uses_shared_feature_bindings_and_preserves_text_only_contract():
+    from ignition.recipes.glm53.contract import prepare
+
+    pool = SimpleNamespace(layout=SimpleNamespace(row_bytes=32, region=lambda _: SimpleNamespace(offset=0, nbytes=8)))
+    text = {"prefill": GraphSignature("prefill", 1, 128,
+        ("token_ids", "vision_token_indices", "vision_feature_slot"))}
+    plain = ParseDict(prepare(text, {}, pool, page_tokens=256, draft_lag=None), p.ModelContract())
+    assert plain.vision.max_images == 0 and not plain.frontend.HasField("image_layout")
+    assert 154854 in plain.frontend.rejected_tokens
+    signatures = {**text, "vision64": GraphSignature("vision", 1, 64,
+        ("vision_pixel_values", "vision_position_ids", "vision_cu_seqlens", "vision_num_patches",
+         "vision_slot", "vision_generation", "vision_feature_offset", "vision_feature_slot"))}
+    vision = ParseDict(prepare(signatures, {}, pool, page_tokens=256, draft_lag=None, image_slots=2), p.ModelContract())
+    assert vision.vision.feature_slots == 2 and vision.vision.features_per_request == 8192
+    assert vision.frontend.image_layout == p.GLM_IMAGE_LAYOUT
+    assert vision.frontend.image_preparation == p.GLM_IMAGE_PREPARATION
+    assert vision.frontend.image_tokens.feature_token == 154854
+    assert 154854 not in vision.frontend.rejected_tokens and 154855 in vision.frontend.rejected_tokens
+    graph = next(graph for graph in vision.graphs if graph.kind == p.PREFILL)
+    assert next(value for value in graph.inputs if value.buffer == "vision_token_indices").source == p.IMAGE_FEATURE_INDEX
+    assert next(value for value in graph.inputs if value.buffer == "vision_feature_slot").source == p.IMAGE_FEATURE_SLOT
+
+
 def test_history_plane_registers_actual_row_geometry():
     import torch
     tensor = torch.empty((8, 64, 12), dtype=torch.bfloat16)

@@ -8,7 +8,7 @@ from ignition.errors import FetchError, UsageError
 from ignition.recipes import ResolvedModel, resolve
 from ignition.recipes.declaration import Speculation
 
-from .config import Configuration, Setting
+from .config import AUTOTUNE_EFFORTS, Configuration, Setting
 
 
 @dataclass(frozen=True)
@@ -40,21 +40,22 @@ def resolve_model(configuration: Configuration, name: str | None) -> ResolvedMod
 
 def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gpus: str | None,
            concurrency: Setting, speculation: Speculation | None, prefill_chunk: int | None = None,
-           context_parallel: bool = True, stream_overlap: bool = True, roce_ring: bool = False,
+           context_parallel: bool = True, stream_overlap: bool = True, roce_ring: bool = False, roce_chain: bool = False,
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
            online_mxfp8: bool = False, language_model_only: bool = False,
-           compile_workers: int | None = None, tuning_gpus: str | None = None,
+           compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None,
            image_concurrency: int | None = None, mla_compute_mode: str = "auto") -> planning.Plan:
     """Select GPUs and estimate memory for one checkpoint from the configuration and command-line intent."""
     workers = compiler_workers(configuration, compile_workers)
     result = planning.plan(
         model.recipe, model.checkpoint, host.gpus, selected=None if gpus is None else planning.parse_gpus(gpus),
         concurrency=concurrency.value, reserve_bytes=configuration.reserve_bytes, speculation=speculation,
-        prefill_chunk=prefill_chunk, context_parallel=context_parallel, stream_overlap=stream_overlap, roce_ring=roce_ring,
+        prefill_chunk=prefill_chunk, context_parallel=context_parallel, stream_overlap=stream_overlap, roce_ring=roce_ring, roce_chain=roce_chain,
         mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs, expert_scale_compression=expert_scale_compression,
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
         online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
-    result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"))
+    result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
+                     autotune_effort=tuning_effort(configuration, autotune_effort))
     return tuning_devices(result, host, tuning_gpus)
 
 
@@ -62,6 +63,13 @@ def image_capacity_setting(configuration, model, flag=None):
     if not model.recipe.max_images and flag is None:
         return None
     return configuration.model_setting(model.checkpoint.alias, "image_concurrency", None, flag).value
+
+
+def tuning_effort(configuration, flag=None):
+    value = configuration.get("preparation.autotune_effort", flag).value
+    if value not in AUTOTUNE_EFFORTS:
+        raise UsageError(f"--autotune-effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
+    return value
 
 
 def compiler_workers(configuration, flag=None):
@@ -122,14 +130,21 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     """Apply the command line's speculation overrides to the recipe's settings; None disables speculation."""
     recipe, alias = model.recipe, model.checkpoint.alias
     default, limit = recipe.speculation, recipe.max_draft_tokens
-    packed = getattr(args, "packed_verification", False)
+    graph_budget = Setting(args.speculative_graph_budget, "flag")
+    if configuration is not None:
+        graph_budget = configuration.model_setting(alias, "speculative_graph_budget",
+            None if default is None else default.graph_budget, args.speculative_graph_budget)
+    elif graph_budget.value is None:
+        graph_budget = Setting(None if default is None else default.graph_budget, "recipe")
+    explicit_graph_budget = graph_budget.value is not None and graph_budget.source not in ("recipe", "[defaults]")
     given = [flag for flag, value in (
         ("--mtp-draft-tokens", args.mtp_draft_tokens),
         ("--speculative-token-capacity", args.speculative_token_capacity),
         ("--no-mtp-adaptive-verification", args.no_mtp_adaptive_verification or None),
         ("--mtp-proposal-source", args.mtp_proposal_source),
-        ("--history-drafts", args.history_drafts or None),
-        ("--packed-verification", packed or None)) if value is not None]
+        ("--history-drafts", args.history_drafts or None)) if value is not None]
+    if explicit_graph_budget:
+        given.append("--speculative-graph-budget")
     if default is None:
         if args.no_mtp or given:
             raise UsageError(f"{alias} has no multi-token speculation; {(given or ['--no-mtp'])[0]} does not apply")
@@ -151,11 +166,22 @@ def speculation(args, model: ResolvedModel, configuration: Configuration | None 
     capacity = args.speculative_token_capacity
     if configuration is not None:
         capacity = configuration.model_setting(alias, "speculative_token_capacity", default.token_capacity, capacity).value
+    elif capacity is None:
+        capacity = default.token_capacity
     if capacity is not None and (type(capacity) is not int or capacity < drafts + 1):
         raise UsageError("--speculative-token-capacity must cover the maximum verification width")
-    if packed and (not adaptive or drafts < 1 or source != "mtp" or history):
-        raise UsageError("--packed-verification requires adaptive verification of retained learned proposals")
-    return Speculation(drafts, adaptive, source, history, capacity, packed)
+    packed = default.packed_verification and drafts > 0
+    prefix_selection = default.draft_prefix_selection if drafts else "cpu"
+    if packed and not adaptive:
+        raise UsageError(f"{alias} requires adaptive verification; --no-mtp-adaptive-verification does not apply")
+    if packed and (source != "mtp" or history):
+        raise UsageError(f"{alias} requires verification of retained learned proposals")
+    if explicit_graph_budget and not (packed and adaptive and source == "mtp" and not history):
+        raise UsageError("--speculative-graph-budget requires packed adaptive learned speculation with positive draft depth")
+    budget = graph_budget.value if packed else None
+    if budget is not None and (type(budget) is not int or budget < 1):
+        raise UsageError("--speculative-graph-budget must be a positive integer")
+    return Speculation(drafts, adaptive, source, history, capacity, packed, prefix_selection, budget)
 
 
 def fetch(model: ResolvedModel, hub_cache, *, progress_bars: bool = True) -> str:

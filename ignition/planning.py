@@ -178,7 +178,9 @@ class Plan:
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
     roce_ring: bool = False
+    roce_chain: bool = False
     compile_workers: int | None = None
+    autotune_effort: str = "medium"
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -285,21 +287,25 @@ class Plan:
                       "total_bytes": gpu.total_bytes} for gpu in self.gpus],
             "tensor_parallel": self.world_size, "max_concurrency": self.concurrency,
             "image_concurrency": self.image_concurrency,
-            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "context_parallel": self.context_parallel,
+            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "roce_chain": self.roce_chain, "context_parallel": self.context_parallel,
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
             "expert_scale_compression": self.expert_scale_compression,
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
+            "autotune_effort": self.autotune_effort,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,
             "speculation": None if self.speculation is None else {
                 "draft_tokens": self.speculation.draft_tokens, "adaptive": self.speculation.adaptive,
                 "packed_verification": self.speculation.packed_verification,
+                "draft_prefix_selection": self.speculation.draft_prefix_selection,
                 "proposal_source": self.speculation.proposal_source,
-                "history_drafts": self.speculation.history_drafts},
+                "history_drafts": self.speculation.history_drafts,
+                **({"graph_budget": self.speculation.graph_budget}
+                   if self.speculation.graph_budget is not None else {})},
             "context": self.context, "checkpoint_context": self.recipe.context,
             "weights_bytes": self.weights_bytes, "mapped_host_bytes": self.checkpoint.mapped_host_bytes,
             "graph_bytes": self.graph_bytes,
@@ -320,6 +326,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         context_parallel: bool = True, stream_overlap: bool = True, cache_states: int | None = None,
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
+        roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False,
         language_model_only: bool = False, mla_compute_mode: str = "auto") -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
@@ -333,13 +340,25 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
     if expert_scale_compression is not None and expert_scale_compression not in checkpoint.scale_compressed_device_bytes:
         raise UsageError(f"--expert-scale-compression {expert_scale_compression}: {checkpoint.alias}"
                          " does not prepare this scale encoding")
+    if (speculation is not None and speculation.packed_verification and speculation.adaptive
+            and speculation.draft_tokens > 0 and speculation.learned and not speculation.history_drafts
+            and speculation.graph_budget is None and recipe.speculation is not None):
+        speculation = replace(speculation, graph_budget=recipe.speculation.graph_budget)
+    if speculation is not None and speculation.graph_budget is not None:
+        from ignition.components.capacity import packed_speculative_shapes
+
+        try:
+            packed_speculative_shapes(concurrency, speculation.draft_tokens + 1,
+                                      speculation.token_capacity, speculation.graph_budget)
+        except ValueError as error:
+            raise UsageError(f"--speculative-graph-budget: {error}") from error
     costs = recipe.costs(len(gpus), speculation, checkpoint)
     plan = Plan(recipe, checkpoint, gpus, concurrency, recipe.prefill_chunk if prefill_chunk is None else prefill_chunk,
                 speculation, 0, 0, 0, reserve_bytes,
                 recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
-                expert_scale_compression=expert_scale_compression, roce_ring=roce_ring,
+                expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
@@ -377,11 +396,26 @@ def _shortfall(plan: Plan, options: list[str], scope: str) -> CapacityError:
     return CapacityError("\n".join(lines))
 
 
+
+def host_shape_error(roce_ring: bool, roce_chain: bool, hosts: int | None) -> str | None:
+    """Why a ring or chain cannot be formed over ``hosts`` ranks on separate hosts, or None when it can.
+
+    A ring or a chain needs 2 to 16 ranks in rank order on separate hosts; the two shapes exclude each
+    other. ``hosts`` is the rank count, or None when ranks share one host."""
+    if roce_ring and roce_chain:
+        return "--roce-ring and --roce-chain exclude each other"
+    if not (roce_ring or roce_chain):
+        return None
+    flag = "--roce-ring" if roce_ring else "--roce-chain"
+    if hosts is None or not 2 <= hosts <= 16:
+        return f"{flag} requires at least two hosts in rank order, at most 16, each rank on its own host"
+    return None
+
 def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selected: tuple[int, ...] | None,
          concurrency: int, reserve_bytes: int, speculation: Speculation | None,
          prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
-         expert_scale_compression: str | None = None, roce_ring: bool = False,
+         expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False,
          language_model_only: bool = False, mla_compute_mode: str = "auto") -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
@@ -434,7 +468,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    speculation=speculation, prefill_chunk=chunk, context_parallel=context_parallel,
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
-                   expert_scale_compression=expert_scale_compression, roce_ring=roce_ring,
+                   expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)

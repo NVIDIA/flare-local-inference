@@ -71,7 +71,7 @@ class PreparedModel(PreparedExecution):
 
         if not hasattr(flare_heliopause, "Server"):
             raise RuntimeError("in-process HTTP diagnostics require heliopause's qualification Cargo feature; "
-                               "use ignition run for package-based serving")
+                               "use ignition export followed by flare run for package-based serving")
         with self._handoff_lock:
             if self._consumed or self.closed:
                 raise RuntimeError("prepared model has already been consumed or closed")

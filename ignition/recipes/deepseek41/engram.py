@@ -97,43 +97,40 @@ class Tables:
         return EmbeddingHeadPartition.for_rank(self.geometry.offsets[ordinal],
             self.geometry.num_embeddings[ordinal], rank, self.shard.world_size)
 
-    def append(self, index, payload, cursor):
-        from ignition.preparation.package_file import align
-        from ignition.preparation import runtime_package_pb2 as proto
-
-        target = index.engram
-        target.token_map.extend(self.token_map)
-        target.pad_token_id = 2
-        target.compressed_vocabulary = self.geometry.compressed_vocab_size
+    def export_metadata(self):
+        """Describe table geometry and checkpoint spans for native publication."""
+        tables = []
         for ordinal, layer in enumerate(self.geometry.layer_ids):
-            table = target.tables.add(layer=layer, rows=self.geometry.num_embeddings[ordinal],
-                embedding_width=256, scale_block=32, encoding=proto.EngramTable.FP8_E4M3_E8M0,
+            table = dict(layer=layer, rows=self.geometry.num_embeddings[ordinal],
+                embedding_width=256, scale_block=32, encoding="FP8_E4M3_E8M0",
                 weight_buffer=f"engram_{layer}_weights", scale_buffer=f"engram_{layer}_scales",
                 hash_buffer=f"engram_{layer}_hashes", ready_event=f"engram_{layer}_ready",
                 request_buffer=f"engram_{layer}_requests")
-            table.hash.method = proto.EngramHash.XOR_MODULO
-            table.hash.orders.extend(order for order in (2, 3, 4) for _ in range(8))
-            table.hash.multipliers.extend(self.geometry.multipliers[ordinal])
-            table.hash.primes.extend(self.geometry.primes[ordinal])
             offsets = [0] * 24
             first = 0
+            shards = []
             for rank in range(self.shard.world_size):
                 partition = self.partition(ordinal, rank)
                 for head in partition.heads:
                     offsets[head] = first + partition.row_mapping[head][2]
-                planes = (table if self.shard.world_size == 1 else
-                          table.shards.add(rank=rank, first_row=first, rows=partition.rows))
+                planes = dict(rank=rank, first_row=first, rows=partition.rows)
                 for name, source, width in zip(("weights", "scales"), self.sources[layer], (256, 8), strict=True):
-                    cursor = align(cursor)
-                    span = getattr(planes, name)
-                    span.offset, span.nbytes = cursor, partition.rows * width
-                    for start, end in partition.source_rows:
-                        nbytes = (end - start) * width
-                        payload.append((cursor, source.path, source.offset + start * width, nbytes))
-                        cursor += nbytes
+                    planes[name] = [dict(path=str(source.path), offset=source.offset + start * width,
+                                         nbytes=(end - start) * width)
+                                    for start, end in partition.source_rows]
+                if self.shard.world_size == 1:
+                    table.update(weights=planes["weights"], scales=planes["scales"])
+                else:
+                    shards.append(planes)
                 first += partition.rows
-            table.hash.offsets.extend(offsets)
-        return cursor
+            table["hash"] = dict(method="XOR_MODULO", orders=[order for order in (2, 3, 4) for _ in range(8)],
+                multipliers=list(self.geometry.multipliers[ordinal]), primes=list(self.geometry.primes[ordinal]),
+                offsets=offsets)
+            if shards:
+                table["shards"] = shards
+            tables.append(table)
+        return dict(token_map=list(self.token_map), pad_token_id=2,
+                    compressed_vocabulary=self.geometry.compressed_vocab_size, tables=tables)
 
 
 class PreparedTableRequests:

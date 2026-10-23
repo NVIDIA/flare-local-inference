@@ -2,11 +2,10 @@
 //! launching, attaching to, and stopping serving groups. See docs/orbit.md.
 //!
 //! A launch verifies the package at the controller, where the operator accepts its publisher;
-//! checks every node's STATUS; issues a grant in the cluster's rank order; transfers an explicit
-//! executable override; places the package, either complete on rank zero from the controller or
-//! at the node that holds it, from where every other node fetches its ranks' byte ranges with TRANSFER;
-//! and sends RUN to rank zero and then to the peers. Each rank's output is printed with a
-//! `[rank R name]` prefix.
+//! checks node capacity; signs a launch grant; deploys an explicit executable override; and
+//! stages the complete source on rank zero when needed. RUN starts native serving ranks,
+//! which distribute peer shards and establish their collective transport. The controller
+//! prints each rank's output with a `[rank R name]` prefix.
 //!
 //! Stopping sends STOP to rank zero and waits for it to exit, so its coordinated shutdown drains
 //! while every peer still participates in collectives. Peers still running 30 seconds after rank
@@ -28,16 +27,15 @@ use flare_helios::startup::StartupProgress;
 use serde::Deserialize;
 use serde_json::{Value, json};
 
-use super::agent::{Hello, exchange_hello};
 use super::cache;
-use super::grant::{ControllerKey, ControllerSet, Grant, Member, Package, Signed, Source};
-use super::identity::{Key, PublicKey};
+use super::grant::{Grant, Member, Package, Signed, Source};
+#[cfg(test)]
+use super::identity::Key;
 use super::plan;
 use super::session::{FRAME_LIMIT, Session};
-use super::store::{GroupSpec, Node, Orbit, join_key};
-use super::{
-    Failure, PROTOCOL_VERSION, frame, hex, hmac_sha256, hostname, now, random, unhex, with_port,
-};
+use super::store::Orbit;
+use super::store::{GroupSpec, Node};
+use super::{Failure, frame, hex, now, random};
 
 /// Rank zero's rendezvous port, on the address its host routes toward its peers.
 pub const RENDEZVOUS_PORT: u16 = 29800;
@@ -160,6 +158,7 @@ pub struct RunOptions {
     pub rank_zero: Vec<String>,
     pub roce_ring: bool,
     pub transfer_streams: Option<u8>,
+    pub roce_chain: bool,
     /// An executable to upload; absent means each node uses its installed agent executable.
     pub executable: Option<PathBuf>,
     /// Return once every rank has started instead of following the group.
@@ -184,6 +183,8 @@ pub struct LaunchOptions {
     /// Place and verify the package on the members without sending the executable or
     /// starting ranks; the returned launch then has no rank sessions.
     pub stage_only: bool,
+    /// Serve over a chain in rank order (exclusive with roce_ring).
+    pub roce_chain: bool,
 }
 
 /// A `flare orbit run` package argument.
@@ -265,400 +266,38 @@ pub struct RankEnd {
     pub result: Result<i32, String>,
 }
 
-/// The controlling machine's identity and orbit file.
-pub struct Controller {
-    key: Key,
-    orbit: Orbit,
-    orbit_path: PathBuf,
-    name: String,
+/// Orbit placement and lifecycle management use the shared paired-agent client.
+pub struct Controller(crate::agent_client::Client);
+impl std::ops::Deref for Controller {
+    type Target = crate::agent_client::Client;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
-
+impl std::ops::DerefMut for Controller {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
 impl Controller {
-    /// Load the controller key, creating it on first use, and the orbit file.
     pub fn open(orbit_path: Option<&Path>, key_path: Option<&Path>) -> Result<Self, Failure> {
-        let key_path = key_path.map_or_else(Orbit::default_key_path, Path::to_path_buf);
-        let orbit_path = orbit_path.map_or_else(Orbit::default_path, Path::to_path_buf);
-        let key = Key::load_or_create(&key_path)
-            .map_err(|e| format!("controller key {}: {e}", key_path.display()))?;
-        let orbit = Orbit::load(&orbit_path)?;
-        Ok(Self::new(key, orbit, orbit_path))
+        Ok(Self(crate::agent_client::Client::open(
+            orbit_path, key_path,
+        )?))
     }
-
-    /// A controller with this key and orbit, saving the orbit to `orbit_path`.
+    #[cfg(test)]
     pub fn new(key: Key, orbit: Orbit, orbit_path: PathBuf) -> Self {
-        Self {
-            key,
-            orbit,
-            orbit_path,
-            name: hostname(),
-        }
+        Self(crate::agent_client::Client::new(key, orbit, orbit_path))
     }
-
-    fn save(&self) -> Result<(), Failure> {
-        self.orbit.save(&self.orbit_path)
-    }
-
-    fn revision(&self) -> Result<u64, Failure> {
-        Ok(self.orbit.controller_set()?.map_or(0, |set| set.revision))
-    }
-
     /// The orbit file's nodes of a cluster, in rank order.
     pub fn cluster_nodes(&self, name: Option<&str>) -> Result<(String, Vec<Node>), Failure> {
         self.cluster(name)
-    }
-
-    pub fn checkpoint_route(
-        &self,
-        cluster: Option<&str>,
-        request: super::checkpoint::RouteRequest,
-    ) -> Result<Signed, Failure> {
-        let (_, nodes) = self.cluster(cluster)?;
-        if nodes.len() != request.gpu_uuids.len() {
-            return Err(
-                "checkpoint cluster must list exactly one agent per preparation rank".into(),
-            );
-        }
-        let mut records = Vec::new();
-        let mut members = Vec::new();
-        for (rank, node) in nodes.iter().enumerate() {
-            let status = self.node_status(node, None)?;
-            if !status
-                .gpus
-                .iter()
-                .any(|gpu| gpu.uuid == request.gpu_uuids[rank])
-            {
-                return Err(format!(
-                    "checkpoint rank {rank}'s GPU is not on orbit node {}; check cluster order",
-                    node.name
-                )
-                .into());
-            }
-            let (mut session, _) = self.node_session(node)?;
-            session.write_frame(frame::FABRIC, b"{}")?;
-            records.push(session.expect(frame::OK)?);
-            members.push(Member {
-                rank,
-                name: node.name.clone(),
-                public_key: node.public_key.clone(),
-                address: node.address.clone(),
-                gpus: vec![request.gpu_uuids[rank].clone()],
-            });
-        }
-        let grant = super::checkpoint::Grant {
-            purpose: "checkpoint-stream-v1".into(),
-            ring: super::fabric::plan(&nodes, &records)?,
-            members,
-            source_port: request.source_port,
-            streams: request.streams,
-            catalog_sha256: request.catalog_sha256,
-            identity: request.identity,
-            expires: now() + 3600,
-        };
-        grant.validate()?;
-        Signed::sign(&self.key, &grant)
     }
 
     /// The orbit file's nodes of a cluster, in rank order.
     fn cluster(&self, name: Option<&str>) -> Result<(String, Vec<Node>), Failure> {
         let (name, nodes) = self.orbit.cluster(name)?;
         Ok((name, nodes.into_iter().cloned().collect()))
-    }
-
-    // ---- sessions ------------------------------------------------------------------------------
-
-    pub(super) fn node_session(&self, node: &Node) -> Result<(Session, Hello), Failure> {
-        let (mut session, mut hello) = self.handshake(&node.address)?;
-        let expected = node.key()?;
-        if session.remote() != expected {
-            return Err(format!(
-                "{} presents key {}, not the key this node paired with ({})",
-                node.address,
-                session.remote().fingerprint(),
-                expected.fingerprint()
-            )
-            .into());
-        }
-        hello.controllers_revision = self.synchronize(&mut session, &hello)?;
-        Ok((session, hello))
-    }
-
-    fn handshake(&self, address: &str) -> Result<(Session, Hello), Failure> {
-        let mut session = Session::connect(address, &self.key)?;
-        let mine = Hello {
-            version: PROTOCOL_VERSION,
-            kind: "controller".into(),
-            name: self.name.clone(),
-            public_key: self.key.public().to_hex(),
-            controllers_revision: self.revision()?,
-            free_bytes: 0,
-            executable: None,
-        };
-        let hello = exchange_hello(&mut session, &mine)?;
-        if hello.kind != "node" {
-            return Err(format!("{address} is a flare {}, not an agent node", hello.kind).into());
-        }
-        Ok((session, hello))
-    }
-
-    /// Send the orbit file's controller-set record to a paired node holding an older revision,
-    /// and return the revision the node holds afterwards. An unpaired node becomes paired only
-    /// through PAIR, so it never receives the record here.
-    fn synchronize(&self, session: &mut Session, hello: &Hello) -> Result<u64, Failure> {
-        let ours = self.revision()?;
-        let Some(record) = self.orbit.controllers.as_ref() else {
-            return Ok(hello.controllers_revision);
-        };
-        if hello.controllers_revision == 0 || hello.controllers_revision >= ours {
-            return Ok(hello.controllers_revision);
-        }
-        session.write_frame(frame::CONTROLLERS, &serde_json::to_vec(record)?)?;
-        let reply = session
-            .expect(frame::OK)
-            .map_err(|e| format!("controller set revision {ours} refused: {e}"))?;
-        let reply: Value = serde_json::from_slice(&reply)?;
-        Ok(reply["revision"].as_u64().unwrap_or(ours))
-    }
-
-    // ---- pairing and the controller set --------------------------------------------------------
-
-    /// Pair with the agents at `hosts` and record them in the orbit file. With `code`, both sides
-    /// prove the join code inside the session; without it, each node must accept the first
-    /// controller. Prints each node's name and fingerprint for comparison with what
-    /// `flare agent install` printed on the host.
-    pub fn pair(&mut self, hosts: &[String], code: Option<&str>) -> Result<(), Failure> {
-        let record = self.pairing_record()?;
-        let code_key = code.map(join_key);
-        let mut failed = Vec::new();
-        for host in hosts {
-            match self.pair_one(&with_port(host), &record, code_key.as_ref()) {
-                Ok(node) => println!(
-                    "paired {}  fingerprint {}  address {}",
-                    node.name, node.fingerprint, node.address
-                ),
-                Err(error) => {
-                    eprintln!("{host}: {error}");
-                    failed.push(host.as_str());
-                }
-            }
-        }
-        if self.orbit.cluster.is_empty() && self.orbit.node.len() >= 2 {
-            let names: Vec<String> = self
-                .orbit
-                .node
-                .iter()
-                .map(|n| format!("{:?}", n.name))
-                .collect();
-            println!(
-                "\nTo launch on these nodes, list them in rank order as a cluster in {}:\n\n[cluster.NAME]\nnodes = [{}]",
-                self.orbit_path.display(),
-                names.join(", ")
-            );
-        }
-        if !failed.is_empty() {
-            return Err(format!("pairing failed for {}", failed.join(", ")).into());
-        }
-        Ok(())
-    }
-
-    fn pair_one(
-        &mut self,
-        address: &str,
-        record: &Signed,
-        code_key: Option<&[u8; 32]>,
-    ) -> Result<Node, Failure> {
-        let (mut session, hello) = self.handshake(address)?;
-        let key = session.remote();
-        if let Some(known) = self
-            .orbit
-            .node
-            .iter()
-            .find(|n| n.name == hello.name && n.public_key != key.to_hex())
-        {
-            return Err(format!(
-                "the orbit file records another node named {} (fingerprint {}); remove it with \
-                 `flare orbit forget {}` before pairing this host",
-                known.name, known.fingerprint, known.name
-            )
-            .into());
-        }
-        let hash = *session.handshake_hash();
-        let mut request = json!({"controllers": record});
-        if let Some(code_key) = code_key {
-            let proof = hmac_sha256(code_key, &[b"controller".as_slice(), &hash].concat());
-            request["proof"] = hex(&proof).into();
-        }
-        let reply: Value = serde_json::from_slice(&session.request(frame::PAIR, &request)?)?;
-        let public_key = PublicKey::from_hex(
-            reply["public_key"]
-                .as_str()
-                .ok_or("PAIR reply lacks public_key")?,
-        )?;
-        if public_key != key {
-            return Err(
-                "the PAIR reply names a key other than the one the node authenticated".into(),
-            );
-        }
-        if let Some(code_key) = code_key {
-            let expected = hmac_sha256(code_key, &[b"node".as_slice(), &hash].concat());
-            let proof = reply["proof"].as_str().map(unhex).transpose()?;
-            if !proof.is_some_and(|proof| constant_time_equal(&proof, &expected)) {
-                return Err(
-                    "the node did not prove the join code, so it may not be the host where the \
-                     code was installed; it was not recorded"
-                        .into(),
-                );
-            }
-        }
-        let node = Node {
-            name: reply["name"].as_str().unwrap_or(&hello.name).to_owned(),
-            fingerprint: key.fingerprint(),
-            public_key: key.to_hex(),
-            address: address.to_owned(),
-        };
-        self.orbit.upsert(node.clone());
-        self.save()?;
-        Ok(node)
-    }
-
-    /// The orbit file's controller-set record, created at revision 1 with this controller alone
-    /// when the orbit file has none.
-    fn ensure_record(&mut self) -> Result<Signed, Failure> {
-        if let Some(record) = &self.orbit.controllers {
-            return Ok(record.clone());
-        }
-        let set = ControllerSet {
-            revision: 1,
-            keys: vec![ControllerKey {
-                name: self.name.clone(),
-                public_key: self.key.public().to_hex(),
-            }],
-        };
-        let record = Signed::sign(&self.key, &set)?;
-        self.orbit.controllers = Some(record.clone());
-        self.save()?;
-        Ok(record)
-    }
-
-    /// The record pairing hands a node. A node accepts a first record only from the controller
-    /// that signed it, so a record another controller signed is signed again here with the same
-    /// revision and keys.
-    fn pairing_record(&mut self) -> Result<Signed, Failure> {
-        let record = self.ensure_record()?;
-        if record.signer()? == self.key.public() {
-            return Ok(record);
-        }
-        let set: ControllerSet = record.verify(|_| true)?;
-        if !set.contains(&self.key.public()) {
-            return Err(self.not_a_member());
-        }
-        Signed::sign(&self.key, &set)
-    }
-
-    fn not_a_member(&self) -> Failure {
-        format!(
-            "this controller ({}) is not in the controller set of {}",
-            self.key.public().fingerprint(),
-            self.orbit_path.display()
-        )
-        .into()
-    }
-
-    /// Authorize another controller, given its public key as hex: write the next controller-set
-    /// revision, signed by this controller, and send it to every node in the orbit file.
-    pub fn controllers_add(&mut self, name: &str, public_key: &str) -> Result<(), Failure> {
-        let key = PublicKey::from_hex(public_key.trim())
-            .map_err(|e| format!("controller public key: {e}"))?;
-        self.ensure_record()?;
-        self.advance(|keys| {
-            if keys.iter().any(|k| k.public_key == key.to_hex()) {
-                return Err(
-                    format!("{} is already an authorized controller", key.fingerprint()).into(),
-                );
-            }
-            keys.push(ControllerKey {
-                name: name.to_owned(),
-                public_key: key.to_hex(),
-            });
-            Ok(())
-        })
-    }
-
-    /// Remove the controller named by its fingerprint, public key, or name: write the next
-    /// controller-set revision, signed by this controller, and send it to every node.
-    pub fn controllers_remove(&mut self, controller: &str) -> Result<(), Failure> {
-        self.advance(|keys| {
-            let before = keys.len();
-            keys.retain(|k| {
-                !(k.name == controller
-                    || k.public_key == controller
-                    || PublicKey::from_hex(&k.public_key)
-                        .is_ok_and(|p| p.fingerprint() == controller))
-            });
-            match before - keys.len() {
-                1 => Ok(()),
-                0 => Err(format!("no authorized controller matches {controller}").into()),
-                _ => Err(format!(
-                    "{controller} matches several controllers; name one by fingerprint"
-                )
-                .into()),
-            }
-        })
-    }
-
-    fn advance(
-        &mut self,
-        change: impl FnOnce(&mut Vec<ControllerKey>) -> Result<(), Failure>,
-    ) -> Result<(), Failure> {
-        let set = self
-            .orbit
-            .controller_set()?
-            .ok_or("the orbit file has no controller set; pair a node first")?;
-        if !set.contains(&self.key.public()) {
-            return Err(self.not_a_member());
-        }
-        let mut keys = set.keys.clone();
-        change(&mut keys)?;
-        if keys.is_empty() {
-            return Err("the controller set must keep at least one controller".into());
-        }
-        let next = ControllerSet {
-            revision: set.revision + 1,
-            keys,
-        };
-        self.orbit.controllers = Some(Signed::sign(&self.key, &next)?);
-        self.save()?;
-        println!("controller set revision {}:", next.revision);
-        for key in &next.keys {
-            let fingerprint = PublicKey::from_hex(&key.public_key)?.fingerprint();
-            println!("  {fingerprint}  {}", key.name);
-        }
-        self.distribute();
-        Ok(())
-    }
-
-    /// Bring every node in the orbit file to the orbit file's controller-set revision, reporting
-    /// nodes that cannot be reached; those receive it when any controller next connects.
-    fn distribute(&self) {
-        let nodes = &self.orbit.node;
-        let results = parallel(nodes, |_, node| self.node_session(node));
-        for (node, result) in nodes.iter().zip(results) {
-            match result {
-                Ok((_, hello)) => {
-                    println!("  {}: revision {}", node.name, hello.controllers_revision)
-                }
-                Err(error) => eprintln!("  {}: not updated: {error}", node.name),
-            }
-        }
-    }
-
-    /// Remove a node from the orbit file. Clusters that list it fail to resolve until edited.
-    pub fn forget(&mut self, name: &str) -> Result<(), Failure> {
-        let before = self.orbit.node.len();
-        self.orbit.node.retain(|n| n.name != name);
-        if self.orbit.node.len() == before {
-            return Err(format!("the orbit file has no node named {name}").into());
-        }
-        self.save()
     }
 
     // ---- status --------------------------------------------------------------------------------
@@ -858,11 +497,17 @@ impl Controller {
         }
         let mut rank_zero = spec.as_ref().map_or_else(Vec::new, |s| s.rank_zero.clone());
         rank_zero.extend(options.rank_zero.iter().cloned());
-        let roce_ring = options.roce_ring || spec.as_ref().is_some_and(|s| s.roce_ring);
+        // An explicit shape on the command line replaces the saved one; otherwise the saved shape holds.
+        let (roce_ring, roce_chain) = if options.roce_ring || options.roce_chain {
+            (options.roce_ring, options.roce_chain)
+        } else {
+            spec.as_ref()
+                .map_or((false, false), |s| (s.roce_ring, s.roce_chain))
+        };
         let transfer_streams = options
             .transfer_streams
             .or_else(|| spec.as_ref().and_then(|s| s.transfer_streams));
-        package_streams(roce_ring, transfer_streams)?;
+        package_streams(transfer_streams)?;
         let gpus = if options.gpus.is_empty() {
             spec.as_ref().map_or_else(Vec::new, |s| s.gpus.clone())
         } else {
@@ -1014,6 +659,7 @@ impl Controller {
                 gpus,
                 roce_ring,
                 transfer_streams,
+                roce_chain,
                 executable: options
                     .executable
                     .as_deref()
@@ -1057,6 +703,7 @@ impl Controller {
                 roce_ring,
                 transfer_streams,
                 stage_only: false,
+                roce_chain,
             },
         )?;
         eprintln!(
@@ -1083,7 +730,7 @@ impl Controller {
         run_args: &mut crate::cli::Run,
         transfer_streams: Option<u8>,
     ) -> Result<(), Failure> {
-        package_streams(run_args.roce_ring, transfer_streams)?;
+        package_streams(transfer_streams)?;
         let resolved = self.resolve_package(package, run_args, false)?;
         let world = resolved.ranks.len();
         let nodes: Vec<Node> = to
@@ -1104,6 +751,7 @@ impl Controller {
             placements: vec![Vec::new(); world],
             stage_only: true,
             roce_ring: run_args.roce_ring,
+            roce_chain: run_args.roce_chain,
             transfer_streams,
             ..LaunchOptions::default()
         };
@@ -1121,9 +769,10 @@ impl Controller {
             );
             return Ok(());
         }
-        if run_args.roce_ring {
+        if run_args.roce_ring || run_args.roce_chain {
             return Err(
-                "--roce-ring push requires one target node per package rank, in ring order".into(),
+                "--roce-ring and --roce-chain push require one target node per package rank, in rank order"
+                    .into(),
             );
         }
         // Fewer or more nodes than ranks: each listed node gets the complete package, which
@@ -1387,10 +1036,18 @@ impl Controller {
                 format!("{} placements for {world} ranks", options.placements.len()).into(),
             );
         }
-        if options.roce_ring && !(package.needs.multi_host && (2..=16).contains(&world)) {
-            return Err("--roce-ring requires a multi-host package with 2..16 ranks".into());
+        if (options.roce_ring || options.roce_chain)
+            && !(package.needs.multi_host && (2..=16).contains(&world))
+        {
+            return Err(
+                "--roce-ring and --roce-chain require a multi-host package with 2..16 ranks".into(),
+            );
         }
-        let streams = package_streams(options.roce_ring, options.transfer_streams)?;
+        let streams = if world > 1 {
+            package_streams(options.transfer_streams)?
+        } else {
+            1
+        };
 
         // Every node must be free. Rank zero reports the address it routes toward its peers,
         // where they reach its rendezvous.
@@ -1446,15 +1103,24 @@ impl Controller {
         };
 
         let issued = now();
-        let transfer_ring = if options.roce_ring {
+        let transfer_fabric = if world > 1
+            && (options.stage_only
+                || matches!(&package.holder,
+            Holder::Node { node, .. } if node.public_key != nodes[0].public_key))
+        {
             let records = all(parallel_mut(&mut sessions, |rank, session| {
                 session
                     .request(frame::FABRIC, &json!({}))
                     .map_err(|e| at(&nodes[rank].name, e))
             }))?;
-            super::fabric::plan(nodes, &records)?
+            Some(super::fabric::plan(
+                nodes,
+                &records,
+                options.roce_ring,
+                options.roce_chain,
+            )?)
         } else {
-            Vec::new()
+            None
         };
         let mut grant = Grant {
             group: group_id(&options.name, issued, &random(2)?),
@@ -1486,8 +1152,9 @@ impl Controller {
             serving: options.serving.clone(),
             rank_zero: options.rank_zero.clone(),
             roce_ring: options.roce_ring,
-            transfer_ring,
+            transfer_fabric,
             single_host: !package.needs.multi_host,
+            roce_chain: options.roce_chain,
             issued,
             expires: issued + GRANT_SECONDS,
         };
@@ -1552,14 +1219,14 @@ impl Controller {
             .map_err(|e| at(&nodes[rank].name, e))
         }))?;
 
-        // Every node other than the source fetches from it: rank zero the complete package,
-        // peers their ranks' ranges.
+        // Launch needs the complete source on rank zero. Prestaging also fetches peer ranges;
+        // serving launches leave those ranges to the rank processes.
         let mut source = match &package.holder {
             Holder::Controller { .. } => nodes[0].clone(),
             Holder::Node { node, .. } => node.clone(),
         };
-        // An outside source has no ring links. Stage it once on rank zero before its peers fetch.
-        if options.roce_ring
+        // An outside source has no fabric links. Stage it once on rank zero before its peers fetch.
+        if grant.transfer_fabric.is_some()
             && !nodes
                 .iter()
                 .any(|node| node.public_key == source.public_key)
@@ -1587,7 +1254,7 @@ impl Controller {
             source = nodes[0].clone();
         }
         all(parallel_mut(&mut sessions, |rank, session| {
-            if nodes[rank].public_key == source.public_key {
+            if (rank > 0 && !options.stage_only) || nodes[rank].public_key == source.public_key {
                 return Ok(());
             }
             let (directory, files) = if rank == 0 {
@@ -1624,6 +1291,9 @@ impl Controller {
                 ranks: Vec::new(),
             });
         }
+        grant
+            .serving
+            .extend(["--transfer-streams".into(), streams.to_string()]);
         // Transfers can outlast a grant's launch window, so RUN carries a grant issued now.
         grant.issued = now();
         grant.expires = grant.issued + GRANT_SECONDS;
@@ -2014,15 +1684,11 @@ fn put(
     Ok(())
 }
 
-fn package_streams(roce_ring: bool, selected: Option<u8>) -> Result<u8, Failure> {
-    match (roce_ring, selected) {
-        (true, None) => Ok(8),
-        (true, Some(streams @ 1..=64)) => Ok(streams),
-        (true, Some(_)) => Err("transfer streams must be in 1..=64".into()),
-        (false, None) => Ok(1),
-        (false, Some(_)) => {
-            Err("--transfer-streams requires --roce-ring or a saved ring group".into())
-        }
+fn package_streams(selected: Option<u8>) -> Result<u8, Failure> {
+    match selected {
+        None => Ok(8),
+        Some(streams @ 1..=64) => Ok(streams),
+        Some(_) => Err("transfer streams must be in 1..=64".into()),
     }
 }
 
@@ -2589,10 +2255,6 @@ fn at(node: &str, error: Failure) -> Failure {
     format!("{node}: {error}").into()
 }
 
-fn constant_time_equal(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |d, (x, y)| d | (x ^ y)) == 0
-}
-
 /// Every value, or one error listing every failure.
 fn all<T>(results: Vec<Result<T, Failure>>) -> Result<Vec<T>, Failure> {
     let mut values = Vec::with_capacity(results.len());
@@ -2680,14 +2342,14 @@ mod tests {
     #[test]
     fn launching_uploads_and_runs_an_explicit_executable_override() {
         check_launch(Some(
-            b"#!/bin/sh\necho \"$0\"\necho \"$@\"\nod -An -tx1 -j 40000 -N 4 \"$2\"\nexit 0\n",
+            b"#!/bin/sh\necho \"$0\"\necho \"$@\"\nif [ -f \"$2\" ]; then od -An -tx1 -j 40000 -N 4 \"$2\"; fi\nexit 0\n",
         ));
     }
 
     /// A controller over two in-process agents paired with its key, scripts as the executables,
     /// and a two-rank package whose "primary" is a plain file: rank 0 reads all of it, rank 1
-    /// two ranges. Launching exercises PUT, TRANSFER, FETCH, RUN and output following end to
-    /// end; only the rank processes are fakes.
+    /// two ranges. Launching exercises PUT, RUN and output following, while staging exercises
+    /// TRANSFER and FETCH. The rank scripts report arguments without loading a model.
     fn check_launch(executable: Option<&[u8]>) {
         let zero = harness(21);
         let one = crate::orbit::agent::tests::Harness {
@@ -2821,6 +2483,7 @@ mod tests {
                     roce_ring: true,
                     transfer_streams: Some(8),
                     stage_only: false,
+                    roce_chain: false,
                 },
             )
             .unwrap();
@@ -2849,8 +2512,8 @@ mod tests {
         }
         assert_eq!(exits, BTreeMap::from([(0, 0), (1, 0)]));
 
-        // Rank zero holds the complete package; rank one holds only its ranges, fetched from
-        // rank zero, and loads with --verify-weights.
+        // Rank zero holds the complete package. Peer processes fetch their own shards during
+        // serving bootstrap; the controller starts them without a local package.
         let complete = zero.agent.cache.join(format!(
             "packages/{}/model.safetensors",
             launch.grant.complete_directory()
@@ -2860,10 +2523,7 @@ mod tests {
             "packages/{}/model.safetensors",
             launch.grant.cache_directory(1)
         ));
-        let copy = fs::read(&partial).unwrap();
-        assert_eq!(copy[..4096], bytes[..4096]);
-        assert_eq!(copy[40_000..48_000], bytes[40_000..48_000]);
-        assert!(copy[4096..40_000].iter().all(|&b| b == 0));
+        assert!(!partial.exists());
         for harness in [&zero, &one] {
             let selected = match executable {
                 Some(bytes) => {
@@ -2891,6 +2551,15 @@ mod tests {
                 .unwrap();
             let (lines, exit) = crate::orbit::agent::tests::collect(&mut session);
             assert_eq!(exit, 0);
+            if std::ptr::eq(harness, &one) {
+                assert!(
+                    lines
+                        .iter()
+                        .any(|line| line.starts_with("run --package-cache ")
+                            && line.contains("--rank 1 --rendezvous 127.0.0.1:29800")),
+                    "{lines:?}"
+                );
+            }
             assert!(
                 lines.contains(&selected.to_string_lossy().into_owned()),
                 "{lines:?}"
@@ -2922,7 +2591,7 @@ mod tests {
                 .is_empty()
         );
         assert!(complete.is_file());
-        assert!(partial.is_file());
+        assert!(!partial.exists());
 
         // Staging places and verifies the package without executables or ranks.
         let staged = ResolvedPackage {
@@ -2962,7 +2631,7 @@ mod tests {
             bytes[40_000..48_000]
         );
         assert!(staged_rank.with_file_name(".verified").is_file());
-        assert_eq!(one.verified.lock().unwrap().len(), 2);
+        assert_eq!(one.verified.lock().unwrap().len(), 1);
 
         // A source outside the ring stages once on rank zero, which serves the peer over fabric.
         let outside = crate::orbit::agent::tests::Harness {

@@ -17,6 +17,52 @@ class StartupProgress:
             self.active.update(message)
 
 
+def graph_catalog(progress, signatures):
+    """Persist the registered graph shapes without changing the active phase."""
+    if progress is None:
+        return
+    from collections import Counter, defaultdict
+    from math import prod
+    from rich.table import Table
+
+    counts = Counter((s.kind, s.speculation_enabled, s.draft_tokens or 0,
+                      s.batch_capacity, s.token_capacity, s.packed_token_capacity, s.prefill_capacity)
+                     for s in signatures)
+    groups = defaultdict(list)
+    for (kind, mode, drafts, batch, width, packed, prefill), copies in counts.items():
+        groups[kind, mode, drafts, copies].append(((batch,), (width,), (packed,), (prefill,)))
+    table = Table(title=f"Graph catalog: {sum(counts.values())} graphs (before compilation/capture)", title_justify="left",
+                  box=None, padding=(0, 1), caption="B=batch  W=logical width/tokens  P=packed rows  D=draft depth",
+                  caption_justify="left")
+    for name in ("Kind", "Spec", "B", "W", "P", "D", "Prefill", "Count"):
+        table.add_column(name, overflow="fold", no_wrap=name == "Kind")
+    def values(items):
+        return ",".join(str(value) if value else "-" for value in items)
+
+    for (kind, mode, drafts, copies), shapes in groups.items():
+        # Merge one axis only when every other axis has identical coverage.
+        for axis in (2, 0, 1, 3):
+            merged = defaultdict(set)
+            for shape in shapes:
+                merged[shape[:axis] + shape[axis + 1:]].update(shape[axis])
+            shapes = [key[:axis] + (tuple(sorted(values)),) + key[axis:]
+                      for key, values in merged.items()]
+        for batch, width, packed, prefill in shapes:
+            table.add_row(kind, "-" if mode is None else "on" if mode else "off",
+                          values(batch), values(width), values(packed), str(drafts) if drafts else "-",
+                          values(prefill), str(copies * prod(map(len, (batch, width, packed, prefill)))))
+    if isinstance(progress, StartupProgress):
+        progress.console.print(table)
+    else:
+        from rich.console import Console
+
+        console = Console(width=120, color_system=None)
+        with console.capture() as output:
+            console.print(table)
+        for line in output.get().splitlines():
+            progress(line)
+
+
 class _Phase:
     def __init__(self, progress, label, total):
         self.progress, self.label, self.total = progress, label, total
@@ -65,7 +111,7 @@ class _Phase:
 
 
 @contextmanager
-def phase(progress, label, *, total=None):
+def phase(progress, label, *, total=None, live=True):
     """Display completed work and elapsed time without estimating unknown progress."""
     stage = _Phase(progress, label, total)
     display = progress if isinstance(progress, StartupProgress) else None
@@ -74,7 +120,7 @@ def phase(progress, label, *, total=None):
         from rich.live import Live
 
         display.active = stage
-        if display.console.is_terminal:
+        if live and display.console.is_terminal:
             stage.live = Live(stage, console=display.console, refresh_per_second=8,
                               redirect_stdout=False, redirect_stderr=False)
             stage.live.start()

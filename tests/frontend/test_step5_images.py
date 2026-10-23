@@ -37,7 +37,6 @@ def test_native_chat_template(reference, tmp_path):
 
     _, tokenizer, assets = reference
     original = _compile_jinja_template((CHECKPOINT / "chat_template.jinja").read_text())
-    prepared = _compile_jinja_template((assets / "chat_template.jinja").read_text())
     config = json.loads((CHECKPOINT / "tokenizer_config.json").read_text())
     special = {key: config[key] for key in ("bos_token", "eos_token")}
     for name in ("tokenizer.json", "tokenizer_config.json"):
@@ -59,7 +58,6 @@ def test_native_chat_template(reference, tmp_path):
         for preserve in (False, True):
             options = dict(options, add_generation_prompt=True, preserve_thinking=preserve)
             rendered = original.render(messages=messages, **special, **options)
-            assert prepared.render(messages=messages, **special, **options) == rendered
             fixtures["cases"].append({"name": f"{name}-{preserve}", "messages": messages, "options": options,
                 "rendered": rendered, "token_ids": tokenizer.encode(rendered, add_special_tokens=False).ids})
     for name, options in (("thinking_disabled", {"enable_thinking": False, "add_generation_prompt": True}),

@@ -2,20 +2,17 @@
 
 import ipaddress
 import json
-import os
 import socket
 import sys
-import tempfile
 import traceback
 from dataclasses import replace
-from pathlib import Path
 
 from ignition import planning
 from ignition.errors import CapacityError, FlareError, PreparationError, UsageError
 
 from . import display, environment
 from .preparation import (Host, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
-                          stream_overlap, tuning_devices)
+                          stream_overlap, tuning_devices, tuning_effort)
 from .config import Configuration
 
 # Request bytes allowed per context token: JSON-escaped text (a \uXXXX escape takes six bytes per
@@ -23,15 +20,13 @@ from .config import Configuration
 _BODY_BYTES_PER_TOKEN = 32
 
 
-def _checkpoint_ring(args):
-    settings = dict(orbit_file=args.orbit_file, key_file=args.key_file, cluster=args.cluster,
-                    streams=args.transfer_streams)
-    if not args.roce_ring:
-        if any(value is not None for value in settings.values()):
-            raise UsageError("--orbit-file, --key-file, --cluster and --transfer-streams require --roce-ring")
+def _checkpoint_fabric(args):
+    if args.ranks < 2:
+        if args.transfer_streams is not None:
+            raise UsageError("--transfer-streams requires multiple host ranks")
         return None
-    settings["streams"] = 8 if settings["streams"] is None else settings["streams"]
-    return settings
+    return dict(ring=args.roce_ring, chain=args.roce_chain,
+                streams=8 if args.transfer_streams is None else args.transfer_streams)
 
 
 def _address(host: str, port: int) -> str:
@@ -112,77 +107,20 @@ def _publisher(configuration, args, model=None, hub_cache=None):
     return replace(signer, license=license)
 
 
-def run(args) -> int:
-    from .runtime import binary, cached_package
+def _check_host_shape(args) -> None:
+    """Reject a host shape the rank count cannot form, before any model or GPU work."""
+    from ignition.planning import host_shape_error
 
-    configuration = Configuration.load(args.config)
-    publisher = _publisher(configuration, args)
-    model = resolve_model(configuration, args.model)
-    concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
-                                                args.max_concurrency)
-    plan = derive(configuration, model, Host.discover(), gpus=args.gpus, concurrency=concurrency,
-                  compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
-                  image_concurrency=args.image_concurrency,
-                  speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
-                  context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-                  roce_ring=args.roce_ring,
-                  mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
-                  expert_scale_compression=args.expert_scale_compression,
-                  online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
-                  mla_compute_mode=args.mla_compute_mode)
-    runtime = binary()
-    host = configuration.get("server.host", args.host).value
-    port = configuration.get("server.port", args.port).value
-    _address(host, port)
-    with cached_package(configuration, model, plan, args.no_compile, publisher,
-                        configuration.shard_size(getattr(args, "shard_size", None))) as package:
-        if not package.exists():
-            _prepare(args, export_path=package)
-        else:
-            print(f"Load cached runtime package. {package}", flush=True)
-    environment.apply(configuration, plan.gpus, plan.recipe.b12x_environment)
-    command = [str(runtime), "run", str(package), "--gpus", ",".join(str(rank) for rank in range(plan.world_size)),
-               "--host", host, "--port", str(port)]
-    command += configuration.prefix_cache_flags()
-    if args.served_model_name is not None:
-        command += ["--served-model-name", args.served_model_name]
-    if args.kv_cache_limit != "memory":
-        command += ["--kv-cache-limit", args.kv_cache_limit]
-    if args.memory_limit is not None:
-        command += [f"--memory-limit={args.memory_limit}"]
-    for path in args.publisher_keys:
-        command += ["--publisher-keys", str(path)]
-    if publisher.development:
-        from ignition.development import profile
-        command += ["--publisher-keys", str(profile(configuration, publisher))]
-    else:
-        # Before the key is published at the official source, the profile keygen wrote beside the
-        # signing key lets Flare verify the signatures; Flare reports the identity as unverified.
-        profile = Path(configuration.values["publishing"]["signing_key"]).expanduser().parent / "publisher.json"
-        if profile.is_file():
-            command += ["--publisher-keys", str(profile)]
-    command += ["--dangerously-approve-key", publisher.fingerprint.hex(),
-                "--dangerously-accept-publisher", publisher.namespace]
-    if args.trust_store is not None:
-        command += ["--trust-store", str(args.trust_store)]
-    if args.verify_weights:
-        command += ["--verify-weights"]
-    key = configuration.get("server.api_key").value
-    if key:
-        key_file = tempfile.TemporaryFile()
-        key_file.write(key.encode())
-        key_file.flush()
-        descriptor = key_file.fileno()
-        os.set_inheritable(descriptor, True)
-        command += ["--api-key-file", f"/proc/self/fd/{descriptor}"]
-    os.execv(command[0], command)
-    raise AssertionError("execv returned")
+    error = host_shape_error(args.roce_ring, args.roce_chain, args.ranks if args.ranks > 1 else None)
+    if error:
+        raise UsageError(error)
 
 
 def export(args) -> int:
     from ignition.preparation.package_snapshot import export_options
     from .publishing import snapshot_destination, validate_repository
     configuration = Configuration.load(args.config)
+    _check_host_shape(args)
     model = resolve_model(configuration, args.model)
     repository = getattr(args, 'repo_id', None) or model.recipe.export_repository
     if repository:
@@ -193,9 +131,7 @@ def export(args) -> int:
         args.output = args.output.with_name(args.output.name + ".safetensors")
     if args.output.exists():
         raise UsageError(f"export destination already exists: {args.output}")
-    if args.roce_ring and args.ranks < 2:
-        raise UsageError("--roce-ring requires at least two hosts")
-    _checkpoint_ring(args)
+    _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
     cache = configuration.directory('package_cache')
@@ -219,8 +155,7 @@ def _export_hosts(args, *, export_path) -> int:
     from ignition.progress import phase
     from ignition.preparation.host_ranks import HostRendezvous, local_topology, source_identity, topology_gpu
 
-    if args.roce_ring and args.ranks < 2:
-        raise UsageError("--roce-ring requires at least two hosts in ring order")
+    _check_host_shape(args)
     if args.rendezvous is None:
         raise UsageError("--ranks greater than one requires --rendezvous ADDRESS:PORT for the peer hosts")
     progress = _serving_progress(args.verbose)
@@ -238,7 +173,7 @@ def _export_hosts(args, *, export_path) -> int:
     local = (host.gpus[selected[0]],)
     rendezvous = HostRendezvous(args.rendezvous, args.ranks, identity=source_identity(),
                                 topology=local_topology(local[0]),
-                                checkpoint_ring=_checkpoint_ring(args),
+                                checkpoint_fabric=_checkpoint_fabric(args),
                                 checkpoint_token_file=configuration.get("preparation.checkpoint_token_file").value)
     with phase(progress, "Wait for tensor-parallel hosts") as stage:
         topologies = rendezvous.accept(report=stage.update)
@@ -248,12 +183,13 @@ def _export_hosts(args, *, export_path) -> int:
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-                         roce_ring=args.roce_ring,
+                         roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression,
                          online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
                          mla_compute_mode=args.mla_compute_mode)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache)
+    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   autotune_effort=tuning_effort(configuration, args.autotune_effort))
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
     options.pop("api_key")
@@ -278,7 +214,7 @@ def _export_hosts(args, *, export_path) -> int:
                     kernel_cache=configuration.directory("kernel_cache"), progress=progress,
                     retain_graphs=True, package_storage=storage, ranks=rendezvous)
         with prepared:
-            with phase(progress, "Export native packages") as stage:
+            with phase(progress, "Export native packages", live=False) as stage:
                 from ignition.preparation.rebuild_manifest import from_plan
 
                 options['rebuild_manifest'] = from_plan(model, plan, compiled_forwards=not args.no_compile)
@@ -316,11 +252,11 @@ def _prepare(args, *, export_path) -> int:
                                                     args.max_concurrency)
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
-                      compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
+                      compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                       context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-                      roce_ring=args.roce_ring,
+                      roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                       mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                       expert_scale_compression=args.expert_scale_compression,
                       online_mxfp8=args.online_mxfp8, language_model_only=args.language_model_only,
@@ -330,9 +266,13 @@ def _prepare(args, *, export_path) -> int:
         restricted = "" if host.restriction is None else f" of CUDA_VISIBLE_DEVICES={host.restriction}"
         serial = "" if plan.stream_overlap or not plan.recipe.stream_overlap else " · branches serialized"
         capacity = "" if plan.speculation is None else f" · speculative token capacity {plan.speculative_token_capacity}"
+        if plan.speculation is not None and plan.speculation.graph_budget is not None:
+            capacity += f" · packed graph budget {plan.speculation.graph_budget}"
         tuning = "" if not plan.tuning_gpus else " · tuning GPUs " + planning.format_gpus(gpu.index for gpu in plan.tuning_gpus)
         if plan.roce_ring:
             serial += " · experimental RoCE ring (native neighbor relays)"
+        if plan.roce_chain:
+            serial += " · experimental RoCE chain (native neighbor relays, open ends)"
         stage.update(f"GPU{'s' if plan.world_size > 1 else ''} {indices}{restricted}"
                      f" · concurrency {plan.concurrency} · images {plan.image_concurrency} · {display.speculation(plan.speculation, brief=True)}{capacity}{serial}"
                      f" · prompt logprobs {'on' if plan.prompt_logprobs else 'off'}"
@@ -340,7 +280,8 @@ def _prepare(args, *, export_path) -> int:
                      f" · expert scales {plan.expert_scale_compression or 'native'}"
                      f"{' · online MXFP8' if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
-                     f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}")
+                     f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
+                     f" · autotune effort {plan.autotune_effort}")
     if args.config is None and not configuration.exists:
         configuration.write_initial(model.checkpoint.alias, concurrency.value)
     if not cached:
@@ -391,7 +332,7 @@ def _prepare(args, *, export_path) -> int:
             from ignition.preparation.model_package import export_package
 
             publisher = _publisher(configuration, args, model, hub_cache)
-            with phase(progress, "Export native package") as stage:
+            with phase(progress, "Export native package", live=False) as stage:
                 try:
                     options.pop("api_key")
                     from ignition.preparation.rebuild_manifest import from_plan
@@ -431,9 +372,8 @@ def serve(args) -> int:
     """
     from ignition.progress import phase
 
-    if args.roce_ring and args.ranks < 2:
-        raise UsageError("--roce-ring requires at least two hosts")
-    _checkpoint_ring(args)
+    _check_host_shape(args)
+    _checkpoint_fabric(args)
     if args.ranks > 1 and args.tuning_gpus is not None:
         raise UsageError("--tuning-gpus applies to local preparation; multi-host ranks retain their sharding")
     if args.eager and not args.direct:
@@ -456,7 +396,7 @@ def serve(args) -> int:
     hub_cache = configuration.directory("hub_cache")
     model = resolve_model(configuration, args.model)
     if not model.cached(hub_cache):
-        raise UsageError(f"{model.checkpoint.alias} is not cached; ignition export or run downloads it")
+        raise UsageError(f"{model.checkpoint.alias} is not cached; ignition export downloads it")
     concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
                                                 args.max_concurrency)
     host = Host.discover()
@@ -477,7 +417,7 @@ def serve(args) -> int:
         local = (host.gpus[selected[0]],)
         rendezvous = HostRendezvous(args.rendezvous, args.ranks, identity=source_identity(),
                                     topology=local_topology(local[0]),
-                                    checkpoint_ring=_checkpoint_ring(args),
+                                    checkpoint_fabric=_checkpoint_fabric(args),
                                     checkpoint_token_file=configuration.get("preparation.checkpoint_token_file").value)
         with phase(progress, "Wait for tensor-parallel hosts") as stage:
             topologies = rendezvous.accept(report=stage.update)
@@ -488,11 +428,12 @@ def serve(args) -> int:
                          image_concurrency=image_capacity_setting(configuration, model, args.image_concurrency),
                          speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
                          context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
-                         roce_ring=args.roce_ring,
+                         roce_ring=args.roce_ring, roce_chain=args.roce_chain,
                          cache_states=args.prefix_cache_states, mixed_prefill=args.mixed_prefill, prompt_logprobs=args.prompt_logprobs,
                          expert_scale_compression=args.expert_scale_compression, online_mxfp8=args.online_mxfp8,
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
-    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache)
+    plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   autotune_effort=tuning_effort(configuration, args.autotune_effort))
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)
         local = plan.gpus
@@ -523,6 +464,10 @@ def serve(args) -> int:
         if not any(signature.packed_token_capacity for signature in local_model.signatures.values()):
             prepared.close()
             raise UsageError("this prepared recipe does not declare packed verification capacities")
+        if plan.speculation.draft_prefix_selection == "gpu" and not any(
+                signature.kind == "packed_speculative" for signature in local_model.signatures.values()):
+            prepared.close()
+            raise UsageError("this prepared recipe does not declare GPU prefix-selection rounds")
     if args.direct:
         from ignition.direct.server import serve_direct
 

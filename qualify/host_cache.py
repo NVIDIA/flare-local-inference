@@ -21,6 +21,7 @@ import time
 import urllib.request
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Protocol
 
 from qualify.server import Run, comparable_message, metric_delta, prefill_launches, resource_totals
 
@@ -69,7 +70,13 @@ class Server:
             raise RuntimeError(f"flare exited with status {self.process.returncode}; see {self.log.name}")
 
 
-def run_for(server: Server, artifacts: Path, timeout: float) -> Run:
+class Bound(Protocol):
+    """A process or rank group bound to a local HTTP port."""
+
+    url: str
+
+
+def run_for(server: Bound, artifacts: Path, timeout: float) -> Run:
     artifacts.mkdir(parents=True, exist_ok=True)
     return Run(SimpleNamespace(base_url=server.url, artifacts=artifacts, timeout=timeout,
                                max_response_bytes=64 << 20, require_metrics=True, cases=None))

@@ -4,9 +4,10 @@ from ignition.preparation.tuning import RecordedPreparationSession
 
 
 def preparation_session(*, device, checkpoint, namespace=None, coordinator=None, headroom_bytes=0,
-                        benchmark_storage=None, compile_workers=None, tuning_replica=None):
+                        benchmark_storage=None, compile_workers=None, tuning_replica=None, autotune_effort="medium"):
     return RecordedPreparationSession(
         device=device, checkpoint=checkpoint, compile_workers=compile_workers, tuning_replica=tuning_replica,
+        autotune_effort=autotune_effort,
         namespace=namespace, coordinator=coordinator,
         headroom_bytes=headroom_bytes, benchmark_storage=benchmark_storage,
         workload_schema="qwen38-active-operators-v1",
@@ -14,7 +15,7 @@ def preparation_session(*, device, checkpoint, namespace=None, coordinator=None,
         search_limits={
             "bf16_projection": "all eligible b12x backends and rows_per_tile configurations",
             "mxfp8_projection": "BF16 or quantized activations with eligible b12x projection configurations",
-            "qsa": "fixed attention_splits=16 and singleton kernel configuration",
+            "qsa": "fixed attention_splits=16; eligible direct-KV warp configurations",
             "gdn_prefill": "sequential k_split=1; v_split, stages, and window_tiles remain tunable",
             "operator_scratch": "one arena sized to the complete candidate envelope",
         },

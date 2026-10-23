@@ -245,8 +245,7 @@ def collect_inventory(prepared, storage, package, *, external=()):
                 imported_peer_bytes=(0 if storage.peer_storage is None else sum(
                     size for parts in storage.peer_storage.imported_mappings.values() for _, size in parts)),
                 entries=attribute(retained, claims), preparation_entries=attribute(preparation_only, claims),
-                graphs=len(prepared.graphs), kernels=len(package.kernels), modules=len(package.modules),
-                cubin_bytes=sum(len(image) for image in package.modules.values()))
+                graphs=len(prepared.graphs), **package.export_counts)
 
 
 def format_inventory(reports):

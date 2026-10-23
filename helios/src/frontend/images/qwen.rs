@@ -22,6 +22,7 @@ impl QwenProcessor {
         Ok(Self {
             patches: patches::PatchProcessor {
                 limits,
+                patch_size: PATCH,
                 min_pixels: settings.min_pixels,
                 max_pixels: settings.max_pixels,
                 normalization: patches::Normalization::Symmetric,

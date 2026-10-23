@@ -3,7 +3,7 @@
 use super::format::*;
 use crate::Result;
 
-pub(super) mod wire {
+pub mod wire {
     include!(concat!(env!("OUT_DIR"), "/flare.runtime.rs"));
 }
 
@@ -142,6 +142,11 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                     "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
                     "image_mean": config.image_mean, "image_std": config.image_std,
                 }}),
+                Profile::PatchMerge(config) => serde_json::json!({"patch_merge": {
+                    "patch_size": config.patch_size, "min_pixels": config.min_pixels, "max_pixels": config.max_pixels,
+                    "image_mean": config.image_mean, "image_std": config.image_std,
+                    "image_token": config.image_token, "start_token": config.start_token, "end_token": config.end_token,
+                }}),
                 Profile::DeepseekRowMajor(config) => serde_json::json!({"deepseek_row_major": {
                     "min_pixels": config.min_pixels, "max_tokens": config.max_tokens,
                     "max_width_height_ratio": config.max_width_height_ratio,
@@ -150,6 +155,7 @@ pub(super) fn frontend_settings(value: wire::FrontendSettings) -> Result<serde_j
                 Profile::Moonvit(_) => serde_json::json!({"moonvit": {}}),
                 Profile::Step(_) => serde_json::json!({"step": {}}),
                 Profile::Radio(_) => serde_json::json!({"radio": {}}),
+                Profile::Glm(_) => serde_json::json!({"glm": {}}),
             })
         })
         .transpose()?;
@@ -589,6 +595,24 @@ mod tests {
     }
 
     #[test]
+    fn serialized_glm_profile_selects_only_image_preparation() {
+        // Field 8 adds the GLM profile without changing any preceding profile tag.
+        let bytes = &[0x0a, 0x00, 0x12, 0x02, 0x42, 0x00, 0x1a, 0x01, 0x01][..];
+        let decoded = wire::FrontendSettings::decode(bytes).unwrap();
+        let json = frontend_settings(decoded).unwrap();
+        assert_eq!(json["image"], serde_json::json!({"glm": {}}));
+        assert_eq!(json["prompt_encoder"], 0);
+        #[cfg(feature = "server")]
+        {
+            let frontend: crate::frontend::FrontendSettings = serde_json::from_value(json).unwrap();
+            let settings = frontend.image.unwrap();
+            assert_eq!(settings.preparation_kind(), crate::model::contract::ImagePreparationKind::Glm);
+            let processor = crate::frontend::images::ImageProcessor::load(settings, Default::default()).unwrap();
+            assert_eq!(processor.geometry(112, 112).unwrap().tokens, 16);
+        }
+    }
+
+    #[test]
     fn prompt_encoder_round_trip_preserves_explicit_image_token_and_rejects_unknown_encoder() {
         for encoder in [1, 2] {
             let value = wire::FrontendSettings {
@@ -641,5 +665,132 @@ mod tests {
             )
             .unwrap();
         }
+    }
+    #[test]
+    fn serialized_scored_prefill_preserves_operation_and_prompt_target_values() {
+        // GraphContract(kind=12) and ValueBinding(source=39) predate packed rounds.
+        let graph = wire::GraphContract::decode(b"\x0a\x05score\x12\x0d\x0a\x07targets\x10\x27\x18\x04\x40\x0c".as_slice()).unwrap();
+        let contract: crate::model::contract::GraphContract =
+            serde_json::from_value(serde_json::to_value(graph).unwrap()).unwrap();
+        assert_eq!(contract.kind, crate::model::contract::GraphOperation::ScoredPrefill);
+        assert_eq!(contract.inputs[0].source, crate::model::contract::ValueSource::PromptTargetToken);
+        assert_eq!(contract.inputs[0].indexing, crate::model::contract::InputIndexing::PackedToken);
+        let execution = wire::ExecutionGraph::decode(b"\x12\x0escored_prefill\x20\x01\x28\x40".as_slice()).unwrap();
+        assert_eq!(crate::execution::GraphKind::try_from(execution.kind.as_str()).unwrap(),
+            crate::execution::GraphKind::ScoredPrefill);
+        assert_eq!(execution.draft_tokens, None);
+        assert_eq!(execution.packed_tokens(), 64);
+    }
+
+    #[test]
+    fn packed_combined_metadata_is_additive_and_unknown_operations_are_rejected() {
+        let legacy = wire::ExecutionGraph::decode(b"\x12\x0cverification\x20\x08\x28\x06".as_slice()).unwrap();
+        assert_eq!(legacy.draft_tokens, None);
+        assert_eq!(legacy.verify_tokens, None);
+        assert_eq!(legacy.packed_token_capacity, 0);
+        assert_eq!(crate::model::contract::GraphOperation::try_from(11).unwrap(),
+            crate::model::contract::GraphOperation::Verification);
+        assert_eq!(crate::model::contract::ValueSource::try_from(5).unwrap(),
+            crate::model::contract::ValueSource::QueryLength);
+        assert!(crate::model::contract::GraphOperation::try_from(99).is_err());
+        assert!(crate::model::contract::ValueSource::try_from(99).is_err());
+        let graph = wire::ExecutionGraph { kind: "packed_speculative".into(),
+            batch_capacity: 32, token_capacity: 6, draft_tokens: Some(1), verify_tokens: Some(6),
+            packed_token_capacity: 128, draft_source: 1, ..Default::default() };
+        let restored = wire::ExecutionGraph::decode(graph.encode_to_vec().as_slice()).unwrap();
+        assert_eq!((restored.draft_tokens, restored.verify_tokens, restored.packed_token_capacity),
+            (Some(1), Some(6), 128));
+    }
+
+    #[cfg(feature = "server")]
+    #[test]
+    fn serialized_tag_parsers_keep_existing_ids_defaults_and_serving_behavior() {
+        use crate::model::contract::{FrontendContract, ReasoningParserKind, ToolParserKind};
+        use crate::output::tagged::OutputConfig as TaggedConfig;
+        use crate::output::{Input, OutputConfig, OutputPipeline, Termination};
+        use crate::server::output::Accumulator;
+        for (kind, expected, payload) in [
+            (
+                1,
+                ToolParserKind::QwenCoder,
+                "<tool_call><function=lookup></function></tool_call>",
+            ),
+            (
+                2,
+                ToolParserKind::GlmArgumentTags,
+                "<tool_call>lookup</tool_call>",
+            ),
+            (
+                3,
+                ToolParserKind::Dsml,
+                "<｜DSML｜tool_calls><｜DSML｜invoke name=\"lookup\"></｜DSML｜invoke></｜DSML｜tool_calls>",
+            ),
+        ] {
+            let tool = wire::ToolParser::decode(&[0x08, kind][..]).unwrap();
+            let reason =
+                wire::ReasoningParser::decode(&b"\x08\x01\x12\x07<think>\x1a\x08</think>"[..])
+                    .unwrap();
+            let value = wire::FrontendContract {
+                tools: Some(tool),
+                reasoning: Some(reason),
+                assistant_marker: "assistant".into(),
+                ..Default::default()
+            };
+            let syntax: FrontendContract =
+                serde_json::from_value(serde_json::to_value(value).unwrap()).unwrap();
+            assert_eq!(syntax.tools.as_ref().unwrap().kind, expected);
+            assert_eq!(syntax.tools.as_ref().unwrap().wrapping_newlines, 0);
+            assert_eq!(
+                syntax.reasoning.as_ref().unwrap().kind,
+                ReasoningParserKind::ThinkTags
+            );
+            let mut parser = OutputPipeline::new(OutputConfig {
+                syntax,
+                control_tokens: vec![],
+                content: TaggedConfig {
+                    structured: false,
+                    start: crate::output::tagged::OutputStart::Reasoning,
+                    tools: vec![serde_json::json!({"function":{"name":"lookup"}})],
+                },
+            });
+            let mut output = Accumulator::new("package".into());
+            let text = format!("plan</think>{payload}");
+            for character in text.chars() {
+                output
+                    .apply(parser.push(Input::Text(&character.to_string())).unwrap())
+                    .unwrap();
+            }
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            assert_eq!(output.message()["reasoning_content"], "plan");
+            assert_eq!(
+                output.message()["tool_calls"][0]["function"]["name"],
+                "lookup"
+            );
+        }
+        assert_eq!(
+            ToolParserKind::try_from(wire::ToolParser::decode(&[0x08, 4][..]).unwrap().kind)
+                .unwrap(),
+            ToolParserKind::Xtml
+        );
+        assert_eq!(
+            ReasoningParserKind::try_from(
+                wire::ReasoningParser::decode(&[0x08, 2][..]).unwrap().kind
+            )
+            .unwrap(),
+            ReasoningParserKind::XtmlThink
+        );
+        assert!(ToolParserKind::try_from(wire::ToolParser::decode(&[][..]).unwrap().kind).is_err());
+        let syntax: FrontendContract = serde_json::from_value(
+            serde_json::to_value(wire::FrontendContract {
+                assistant_marker: "assistant".into(),
+                ..Default::default()
+            })
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(syntax.tools.is_none() && syntax.reasoning.is_none());
     }
 }

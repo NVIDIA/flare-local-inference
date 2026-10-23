@@ -1,14 +1,8 @@
-"""Locate native executables and cache packages by their preparation inputs."""
+"""Locate the native Flare executable used by checkpoint distribution."""
 
-from contextlib import contextmanager
-from dataclasses import asdict
-import hashlib
-from importlib import metadata, util
-import json
 import os
 from pathlib import Path
 import shutil
-from filelock import FileLock
 
 from ignition.errors import UsageError
 
@@ -22,54 +16,3 @@ def binary():
     if not executable.is_file():
         raise UsageError("flare executable is missing; build flare/Cargo.toml or install flare on PATH")
     return executable
-
-
-def package_key(model, plan, no_compile):
-    inputs = {"version": 4, "checkpoint": model.checkpoint.revision,
-              "repository": model.checkpoint.repository, "compile": not no_compile,
-              "concurrency": plan.concurrency, "image_concurrency": plan.image_concurrency,
-              "prefill_chunk": plan.prefill_chunk,
-              "context_parallel": plan.context_parallel, "stream_overlap": plan.stream_overlap,
-              "mixed_prefill": plan.mixed_prefill, "roce_ring": plan.roce_ring,
-              "expert_scale_compression": plan.expert_scale_compression, "online_mxfp8": plan.online_mxfp8,
-              "language_model_only": plan.language_model_only,
-              "cache_states": plan.cache_states, "reserve_bytes": plan.reserve_bytes,
-              "gpus": [(gpu.name, gpu.total_bytes) for gpu in plan.gpus],
-              "speculation": None if plan.speculation is None else asdict(plan.speculation)}
-    if plan.prompt_logprobs:
-        inputs["prompt_logprobs"] = True
-    if plan.mla_compute_mode != "auto":
-        inputs["mla_compute_mode"] = plan.mla_compute_mode
-    inputs["libraries"] = {name: metadata.version(name) for name in
-                           ("torch", "transformers", "flashinfer-python", "cuda-python")}
-    key = hashlib.sha256(json.dumps(inputs, sort_keys=True).encode())
-    root = Path(__file__).resolve().parents[2]
-    source_roots = [root / "ignition", root / "heliopause/src"]
-    flashinfer = util.find_spec("flashinfer")
-    if flashinfer is None:
-        raise UsageError("the preparation environment requires FlashInfer")
-    source_roots.append(Path(flashinfer.origin).parent)
-    for source_root in source_roots:
-        for source in sorted(source_root.rglob("*")):
-            if source.is_file() and source.suffix in (".py", ".rs", ".cu", ".cuh", ".cpp", ".h"):
-                key.update(str(source.relative_to(source_root)).encode())
-                key.update(source.read_bytes())
-    if model.directory is not None:
-        for source in sorted(model.directory.rglob("*")):
-            if source.is_file():
-                stat = source.stat()
-                key.update(str((source.relative_to(model.directory), stat.st_size, stat.st_mtime_ns)).encode())
-    return key.hexdigest()
-
-
-@contextmanager
-def cached_package(configuration, model, plan, no_compile, publisher, shard_size=None):
-    shard_size = configuration.shard_size() if shard_size is None else shard_size
-    root = configuration.directory("package_cache")
-    root.mkdir(parents=True, exist_ok=True)
-    key = hashlib.sha256((package_key(model, plan, no_compile) + publisher.fingerprint.hex()
-                          + publisher.namespace + publisher.official_source + f":shard-size={shard_size}").encode()).hexdigest()
-    with FileLock(root / f"{key}.lock"):
-        from ignition.preparation.package_snapshot import export_options
-        with export_options(root):
-            yield root / 'snapshots' / key / 'model.safetensors'

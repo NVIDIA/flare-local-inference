@@ -4,7 +4,7 @@ pub(super) fn measured_costs(graphs: &[crate::execution::GraphDescriptor]) -> co
     let mut costs = cost::ActionCosts::prepared(graphs).unwrap();
     for graph in graphs {
         costs.observe(
-            &ScheduledStep { packed_token_capacity: 0,
+            &ScheduledStep { draft_tokens: graph.draft_tokens, packed_token_capacity: graph.packed_token_capacity,
                 kind: graph.kind,
                 batch_capacity: graph.batch_capacity,
                 token_capacity: graph.token_capacity,
@@ -154,7 +154,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
             GraphKind::Speculative,
         ] {
             for tokens in 1..=if kind == GraphKind::Speculative { 8 } else { 1 } {
-                graphs.push(crate::execution::GraphDescriptor { packed_token_capacity: 0,
+                graphs.push(crate::execution::GraphDescriptor { draft_tokens: 0, packed_token_capacity: 0,
                     name: format!("{kind:?}-{batch}-{tokens}"),
                     kind,
                     sampling_mode: crate::execution::SamplingMode::General,
@@ -173,7 +173,7 @@ pub(crate) fn duration_graphs(active: usize) -> Vec<crate::execution::GraphDescr
         (GraphKind::Vision, vec![8, 16, 256, 1024, 4096, 16384]),
     ] {
         for tokens in capacities {
-            graphs.push(crate::execution::GraphDescriptor { packed_token_capacity: 0,
+            graphs.push(crate::execution::GraphDescriptor { draft_tokens: 0, packed_token_capacity: 0,
                 name: format!("{kind:?}-{tokens}"),
                 kind,
                 sampling_mode: crate::execution::SamplingMode::General,
@@ -1413,17 +1413,56 @@ fn fixed_graph_masks_grammar_and_host_stops_to_one_token() {
     }
 }
 #[test]
-fn copied_continuations_are_observed_tokens_and_width_catalog_is_validated() {
-    use super::speculation::{copy_proposal, validate_widths};
-    let tokens = [1, 2, 3, 4, 90, 91, 92, 8, 1, 2, 3, 4];
-    let (ids, count) = copy_proposal(&tokens, 3);
-    assert_eq!(count, 3);
-    assert_eq!(&ids[..3], &[90, 91, 92]);
-    assert_eq!(copy_proposal(&[1, 2, 3, 4], 7).1, 0);
-    assert_eq!(copy_proposal(&tokens, 0).1, 0);
+fn speculative_width_catalog_is_validated() {
+    use super::speculation::validate_widths;
     for bad in [vec![2], vec![1, 9], vec![1, 4, 2]] {
         assert!(validate_widths(&bad).is_err());
     }
+}
+
+#[test]
+fn shared_drafts_learn_committed_outputs_without_prompt_backfill_or_slot_joining() {
+    let mut s = scheduler(1, 64, 4);
+    s.enable_history_drafts().unwrap();
+    s.enable_speculation(&[1, 2, 4, 8]).unwrap();
+    s.fixed_speculative_width(Some(8)).unwrap();
+    let h = s.admit(spec(65, 32)).unwrap();
+    assert_eq!(s.history_proposal(&[0, 1, 2, 3], 7).1, 0);
+    init(&mut s, 1);
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(2)).unwrap();
+    s.complete(Fence(2), &records(h, 2, 65, 1, 10, 1), Default::default()).unwrap();
+    retain_prompt(&mut s, 3);
+    let step = s.plan().unwrap();
+    assert_eq!(step.kind, GraphKind::Speculative);
+    s.commit(&step, Fence(4)).unwrap();
+    let mut completion = vector_records(h, 4, 70, 6, &[11, 12, 13, 90, 91], 8, 1);
+    completion[0].vector.as_mut().unwrap().accepted_drafts = 4;
+    let mut invalid = completion;
+    invalid[0].generation += 1;
+    assert!(s.complete(Fence(4), &invalid, Default::default()).is_err());
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7).1, 0);
+    s.complete(Fence(4), &completion, Default::default()).unwrap();
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7), ([90, 91, -1, -1, -1, -1, -1], 2));
+    assert_eq!(s.history_proposal(&[0, 1, 2, 3], 7).1, 0);
+    assert_eq!(s.history_proposal(&[12, 13, 90, 91], 7).1, 0);
+    s.cancel(h).unwrap();
+    let next = s.admit(spec(66, 16)).unwrap();
+    assert_eq!(next.slot, h.slot);
+    assert_ne!(next.generation, h.generation);
+    assert_eq!(s.history_proposal(&[10, 11, 12, 13], 7).0[0], 90);
+    init(&mut s, 5);
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(6)).unwrap();
+    s.complete(Fence(6), &records(next, 6, 66, 1, 92, 1), Default::default()).unwrap();
+    retain_prompt(&mut s, 7);
+    assert_eq!(s.history_proposal(&[12, 13, 90, 91], 7).1, 0);
+    let step = s.plan().unwrap();
+    s.commit(&step, Fence(8)).unwrap();
+    let mut failed = vector_records(next, 8, 66, 1, &[], 8, 3);
+    failed[0].error_code = 1;
+    s.complete(Fence(8), &failed, Default::default()).unwrap();
+    assert_eq!(s.history_proposal(&[1, 2, 3, 4], 7).1, 0);
 }
 
 #[test]
@@ -1586,24 +1625,20 @@ fn loaded_catalog_cannot_change_under_a_plan() {
 }
 
 #[test]
-fn acceptance_keeps_request_source_and_censored_depths_separate() {
-    use speculation::{
-        AcceptanceProfile,
-        ProposalSource::{Copy, Mtp},
-    };
+fn acceptance_keeps_request_program_and_censored_prefixes_separate() {
+    use speculation::{AcceptanceProfile, ProposalSource::{Copy, Mtp}};
     let mut a = AcceptanceProfile::default();
     let b = AcceptanceProfile::default();
-    a.observe(5, 2, false, 0b10);
-    assert!(a.probability(Mtp, 0).unwrap() > 0.5);
-    assert!(a.probability(Copy, 1).unwrap() > 0.5);
-    assert_eq!(a.probability(Copy, 0), Some(0.5));
-    assert_eq!(a.probability(Mtp, 1), Some(0.5));
-    assert_eq!(a.probability(Mtp, 2), Some(0.5));
-    a.observe(5, 2, true, 0b110);
-    assert!(a.probability(Copy, 2).unwrap() < 0.5);
-    assert_eq!(a.probability(Mtp, 2), Some(0.5));
-    assert_eq!(a.probability(Copy, 3), Some(0.5));
-    assert_eq!(b.probability(Mtp, 0), Some(0.5));
+    a.observe(Mtp, 2, 5, 2, false, None);
+    assert!(a.prefix_probability(Mtp, 0).unwrap() > 0.5);
+    assert!(a.prefix_probability(Mtp, 1).unwrap() > 0.25);
+    assert_eq!(a.prefix_probability(Copy, 0), Some(0.5));
+    assert_eq!(a.prefix_probability(Mtp, 2), Some(0.125));
+    a.observe(Copy, 2, 5, 2, true, None);
+    assert!(a.prefix_probability(Copy, 2).unwrap() < 0.125);
+    assert_eq!(a.prefix_probability(Mtp, 2), Some(0.125));
+    assert!(a.prefix_probability(Copy, 3).unwrap() < 0.0625);
+    assert_eq!(b.prefix_probability(Mtp, 0), Some(0.5));
     assert_eq!(b.expected_tokens(Mtp, 0), 0.0);
     assert_eq!(b.expected_tokens(Mtp, 3), 1.75);
 }
@@ -1636,10 +1671,10 @@ fn physically_offered_padding_is_not_an_acceptance_observation() {
         let profile = s.request(h).unwrap().acceptance();
         if remaining == 1 {
             assert_eq!(profile.rounds(), 0);
-            assert_eq!(profile.probability(Mtp, 0), Some(0.5));
+            assert_eq!(profile.prefix_probability(Mtp, 0), Some(0.5));
         } else {
-            assert!(profile.probability(Mtp, 0).unwrap() > 0.5);
-            assert_eq!(profile.probability(Mtp, 1), Some(0.5));
+            assert!(profile.prefix_probability(Mtp, 0).unwrap() > 0.5);
+            assert_eq!(profile.prefix_probability(Mtp, 1), Some(0.25));
         }
     }
 }
@@ -1662,11 +1697,11 @@ fn completion_learns_only_proven_acceptance_and_is_transactional() {
         let profile = s.request(h).unwrap().acceptance();
         assert_eq!(profile.rounds(), 1);
         if accepted == 1 {
-            assert!(profile.probability(Mtp, 0).unwrap() > 0.5);
-            assert_eq!(profile.probability(Mtp, 1), Some(0.5));
+            assert!(profile.prefix_probability(Mtp, 0).unwrap() > 0.5);
+            assert_eq!(profile.prefix_probability(Mtp, 1), Some(0.25));
         } else {
-            assert!(profile.probability(Mtp, 0).unwrap() < 0.5);
-            assert_eq!(profile.probability(Mtp, 1), Some(0.5));
+            assert!(profile.prefix_probability(Mtp, 0).unwrap() < 0.5);
+            assert!(profile.prefix_probability(Mtp, 1).unwrap() < 0.25);
         }
     }
 }
@@ -1731,7 +1766,7 @@ fn graph_duration_median_uses_runtime_observations_and_excludes_queue_wait() {
 fn readiness_correction_changes_shape_cost_without_changing_handoff_or_service_time() {
     use crate::execution::{ExecutionTiming, ReadinessIntervals};
     let mut costs = cost::ActionCosts::prepared(&duration_graphs(1)).unwrap();
-    let step = ScheduledStep { kind: GraphKind::Decode, batch_capacity: 1, token_capacity: 1,
+    let step = ScheduledStep { draft_tokens: 0, kind: GraphKind::Decode, batch_capacity: 1, token_capacity: 1,
         packed_token_capacity: 0, mixed: None, lanes: vec![], requires_feedback: false };
     let timestamps = [1000u64, 3000, 3100].into_iter().flat_map(u64::to_ne_bytes).collect::<Vec<_>>();
     let mut gpu_ns = [None; 16];

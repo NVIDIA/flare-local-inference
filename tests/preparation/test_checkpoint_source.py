@@ -418,13 +418,38 @@ def test_completed_root_reads_release_aligned_page_cache(tmp_path):
 def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, failed_send):
     import contextlib
     import signal
+    import flare_heliopause
     import torch.distributed as dist
     from ignition.preparation import host_ranks, runtime_package
+    from ignition.preparation.package_file import read_sources
 
     events = []
+    control_root, control_peer = socket.socketpair()
+    data_root, data_peer = socket.socketpair()
+    for connection in (control_root, control_peer, data_root, data_peer):
+        connection.settimeout(5)
+    root_channel = transport.Channel(data_root, b"k" * 32, server=True)
+    peer_channel = transport.Channel(data_peer, b"k" * 32, server=False)
+    destination = tmp_path / "received.json"
+    receiver_errors = []
+    def receive_export():
+        try:
+            request = dict(control_fd=control_root.fileno(),
+                           channels=host_ranks._export_channels([root_channel]),
+                           destination=str(destination))
+            flare_heliopause.export_receive_ranks(json.dumps([request]), tmp_path / "cache", False,
+                                                (control_root, root_channel))
+        except BaseException as error:
+            receiver_errors.append(error)
+    receiver = None
+    if failed_send:
+        control_root.close()
+    else:
+        receiver = threading.Thread(target=receive_export)
+        receiver.start()
     class Owner:
         stats = dict(payload_bytes=0, metadata_bytes=0, requests=0)
-        channel_stats = []
+        channel_stats = [(peer_channel, {})]
         def report(self):
             return dict(self.stats)
         @contextlib.contextmanager
@@ -433,7 +458,7 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
         def finish(self, *, keep_transport=False):
             events.append("drained")
         def close_transport(self):
-            pass
+            events.append("transport-closed")
         def close(self):
             events.append("owner-closed")
     owner = Owner()
@@ -443,26 +468,26 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
     class Control:
         def getsockname(self):
             return "127.0.0.1", 0
-        def sendfile(self, stream, *, count):
-            events.append("package-sent")
-            if failed_send:
-                raise ConnectionError("synthetic interrupted export")
-            return len(stream.read(count))
+        def fileno(self):
+            assert "drained" in events and "owner-closed" not in events
+            events.append("package-send-started")
+            return control_peer.fileno()
         def close(self):
-            pass
+            control_peer.close()
     model = SimpleNamespace(memory_report={}, manifest=lambda: None, close=lambda: events.append("model-closed"))
     assignment = {"config": None, "prepare": lambda *args, **kwargs: model,
                   "store": ("127.0.0.1", 1234), "packaged": False}
     source = tmp_path / "weights.bin"
     source.write_bytes(b"synthetic weights")
-    commands = iter((("checkpoint-source", None), assignment, ("export", {}), [str(source)], "close"))
+    commands = iter((("checkpoint-source", None), assignment, ("export", {}), "close"))
     def export(*args, **kwargs):
         from ignition.preparation.package_file import write_sources
         from ignition.preparation.runtime_package_pb2 import ModelIndex, BundleIndex, Span
         size = source.stat().st_size
         index = ModelIndex(version=4, ranks=[BundleIndex(resources={'weights': Span(nbytes=size)})])
         write_sources(args[3], index, [(0, source, 0, size)])
-        return SimpleNamespace(memory_inventory={})
+        return SimpleNamespace(memory_inventory={},
+                               native_output=flare_heliopause.NativeRankOutput.from_sources(args[3]))
     monkeypatch.setattr(transport, "RemoteSource", remote)
     monkeypatch.setattr(transport, "token", lambda path: b"test" * 8)
     monkeypatch.setattr(host_ranks, "_watch_until_closed", lambda *args, **kwargs: None)
@@ -487,5 +512,17 @@ def test_peer_export_keeps_the_remote_owner_for_cleanup(tmp_path, monkeypatch, f
                                   hub_cache=tmp_path, export_staging=tmp_path, identity="test")
     finally:
         signal.signal(signal.SIGINT, previous)
+        if receiver is not None:
+            receiver.join(10)
+            assert not receiver.is_alive() and not receiver_errors
+        for connection in (control_root, control_peer, data_root, data_peer):
+            connection.close()
     assert events.count("owner-closed") == 1
-    assert events.index("drained") < events.index("package-sent") < events.index("owner-closed")
+    assert events.index("drained") < events.index("package-send-started") < events.index("owner-closed")
+    if not failed_send:
+        assert events.index("package-send-started") < events.index("transport-closed") < events.index("owner-closed")
+        index, locate = read_sources(destination)
+        [(path, offset, size)] = locate(index.ranks[0].resources["weights"])
+        with path.open("rb") as stream:
+            stream.seek(offset)
+            assert stream.read(size) == b"synthetic weights"

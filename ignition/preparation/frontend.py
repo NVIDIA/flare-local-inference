@@ -1,6 +1,7 @@
 """Extract and validate the structural frontend fields consumed by Helios."""
 
 import json
+import hashlib
 from enum import IntEnum
 from pathlib import Path
 
@@ -12,6 +13,15 @@ class PromptEncoder(IntEnum):
 
 
 TOKEN_FIELDS = ("bos_token", "eos_token", "unk_token", "sep_token", "pad_token", "cls_token", "mask_token")
+
+
+def annotated_template_asset(source: bytes, annotated: Path):
+    """Validate output-preserving message annotations against a checkpoint template."""
+    annotated = annotated.resolve()
+    contents = annotated.read_bytes()
+    if contents.replace(b"{%- mark -%}", b"") != source:
+        raise ValueError(f"checkpoint chat template does not match {annotated}")
+    return {"path": str(annotated), "sha256": hashlib.sha256(contents).hexdigest()}
 
 
 def _token(value):
@@ -44,6 +54,22 @@ def _expected(config, values, label):
 
 
 def image_settings(config, model, profile):
+    if profile == "glm":
+        _expected(config, {"processor_class": "Glm5NextProcessor"}, "GLM processor")
+        image = config["image_processor"]
+        _expected(image, {"image_processor_type": "Glm5NextImageProcessor", "patch_size": 14,
+            "temporal_patch_size": 2, "merge_size": 2, "patch_expand_factor": 1,
+            "min_image_tokens": 16, "max_image_tokens": 8000,
+            "image_mean": [0.48145466, 0.4578275, 0.40821073],
+            "image_std": [0.26862954, 0.26130258, 0.27577711]}, "GLM image processor")
+        optional = {"resample": 3, "rescale_factor": 1 / 255,
+            "do_resize": True, "do_rescale": True, "do_normalize": True, "do_convert_rgb": True}
+        _expected(image, {key: value for key, value in optional.items() if key in image}, "GLM image processor")
+        _expected(model, {"model_type": "glm5_next", "image_token_id": 154854, "video_token_id": 154855},
+                  "GLM model configuration")
+        _expected(model["vision_config"], {"patch_size": 14, "temporal_patch_size": 2,
+            "spatial_merge_size": 2, "in_channels": 3}, "GLM vision configuration")
+        return {"glm": {}}
     if profile == "radio":
         _expected(config, {"image_processor_type": "NemotronH_Omni_Reasoning_V3ImageProcessor",
             "patch_size": 16, "downsample_ratio": .5, "max_model_len": 16384,

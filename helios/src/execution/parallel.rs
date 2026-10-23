@@ -10,6 +10,9 @@ use super::{ExecutionManifest, FrameCompletion, GraphExecutor, RankStream, Uploa
 use crate::{Error, Result, Shutdown, cache::Fence};
 use wire::*;
 
+// Rank exchanges within a step are brief; poll that long before blocking, as threaded ranks do.
+const HANDOFF_SPIN: std::time::Duration = std::time::Duration::from_micros(500);
+
 struct Peer {
     channel: Channel,
     completion: Option<FrameCompletion>,
@@ -129,29 +132,17 @@ impl TensorParallelExecutor {
         fence: Fence,
     ) -> Result<Fence> {
         let dispatched = Instant::now();
-        let mut payload = Vec::new();
-        for value in [fence.0 as usize, graph, usize::from(grammar), uploads.len()] {
-            number(&mut payload, value);
-        }
-        for upload in uploads {
-            let index = self
-                .local
-                .manifest()
-                .buffers
-                .iter()
-                .position(|buffer| buffer.name == upload.buffer)
-                .ok_or_else(|| invalid("rank upload buffer is absent"))?;
-            for value in [index, upload.offset, upload.bytes.len()] {
-                number(&mut payload, value);
-            }
-            payload.extend_from_slice(upload.bytes);
-        }
         for peer in &mut self.peers {
             peer.channel.nonblocking(false)?;
-            peer.channel.send(PREPARE, &payload)?;
         }
+        wire::prepare(self.local.manifest(), fence, graph, grammar, uploads, |tag, bytes| {
+            for peer in &mut self.peers {
+                peer.channel.send(tag, bytes)?;
+            }
+            Ok(())
+        })?;
         for peer in &mut self.peers {
-            if !peer.channel.receive(READY)?.is_empty() {
+            if !peer.channel.handoff(READY, HANDOFF_SPIN)?.is_empty() {
                 return Err(invalid("unexpected rank readiness payload"));
             }
         }
@@ -216,6 +207,7 @@ impl TensorParallelExecutor {
                 }
                 let timing = wire::timing(&mut reader)?;
                 let proposal_confidence = wire::proposal_confidence(&mut reader)?;
+                let speculative_survival = wire::speculative_survival(&mut reader)?;
                 if reader.0.len() != self.local.manifest().completion_bytes() {
                     return Err(invalid("rank completion size differs from its ABI"));
                 }
@@ -223,6 +215,7 @@ impl TensorParallelExecutor {
                     logprobs: None,
                     prompt_logprobs: None,
                     proposal_confidence,
+                    speculative_survival,
                     fence,
                     graph_index: graph,
                     timing,
@@ -240,7 +233,8 @@ impl TensorParallelExecutor {
         }
         let root = self.completion.as_ref().unwrap();
         for (index, peer) in self.peers.iter().enumerate() {
-            agree(root, peer.completion.as_ref().unwrap())
+            let agreement = if self.local.manifest().graphs[root.graph_index].kind == super::GraphKind::PackedSpeculative { agree_packed } else { agree };
+            agreement(root, peer.completion.as_ref().unwrap())
                 .map_err(|error| invalid(format!("rank {}: {error}", index + 1)))?;
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
@@ -330,6 +324,18 @@ pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()
         }
         _ => return Err(invalid("tensor-parallel proposal confidence presence differs")),
     }
+    match (&root.speculative_survival, &peer.speculative_survival) {
+        (None, None) => {}
+        (Some(root_values), Some(peer_values)) => {
+            super::validate_speculative_survival(root_values, &root.records)?;
+            super::validate_speculative_survival(peer_values, &peer.records)?;
+            if root_values.iter().flatten().zip(peer_values.iter().flatten())
+                .any(|(a, b)| (*a == -1.0) != (*b == -1.0)) {
+                return Err(invalid("tensor-parallel speculative survival observation extents differ"));
+            }
+        }
+        _ => return Err(invalid("tensor-parallel speculative survival presence differs")),
+    }
     for (lane, (a, b)) in root.records.iter().zip(peer.records.iter()).enumerate() {
         if a.generation != b.generation
             || a.submission_sequence != b.submission_sequence
@@ -341,6 +347,22 @@ pub(super) fn agree(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()
                 "tensor-parallel request epochs, consumption, or status differ at graph {}, fence {}, lane {lane}: root {a:?}, peer {b:?}",
                 root.graph_index, root.fence.0,
             )));
+        }
+    }
+    Ok(())
+}
+
+pub(super) fn agree_packed(root: &FrameCompletion, peer: &FrameCompletion) -> Result<()> {
+    agree(root, peer)?;
+    for (a, b) in root.records.iter().zip(peer.records.iter()) {
+        // ABI3 leaves inactive token/vector payload undefined. Retain the base
+        // transport agreement above, and compare only committed active values.
+        if a.status == 0 && b.status == 0 { continue; }
+        if a.generation != b.generation || a.submission_sequence != b.submission_sequence
+            || a.consumed_tokens != b.consumed_tokens || a.generated_tokens != b.generated_tokens
+            || a.token_id != b.token_id || a.status != b.status || a.error_code != b.error_code
+            || a.reserved != b.reserved || a.vector != b.vector {
+            return Err(invalid("packed combined rank completion prefixes or committed state differ"));
         }
     }
     Ok(())
@@ -383,7 +405,10 @@ pub unsafe fn serve_rank(
                 return Err(invalid("unexpected coordinator readiness payload"));
             }
             loop {
-                let (tag, bytes) = channel.wait(true)?;
+                let (tag, bytes) = match channel.spin(HANDOFF_SPIN)? {
+                    Some(message) => message,
+                    None => channel.wait(true)?,
+                };
                 if tag == DRAIN && bytes.is_empty() {
                     let shutdown = executor.close();
                     if !shutdown.drained {
@@ -397,19 +422,11 @@ pub unsafe fn serve_rank(
                     }
                     return Ok(());
                 }
-                if tag != PREPARE {
+                if ![PREPARE, PREPARE_MORE].contains(&tag) {
                     return Err(invalid("expected rank prepare or drain"));
                 }
-                let mut reader = Reader(&bytes);
-                let fence = Fence(reader.number()? as u64);
-                let graph = reader.number()?;
-                let grammar = match reader.number()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(invalid("invalid grammar flag")),
-                };
-                let owned = uploads(executor.manifest(), &mut reader)?;
-                reader.end()?;
+                let (fence, graph, grammar, owned) =
+                    receive_prepare(&mut channel, executor.manifest(), tag, bytes)?;
                 let uploads: Vec<_> = owned
                     .iter()
                     .map(|upload| Upload {
@@ -422,7 +439,7 @@ pub unsafe fn serve_rank(
                     return Err(invalid("rank submission sequence or capacity differs"));
                 }
                 channel.send(READY, &[])?;
-                if !channel.receive(COMMIT)?.is_empty() {
+                if !channel.handoff(COMMIT, HANDOFF_SPIN)?.is_empty() {
                     return Err(invalid("unexpected rank commit payload"));
                 }
                 if executor.submit(graph, &uploads, grammar)? != Some(fence) {
@@ -442,7 +459,7 @@ pub unsafe fn serve_rank(
                     if started.elapsed() > TIMEOUT {
                         return Err(invalid("rank graph completion deadline expired"));
                     }
-                    std::thread::sleep(std::time::Duration::from_micros(50));
+                    std::thread::yield_now();
                 };
                 channel.nonblocking(false)?;
                 channel.send(COMPLETE, &completion(&completed))?;

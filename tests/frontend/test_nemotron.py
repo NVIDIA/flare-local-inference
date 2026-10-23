@@ -75,12 +75,20 @@ def test_native_nemotron_chat_matches_checkpoint(tmp_path):
     decode_cases = [dict(name=f"decode_{index}_{skip}", token_ids=case["token_ids"], skip_special_tokens=skip,
                         text=tokenizer.decode(case["token_ids"], skip_special_tokens=skip))
                     for index, case in enumerate(encode_cases) for skip in (False, True)]
-    assets = {name: hashlib.sha256((snapshot / name).read_bytes()).hexdigest()
+    from ignition.preparation.frontend import annotated_template_asset
+    annotated = annotated_template_asset((snapshot / "chat_template.jinja").read_bytes(),
+        ROOT / "ignition/recipes/nemotron_h/assets/chat_template.jinja")
+    native_assets = tmp_path / "assets"
+    native_assets.mkdir()
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        (native_assets / name).symlink_to(snapshot / name)
+    (native_assets / "chat_template.jinja").symlink_to(annotated["path"])
+    assets = {name: hashlib.sha256((native_assets / name).read_bytes()).hexdigest()
               for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja")}
     fixture = tmp_path / "chat.json"
     fixture.write_text(json.dumps(dict(assets=assets, cases=cases,
                                       encode_cases=encode_cases, decode_cases=decode_cases)))
-    result = subprocess.run([str(ROOT / "helios/target/debug/test_frontend"), str(snapshot), str(fixture)],
+    result = subprocess.run([str(ROOT / "helios/target/debug/test_frontend"), str(native_assets), str(fixture)],
                             capture_output=True, text=True)
     assert result.returncode == 0, result.stdout + result.stderr
     assert json.loads(result.stdout) == dict(cases=len(cases), encode_cases=len(encode_cases),

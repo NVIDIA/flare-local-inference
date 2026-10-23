@@ -1,6 +1,8 @@
 """Block-FP8 preparation, compilation and replay preserve arbitrary FP32 scales."""
 
+import gc
 import os
+import weakref
 
 import pytest
 import torch
@@ -13,8 +15,8 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires FLARE_RUN_CUDA_TESTS=1 and an assigned GPU")
 
 
-@pytest.mark.parametrize("rows", [1, 4, 64, 4096])
-def test_block_fp8_compiled_replay(rows):
+@pytest.mark.parametrize("rows", [1, 2, 4, 17, 31, 32, 33, 64, 65, 4096])
+def test_block_fp8_compiled_replay(rows, monkeypatch):
     from flashinfer.quantization import per_token_group_quant_8bit
 
     device = torch.device("cuda", 0)
@@ -26,7 +28,18 @@ def test_block_fp8_compiled_replay(rows):
     with RecordedPreparationSession(device=device, checkpoint="block-fp8-projection",
             workload_schema="block-fp8-projection", numerical_policy="default") as session:
         projection = BlockFP8Projection(source, BlockFP8Weight(values, scales), session=session, name="projection")
-        session.tune()
+        tuning_inputs = []
+
+        def track_inputs(trial, *args, **kwargs):
+            result = per_token_group_quant_8bit(trial, *args, **kwargs)
+            tuning_inputs.extend(weakref.ref(value) for value in (trial, *result))
+            return result
+
+        with monkeypatch.context() as patch:
+            patch.setattr("ignition.components.block_fp8.per_token_group_quant_8bit", track_inputs)
+            session.tune()
+        gc.collect()
+        assert tuning_inputs and all(value() is None for value in tuning_inputs)
 
         def forward():
             output.copy_(projection(source))

@@ -81,28 +81,34 @@ def test_tp8_kernel_catalogs_fit_the_combined_index(tmp_path):
     assert description.ByteSize() > 16 << 20
 
 
-def test_index_read_does_not_touch_the_payload(tmp_path, monkeypatch):
+def test_index_read_does_not_touch_the_payload(tmp_path):
+    import re
+    import shutil
+    import subprocess
+    import sys
+
+    trace_program = shutil.which("strace")
+    if trace_program is None:
+        pytest.skip("requires strace to observe native file reads")
     description = index().SerializeToString()
     path = tmp_path / "model.safetensors"
     write_container(path, header(2 << 20, len(description)), bytes(2 << 20), description)
+    trace = tmp_path / "reads.txt"
+    result = subprocess.run([trace_program, "-yy", "-e", "trace=read,pread64", "-o", str(trace),
+        sys.executable, "-c", "from ignition.preparation.package_file import read_index; "
+        "import sys; index,base=read_index(sys.argv[1]); assert index.version==4 and base==4096",
+        str(path)], capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
     reads = []
-    original = Path.open
-
-    class Reader:
-        def __init__(self, source):
-            self.source = source
-        def __getattr__(self, name):
-            return getattr(self.source, name)
-        def __enter__(self):
-            return self
-        def __exit__(self, *args):
-            self.source.close()
-        def read(self, size=-1):
-            reads.append((self.source.tell(), size))
-            return self.source.read(size)
-
-    monkeypatch.setattr(Path, "open", lambda self, *args, **kwargs: Reader(original(self, *args, **kwargs)))
-    assert read_index(path) == (index(), ALIGNMENT)
+    for line in trace.read_text().splitlines():
+        if f"<{path}>" not in line:
+            continue
+        assert line.startswith("pread64("), line
+        match = re.search(r", (\d+), (\d+)\) = (\d+)$", line)
+        assert match, line
+        size, offset, returned = map(int, match.groups())
+        assert returned == size
+        reads.append((offset, size))
     assert reads == [(0, 8), (8, ALIGNMENT - 8), (ALIGNMENT + (2 << 20), len(description))]
 
 
@@ -237,7 +243,7 @@ def test_publication_failure_and_overwrite_leave_files_untouched(tmp_path):
     source = tmp_path / "source"
     source.write_bytes(b"data")
     output = tmp_path / "model.safetensors"
-    with pytest.raises(ValueError, match="truncated package resource"):
+    with pytest.raises(ValueError, match="source range exceeds file"):
         publish(output, index(), [(0, source, 0, 5)])
     assert list(tmp_path.iterdir()) == [source]
     publish(output, index(), [(0, source, 0, 4)])
@@ -247,32 +253,26 @@ def test_publication_failure_and_overwrite_leave_files_untouched(tmp_path):
     assert output.read_bytes() == saved
 
 
-def test_multi_host_package_appends_every_rank_after_rank_zero_in_place(tmp_path):
-    from ignition.preparation.package_file import extend_cluster
-    from ignition.preparation.runtime_package import _roce_transport
-
+def test_multi_host_package_combines_every_rank_and_preserves_transport_geometry(tmp_path):
     files, contents = [], [b"weights-zero" * 1000, b"weights-one" + bytes(5000)]
     for rank, data in enumerate(contents):
         source = tmp_path / f"source-{rank}"
         source.write_bytes(data)
         description = index()
+        description.ranks[0].allocations.add(name="weights", file="storage.bin")
         description.ranks[0].resources["storage.bin"].CopyFrom(proto.Span(offset=0, nbytes=len(data)))
         if rank == 0:
             description.contract.model_id = "glm"
-        _roce_transport(description.ranks[0].roce, {
-            "proxy_abi": 7, "world_size": 2, "rank": rank,
-            "region": {"address": 0x100000000000, "nbytes": 1 << 20},
-            "counters": {"address": 0x200000001000, "nbytes": 1024},
-            "slot_bytes": 1 << 20, "pipe_bytes": 64 << 20, "ctrl_offset": 4 << 20,
-            **({"varlen_bytes": 8 << 20} if rank == 1 else {}),
-            # The preparing hosts' fabric is not recorded: each serving host discovers its own.
-            "hca_names": ["rocep1s0f0", "roceP2p1s0f0"], "gid_index": 3, "traffic_class": 0, "rails": 2,
-            "routes": [[], [[0, 0], [1, 1]]] if rank == 0 else [[[0, 0], [1, 1]], []]})
-        files.append(tmp_path / f"rank-{rank}.safetensors")
-        publish(files[-1], description, [(0, source, 0, len(data))])
-    with files[1].open("rb") as peer:
-        extend_cluster(files[0], [peer], (2, "export-a"))
-    result, start = read_index(files[0])
+        description.ranks[0].roce.CopyFrom(proto.RoceTransport(
+            proxy_abi=7, world=2, rank=rank, region_address=0x100000000000,
+            region_bytes=1 << 20, counters_address=0x200000001000, counters_bytes=1024,
+            slot_bytes=1 << 20, pipe_bytes=64 << 20, ctrl_offset=4 << 20,
+            **({"varlen_bytes": 8 << 20} if rank == 1 else {})))
+        files.append(tmp_path / f"rank-{rank}.json")
+        write_sources(files[-1], description, [(0, source, 0, len(data))])
+    output = tmp_path / "model.safetensors"
+    combine(output, files, [], cluster=(2, "export-a"))
+    result, start = read_index(output)
     assert (result.cluster.world, result.cluster.export_id) == (2, "export-a")
     assert result.contract.model_id == "glm"
     assert [bundle.roce.rank for bundle in result.ranks] == [0, 1]
@@ -280,11 +280,11 @@ def test_multi_host_package_appends_every_rank_after_rank_zero_in_place(tmp_path
     assert [bundle.roce.varlen_bytes for bundle in result.ranks] == [0, 8 << 20]
     assert all(field not in proto.RoceTransport.DESCRIPTOR.fields_by_name
                for field in ("hcas", "gid_index", "traffic_class", "rails", "routes"))
-    with files[0].open("rb") as package:
+    with output.open("rb") as package:
         for bundle, expected in zip(result.ranks, contents, strict=True):
             span = bundle.resources["storage.bin"]
             assert span.offset % ALIGNMENT == 0
             package.seek(start + span.offset)
             assert package.read(span.nbytes) == expected
-    with pytest.raises(ValueError, match="every rank"):
-        extend_cluster(files[1], [], (2, "export-a"))
+    with pytest.raises(ValueError):
+        combine(tmp_path / "incomplete.safetensors", files[:1], [], cluster=(2, "export-a"))

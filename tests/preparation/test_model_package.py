@@ -94,7 +94,7 @@ def test_combined_file_preserves_rank_resources_and_frontend_ranges(tmp_path):
     assert index.contract.model_id == 'test'
     with model.open('r+b') as source:
         source.truncate(model.stat().st_size - 1)
-    with pytest.raises(ValueError, match='safetensors data length'):
+    with pytest.raises(ValueError, match='truncated export source'):
         read_index(model)
 
 
@@ -126,6 +126,6 @@ def test_offloaded_engram_planes_are_stored_once_and_bounds_checked(tmp_path):
         combine(tmp_path / 'duplicated', [ranks[0], ranks[0]], [])
     with source.open('r+b') as table:
         table.truncate(12 + 5)
-    with pytest.raises(ValueError, match='truncated package resource'):
+    with pytest.raises(ValueError, match='source range exceeds file'):
         combine(tmp_path / 'truncated', ranks, [])
     assert not (tmp_path / 'truncated').exists()

@@ -1,7 +1,8 @@
 use std::io::{ErrorKind, Read, Write};
 use std::time::Duration;
 
-use crate::execution::{ExecutionManifest, FrameCompletion, OwnedUpload, RankStream};
+use crate::cache::Fence;
+use crate::execution::{ExecutionManifest, FrameCompletion, OwnedUpload, RankStream, Upload};
 use crate::{Error, ExecutionError, Failure, Result};
 
 pub(super) const HELLO: u8 = 1;
@@ -13,6 +14,7 @@ pub(super) const DRAIN: u8 = 6;
 pub(super) const DRAINED: u8 = 7;
 pub(super) const RELEASE: u8 = 8;
 pub(super) const FAILED: u8 = 9;
+pub(super) const PREPARE_MORE: u8 = 10;
 const MAX_PACKET: usize = 64 * 1024 * 1024;
 pub(super) const TIMEOUT: Duration = Duration::from_secs(120);
 
@@ -109,6 +111,29 @@ impl Channel {
         message?.ok_or_else(|| invalid("tensor-parallel control deadline expired"))
     }
 
+    /// Poll without blocking for up to `limit` before a caller's blocking wait.
+    pub fn spin(&mut self, limit: std::time::Duration) -> Result<Option<(u8, Vec<u8>)>> {
+        self.nonblocking(true)?;
+        let started = std::time::Instant::now();
+        let result = loop {
+            match self.poll() {
+                Ok(None) if started.elapsed() < limit => std::hint::spin_loop(),
+                other => break other,
+            }
+        };
+        self.nonblocking(false)?;
+        result
+    }
+
+    /// Receive `expected`, polling briefly before blocking.
+    pub fn handoff(&mut self, expected: u8, limit: std::time::Duration) -> Result<Vec<u8>> {
+        match self.spin(limit)? {
+            Some((tag, data)) if tag == expected => Ok(data),
+            Some((tag, _)) => Err(invalid(format!("expected rank message {expected}, received {tag}"))),
+            None => self.receive(expected),
+        }
+    }
+
     pub fn receive(&mut self, expected: u8) -> Result<Vec<u8>> {
         let (tag, data) = self.wait(false)?;
         if tag != expected {
@@ -156,7 +181,7 @@ impl<'a> Reader<'a> {
 pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     let mut bytes = Vec::new();
     for value in [
-        3,
+        4,
         manifest.abi_version as usize,
         manifest.max_active,
         manifest.input_frame_bytes,
@@ -189,6 +214,9 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
         ] {
             number(&mut bytes, value);
         }
+        if graph.kind == super::super::GraphKind::PackedSpeculative {
+            number(&mut bytes, graph.draft_tokens);
+        }
         for binding in &graph.input_bindings {
             string(&mut bytes, &binding.buffer_name);
             number(&mut bytes, binding.host_offset);
@@ -209,9 +237,99 @@ pub(super) fn layout(manifest: &ExecutionManifest) -> Vec<u8> {
     bytes
 }
 
+/// Split validated uploads into bounded packets while preserving element alignment.
+pub(super) fn prepare(
+    manifest: &ExecutionManifest,
+    fence: Fence,
+    graph: usize,
+    grammar: bool,
+    uploads: &[Upload<'_>],
+    mut send: impl FnMut(u8, &[u8]) -> Result<()>,
+) -> Result<()> {
+    let capacity = uploads.iter().fold(32usize, |size, upload| {
+        size.saturating_add(24).saturating_add(upload.bytes.len())
+    }).min(MAX_PACKET);
+    let mut packet = Vec::with_capacity(capacity);
+    for value in [fence.0 as usize, graph, usize::from(grammar), 0] {
+        number(&mut packet, value);
+    }
+    let mut count = 0;
+    let mut flush = |packet: &mut Vec<u8>, count: &mut usize, tag| -> Result<()> {
+        packet[24..32].copy_from_slice(&(*count as u64).to_le_bytes());
+        send(tag, packet)?;
+        packet.truncate(32);
+        *count = 0;
+        Ok(())
+    };
+    for upload in uploads {
+        let index = manifest.buffers.iter()
+            .position(|buffer| buffer.name == upload.buffer)
+            .ok_or_else(|| invalid("rank upload buffer is absent"))?;
+        let alignment = manifest.buffers[index].dtype.size();
+        let mut offset = upload.offset;
+        let mut bytes = upload.bytes;
+        while !bytes.is_empty() {
+            let available = MAX_PACKET.saturating_sub(packet.len() + 24);
+            let size = (available / alignment * alignment).min(bytes.len());
+            if size == 0 {
+                flush(&mut packet, &mut count, PREPARE_MORE)?;
+                continue;
+            }
+            for value in [index, offset, size] {
+                number(&mut packet, value);
+            }
+            packet.extend_from_slice(&bytes[..size]);
+            count += 1;
+            offset += size;
+            bytes = &bytes[size..];
+        }
+    }
+    flush(&mut packet, &mut count, PREPARE)
+}
+
+pub(super) fn receive_prepare(
+    channel: &mut Channel,
+    manifest: &ExecutionManifest,
+    mut tag: u8,
+    mut bytes: Vec<u8>,
+) -> Result<(Fence, usize, bool, Vec<OwnedUpload>)> {
+    let mut identity = None;
+    let mut remaining = manifest.input_frame_bytes;
+    let mut owned = Vec::new();
+    loop {
+        if ![PREPARE, PREPARE_MORE].contains(&tag) {
+            return Err(invalid("expected rank prepare packet"));
+        }
+        let mut reader = Reader(&bytes);
+        let fence = Fence(reader.number()? as u64);
+        let graph = reader.number()?;
+        let grammar = match reader.number()? {
+            0 => false,
+            1 => true,
+            _ => return Err(invalid("invalid grammar flag")),
+        };
+        let received = (fence, graph, grammar);
+        if identity.is_some_and(|expected| expected != received) {
+            return Err(invalid("rank prepare packet identity differs"));
+        }
+        identity = Some(received);
+        let part = uploads(manifest, &mut reader, &mut remaining)?;
+        reader.end()?;
+        if tag == PREPARE_MORE && part.is_empty() {
+            return Err(invalid("empty rank prepare continuation"));
+        }
+        owned.extend(part);
+        if tag == PREPARE {
+            return Ok((fence, graph, grammar, owned));
+        }
+        (tag, bytes) = channel.wait(false)?;
+    }
+}
+
 pub(super) fn uploads(
     manifest: &ExecutionManifest,
     data: &mut Reader<'_>,
+    remaining: &mut usize,
 ) -> Result<Vec<OwnedUpload>> {
     let count = data.number()?;
     if count > manifest.input_frame_bytes || count > data.0.len() / 24 {
@@ -225,6 +343,10 @@ pub(super) fn uploads(
             .ok_or_else(|| invalid("rank upload buffer index out of range"))?;
         let offset = data.number()?;
         let count = data.number()?;
+        if count == 0 || count > *remaining {
+            return Err(invalid("rank uploads exceed the input-frame extent"));
+        }
+        *remaining -= count;
         uploads.push(OwnedUpload {
             buffer: buffer.name.clone(),
             offset,
@@ -255,6 +377,12 @@ pub(super) fn completion(value: &FrameCompletion) -> Vec<u8> {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
     }
+    number(&mut bytes, usize::from(value.speculative_survival.is_some()));
+    if let Some(rows) = &value.speculative_survival {
+        for value in rows.iter().flatten() {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+    }
     for record in value.records.iter() {
         for field in record.fields() {
             bytes.extend_from_slice(&field.to_le_bytes());
@@ -274,6 +402,20 @@ pub(super) fn proposal_confidence(reader: &mut Reader<'_>) -> Result<Option<[[f3
             Ok(Some(rows))
         }
         _ => Err(invalid("invalid proposal confidence presence")),
+    }
+}
+
+pub(super) fn speculative_survival(reader: &mut Reader<'_>) -> Result<Option<[[f32; 7]; 64]>> {
+    match reader.number()? {
+        0 => Ok(None),
+        1 => {
+            let mut rows = [[-1.0; 7]; 64];
+            for value in rows.iter_mut().flatten() {
+                *value = f32::from_le_bytes(reader.bytes(4)?.try_into().unwrap());
+            }
+            Ok(Some(rows))
+        }
+        _ => Err(invalid("invalid speculative survival presence")),
     }
 }
 

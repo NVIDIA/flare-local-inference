@@ -5,6 +5,10 @@ fn main() {
         let mut config = prost_build::Config::new();
         config
             .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
+            .file_descriptor_set_path(
+                std::path::PathBuf::from(std::env::var("OUT_DIR").unwrap())
+                    .join("runtime_package_descriptor.bin"),
+            )
             .field_attribute(".flare.runtime.ExecutionGraph.packed_token_capacity", "#[serde(default)]")
             .compile_protos(&["proto/runtime_package.proto"], &["proto"])
             .expect("compile runtime package protobuf schema");

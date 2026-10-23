@@ -41,7 +41,7 @@ def test_server_cli_help_does_not_prepare_model():
         cwd=ROOT, check=False, capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stderr
-    for command in ("run", "export"):
+    for command in ("export", "serve"):
         assert f"\n    {command} " in result.stdout
-    for command in ("prepare", "plan", "models", "pull", "status", "bench", "config", "skill"):
+    for command in ("run", "prepare", "plan", "models", "pull", "status", "bench", "config", "skill"):
         assert f"\n    {command} " not in result.stdout

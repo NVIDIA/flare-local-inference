@@ -2,6 +2,8 @@ use flare_helios::{ReplayWorker, runtime_package::NativeResources};
 use serde::Deserialize;
 use std::{collections::HashMap, path::PathBuf, time::Duration};
 
+mod tp4_collective;
+
 #[derive(Deserialize)]
 struct Reference {
     allocation: String,
@@ -22,6 +24,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .nth(1)
             .ok_or("expected fixture directory")?,
     );
+    if std::env::args().nth(2).as_deref() == Some("--tp4-collective") {
+        return tp4_collective::run(root);
+    }
     let expected: Expected = serde_json::from_slice(&std::fs::read(root.join("expected.json"))?)?;
     let owner = unsafe {
         NativeResources::load(

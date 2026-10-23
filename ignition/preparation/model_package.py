@@ -1,8 +1,6 @@
 """Publish a model package containing one native resource bundle per rank."""
 
 from pathlib import Path
-import shutil
-import tempfile
 
 from .runtime_package import export_model
 from .package_file import DEFAULT_SHARD_SIZE, combine
@@ -18,14 +16,13 @@ def export_package(prepared, images, storage, path, *, options, publisher, progr
     """
     if publisher is None:
         raise ValueError("final model publication requires a signing publisher")
-    import torch
     import torch.distributed as dist
 
     path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    staging = path.parent if staging is None else Path(staging)
-    staging.mkdir(parents=True, exist_ok=True)
-    stage = Path(tempfile.mkdtemp(prefix=f'.{path.name}-', dir=staging))
+    import flare_heliopause
+
+    native_stage = flare_heliopause.NativeExportStage(path, staging)
+    stage = Path(native_stage.path)
     from .package_snapshot import _OPTIONS, ExportOptions
     token = _OPTIONS.set(_OPTIONS.get() or ExportOptions(path.parent / '.flare-cache'))
     try:
@@ -35,7 +32,6 @@ def export_package(prepared, images, storage, path, *, options, publisher, progr
                 control.send(('export', stage / roots[rank], options, _OPTIONS.get()))
             dist.barrier()
             storage.peer_storage.reset()
-            torch.cuda.synchronize()
             dist.barrier()
         model = prepared if storage.world == 1 else prepared.model
         package = export_model(model, images, storage, stage / roots[0], options=options, progress=progress,
@@ -58,5 +54,4 @@ def export_package(prepared, images, storage, path, *, options, publisher, progr
         print_inventory(inventories, console=console or getattr(progress, "console", None))
     finally:
         _OPTIONS.reset(token)
-        if stage.exists():
-            shutil.rmtree(stage)
+        native_stage.close()

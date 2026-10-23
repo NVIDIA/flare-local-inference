@@ -102,6 +102,51 @@ restoration, and prefill must declare producers of that view. A host-owned
 pending token instead declares a value binding. Shared scheduling derives its
 completion dependency from these concrete inputs.
 
+### Device-allocated speculative prefixes
+
+`PACKED_SPECULATIVE` declares one captured proposal, causal prefix allocation,
+target verification, and accepted-state commit. Its execution descriptor carries
+the request capacity, `draft_tokens`, logical `verify_tokens`, and
+`packed_token_capacity`. The configured proposal depth is fixed across dispatches.
+The host chooses physical target capacity before generating the round's proposals,
+using completed observations rather than current draft values. The graph generates
+the complete proposal block before allocating verification prefixes.
+
+The `SPECULATIVE_PREFIX_LIMIT` input contains each submitted lane's immutable
+upper bound, including its pending token. The graph initializes proposal
+validation from those bounds, then writes actual lengths to device-owned
+`query_lengths`; this operation cannot bind host `QUERY_LENGTH` values.
+Helios fixes the cohort, original request slots, generations, pending tokens,
+page tables and continuation rows for the entire submission. Page reservations
+cover each lane's upper bound, including the cache contract's draft-page extent;
+dividing the total target budget evenly among lanes is insufficient.
+
+Every submitted lane starts with one pending position. Allocation repeatedly
+selects the highest immediate-frontier survival probability, multiplying FP32
+confidence values sequentially in FP64. Ties prefer the shorter prefix and then
+the original request slot; floating-point total ordering distinguishes signed
+zeros. Later confidence cannot influence admission of its predecessors. Zero
+probability does not stop allocation while a permitted frontier remains.
+The sum of admitted lengths cannot exceed the captured physical target capacity.
+Rank-zero confidence is broadcast before allocation; validation agreement
+suppresses commitment on every rank if any participating rank rejects the cohort.
+
+Allocation consumes no random draws. Valid rounds preserve the proposal depth's
+draft RNG reservation and the verifier width's target RNG reservation, regardless
+of the admitted prefix. Terminal completion reports actual offered drafts,
+accepted drafts and emitted tokens. Helios validates every offer against its
+reserved lane ceiling and validates the aggregate target budget before changing
+request state. Invalid ownership cannot mutate a replacement request.
+
+There is no intermediate proposal completion. The target completion still
+precedes host admission, stop processing and reservation of another round.
+Cancellation suppresses publication but retains slots, pages, mailboxes and
+scratch until the terminal fence drains. Embedding delivery uses one
+GPU-produced request per table and submission, followed by the existing compact
+row transfer; a round contains only one target pass. Host-stop and constrained
+requests retain their ordinary width-one barriers. Packages containing only the
+separate proposal and verification operations retain their existing semantics.
+
 `state_rows_per_request` is a per-graph storage requirement. The runtime uses the
 maximum among selected graphs to partition execution and snapshot rows. It is
 not a model capability flag. Captured programs perform state updates and accepted

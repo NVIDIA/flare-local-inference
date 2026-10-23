@@ -31,7 +31,7 @@ def pack(layout, step):
             if source == p.CONSTANT: values = [0] * width
             elif source == p.REQUEST_SLOT: values = [request.slot]
             elif source == p.REQUEST_GENERATION: values = [request.generation]
-            elif source == p.QUERY_LENGTH: values = [lane.tokens]
+            elif source in (p.QUERY_LENGTH, p.SPECULATIVE_PREFIX_LIMIT): values = [lane.tokens]
             elif source == p.SAMPLE_ENABLED: values = [int(step.kind != "prefill" or lane.start + lane.tokens == len(request.prompt))]
             elif source == p.PROMPT_TOKEN: values = request.prompt[lane.start:lane.start + lane.tokens]
             elif source == p.PENDING_TOKEN: values = [request.pending_token]

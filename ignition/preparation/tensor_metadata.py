@@ -145,19 +145,23 @@ def _triton_parameters(kernel):
                  for value in types)
 
 
-def live_metadata(allocations, declared, buffers):
+def live_metadata(allocations, declared, buffers, *, zero_ranges=()):
     """Collect exact tensor leaves and compiler-declared scalar arguments.
 
     Integer and byte tensors can contain pointers or tensor maps. They remain
     opaque unless their checkpoint or native-I/O role establishes numeric data.
     Integer aliases also prevent inferring numeric data from a floating view.
+    Overlapping driver mappings describe coverage, with zero-initialized and
+    declared disposable storage excluded. Views crossing coverage boundaries still classify their covered bytes.
     """
     from bisect import bisect_right
     import torch
     from triton.compiler import CompiledKernel
 
-    bounds = sorted((allocation.address, allocation.address + allocation.nbytes) for allocation in allocations
-                    if allocation.initialize != "zero")
+    bounds = subtract_ranges(
+        merge_ranges((a.address, a.address + a.nbytes) for a in allocations if a.initialize != "zero"),
+        merge_ranges([(a.address, a.address + a.nbytes) for a in allocations if a.initialize == "zero"]
+                     + [(address, address + size) for address, size in zero_ranges]))
     starts = [start for start, _ in bounds]
     numeric, opaque, arguments = [], [], {}
     seen = set()
@@ -166,12 +170,12 @@ def live_metadata(allocations, declared, buffers):
             if value.device.type != "cuda" or value.layout != torch.strided or not value.numel():
                 continue
             address = value.data_ptr()
-            index = bisect_right(starts, address) - 1
-            if index < 0 or address >= bounds[index][1]:
-                continue
             end = address + value.element_size() * (1 + sum((size - 1) * stride
                                                            for size, stride in zip(value.shape, value.stride())))
-            if end > bounds[index][1]:
+            index = max(0, bisect_right(starts, address) - 1)
+            if index < len(bounds) and bounds[index][1] <= address:
+                index += 1
+            if index >= len(bounds) or bounds[index][0] >= end:
                 continue
             floating = value.dtype.is_floating_point or value.dtype.is_complex
             layout = address, value.element_size(), tuple(value.shape), tuple(value.stride()), floating
@@ -179,10 +183,16 @@ def live_metadata(allocations, declared, buffers):
                 continue
             seen.add(layout)
             spans = tensor_ranges(value)
-            if floating:
-                numeric.extend(spans)
-            else:
-                opaque.extend(spans or [(address, end)])
+            if not floating and not spans:
+                spans = [(address, end)]
+            classified = numeric if floating else opaque
+            for left, right in spans:
+                index = max(0, bisect_right(starts, left) - 1)
+                while index < len(bounds) and bounds[index][0] < right:
+                    start, stop = bounds[index]
+                    if left < stop:
+                        classified.append((max(left, start), min(right, stop)))
+                    index += 1
         elif type(value) is CompiledKernel:
             layout = _triton_parameters(value)
             if layout is not None:

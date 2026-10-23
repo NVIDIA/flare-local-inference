@@ -119,15 +119,24 @@ fn now_millis() -> u64 {
         .unwrap_or(0)
 }
 
-/// The URL of rank zero's metrics endpoint for its `--host` and `--port` options; a wildcard
-/// bind is reached through the loopback address.
+/// The URL of rank zero's metrics endpoint for its last `--host` and `--port` options;
+/// a wildcard bind is reached through the loopback address.
 pub fn metrics_url(rank_zero: &[String]) -> String {
     let option = |name: &str| {
         rank_zero
             .iter()
-            .position(|a| a == name)
-            .and_then(|i| rank_zero.get(i + 1))
-            .cloned()
+            .enumerate()
+            .rev()
+            .find_map(|(i, argument)| {
+                if argument == name {
+                    rank_zero.get(i + 1).cloned()
+                } else {
+                    argument
+                        .strip_prefix(name)?
+                        .strip_prefix('=')
+                        .map(str::to_owned)
+                }
+            })
     };
     let host = match option("--host").as_deref() {
         None | Some("0.0.0.0") | Some("::") => "127.0.0.1".to_owned(),
@@ -615,26 +624,10 @@ fn session(agent: &Arc<Agent>, stream: TcpStream) -> Result<(), Failure> {
                     Err(error) => Err(error),
                 }
             }
-            frame::FETCH_RING => {
+            frame::FETCH_FABRIC => {
                 let request = json_body(&mut session, length)?;
-                match fetch_ring(agent, &mut session, &mut pinned, &request) {
+                match fetch_fabric(agent, &mut session, &mut pinned, &request) {
                     Ok(()) => continue,
-                    Err(error) => Err(error),
-                }
-            }
-            frame::CHECKPOINT_OPEN => {
-                let request: super::checkpoint::Open =
-                    serde_json::from_value(json_body(&mut session, length)?)?;
-                match super::checkpoint::authorize(&agent.dir, &request.grant) {
-                    Ok(grant) => {
-                        return super::checkpoint::relay(
-                            session,
-                            &agent.key,
-                            &agent.hello()?,
-                            grant,
-                            request,
-                        );
-                    }
                     Err(error) => Err(error),
                 }
             }
@@ -827,6 +820,9 @@ fn put(
     if cache::range_bytes(&ranges) + 4 + header_length as u64 != length {
         return Err("PUT length does not match its ranges".into());
     }
+    let entry = cache::entry(&agent.cache, cache::kind_directory(kind)?, name)?;
+    let lease = cache::Lease::shared(&cache::unit(&agent.cache, &entry))?;
+    lease.exclusive()?;
     let path = cache::store(&agent.cache, kind, name, size, &ranges, &mut body)?;
     let unit = cache::unit(&agent.cache, &path);
     if kind == "package" {
@@ -858,12 +854,14 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
         "packages",
         &format!("{directory}/{}", grant.primary()),
     )?;
+    let lease = cache::Lease::shared(primary.parent().unwrap())?;
+    lease.exclusive()?;
     let marker = primary.with_file_name(VERIFIED);
-    let ring_source = if grant.roce_ring {
-        super::fabric::validate(&grant)?;
+    let fabric_source = if grant.transfer_fabric.is_some() {
+        super::fabric::topology(&grant)?;
         if let Some(member) = grant.member(&source_key) {
             if member.rank != super::fabric::source_rank(&grant) {
-                return Err("transfer source differs from the ring's package source".into());
+                return Err("transfer source differs from the fabric package source".into());
             }
             Some(member.rank)
         } else if rank == 0
@@ -873,9 +871,9 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
                 .as_ref()
                 .is_some_and(|s| s.public_key == source_key.to_hex())
         {
-            None // The one ingress transfer from a source outside the ring.
+            None // The one ingress transfer from a source outside the fabric membership.
         } else {
-            return Err("ring transfer source must be a member, or ingress to rank zero".into());
+            return Err("fabric transfer source must be a member, or ingress to rank zero".into());
         }
     } else {
         None
@@ -887,8 +885,8 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
             .filter(|n| (1..=64).contains(n))
             .ok_or("transfer streams must be in 1..=64")? as usize,
     };
-    if streams > 1 && ring_source.is_none() {
-        return Err("parallel package transfers require ring fabric interfaces".into());
+    if streams > 1 && fabric_source.is_none() {
+        return Err("parallel package transfers require fabric endpoints".into());
     }
     let mut received = 0u64;
     for (file_index, file) in files.iter().enumerate() {
@@ -903,8 +901,8 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
         // Bytes are arriving, so whatever the directory held is no longer verified.
         let _ = fs::remove_file(&marker);
         let started = Instant::now();
-        let path = if let Some(source) = ring_source {
-            let route = super::fabric::path(grant.members.len(), source, rank)?;
+        let path = if let Some(source) = fabric_source {
+            let route = super::fabric::topology(&grant)?.path(source, rank)?;
             eprintln!(
                 "{name}: fabric TCP {} ({streams} streams)",
                 route
@@ -920,7 +918,7 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
                 &ranges,
                 streams,
                 |stream, part| {
-                    let upstream = ring_upstream(
+                    let upstream = fabric_upstream(
                         agent,
                         &grant,
                         &json!({
@@ -1016,42 +1014,42 @@ fn expect_bytes(session: &mut Session, expected: u64) -> Result<(), Failure> {
     Ok(())
 }
 
-fn ring_request(grant: &Grant, request: &Value) -> Result<(Vec<usize>, usize, u64), Failure> {
-    super::fabric::validate(grant)?;
+fn fabric_request(grant: &Grant, request: &Value) -> Result<(Vec<usize>, usize, u64), Failure> {
+    super::fabric::topology(grant)?;
     let rank = |field: &str| -> Result<usize, Failure> {
         let value = request[field]
             .as_u64()
-            .ok_or("ring FETCH lacks rank or rail")?;
-        usize::try_from(value).map_err(|_| "ring FETCH rank overflows".into())
+            .ok_or("fabric FETCH lacks rank or rail")?;
+        usize::try_from(value).map_err(|_| "fabric FETCH rank overflows".into())
     };
     let source = rank("source_rank")?;
     if source != super::fabric::source_rank(grant) {
-        return Err("ring FETCH source differs from the grant's package source".into());
+        return Err("fabric FETCH source differs from the grant's package source".into());
     }
-    let path = super::fabric::path(grant.members.len(), source, rank("destination_rank")?)?;
+    let path = super::fabric::topology(grant)?.path(source, rank("destination_rank")?)?;
     let rail = rank("rail")?;
     if rail >= 2 {
-        return Err("ring FETCH rail is outside the fabric capacity".into());
+        return Err("fabric FETCH rail is outside the fabric capacity".into());
     }
     let name = field(request, "name")?;
     if !grant.package.files.iter().any(|file| file == name) {
-        return Err("ring FETCH file is outside the grant's package".into());
+        return Err("fabric FETCH file is outside the grant's package".into());
     }
     let size = request["size"]
         .as_u64()
-        .ok_or("ring FETCH lacks file size")?;
+        .ok_or("fabric FETCH lacks file size")?;
     let ranges = cache::ranges_from_json(size, request.get("ranges"))?;
     Ok((path, rail, cache::range_bytes(&ranges)))
 }
 
 /// Pull from the preceding rank on the payload path. Every connection stays on one physical link.
-fn ring_upstream(
+fn fabric_upstream(
     agent: &Agent,
     grant: &Grant,
     request: &Value,
     rank: usize,
 ) -> Result<Session, Failure> {
-    let (path, rail, length) = ring_request(grant, request)?;
+    let (path, rail, length) = fabric_request(grant, request)?;
     let index = path
         .iter()
         .position(|r| *r == rank)
@@ -1059,26 +1057,26 @@ fn ring_upstream(
     let previous = *path
         .get(index.checked_sub(1).ok_or("source has no upstream hop")?)
         .ok_or("missing upstream hop")?;
-    let (local, remote) = super::fabric::hop(grant, rank, previous, rail)?;
+    let (local, remote) = super::fabric::topology(grant)?.hop(rank, previous, rail)?;
     let mut upstream = Session::connect_from(local, remote, &agent.key)?;
     authenticate_source(
         agent,
         &mut upstream,
         PublicKey::from_hex(&grant.members[previous].public_key)?,
     )?;
-    upstream.write_frame(frame::FETCH_RING, &serde_json::to_vec(request)?)?;
+    upstream.write_frame(frame::FETCH_FABRIC, &serde_json::to_vec(request)?)?;
     expect_bytes(&mut upstream, length)?;
     Ok(upstream)
 }
 
-fn fetch_ring(
+fn fetch_fabric(
     agent: &Agent,
     session: &mut Session,
     pinned: &mut Pinned,
     request: &Value,
 ) -> Result<(), Failure> {
     let grant = agent.grant(&request["grant"])?;
-    let (path, rail, length) = ring_request(&grant, request)?;
+    let (path, rail, length) = fabric_request(&grant, request)?;
     let rank = grant
         .member(&agent.key.public())
         .ok_or("this relay is outside the grant")?
@@ -1091,18 +1089,18 @@ fn fetch_ring(
         .get(index + 1)
         .ok_or("destination cannot relay its own FETCH")?;
     if session.remote() != PublicKey::from_hex(&grant.members[downstream].public_key)? {
-        return Err("ring FETCH did not arrive from the next member on its path".into());
+        return Err("fabric FETCH did not arrive from the next member on its path".into());
     }
-    let (from, to) = super::fabric::hop(&grant, downstream, rank, rail)?;
+    let (from, to) = super::fabric::topology(&grant)?.hop(downstream, rank, rail)?;
     let (local, remote) = session.addresses()?;
     if local != std::net::SocketAddr::V4(to) || remote.ip() != std::net::IpAddr::V4(from) {
-        return Err("ring FETCH did not use the signed fabric interfaces".into());
+        return Err("fabric FETCH did not use the signed fabric interfaces".into());
     }
     session.transfer_timeout()?;
     if index == 0 {
         return fetch(agent, session, pinned, request);
     }
-    let mut upstream = ring_upstream(agent, &grant, request, rank)?;
+    let mut upstream = fabric_upstream(agent, &grant, request, rank)?;
     // One encrypted record at a time; TCP backpressure bounds memory at every hop.
     session.write_frame_from(frame::OK, length, &mut upstream.body())
 }
@@ -1255,7 +1253,14 @@ fn run(agent: &Arc<Agent>, request: &Value) -> Result<Arc<Group>, Failure> {
             path
         }
     };
-    if !package.is_file() {
+    let local_package = rank == 0
+        || grant.single_host
+        || grant
+            .package
+            .source
+            .as_ref()
+            .is_some_and(|source| source.public_key == mine.to_hex());
+    if local_package && !package.is_file() {
         return Err(format!("package {} is not on this node", package.display()).into());
     }
     let profile = agent
@@ -1264,7 +1269,11 @@ fn run(agent: &Arc<Agent>, request: &Value) -> Result<Arc<Group>, Failure> {
         .join(format!("{}.json", publisher.fingerprint()));
     fs::write(&profile, serde_json::to_vec(&vec![&publisher])?)?;
     let mut command = Command::new(&binary);
-    command.arg("run").arg(&package);
+    command.arg("run");
+    if local_package {
+        command.arg(&package);
+    }
+    command.arg("--package-cache").arg(&agent.cache);
     if !grant.single_host {
         let port = grant
             .rendezvous
@@ -1285,8 +1294,14 @@ fn run(agent: &Arc<Agent>, request: &Value) -> Result<Arc<Group>, Failure> {
     if rank == 0 {
         command.args(&grant.rank_zero);
     }
+    if grant.roce_ring && grant.roce_chain {
+        return Err("grant selects both a ring and a chain".into());
+    }
     if grant.roce_ring {
         command.arg("--roce-ring");
+    }
+    if grant.roce_chain {
+        command.arg("--roce-chain");
     }
     // The controller accepted the publisher at its own terminal; the rank still verifies the
     // package and matches the exact key and namespace before loading.
@@ -1610,20 +1625,22 @@ pub mod tests {
     use crate::orbit::grant::{ControllerKey, ControllerSet, Member, Package, Source};
     use std::net::TcpListener;
 
-    /// A real agent with private test state/cache on an explicitly selected fabric listener.
+    /// A real agent using an explicit identity directory, private cache, and fabric listener.
     #[test]
     #[ignore = "multi-host hardware fixture; runs until stopped"]
     fn serve_ring_transfer_fixture() {
         let root = PathBuf::from(std::env::var("FLARE_RING_TEST_ROOT").expect("fixture directory"));
         let listen = std::env::var("FLARE_RING_TEST_LISTEN").expect("fixture listen address");
         assert!(root.is_absolute());
-        assert!(root.join("agent/controllers.toml").is_file());
-        serve(
-            &listen,
-            AgentDir::new(root.join("agent")),
-            root.join("cache"),
-        )
-        .unwrap();
+        let identity = PathBuf::from(
+            std::env::var("FLARE_RING_TEST_AGENT_DIR").expect("agent identity directory"),
+        );
+        assert!(identity.is_absolute() && identity.join("controllers.toml").is_file());
+        let mut agent = Agent::new(AgentDir::new(identity), root.join("cache")).unwrap();
+        agent.executable =
+            PathBuf::from(std::env::var("FLARE_RING_TEST_EXECUTABLE").expect("serving executable"));
+        assert!(agent.executable.is_absolute() && agent.executable.is_file());
+        serve_on(TcpListener::bind(listen).unwrap(), Arc::new(agent)).unwrap();
     }
 
     #[test]
@@ -1860,7 +1877,8 @@ pub mod tests {
                 serving: vec!["--max-concurrency".into(), "2".into()],
                 rank_zero: vec!["--port".into(), "8001".into()],
                 roce_ring: false,
-                transfer_ring: Vec::new(),
+                transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -1880,6 +1898,39 @@ pub mod tests {
 
     fn run_request(grant: &Signed, rank: usize, binary: &str) -> Value {
         json!({"grant": grant, "rank": rank, "binary": binary, "publisher": publisher()})
+    }
+
+    #[test]
+    fn peer_launch_fetches_missing_shards_and_preserves_an_in_place_source() {
+        for local_source in [false, true] {
+            let harness = harness(84);
+            let mut session = pair_accept_first(&harness);
+            let path = harness.temp.path().join("model.safetensors");
+            let source = local_source.then(|| {
+                fs::write(&path, b"package bytes").unwrap();
+                Source {
+                    public_key: harness.agent.key.public().to_hex(),
+                    path: path.display().to_string(),
+                }
+            });
+            let grant = grant_for(&harness, 1, source);
+            session
+                .request(
+                    frame::RUN,
+                    &json!({"grant": grant, "rank": 1, "publisher": publisher()}),
+                )
+                .unwrap();
+            let (lines, code) = collect(&mut session);
+            assert_eq!(code, 0);
+            let command = lines.iter().find(|line| line.starts_with("run ")).unwrap();
+            if local_source {
+                assert!(command.starts_with(&format!("run {} --package-cache ", path.display())));
+            } else {
+                assert!(command.starts_with("run --package-cache "));
+                assert!(!path.exists());
+            }
+            assert!(command.contains("--rank 1 --rendezvous 127.0.0.1:29800"));
+        }
     }
 
     pub fn collect(session: &mut Session) -> (Vec<String>, i32) {
@@ -2162,7 +2213,7 @@ pub mod tests {
         let command = lines.iter().find(|l| l.starts_with("run ")).unwrap();
         assert!(
             command.contains(
-                "export-13/model.safetensors --rank 0 --rendezvous 0.0.0.0:29800 \
+                "--rank 0 --rendezvous 0.0.0.0:29800 \
                  --max-concurrency 2 --port 8001 --publisher-keys"
             ),
             "{command}"
@@ -2284,7 +2335,8 @@ pub mod tests {
                 serving: vec![],
                 rank_zero: vec![],
                 roce_ring: false,
-                transfer_ring: Vec::new(),
+                transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -2612,6 +2664,39 @@ pub mod tests {
     }
 
     #[test]
+    fn metrics_urls_honor_bind_overrides() {
+        let cases: &[(&[&str], &str)] = &[
+            (
+                &[
+                    "--host", "127.0.0.1", "--port", "8001", "--host", "0.0.0.0", "--port",
+                    "8000", "--host", "0.0.0.0", "--port", "8000",
+                ],
+                "http://127.0.0.1:8000/metrics?format=json",
+            ),
+            (
+                &[
+                    "--host", "10.1.2.3", "--port", "8001", "--host=::1", "--port=9000",
+                ],
+                "http://[::1]:9000/metrics?format=json",
+            ),
+            (
+                &[
+                    "--host=10.1.2.3", "--port=8001", "--host", "0.0.0.0", "--port", "8000",
+                ],
+                "http://127.0.0.1:8000/metrics?format=json",
+            ),
+            (
+                &["--host=::", "--port=9000"],
+                "http://127.0.0.1:9000/metrics?format=json",
+            ),
+        ];
+        for (options, expected) in cases {
+            let options = options.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+            assert_eq!(metrics_url(&options), *expected, "{options:?}");
+        }
+    }
+
+    #[test]
     fn the_sampler_scrapes_rank_zero_metrics_and_reports_gpus_with_holders() {
         let harness = harness(9);
         let mut session = pair_accept_first(&harness);
@@ -2667,12 +2752,17 @@ pub mod tests {
                 serving: vec![],
                 rank_zero: vec![
                     "--host".into(),
+                    "127.0.0.2".into(),
+                    "--port".into(),
+                    "0".into(),
+                    "--host".into(),
                     "0.0.0.0".into(),
                     "--port".into(),
                     port.to_string(),
                 ],
                 roce_ring: false,
-                transfer_ring: Vec::new(),
+                transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,
@@ -2704,190 +2794,205 @@ pub mod tests {
     }
 
     #[test]
-    fn ring_transfers_stream_ranges_through_relays_and_keep_cache_hits_off_the_network() {
-        use crate::orbit::{fabric, store::Node};
-        let hosts = (80..86)
-            .map(|seed| Harness {
-                controller: Key::from_seed(&[80; 32]).unwrap(),
-                ..harness(seed)
-            })
-            .collect::<Vec<_>>();
-        for host in &hosts {
-            pair_accept_first(host);
-        }
-        let nodes = hosts
-            .iter()
-            .enumerate()
-            .map(|(rank, h)| Node {
-                name: format!("rank{rank}"),
-                address: h.address.clone(),
-                public_key: h.agent.key.public().to_hex(),
-                fingerprint: h.agent.key.public().fingerprint(),
-            })
-            .collect::<Vec<_>>();
-        let records = hosts
-            .iter()
-            .map(|h| {
-                connect(h, &h.controller)
-                    .request(frame::FABRIC, &json!({}))
-                    .unwrap()
-            })
-            .collect::<Vec<_>>();
-        let bytes = (0..4_000_019).map(|i| (i % 251) as u8).collect::<Vec<_>>();
-        let package = hosts[0].temp.path().join("model.safetensors");
-        fs::write(&package, &bytes).unwrap();
-        let mut grant = Grant {
-            group: "ring".into(),
-            name: "ring".into(),
-            package: Package {
-                export: "ring".into(),
-                length: bytes.len() as u64,
-                files: vec!["model.safetensors".into()],
-                source: Some(Source {
-                    public_key: nodes[0].public_key.clone(),
-                    path: package.display().to_string(),
-                }),
-            },
-            members: nodes
+    fn fabric_transfers_stream_ranges_directly_or_through_relays() {
+        for ring in [false, true] {
+            use crate::orbit::{fabric, store::Node};
+            let hosts = (80..86)
+                .map(|seed| Harness {
+                    controller: Key::from_seed(&[80; 32]).unwrap(),
+                    ..harness(seed)
+                })
+                .collect::<Vec<_>>();
+            for host in &hosts {
+                pair_accept_first(host);
+            }
+            let nodes = hosts
                 .iter()
                 .enumerate()
-                .map(|(rank, node)| Member {
-                    rank,
-                    name: node.name.clone(),
-                    public_key: node.public_key.clone(),
-                    address: node.address.clone(),
-                    gpus: vec![],
+                .map(|(rank, h)| Node {
+                    name: format!("rank{rank}"),
+                    address: h.address.clone(),
+                    public_key: h.agent.key.public().to_hex(),
+                    fingerprint: h.agent.key.public().fingerprint(),
                 })
-                .collect(),
-            rendezvous: String::new(),
-            serving: vec![],
-            rank_zero: vec![],
-            roce_ring: true,
-            transfer_ring: fabric::plan(&nodes, &records).unwrap(),
-            single_host: false,
-            issued: now(),
-            expires: now() + 60,
-        };
-        let ranges = [(0u64, 100_001u64), (1_000_000, 2_999_999)];
-        let request = |grant: &Grant, rank: usize| {
-            json!({
-                "grant": Signed::sign(&hosts[0].controller, grant).unwrap(), "publisher": publisher(),
-                "source": {"public_key": nodes[0].public_key, "address": "127.0.0.1:1"},
-                "directory": format!("ring-{}-rank{rank}", bytes.len()),
-                "streams": ([0, 4, 8, 16, 32, 64][rank]),
-                "files": [{"name": "model.safetensors", "size": bytes.len(), "ranges": ranges}],
-            })
-        };
-        for count in [json!(0), json!(65), json!("8")] {
-            let mut invalid = request(&grant, 1);
-            invalid["streams"] = count;
-            let error = connect(&hosts[1], &hosts[1].controller)
-                .request(frame::TRANSFER, &invalid)
-                .unwrap_err();
-            assert!(
-                error
-                    .to_string()
-                    .contains("transfer streams must be in 1..=64")
-            );
-        }
-        // The source's management address is deliberately unusable. Rank 2 must go through 1.
-        thread::scope(|scope| {
+                .collect::<Vec<_>>();
+            let records = hosts
+                .iter()
+                .map(|h| {
+                    connect(h, &h.controller)
+                        .request(frame::FABRIC, &json!({}))
+                        .unwrap()
+                })
+                .collect::<Vec<_>>();
+            let bytes = (0..4_000_019).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+            let package = hosts[0].temp.path().join("model.safetensors");
+            fs::write(&package, &bytes).unwrap();
+            let mut grant = Grant {
+                group: "ring".into(),
+                name: "ring".into(),
+                package: Package {
+                    export: "ring".into(),
+                    length: bytes.len() as u64,
+                    files: vec!["model.safetensors".into()],
+                    source: Some(Source {
+                        public_key: nodes[0].public_key.clone(),
+                        path: package.display().to_string(),
+                    }),
+                },
+                members: nodes
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, node)| Member {
+                        rank,
+                        name: node.name.clone(),
+                        public_key: node.public_key.clone(),
+                        address: node.address.clone(),
+                        gpus: vec![],
+                    })
+                    .collect(),
+                rendezvous: String::new(),
+                serving: vec![],
+                rank_zero: vec![],
+                roce_ring: ring,
+                roce_chain: false,
+                transfer_fabric: Some(fabric::plan(&nodes, &records, ring, false).unwrap()),
+                single_host: false,
+                issued: now(),
+                expires: now() + 60,
+            };
+            let ranges = [(0u64, 100_001u64), (1_000_000, 2_999_999)];
+            let request = |grant: &Grant, rank: usize| {
+                json!({
+                    "grant": Signed::sign(&hosts[0].controller, grant).unwrap(), "publisher": publisher(),
+                    "source": {"public_key": nodes[0].public_key, "address": "127.0.0.1:1"},
+                    "directory": format!("ring-{}-rank{rank}", bytes.len()),
+                    "streams": ([0, 4, 8, 16, 32, 64][rank]),
+                    "files": [{"name": "model.safetensors", "size": bytes.len(), "ranges": ranges}],
+                })
+            };
+            for count in [json!(0), json!(65), json!("8")] {
+                let mut invalid = request(&grant, 1);
+                invalid["streams"] = count;
+                let error = connect(&hosts[1], &hosts[1].controller)
+                    .request(frame::TRANSFER, &invalid)
+                    .unwrap_err();
+                assert!(
+                    error
+                        .to_string()
+                        .contains("transfer streams must be in 1..=64")
+                );
+            }
+            // The unusable management address cannot carry payloads in either topology.
+            thread::scope(|scope| {
+                for rank in 1..hosts.len() {
+                    let host = &hosts[rank];
+                    let request = request(&grant, rank);
+                    scope.spawn(move || {
+                        let reply: Value = serde_json::from_slice(
+                            &connect(host, &host.controller)
+                                .request(frame::TRANSFER, &request)
+                                .unwrap(),
+                        )
+                        .unwrap();
+                        assert_eq!(reply["received"], cache::range_bytes(&ranges));
+                        assert_eq!(reply["verified"], true);
+                    });
+                }
+            });
             for rank in 1..hosts.len() {
-                let host = &hosts[rank];
-                let request = request(&grant, rank);
-                scope.spawn(move || {
-                    let reply: Value = serde_json::from_slice(
-                        &connect(host, &host.controller)
-                            .request(frame::TRANSFER, &request)
-                            .unwrap(),
-                    )
-                    .unwrap();
-                    assert_eq!(reply["received"], cache::range_bytes(&ranges));
-                    assert_eq!(reply["verified"], true);
-                });
+                let directory = hosts[rank]
+                    .agent
+                    .cache
+                    .join(format!("packages/ring-{}-rank{rank}", bytes.len()));
+                let copy = fs::read(directory.join("model.safetensors")).unwrap();
+                assert_eq!(copy.len(), bytes.len());
+                for (offset, count) in ranges {
+                    let span = offset as usize..(offset + count) as usize;
+                    assert_eq!(copy[span.clone()], bytes[span]);
+                }
+                assert!(copy[100_001..1_000_000].iter().all(|&b| b == 0));
+                assert!(directory.join(VERIFIED).exists());
+                assert_eq!(hosts[rank].verified.lock().unwrap().len(), 1);
             }
-        });
-        for rank in 1..hosts.len() {
-            let directory = hosts[rank]
-                .agent
-                .cache
-                .join(format!("packages/ring-{}-rank{rank}", bytes.len()));
-            let copy = fs::read(directory.join("model.safetensors")).unwrap();
-            assert_eq!(copy.len(), bytes.len());
-            for (offset, count) in ranges {
-                let span = offset as usize..(offset + count) as usize;
-                assert_eq!(copy[span.clone()], bytes[span]);
-            }
-            assert!(copy[100_001..1_000_000].iter().all(|&b| b == 0));
-            assert!(directory.join(VERIFIED).exists());
-            assert_eq!(hosts[rank].verified.lock().unwrap().len(), 1);
-        }
-        assert!(
-            !hosts[1]
-                .agent
-                .cache
-                .join(format!("packages/ring-{}-rank2", bytes.len()))
-                .exists()
-        );
+            assert!(
+                !hosts[1]
+                    .agent
+                    .cache
+                    .join(format!("packages/ring-{}-rank2", bytes.len()))
+                    .exists()
+            );
 
-        // A node with the wrong identity cannot relay a member's request, even with its grant.
-        let fetch = json!({"grant": Signed::sign(&hosts[0].controller, &grant).unwrap(),
+            if !ring {
+                continue;
+            }
+
+            // A node with the wrong identity cannot relay a member's request, even with its grant.
+            let fetch = json!({"grant": Signed::sign(&hosts[0].controller, &grant).unwrap(),
             "source_rank": 0, "destination_rank": 2, "rail": 0,
             "name": "model.safetensors", "size": bytes.len(), "ranges": ranges});
-        let mut stranger = connect(&hosts[1], &hosts[3].agent.key);
-        assert!(
-            stranger
-                .request(frame::FETCH_RING, &fetch)
-                .unwrap_err()
-                .to_string()
-                .contains("next member")
-        );
+            let mut stranger = connect(&hosts[1], &hosts[3].agent.key);
+            assert!(
+                stranger
+                    .request(frame::FETCH_FABRIC, &fetch)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("next member")
+            );
 
-        // The right identity on an unsigned interface is rejected before forwarding.
-        grant.transfer_ring[1][0]
-            .to
-            .set_ip("127.0.0.2".parse().unwrap());
-        let mut fetch = fetch;
-        fetch["grant"] =
-            serde_json::to_value(Signed::sign(&hosts[0].controller, &grant).unwrap()).unwrap();
-        let mut wrong_link = connect(&hosts[1], &hosts[2].agent.key);
-        assert!(
-            wrong_link
-                .request(frame::FETCH_RING, &fetch)
-                .unwrap_err()
-                .to_string()
-                .contains("fabric interfaces")
-        );
+            // The right identity on an unsigned interface is rejected before forwarding.
+            grant.transfer_fabric.as_mut().unwrap().links[1][2][0]
+                .to
+                .set_ip("127.0.0.2".parse().unwrap());
+            grant.transfer_fabric.as_mut().unwrap().links[2][1][0]
+                .from
+                .set_ip("127.0.0.2".parse().unwrap());
+            let mut fetch = fetch;
+            fetch["grant"] =
+                serde_json::to_value(Signed::sign(&hosts[0].controller, &grant).unwrap()).unwrap();
+            let mut wrong_link = connect(&hosts[1], &hosts[2].agent.key);
+            assert!(
+                wrong_link
+                    .request(frame::FETCH_FABRIC, &fetch)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("fabric interfaces")
+            );
 
-        // A dead next hop never falls back to the management address. Cache hits need no hop.
-        grant.transfer_ring = fabric::plan(&nodes, &records).unwrap();
-        let closed = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = closed.local_addr().unwrap().port();
-        drop(closed);
-        grant.transfer_ring[1][0].from.set_port(port);
-        let cached = request(&grant, 2);
-        let reply: Value = serde_json::from_slice(
-            &connect(&hosts[2], &hosts[2].controller)
-                .request(frame::TRANSFER, &cached)
-                .unwrap(),
-        )
-        .unwrap();
-        assert_eq!(reply["received"], 0);
-        assert_eq!(reply["verified"], false);
-        let mut cold = cached;
-        cold["directory"] = "cold-ring-rank2".into();
-        assert!(
-            connect(&hosts[2], &hosts[2].controller)
-                .request(frame::TRANSFER, &cold)
-                .is_err()
-        );
-        assert!(
-            !hosts[2]
-                .agent
-                .cache
-                .join("packages/cold-ring-rank2/.verified")
-                .exists()
-        );
+            // A dead next hop never falls back to the management address. Cache hits need no hop.
+            grant.transfer_fabric = Some(fabric::plan(&nodes, &records, ring, false).unwrap());
+            let closed = TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = closed.local_addr().unwrap().port();
+            drop(closed);
+            grant.transfer_fabric.as_mut().unwrap().links[1][2][0]
+                .from
+                .set_port(port);
+            grant.transfer_fabric.as_mut().unwrap().links[2][1][0]
+                .to
+                .set_port(port);
+            let cached = request(&grant, 2);
+            let reply: Value = serde_json::from_slice(
+                &connect(&hosts[2], &hosts[2].controller)
+                    .request(frame::TRANSFER, &cached)
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(reply["received"], 0);
+            assert_eq!(reply["verified"], false);
+            let mut cold = cached;
+            cold["directory"] = "cold-ring-rank2".into();
+            assert!(
+                connect(&hosts[2], &hosts[2].controller)
+                    .request(frame::TRANSFER, &cold)
+                    .is_err()
+            );
+            assert!(
+                !hosts[2]
+                    .agent
+                    .cache
+                    .join("packages/cold-ring-rank2/.verified")
+                    .exists()
+            );
+        }
     }
 
     #[test]
@@ -2937,7 +3042,8 @@ pub mod tests {
                 serving: vec![],
                 rank_zero: vec![],
                 roce_ring: false,
-                transfer_ring: Vec::new(),
+                transfer_fabric: None,
+                roce_chain: false,
                 single_host: false,
                 issued: now(),
                 expires: now() + 60,

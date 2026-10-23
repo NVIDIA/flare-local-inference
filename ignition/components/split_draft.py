@@ -97,19 +97,23 @@ def allocate_draft_budget(confidences, budget):
 class PreparedDraftConfidence:
     """Preserve checkpoint storage precision while accumulating confidence in FP32."""
 
-    def __init__(self, source, weight, output, *, name):
+    def __init__(self, source, weight, output, *, name, bias=None, buffers=None):
         o, b, w = source.owner, source.batch, source.width
         hidden = source.draft.head_hidden
         markov = source.markov.embedding
         if weight.shape != (1, hidden.shape[1] + markov.shape[1]):
             raise ValueError("confidence weight must cover hidden and preceding-token Markov features")
         self.hidden = hidden.view(b, o.block_size, -1)[:, o.logit_offset:o.logit_offset + w - 1]
-        self.embeddings = torch.empty((b, w - 1, markov.shape[1]), dtype=markov.dtype, device=markov.device)
-        self.features = torch.empty((b, w - 1, weight.shape[1]), dtype=weight.dtype, device=markov.device)
-        self.logits = torch.empty((b, w - 1), dtype=torch.float32, device=markov.device)
+        buffers = getattr(source, "buffers", None) if buffers is None else buffers
+        def allocate(shape, dtype):
+            return (torch.empty(shape, dtype=dtype, device=markov.device) if buffers is None
+                    else buffers.zeros(shape, dtype))
+        self.embeddings = allocate((b, w - 1, markov.shape[1]), markov.dtype)
+        self.features = allocate((b, w - 1, weight.shape[1]), weight.dtype)
+        self.logits = allocate((b, w - 1), torch.float32)
         self.output = output
         self.projection = UnquantizedProjection(self.features.view(b * (w - 1), -1), weight,
-            self.logits.view(-1, 1), session=o.session, name=name)
+            self.logits.view(-1, 1), session=o.session, name=name, bias=bias)
 
     def record_embedding(self, position, embedding):
         self.embeddings[:, position].copy_(embedding)
@@ -154,7 +158,8 @@ class PreparedDraftProposal:
         self.source, self.storage = source, storage
         o, b = source.owner, source.batch
         self.confidence = PreparedDraftConfidence(source, o.weights.draft.confidence_head,
-            confidence_output[:b, :source.width - 1], name=f"split.proposal{b}x{source.width}.confidence")
+            confidence_output[:b, :source.width - 1], name=f"split.proposal{b}x{source.width}.confidence",
+            bias=getattr(o.weights.draft, "confidence_bias", None))
         self.allowed = torch.zeros_like(source.active)
         self.depth = torch.full_like(source.before, source.width - 1)
         self.completion = PreparedCompletion(o.requests, o.inputs.row_slot_ids[:b],

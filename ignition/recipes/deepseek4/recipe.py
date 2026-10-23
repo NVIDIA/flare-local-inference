@@ -26,7 +26,7 @@ def prepare(
         else {"speculative_widths": speculation.widths, "speculative_token_capacity": plan.speculative_token_capacity, "speculative_fixed_width": speculation.fixed_width}
     )
     config = PreparationConfig(prompt_logprobs=plan.prompt_logprobs,
-        compile_workers=plan.compile_workers, tuning_replica=plan.tuning_replica,
+        compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)),
         compile_decoder=compile_forwards,
         retain_graphs=retain_graphs,
@@ -69,10 +69,10 @@ RECIPE = Recipe(
     ),
     context=1048576,
     page_tokens=256,
-    concurrency=4,
+    concurrency=32,
     max_concurrency=64,
     prefill_chunk=4096,
-    speculation=Speculation(draft_tokens=5),
+    speculation=Speculation(draft_tokens=5, token_capacity=128),
     max_draft_tokens=5,
     # Single-row decode runs the shared expert on an auxiliary stream.
     stream_overlap=True,

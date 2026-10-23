@@ -76,8 +76,10 @@ pub struct Snapshot {
     pub draft_steps: u64,
     /// Completed speculative or verification graphs, including terminal no-op rounds.
     pub verify_steps: u64,
-    /// Draft positions those graphs verified: verification width minus one per graph.
+    /// Draft positions allocated for progressing request rounds, including rejected drafts.
     pub verification_drafts: u64,
+    /// Progressing decode or verification request rounds, including zero-draft rounds.
+    pub verification_rounds: u64,
     /// Accepted draft tokens from progressing request rounds, excluding the bonus token.
     pub accepted_drafts: u64,
     /// Progressing request rounds that offered at least one draft.
@@ -192,6 +194,18 @@ impl Format {
     }
 }
 
+const HOST_TIME_BUCKETS: [u64; 8] = [
+    100_000,
+    1_000_000,
+    10_000_000,
+    100_000_000,
+    1_000_000_000,
+    10_000_000_000,
+    100_000_000_000,
+    u64::MAX,
+];
+const HOST_TOKEN_BUCKETS: [u64; 8] = [64, 256, 1024, 4096, 16384, 65536, 262144, u64::MAX];
+
 #[derive(Default)]
 pub(super) struct Metrics {
     pub scheduler_trace: scheduler::SchedulerMetrics,
@@ -203,6 +217,8 @@ pub(super) struct Metrics {
     generated_tokens: AtomicU64,
     accepted_drafts: AtomicU64,
     draft_rounds: AtomicU64,
+    verification_drafts: AtomicU64,
+    verification_rounds: AtomicU64,
     pub admitted: AtomicU64,
     pub http_requests: [AtomicU64; 5],
     pub completed: AtomicU64,
@@ -211,7 +227,7 @@ pub(super) struct Metrics {
     replay_gpu_ns: AtomicU64,
     replay_readiness_wait_ns: AtomicU64,
     replay_readiness_samples: AtomicU64,
-    launches: [AtomicU64; 11],
+    launches: [AtomicU64; 12],
     sampling_launches: [AtomicU64; 5],
     speculative: [[RoundMetrics; 8]; 7],
     proposals: [[ProposalMetrics; 7]; 7],
@@ -232,6 +248,7 @@ pub(super) struct Metrics {
     retiring_slots: AtomicU64,
     free_pages: AtomicU64,
     free_snapshots: AtomicU64,
+    snapshot_capacity: AtomicU64,
     snapshot_backing_pages: AtomicU64,
     cached_checkpoints: AtomicU64,
     cached_pages: AtomicU64,
@@ -240,6 +257,15 @@ pub(super) struct Metrics {
     host_hits: AtomicU64,
     host_reused_tokens: AtomicU64,
     host_stored: AtomicU64,
+    host_row_refills: AtomicU64,
+    host_lookup_outcomes: [AtomicU64; 5],
+    host_store_reasons: [AtomicU64; 6],
+    pub(super) host_retry_success: AtomicU64,
+    pub(super) host_retry_abandoned: AtomicU64,
+    host_cost_sums: [AtomicU64; 3],
+    host_missing_tokens: [AtomicU64; 8],
+    host_transfer_ns: [AtomicU64; 8],
+    host_prefill_ns: [AtomicU64; 8],
     host_store_skipped: AtomicU64,
     host_store_failed: AtomicU64,
     host_fetched: AtomicU64,
@@ -268,12 +294,15 @@ impl Metrics {
         }
     }
 
-    pub fn progress(&self, prefill: u64, generated: usize, accepted: u64, rounds: u64) {
+    pub fn progress(&self, prefill: u64, generated: usize, accepted: u64, rounds: u64,
+        verification_drafts: u64, verification_rounds: u64) {
         for (counter, value) in [
             (&self.prefill_tokens, prefill),
             (&self.generated_tokens, generated as u64),
             (&self.accepted_drafts, accepted),
             (&self.draft_rounds, rounds),
+            (&self.verification_drafts, verification_drafts),
+            (&self.verification_rounds, verification_rounds),
         ] {
             if value != 0 {
                 counter.fetch_add(value, Ordering::Relaxed);
@@ -288,6 +317,8 @@ impl Metrics {
             generated_tokens: self.generated_tokens.load(Ordering::Relaxed),
             accepted_drafts: self.accepted_drafts.load(Ordering::Relaxed),
             draft_rounds: self.draft_rounds.load(Ordering::Relaxed),
+            verification_drafts: self.verification_drafts.load(Ordering::Relaxed),
+            verification_rounds: self.verification_rounds.load(Ordering::Relaxed),
             active: self.active_requests.load(Ordering::Relaxed),
             pending: self.pending.load(Ordering::Relaxed),
             completed: self.completed.load(Ordering::Relaxed),
@@ -310,10 +341,9 @@ impl Metrics {
             ..Snapshot::default()
         };
         for widths in &self.speculative {
-            for (drafts, counts) in widths.iter().enumerate() {
+            for counts in widths {
                 let rounds = counts.rounds.load(Ordering::Relaxed);
                 snapshot.verify_steps += rounds;
-                snapshot.verification_drafts += rounds * drafts as u64;
             }
         }
         snapshot
@@ -341,13 +371,14 @@ impl Metrics {
             GraphKind::Mixed => 8,
             GraphKind::Proposal => 9,
             GraphKind::Verification => 10,
+            GraphKind::PackedSpeculative => 11,
         };
         self.launches[index].fetch_add(1, Ordering::Relaxed);
         let sampling_index = match kind {
             GraphKind::Prefill | GraphKind::ScoredPrefill => 0,
             GraphKind::Decode => 1,
             GraphKind::Resume => 2,
-            GraphKind::Speculative | GraphKind::Verification => 3,
+            GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative => 3,
             GraphKind::Mixed => 4,
             _ => return,
         };
@@ -389,6 +420,12 @@ impl Metrics {
                 }
             }
         }
+    }
+
+    pub fn packed_speculative_completed(&self, batch: usize, width: usize, drafts: usize,
+        elapsed_ns: u64, records: &[CompletionRecord]) {
+        self.learned_draft_steps.fetch_add(drafts as u64, Ordering::Relaxed);
+        self.speculative_completed(GraphKind::PackedSpeculative, batch, width, elapsed_ns, records);
     }
 
     pub fn proposal_completed(&self, batch: usize, width: usize, elapsed_ns: u64) {
@@ -433,6 +470,7 @@ impl Metrics {
             (&self.retiring_slots, stats.retiring_slots as u64),
             (&self.free_pages, stats.free_pages as u64),
             (&self.free_snapshots, stats.free_snapshots as u64),
+            (&self.snapshot_capacity, stats.snapshot_capacity as u64),
             (
                 &self.snapshot_backing_pages,
                 stats.snapshot_backing_pages as u64,
@@ -444,12 +482,55 @@ impl Metrics {
         }
     }
 
+    pub(super) fn host_lookup_outcome(&self, outcome: crate::offload::LookupOutcome) {
+        self.host_lookup_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn host_store_outcome(&self, outcome: crate::offload::StoreOutcome) {
+        use crate::offload::{StoreOutcome, StoreReason};
+        let reason = match outcome {
+            StoreOutcome::Queued => return,
+            StoreOutcome::Present => 0,
+            StoreOutcome::Retry(StoreReason::Inflight) => 1,
+            StoreOutcome::Retry(StoreReason::Slabs) => 2,
+            StoreOutcome::Retry(StoreReason::Queue) => 3,
+            StoreOutcome::Retry(StoreReason::Budget) => 4,
+            StoreOutcome::Oversize => 5,
+        };
+        self.host_store_reasons[reason].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(super) fn host_lookup_cost(&self, hit: &crate::offload::HostHit, rate: f64) {
+        let missing = hit.consumed_tokens - hit.resident_tokens;
+        for (index, (buckets, value, limits)) in [
+            (&self.host_missing_tokens, missing, HOST_TOKEN_BUCKETS),
+            (
+                &self.host_transfer_ns,
+                (hit.estimated_seconds * 1e9) as u64,
+                HOST_TIME_BUCKETS,
+            ),
+            (
+                &self.host_prefill_ns,
+                (missing as f64 / rate.max(1.0) * 1e9) as u64,
+                HOST_TIME_BUCKETS,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.host_cost_sums[index].fetch_add(value, Ordering::Relaxed);
+            let bucket = limits.iter().position(|limit| value <= *limit).unwrap();
+            buckets[bucket].fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
     /// Host prefix store counters and gauges, written from the model thread.
     /// Lookups, hits, and reused tokens come from the scheduler, which applies
     /// the fetch policy.
     pub fn store(&self, stats: StoreStats) {
         for (target, value) in [
             (&self.host_stored, stats.stored),
+            (&self.host_row_refills, stats.row_refills),
             (&self.host_store_skipped, stats.store_skipped),
             (&self.host_store_failed, stats.store_failed),
             (&self.host_fetched, stats.fetched),
@@ -477,6 +558,81 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
+        for (name, labels, counters) in [
+            (
+                "host_cache_lookup_outcomes_total",
+                &[
+                    "no_match",
+                    "cost_rejected",
+                    "capacity_rejected",
+                    "enqueue_rejected",
+                    "admitted",
+                ][..],
+                &self.host_lookup_outcomes[..],
+            ),
+            (
+                "host_cache_store_reasons_total",
+                &[
+                    "present", "inflight", "slabs", "queue", "budget", "oversize",
+                ][..],
+                &self.host_store_reasons[..],
+            ),
+        ] {
+            text.push_str(&format!("# TYPE flare_{name} counter\n"));
+            for (label, counter) in labels.iter().zip(counters) {
+                text.push_str(&format!(
+                    "flare_{name}{{reason=\"{label}\"}} {}\n",
+                    counter.load(Ordering::Relaxed)
+                ));
+            }
+        }
+        for (index, (name, counters, limits)) in [
+            (
+                "host_cache_missing_tokens",
+                &self.host_missing_tokens,
+                HOST_TOKEN_BUCKETS,
+            ),
+            (
+                "host_cache_estimated_transfer_ns",
+                &self.host_transfer_ns,
+                HOST_TIME_BUCKETS,
+            ),
+            (
+                "host_cache_estimated_prefill_ns",
+                &self.host_prefill_ns,
+                HOST_TIME_BUCKETS,
+            ),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            text.push_str(&format!("# TYPE flare_{name} histogram\n"));
+            let mut count = 0;
+            for (counter, limit) in counters.iter().zip(limits) {
+                count += counter.load(Ordering::Relaxed);
+                let bound = if limit == u64::MAX {
+                    "+Inf".to_owned()
+                } else {
+                    limit.to_string()
+                };
+                text.push_str(&format!("flare_{name}_bucket{{le=\"{bound}\"}} {count}\n"));
+            }
+            text.push_str(&format!("flare_{name}_count {count}\n"));
+            text.push_str(&format!(
+                "flare_{name}_sum {}\n",
+                self.host_cost_sums[index].load(Ordering::Relaxed)
+            ));
+        }
+
+        for (name, help, counts) in [
+            ("execution_nanoseconds_total", "Raw execution time by scheduler selection reason, including readiness stalls and isolated host handoff.", &self.scheduler_trace.execution_ns),
+            ("executions_total", "Completed physical executions by scheduler selection reason; split proposal and verification each count once.", &self.scheduler_trace.executions),
+        ] {
+            let _ = writeln!(text, "# HELP flare_scheduler_{name} {help}\n# TYPE flare_scheduler_{name} counter");
+            for (reason, count) in ["ordinary", "discovery", "timing_refresh", "acceptance_learning"].into_iter().zip(counts) {
+                let _ = writeln!(text, "flare_scheduler_{name}{{reason=\"{reason}\"}} {}", count.load(Ordering::Relaxed));
+            }
+        }
         for (name, help, count) in [
             ("replay_gpu_nanoseconds_total", "Sum of maximum rank-local CUDA durations of completed graphs, including readiness waits.", &self.replay_gpu_ns),
             ("replay_readiness_wait_nanoseconds_total", "Exposed embedding readiness delay measured across ranks; includes RAM and disk delivery.", &self.replay_readiness_wait_ns),
@@ -610,6 +766,16 @@ impl Metrics {
                 &self.draft_rounds,
             ),
             (
+                "verification_draft_tokens_total",
+                "Draft positions allocated for progressing live request rounds, including rejected drafts and excluding padding.",
+                &self.verification_drafts,
+            ),
+            (
+                "verification_request_rounds_total",
+                "Progressing live decode or verification request rounds, including zero-draft rounds; denominator for mean planned verification depth.",
+                &self.verification_rounds,
+            ),
+            (
                 "requests_admitted_total",
                 "Requests admitted into a physical model slot.",
                 &self.admitted,
@@ -690,6 +856,21 @@ impl Metrics {
                 &self.host_reused_tokens,
             ),
             (
+                "host_cache_row_refills_total",
+                "Compacted endpoints restored by complete record replacement.",
+                &self.host_row_refills,
+            ),
+            (
+                "host_cache_retry_success_total",
+                "Deferred publications admitted or found present after resource progress.",
+                &self.host_retry_success,
+            ),
+            (
+                "host_cache_retry_abandoned_total",
+                "Deferred publications abandoned after eviction or permanent refusal.",
+                &self.host_retry_abandoned,
+            ),
+            (
                 "host_cache_stored_total",
                 "Published checkpoints whose copy to the host store completed.",
                 &self.host_stored,
@@ -753,6 +934,7 @@ impl Metrics {
             "mixed",
             "proposal",
             "verification",
+            "packed_speculative",
         ]
         .into_iter()
         .zip(&self.launches)
@@ -788,6 +970,11 @@ impl Metrics {
                 "free_kv_pages",
                 "KV pages reusable after completed GPU fences.",
                 &self.free_pages,
+            ),
+            (
+                "snapshot_capacity",
+                "Prepared snapshot slot capacity.",
+                &self.snapshot_capacity,
             ),
             (
                 "free_snapshots",
@@ -922,6 +1109,81 @@ mod tests {
     use super::*;
 
     #[test]
+    fn host_outcomes_and_capacity_have_bounded_labels_and_cost_histograms() {
+        use crate::offload::{HostHit, LookupOutcome, StoreOutcome, StoreReason, Tier};
+        let metrics = Metrics::default();
+        for outcome in [
+            LookupOutcome::NoMatch,
+            LookupOutcome::CostRejected,
+            LookupOutcome::CapacityRejected,
+            LookupOutcome::EnqueueRejected,
+            LookupOutcome::Admitted,
+        ] {
+            metrics.host_lookup_outcome(outcome);
+        }
+        for outcome in [
+            StoreOutcome::Present,
+            StoreOutcome::Retry(StoreReason::Inflight),
+            StoreOutcome::Retry(StoreReason::Slabs),
+            StoreOutcome::Retry(StoreReason::Queue),
+            StoreOutcome::Retry(StoreReason::Budget),
+            StoreOutcome::Oversize,
+        ] {
+            metrics.host_store_outcome(outcome);
+        }
+        let key = crate::cache::PrefixKey {
+            consumed_tokens: 1024,
+            digest: [0; 16],
+        };
+        let chain = crate::offload::index::Match {
+            key,
+            consumed_tokens: 1024,
+            resident_tokens: 0,
+            nodes: vec![key],
+            skip_pages: 0,
+            pages: 16,
+        };
+        metrics.host_lookup_cost(
+            &HostHit {
+                key,
+                consumed_tokens: 1024,
+                resident_tokens: 0,
+                pages: 16,
+                bytes: 1 << 20,
+                tier: Tier::Disk,
+                estimated_seconds: 0.001,
+                chain,
+            },
+            1024.0,
+        );
+        metrics.scheduler(SchedulerStats {
+            snapshot_capacity: 256,
+            ..Default::default()
+        });
+        let text = metrics.render();
+        assert!(text.contains("flare_snapshot_capacity 256\n"));
+        assert!(text.contains("flare_host_cache_missing_tokens_sum 1024\n"));
+        assert!(text.contains("flare_host_cache_estimated_transfer_ns_sum 1000000\n"));
+        assert!(text.contains("flare_host_cache_estimated_prefill_ns_sum 1000000000\n"));
+        assert_eq!(
+            metrics
+                .host_lookup_outcomes
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            5
+        );
+        assert_eq!(
+            metrics
+                .host_store_reasons
+                .iter()
+                .map(|c| c.load(Ordering::Relaxed))
+                .sum::<u64>(),
+            6
+        );
+    }
+
+    #[test]
     fn readiness_metrics_retain_raw_gpu_time_and_count_only_measured_waits() {
         let metrics = Metrics::default();
         let mut timing = crate::execution::ExecutionTiming::default();
@@ -981,7 +1243,6 @@ mod tests {
         for learned in [false, true] {
             let snapshot = metrics.snapshot(learned);
             assert_eq!(snapshot.verify_steps, 1);
-            assert_eq!(snapshot.verification_drafts, 7);
         }
         let text = metrics.render();
         for line in [
@@ -1007,7 +1268,6 @@ mod tests {
         let snapshot = metrics.snapshot(true);
         assert_eq!(snapshot.draft_steps, 7);
         assert_eq!(snapshot.verify_steps, 2);
-        assert_eq!(snapshot.verification_drafts, 2);
         let text = metrics.render();
         assert!(text.contains("flare_proposal_rounds_total{batch=\"4\",depth=\"7\"} 1"));
         assert!(text.contains("flare_proposal_gpu_nanoseconds_total{batch=\"4\",depth=\"7\"} 700"));
@@ -1017,7 +1277,7 @@ mod tests {
     #[test]
     fn snapshot_json_round_trips_beside_the_prometheus_counters() {
         let metrics = Metrics::new(100, 128, 0);
-        metrics.progress(40, 3, 2, 1);
+        metrics.progress(40, 3, 2, 1, 5, 2);
         metrics.scheduler(SchedulerStats {
             active_requests: 2,
             free_pages: 10,
@@ -1027,6 +1287,8 @@ mod tests {
         let snapshot = metrics.snapshot(true);
         let json = snapshot.json(true);
         assert_eq!(json["generated_tokens"], 3);
+        assert_eq!(json["verification_drafts"], 5);
+        assert_eq!(json["verification_rounds"], 2);
         assert_eq!(json["free_pages"], 10);
         assert_eq!(json["learned_drafter"], true);
         assert_eq!(serde_json::from_value::<Snapshot>(json).unwrap(), snapshot);
@@ -1040,6 +1302,8 @@ mod tests {
         let text = metrics.render();
         for line in [
             "flare_generated_tokens_total 3",
+            "flare_verification_draft_tokens_total 5",
+            "flare_verification_request_rounds_total 2",
             "flare_prefill_tokens_total 40",
             "flare_active_requests 2",
             "flare_free_kv_pages 10",
@@ -1151,7 +1415,7 @@ mod tests {
             text.lines()
                 .filter(|line| line.starts_with("flare_graph_launches_total{"))
                 .count(),
-            11
+            12
         );
     }
 }

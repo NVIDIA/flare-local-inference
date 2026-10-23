@@ -14,6 +14,7 @@ mod threaded;
 pub use rank_stream::RankStream;
 pub use ranks::RankPeers;
 mod transport;
+pub(crate) use transport::validate_speculative_survival;
 mod worker;
 pub use parallel::{TensorParallelExecutor, serve_rank};
 pub(crate) use ranks::RankExecutor;
@@ -29,6 +30,6 @@ mod tests;
 pub use manifest::{
     ABI_VERSION, BATCH_CAPACITIES, BufferDescriptor, CollectiveHealth, Dtype, ExecutionManifest,
     GraphDescriptor, GraphKind, InputBinding, LOGPROB_FIELDS, LOGPROB_PAIR_FIELDS,
-    MAX_OUTPUT_TOKENS, MAX_TOP_LOGPROBS, PROMPT_FIELDS, RECORD_FIELDS, REQUEST_LANES,
+    MAX_OUTPUT_TOKENS, MAX_TOP_LOGPROBS, MAX_LOGPROB_TOKEN_IDS, PROMPT_FIELDS, RECORD_FIELDS, REQUEST_LANES,
     SPECULATIVE_ABI_VERSION, SamplingMode, VECTOR_RECORD_FIELDS,
 };

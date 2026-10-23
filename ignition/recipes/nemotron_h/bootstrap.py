@@ -26,12 +26,12 @@ from ignition.preparation.capture import capture_forwards
 from ignition.preparation.checkpoint import inspect_indexed_checkpoint
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
-from ignition.preparation.frontend import prepare_frontend
+from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.host_memory import release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
-from ignition.preparation.tuning import RecordedPreparationSession
+from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.progress import phase
 
@@ -50,6 +50,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    autotune_effort: str = "medium"
     tuning_replica: TuningReplica | None = None
     device: int = 0
     context: int = 262144
@@ -96,6 +97,7 @@ class PreparationConfig:
 
 
 @torch.no_grad()
+@with_autotune_effort
 def prepare(snapshot, config, *, progress=None, package_storage):
     from .recipe import RECIPE
 
@@ -136,7 +138,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             "headers": [s.header_sha256 for s in manifest.shards],
             "contract": "nemotron-h.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
-            compile_workers=config.compile_workers, tuning_replica=config.tuning_replica,
+            compile_workers=config.compile_workers, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
             device=device, checkpoint=identity,
             workload_schema="nemotron-h", numerical_policy="default", coordinator=coordinator,
             headroom_bytes=config.headroom_bytes, benchmark_storage=package_storage)
@@ -260,8 +262,10 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     pool.clear_for_preparation()
     torch.cuda.synchronize(device)
     release_unused()
-    assets = {role: {"path": str(snapshot / file), "sha256": hashlib.sha256((snapshot / file).read_bytes()).hexdigest()}
-              for role, file in (("tokenizer", "tokenizer.json"), ("chat_template", "chat_template.jinja"))}
+    assets = {role: {"path": str(snapshot / file)}
+              for role, file in (("tokenizer", "tokenizer.json"),)}
+    assets["chat_template"] = annotated_template_asset(
+        (snapshot / "chat_template.jinja").read_bytes(), Path(__file__).with_name("assets") / "chat_template.jinja")
     eos = weights.config.eos_token
     tokenizer = json.loads((snapshot / "tokenizer_config.json").read_text())
     eos_text = tokenizer["eos_token"]

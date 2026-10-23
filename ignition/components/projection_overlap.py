@@ -1,17 +1,17 @@
-"""Capture a chain of quantized projections alongside independent main-stream work."""
+"""Capture a chain of dense projections alongside independent main-stream work."""
 
 import torch
 
-from ignition.components.linear import QuantizedProjection
+from ignition.components.linear import QuantizedProjection, UnquantizedProjection
 from ignition.preparation.scratch import ScratchArena
 from ignition.preparation.tuning import register_finalizer
 
 
 @torch.library.custom_op("flare::start_projection_chain", mutates_args=("outputs", "workspace"))
-def _start(source: torch.Tensor, weights: list[torch.Tensor], scales: list[torch.Tensor],
+def _start(source: torch.Tensor, weights: list[torch.Tensor], scales: list[torch.Tensor | None],
            gains: list[torch.Tensor | None], activation_scales: list[torch.Tensor | None], scale_kinds: list[int],
            outputs: list[torch.Tensor], workspace: torch.Tensor, plans: list[int], stream: int) -> None:
-    from ignition.components.sm103_projection import packed_out_workspace
+    from ignition.components.sm103_projection import bf16_out, packed_out_workspace
 
     auxiliary = torch.cuda.ExternalStream(stream, device=source.device)
     auxiliary.wait_stream(torch.cuda.current_stream(source.device))
@@ -19,8 +19,11 @@ def _start(source: torch.Tensor, weights: list[torch.Tensor], scales: list[torch
         value = source
         for weight, scale, gain, activation_scale, kind, output, plan in zip(
                 weights, scales, gains, activation_scales, scale_kinds, outputs, plans, strict=True):
-            packed_out_workspace(value, weight, scale, gain, activation_scale, output, workspace,
-                                  ("none", "multiplier", "reciprocal")[kind], None, plan, "any")
+            if scale is None:
+                bf16_out(value, weight, output, plan)
+            else:
+                packed_out_workspace(value, weight, scale, gain, activation_scale, output, workspace,
+                                      ("none", "multiplier", "reciprocal")[kind], None, plan, "any")
             value = output
 
 
@@ -58,16 +61,24 @@ class ConcurrentProjectionChain:
         self.weights, self.scales, self.outputs, self.plans = [], [], [], []
         self.gains, self.activation_scales, self.scale_kinds = [], [], []
         for projection in self.projections:
-            if not isinstance(projection, QuantizedProjection) or projection.bias is not None:
-                raise ValueError("projection overlap requires unbiased quantized projections")
-            values, scales, gain, fp4 = _weight_parts(projection.weight)
-            if self.outputs and self.outputs[-1].shape[1] != projection.weight.in_features:
+            if not isinstance(projection, (QuantizedProjection, UnquantizedProjection)) or projection.bias is not None:
+                raise ValueError("projection overlap requires unbiased BF16 or blockscaled projections")
+            if isinstance(projection, QuantizedProjection):
+                values, scales, gain, fp4 = _weight_parts(projection.weight)
+                if scales.dtype == torch.float8_e8m0fnu:
+                    scales = scales.view(torch.uint8)
+                width = projection.weight.in_features
+                activation_scale = projection.activation_scale
+                kind = projection.weight.global_scale_kind if fp4 else "none"
+            else:
+                values, scales, gain = projection.weight, None, None
+                width, activation_scale, kind = values.shape[1], None, "none"
+            if self.outputs and self.outputs[-1].shape[1] != width:
                 raise ValueError("projection chain output width must match the following input width")
             self.weights.append(values)
-            self.scales.append(scales.view(torch.uint8) if scales.dtype == torch.float8_e8m0fnu else scales)
+            self.scales.append(scales)
             self.gains.append(gain)
-            self.activation_scales.append(projection.activation_scale)
-            kind = projection.weight.global_scale_kind if fp4 else "none"
+            self.activation_scales.append(activation_scale)
             self.scale_kinds.append(("none", "multiplier", "reciprocal").index(kind))
             self.outputs.append(projection.output)
             self.plans.append(projection.plan.handle)

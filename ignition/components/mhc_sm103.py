@@ -107,6 +107,18 @@ class ComposedMHC:
                              torch.empty((SPLITS, rows), dtype=torch.float32, device=device),
                              torch.empty((rows, hidden), dtype=torch.bfloat16, device=device))
         self.dot, self.squares, self.collapsed = _SCRATCH[key]
+        self.fp32_norm = None
+        if weights.norm.dtype == torch.float32:
+            from flashinfer.triton.kernels.norm import rms_norm_kernel
+            from ignition.preparation.triton import prepare_triton
+
+            # FlashInfer's CUDA RMSNorm binds weight pointers with the activation dtype.
+            self.fp32_norm = prepare_triton(rms_norm_kernel,
+                (hidden, rows, self.collapsed, hidden, None, None, 0, weights.norm,
+                 scratch.normalized, hidden, None), (rows, 1, 1),
+                EPS=norm_eps, BLOCK_SIZE=triton.next_power_of_2(hidden), HAS_IN_SCALE=False,
+                HAS_OUT_SCALE=False, HAS_OUTPUT=True, HAS_RESIDUAL=False, ROUND_BEFORE_WEIGHT=False,
+                num_warps=max(8, min(32, triton.next_power_of_2(hidden) // 256)))
         flat = scratch.residual.view(rows, -1)
         self.args = (flat, self.high, self.low, self.dot, self.squares, rows)
         self.options = {"K": 4 * hidden, "SPLITS": SPLITS, "BLOCK_T": _BLOCK_T, "BLOCK_K": _BLOCK_K}
@@ -133,4 +145,7 @@ class ComposedMHC:
         self.fuse(s.post, s.comb, self.collapsed, self.dot, self.squares, s.residual, w.scale, w.base,
                                s.residual.shape[1] * s.residual.shape[2], rms_eps, hc_eps, hc_eps, 2.0, iterations,
                                SPLITS, 0)
-        self.norm(self.collapsed, w.norm, norm_eps, out=s.normalized)
+        if self.fp32_norm is None:
+            self.norm(self.collapsed, w.norm, norm_eps, out=s.normalized)
+        else:
+            self.fp32_norm()

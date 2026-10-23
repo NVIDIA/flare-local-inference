@@ -143,12 +143,11 @@ impl<const N: usize> From<[CompletionRecord; N]> for CompletionRecords {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct TokenLogprobs {
     pub token: u32,
     pub logprob: f32,
-    pub top: [(u32, f32); super::MAX_TOP_LOGPROBS],
-    pub top_count: usize,
+    pub top: Vec<(u32, f32)>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -167,6 +166,35 @@ pub struct FrameCompletion {
     pub prompt_logprobs: Option<Vec<Option<PromptLogprobs>>>,
     /// Confidence by proposal batch row; rows and columns outside the graph shape are zero.
     pub proposal_confidence: Option<[[f32; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES]>,
+    /// Verification prefix survival by physical slot; -1 marks an unobserved prefix.
+    pub speculative_survival: Option<[[f32; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES]>,
+}
+
+pub(crate) fn validate_speculative_survival(rows: &[[f32; 7]], records: &[CompletionRecord]) -> Result<()> {
+    if rows.len() < records.len() || rows.len() > REQUEST_LANES {
+        return Err("speculative survival does not cover completion slots".into());
+    }
+    for (slot, row) in rows.iter().enumerate() {
+        let offered = records.get(slot).filter(|record| matches!(record.status, 1 | 2))
+            .and_then(|record| record.vector).map_or(0, |vector| {
+                if vector.emitted_count > vector.accepted_drafts { vector.offered_drafts }
+                else { vector.accepted_drafts.min(vector.offered_drafts) }
+            }).clamp(0, 7) as usize;
+        let mut bound = 1.0;
+        let mut missing = false;
+        for (depth, &value) in row.iter().enumerate() {
+            missing |= value == -1.0;
+            if value != -1.0 && (missing || depth >= offered || !value.is_finite() || !(0.0..=bound).contains(&value)) {
+                return Err(format!("invalid speculative survival at slot {slot}, depth {depth}: value {value}, preceding bound {bound}, observed extent {offered}, row {row:?}").into());
+            }
+            bound = value;
+        }
+    }
+    Ok(())
+}
+
+fn reads_speculative_survival(graph: &super::GraphDescriptor) -> bool {
+    graph.token_capacity > 1 && matches!(graph.kind, GraphKind::Speculative | GraphKind::Verification | GraphKind::PackedSpeculative | GraphKind::Mixed)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -193,9 +221,10 @@ impl ExecutionTiming {
     }
 }
 
-#[derive(Clone, Copy)]
 struct Pending {
     logprobs: u64,
+    logprob_width: usize,
+    logprob_token_ids: Vec<Vec<u32>>,
     prompt_rows: usize,
     fence: Fence,
     graph_index: usize,
@@ -208,6 +237,7 @@ struct Frame {
     input: PinnedHost,
     output: PinnedHost,
     confidence: Option<Readback>,
+    survival: Option<Readback>,
     readiness: Option<Readback>,
     logprobs: Option<Readback>,
     prompt_logprobs: Option<Readback>,
@@ -236,6 +266,23 @@ impl Readback {
             // SAFETY: The caller retains the device source and this pinned
             // destination until the transfer stream completes.
             Self::DeviceCopy(host) => unsafe { stream.download(host, source, nbytes) },
+        }
+    }
+
+    unsafe fn enqueue_pitched_copy(
+        &self,
+        stream: &Stream,
+        source: usize,
+        source_pitch: usize,
+        width: usize,
+        rows: usize,
+    ) -> Result<()> {
+        match self {
+            Self::MappedHost { .. } => Ok(()),
+            // SAFETY: The caller retains both allocations through the transfer event.
+            Self::DeviceCopy(host) => unsafe {
+                stream.download_2d(host, source, source_pitch, width, rows)
+            },
         }
     }
 
@@ -372,11 +419,14 @@ impl GraphExecutor {
                 confidence: manifest
                     .graphs
                     .iter()
-                    .any(|g| g.kind == GraphKind::Proposal)
+                    .any(|g| matches!(g.kind, GraphKind::Proposal | GraphKind::PackedSpeculative))
                     .then(|| {
                         let buffer = manifest.buffer("proposal_confidence")?;
                         Readback::new(&model, buffer.address, buffer.nbytes)
                     })
+                    .transpose()?,
+                survival: manifest.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival")
+                    .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
                     .transpose()?,
                 readiness: manifest.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps")
                     .map(|buffer| Readback::new(&model, buffer.address + index * buffer.nbytes / 2, buffer.nbytes / 2))
@@ -452,7 +502,7 @@ impl GraphExecutor {
             && !resources
                 .frames
                 .iter()
-                .filter_map(|frame| frame.pending)
+                .filter_map(|frame| frame.pending.as_ref())
                 .any(|pending| pending.grammar)
             && (!grammar_constrained
                 || resources.frames.iter().all(|frame| frame.pending.is_none()))
@@ -481,7 +531,7 @@ impl GraphExecutor {
                 grammar
                     || matches!(
                         self.manifest.graphs[graph].kind,
-                        GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification
+                        GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification | GraphKind::PackedSpeculative
                     ),
             )
             .then_some(fence))
@@ -525,10 +575,10 @@ impl GraphExecutor {
         let grammar_constrained = grammar_constrained
             || matches!(
                 graph.kind,
-                GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification
+                GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification | GraphKind::PackedSpeculative
             )
             || resources.engram.is_some();
-        let resolved = validate_uploads(
+        let mut resolved = validate_uploads(
             &self.manifest,
             graph_index,
             uploads,
@@ -538,7 +588,7 @@ impl GraphExecutor {
             || resources
                 .frames
                 .iter()
-                .filter_map(|frame| frame.pending)
+                .filter_map(|frame| frame.pending.as_ref())
                 .any(|pending| pending.grammar)
         {
             return Ok(None);
@@ -561,16 +611,13 @@ impl GraphExecutor {
         let frame = &mut resources.frames[index];
         let dispatched = Instant::now();
         resolved.stage(frame.input.bytes_mut(), index as i32, fence.0 as i64);
-        let mut logprobs = 0u64;
-        if self.copy_logprobs && graph.kind.samples() {
-            for upload in uploads.iter().filter(|u| u.buffer == "logprob_requested") {
-                for (i, bytes) in upload.bytes.chunks_exact(size_of::<i32>()).enumerate() {
-                    if i32::from_ne_bytes(bytes.try_into().unwrap()) != 0 {
-                        logprobs |= 1 << (upload.offset / size_of::<i32>() + i);
-                    }
-                }
-            }
-        }
+        let logprobs = if self.copy_logprobs { resolved.logprobs } else { 0 };
+        let logprob_width = resolved.logprob_width;
+        let logprob_token_ids = if self.copy_logprobs {
+            std::mem::take(&mut resolved.logprob_token_ids)
+        } else {
+            Vec::new()
+        };
         let prompt_rows = if self.copy_logprobs && graph.kind == GraphKind::ScoredPrefill {
             let bytes = uploads.iter().filter(|u| u.buffer == "prompt_target_tokens")
                 .map(|u| u.offset + u.bytes.len()).max().unwrap_or(0);
@@ -581,6 +628,8 @@ impl GraphExecutor {
         } else { 0 };
         frame.pending = Some(Pending {
             logprobs,
+            logprob_width,
+            logprob_token_ids,
             prompt_rows,
             fence,
             graph_index,
@@ -622,8 +671,10 @@ impl GraphExecutor {
                 )?;
                 if logprobs != 0 {
                     let b = self.manifest.buffer("completion_logprobs")?;
-                    frame.logprobs.as_ref().unwrap().enqueue_copy(
-                        &resources.copy, b.address + index * b.nbytes / 2, b.nbytes / 2,
+                    frame.logprobs.as_ref().unwrap().enqueue_pitched_copy(
+                        &resources.copy, b.address + index * b.nbytes / 2,
+                        b.shape[3] * 4, (2 + 2 * logprob_width) * 4,
+                        self.manifest.request_capacity() * MAX_OUTPUT_TOKENS,
                     )?;
                 }
                 if prompt_rows != 0 {
@@ -631,11 +682,18 @@ impl GraphExecutor {
                     frame.prompt_logprobs.as_ref().unwrap().enqueue_copy(&resources.copy,
                         b.address + index * b.nbytes / 2, prompt_rows * super::PROMPT_FIELDS * 4)?;
                 }
-                if graph.kind == GraphKind::Proposal {
+                if matches!(graph.kind, GraphKind::Proposal | GraphKind::PackedSpeculative) {
                     let confidence = self.manifest.buffer("proposal_confidence")?;
                     frame.confidence.as_ref().unwrap().enqueue_copy(
                         &resources.copy, confidence.address, confidence.nbytes,
                     )?;
+                }
+                if reads_speculative_survival(graph) {
+                    if let Some(readback) = &frame.survival {
+                        let buffer = self.manifest.buffer("completion_speculative_survival")?;
+                        readback.enqueue_copy(&resources.copy, buffer.address + index * buffer.nbytes / 2,
+                                              buffer.nbytes / 2)?;
+                    }
                 }
                 if crate::engram::consumes(graph.kind) {
                     if let Some(readback) = &frame.readiness {
@@ -670,7 +728,7 @@ impl GraphExecutor {
             .frames
             .iter_mut()
             .filter(|frame| frame.pending.is_some())
-            .min_by_key(|frame| frame.pending.unwrap().fence);
+            .min_by_key(|frame| frame.pending.as_ref().unwrap().fence);
         let Some(frame) = frame else {
             return Ok(None);
         };
@@ -713,8 +771,21 @@ impl GraphExecutor {
         let logprobs = if pending.logprobs != 0 {
             // SAFETY: This frame's transfer event covers its sidecar; the source
             // and pinned destination remain owned until decoding completes.
-            let bytes = unsafe { frame.logprobs.as_ref().unwrap().bytes() };
-            match decode_logprobs(bytes, &records, self.manifest.max_top_logprobs()?, pending.logprobs) {
+            let readback = frame.logprobs.as_ref().unwrap();
+            let fields = match readback {
+                Readback::MappedHost { .. } => self.manifest.buffer("completion_logprobs")?.shape[3],
+                Readback::DeviceCopy(_) => 2 + 2 * pending.logprob_width,
+            };
+            let bytes = unsafe { readback.bytes() };
+            let nbytes = records.len() * MAX_OUTPUT_TOKENS * fields * size_of::<f32>();
+            match decode_logprobs(
+                &bytes[..nbytes],
+                &records,
+                self.manifest.max_top_logprobs()?,
+                fields,
+                pending.logprobs,
+                &pending.logprob_token_ids,
+            ) {
                 Ok(values) => Some(values),
                 Err(error) => {
                     self.poison = Some(error.clone());
@@ -754,6 +825,24 @@ impl GraphExecutor {
                 return Err(error);
             }
         };
+        let speculative_survival = if reads_speculative_survival(&self.manifest.graphs[pending.graph_index]) {
+            frame.survival.as_ref().map(|readback| {
+                let mut rows = [[-1.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
+                // SAFETY: The completion transfer protects this frame's retained feedback bytes.
+                for (row, bytes) in rows.iter_mut().zip(unsafe { readback.bytes() }.chunks_exact(7 * 4)) {
+                    for (value, bytes) in row.iter_mut().zip(bytes.chunks_exact(4)) {
+                        *value = f32::from_ne_bytes(bytes.try_into().unwrap());
+                    }
+                }
+                rows
+            })
+        } else { None };
+        if let Some(rows) = &speculative_survival {
+            if let Err(error) = validate_speculative_survival(rows, &records) {
+                self.poison = Some(error.clone());
+                return Err(error);
+            }
+        }
         Ok(Some(FrameCompletion {
             fence: pending.fence,
             graph_index: pending.graph_index,
@@ -787,8 +876,9 @@ impl GraphExecutor {
             records,
             logprobs,
             prompt_logprobs,
-            proposal_confidence: if self.manifest.graphs[pending.graph_index].kind
-                == GraphKind::Proposal
+            speculative_survival,
+            proposal_confidence: if matches!(self.manifest.graphs[pending.graph_index].kind,
+                GraphKind::Proposal | GraphKind::PackedSpeculative)
             {
                 let mut confidence = [[0.0; MAX_OUTPUT_TOKENS - 1]; REQUEST_LANES];
                 let graph = &self.manifest.graphs[pending.graph_index];
@@ -800,7 +890,7 @@ impl GraphExecutor {
                     .zip(unsafe { frame.confidence.as_ref().unwrap().bytes() }
                         .chunks_exact(4 * self.manifest.buffer("proposal_confidence")?.shape[1]))
                 {
-                    for (value, bytes) in row.iter_mut().take(graph.token_capacity - 1).zip(bytes.chunks_exact(4)) {
+                    for (value, bytes) in row.iter_mut().take(if graph.kind == GraphKind::PackedSpeculative { graph.draft_tokens } else { graph.token_capacity - 1 }).zip(bytes.chunks_exact(4)) {
                         *value = f32::from_ne_bytes(bytes.try_into().unwrap());
                     }
                 }
@@ -862,6 +952,9 @@ pub(super) struct ResolvedUploads<'uploads, 'bytes, 'storage> {
     bindings: &'storage [ResolvedUpload],
     frame_index: ResolvedUpload,
     submission_sequence: ResolvedUpload,
+    logprobs: u64,
+    logprob_width: usize,
+    logprob_token_ids: Vec<Vec<u32>>,
 }
 
 impl ResolvedUploads<'_, '_, '_> {
@@ -973,11 +1066,78 @@ pub(super) fn validate_uploads<'uploads, 'bytes, 'storage>(
         }
         storage.push(resolved);
     }
+    let mut logprobs = 0u64;
+    if graph.kind.samples() {
+        for upload in uploads.iter().filter(|u| u.buffer == "logprob_requested") {
+            for (i, bytes) in upload.bytes.chunks_exact(size_of::<i32>()).enumerate() {
+                if i32::from_ne_bytes(bytes.try_into().unwrap()) != 0 {
+                    logprobs |= 1 << (upload.offset / size_of::<i32>() + i);
+                }
+            }
+        }
+    }
+    let mut logprob_width = if logprobs != 0 {
+        (manifest.buffer("completion_logprobs")?.shape[3] / 2 - 1).min(super::MAX_TOP_LOGPROBS)
+    } else {
+        0
+    };
+    let mut logprob_token_ids = Vec::new();
+    if graph.kind.samples() && manifest.logprob_token_id_capacity() != 0 {
+        let capacity = manifest.request_capacity();
+        if !uploads.iter().any(|u| {
+            u.buffer == "logprob_requested" && u.offset == 0 && u.bytes.len() == capacity * 4
+        }) {
+            return Err(
+                "sampling requires all generation logprob gates on every submission".into(),
+            );
+        }
+        let counts = uploads
+            .iter()
+            .find(|u| {
+                u.buffer == "logprob_token_id_counts"
+                    && u.offset == 0
+                    && u.bytes.len() == capacity * 4
+            })
+            .ok_or("sampling requires all logprob token ID counts on every submission")?;
+        for (slot, count) in counts.bytes.chunks_exact(4).enumerate() {
+            let count = i32::from_ne_bytes(count.try_into().unwrap());
+            if !(0..=super::MAX_LOGPROB_TOKEN_IDS as i32).contains(&count)
+                || (count != 0 && logprobs & (1 << slot) == 0)
+            {
+                return Err("invalid logprob token ID count or request gate".into());
+            }
+            if count == 0 {
+                continue;
+            }
+            if logprob_token_ids.is_empty() {
+                logprob_token_ids.resize_with(capacity, Vec::new);
+            }
+            let ids = uploads
+                .iter()
+                .find(|u| {
+                    u.buffer == "logprob_token_ids"
+                        && u.offset == slot * super::MAX_LOGPROB_TOKEN_IDS * 4
+                        && u.bytes.len() == count as usize * 4
+                })
+                .ok_or("missing requested logprob token ID prefix")?;
+            for id in ids.bytes.chunks_exact(4) {
+                let id = i32::from_ne_bytes(id.try_into().unwrap());
+                if id < 0 || logprob_token_ids[slot].contains(&(id as u32)) {
+                    return Err("invalid or duplicate requested logprob token ID".into());
+                }
+                logprob_token_ids[slot].push(id as u32);
+            }
+            logprob_width = logprob_width.max(count as usize);
+        }
+    }
     Ok(ResolvedUploads {
         uploads,
         bindings: storage,
         frame_index,
         submission_sequence,
+        logprobs,
+        logprob_width,
+        logprob_token_ids,
     })
 }
 
@@ -1060,10 +1220,14 @@ pub(super) fn decode_logprobs(
     bytes: &[u8],
     records: &[CompletionRecord],
     k: usize,
+    fields: usize,
     requested: u64,
+    selections: &[Vec<u32>],
 ) -> Result<Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]>> {
-    let fields = super::LOGPROB_PAIR_FIELDS * (1 + k);
     if !(1..=super::MAX_TOP_LOGPROBS).contains(&k)
+        || fields < 2 + 2 * k
+        || fields > super::LOGPROB_FIELDS
+        || fields % 2 != 0
         || bytes.len() != records.len() * MAX_OUTPUT_TOKENS * fields * size_of::<i32>()
     {
         return Err(Error::execution(
@@ -1071,13 +1235,22 @@ pub(super) fn decode_logprobs(
             "generation logprob frame extent mismatch",
         ));
     }
-    let mut result = vec![[None; MAX_OUTPUT_TOKENS]; records.len()];
-    for (slot, record) in records.iter().enumerate()
-        .filter(|(slot, r)| r.status != 0 && requested & (1 << slot) != 0)
+    let mut result: Vec<[Option<TokenLogprobs>; MAX_OUTPUT_TOKENS]> = (0..records.len())
+        .map(|_| std::array::from_fn(|_| None))
+        .collect();
+    for (slot, record) in records
+        .iter()
+        .enumerate()
+        .filter(|(slot, r)| matches!(r.status, 1 | 2) && requested & (1 << slot) != 0)
     {
-        let count = record.vector.map_or(
-            usize::from(record.token_id >= 0), |v| v.emitted_count as usize,
-        );
+        let count = record
+            .vector
+            .map_or(usize::from(record.token_id >= 0), |v| {
+                v.emitted_count as usize
+            });
+        if count > MAX_OUTPUT_TOKENS {
+            return Err("generation logprob emitted count exceeds the frame".into());
+        }
         for position in 0..count {
             let start = (slot * MAX_OUTPUT_TOKENS + position) * fields * size_of::<i32>();
             let int = |at: usize| {
@@ -1085,20 +1258,31 @@ pub(super) fn decode_logprobs(
                 i32::from_ne_bytes(bytes[offset..offset + size_of::<i32>()].try_into().unwrap())
             };
             let float = |at| f32::from_bits(int(at) as u32);
-            let expected = record.vector.map_or(record.token_id, |v| v.tokens[position]);
+            let expected = record
+                .vector
+                .map_or(record.token_id, |v| v.tokens[position]);
             if int(0) < 0 || i64::from(int(0)) != expected || float(1).is_nan() {
-                continue;
+                return Err("generated token is missing its raw logprob record".into());
+            }
+            let ids = selections.get(slot).map_or(&[][..], Vec::as_slice);
+            let count = if ids.is_empty() { k } else { ids.len() };
+            if count > super::MAX_LOGPROB_TOKEN_IDS || 2 + 2 * count > fields {
+                return Err("generation logprob selection exceeds the copied width".into());
             }
             let mut value = TokenLogprobs {
                 token: int(0) as u32,
                 logprob: float(1),
-                top: [(0, 0.); super::MAX_TOP_LOGPROBS],
-                top_count: 0,
+                top: Vec::with_capacity(count + usize::from(!ids.is_empty())),
             };
-            for i in 0..k {
+            for i in 0..count {
                 let id = int(super::LOGPROB_PAIR_FIELDS * (1 + i));
-                if id < 0 {
+                if id < 0 && ids.is_empty() {
                     break;
+                }
+                if id < 0 || (!ids.is_empty() && id as u32 != ids[i]) {
+                    return Err(
+                        "generation logprob ID does not match the requested selection".into(),
+                    );
                 }
                 let lp = float(super::LOGPROB_PAIR_FIELDS * (1 + i) + 1);
                 if lp.is_nan() {
@@ -1107,7 +1291,7 @@ pub(super) fn decode_logprobs(
                         "invalid generation logprob alternative",
                     ));
                 }
-                if i > 0 {
+                if ids.is_empty() && i > 0 {
                     let (previous, p) = value.top[i - 1];
                     if lp > p || (lp == p && id as u32 <= previous) {
                         return Err(Error::execution(
@@ -1116,8 +1300,10 @@ pub(super) fn decode_logprobs(
                         ));
                     }
                 }
-                value.top[i] = (id as u32, lp);
-                value.top_count += 1;
+                value.top.push((id as u32, lp));
+            }
+            if !ids.is_empty() && !ids.contains(&value.token) {
+                value.top.push((value.token, value.logprob));
             }
             result[slot][position] = Some(value);
         }
@@ -1144,7 +1330,7 @@ pub(super) fn decode_prompt_logprobs(bytes: &[u8], rows: usize) -> Result<Vec<Op
         }
         let mut value = TokenLogprobs {
             token: int(0) as u32, logprob: float(1),
-            top: [(0, 0.); super::MAX_TOP_LOGPROBS], top_count: 0,
+            top: Vec::with_capacity(super::MAX_TOP_LOGPROBS),
         };
         for i in 0..super::MAX_TOP_LOGPROBS {
             let token = int(3 + 2 * i);
@@ -1161,8 +1347,7 @@ pub(super) fn decode_prompt_logprobs(bytes: &[u8], rows: usize) -> Result<Vec<Op
                     return Err("prompt alternatives are not ordered".into());
                 }
             }
-            value.top[i] = (token as u32, lp);
-            value.top_count += 1;
+            value.top.push((token as u32, lp));
         }
         Ok(Some(PromptLogprobs { value, rank: int(2) as u32 }))
     }).collect()

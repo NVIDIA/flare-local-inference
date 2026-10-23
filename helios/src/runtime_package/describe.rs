@@ -276,6 +276,9 @@ fn vision_json(
             Profile::Moonvit(_) => json!({"profile": "moonvit"}),
             Profile::Step(_) => json!({"profile": "step"}),
             Profile::Radio(_) => json!({"profile": "radio"}),
+            Profile::PatchMerge(c) => json!({"profile": "patch_merge", "patch_size": c.patch_size,
+                "min_pixels": c.min_pixels, "max_pixels": c.max_pixels}),
+            Profile::Glm(_) => json!({"profile": "glm"}),
         }
     });
     json!({
@@ -462,6 +465,27 @@ mod tests {
         assert_eq!(before["cache"], after["cache"]);
         assert_eq!(after["rebuild"]["version"], 99);
         assert_eq!(after["ranks"][0]["rebuild_weights"]["version"], 99);
+    }
+
+    #[test]
+    fn rebuild_metadata_without_a_chain_field_describes_its_recorded_shape() {
+        // Field 22 (`roce_chain`) is absent from rebuild metadata serialized without it; such a
+        // ring package keeps its ring shape and reads as not a chain.
+        let ring = wire::RebuildManifest {
+            version: 1,
+            roce_ring: true,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let decoded = wire::RebuildManifest::decode(ring.as_slice()).unwrap();
+        assert!(decoded.roce_ring && !decoded.roce_chain);
+        // The same minimal serving index as the test above, with the ring's rebuild metadata.
+        let bytes = [8, 4, 18, 0, 58, 0, 66, 0, 82, 2, 26, 0];
+        let mut index = wire::ModelIndex::decode(bytes.as_slice()).unwrap();
+        index.rebuild = Some(decoded);
+        let described = describe_index(&index, InspectionOptions::default(), None).unwrap();
+        assert_eq!(described["rebuild"]["roce_ring"], true);
+        assert_eq!(described["rebuild"]["roce_chain"], false);
     }
 
     #[test]

@@ -13,6 +13,7 @@ pub struct PolicyConfig {
     pub decode_age_price: f64,
     pub adaptation_ms: f64,
     pub estimate_ttl_ns: u64,
+    pub adaptive_verification_alpha: f64,
 }
 
 impl Default for PolicyConfig {
@@ -24,6 +25,7 @@ impl Default for PolicyConfig {
             decode_age_price: 0.1,
             adaptation_ms: 100.0,
             estimate_ttl_ns: 30_000_000_000,
+            adaptive_verification_alpha: 1.0,
         }
     }
 }
@@ -61,6 +63,7 @@ impl RequestAccounting {
 
 #[derive(Clone, Copy)]
 pub(super) struct Candidate {
+    pub draft_tokens: usize,
     pub kind: GraphKind,
     pub mask: u64,
     pub batch: usize,
@@ -77,7 +80,7 @@ pub(super) struct Candidate {
 
 impl Candidate {
     pub(super) fn cost_key(self) -> cost::Key {
-        cost::Key {
+        cost::Key { drafts: self.draft_tokens,
             kind: self.kind,
             batch: self.batch,
             tokens: self.capacity,
@@ -102,7 +105,7 @@ impl RequestScheduler {
             candidate.prefill_capacity, rows(candidate)];
         let left = physical(smaller);
         let right = physical(larger);
-        if smaller.kind != larger.kind || smaller.mask != larger.mask
+        if smaller.kind == GraphKind::PackedSpeculative || smaller.kind != larger.kind || smaller.mask != larger.mask
             || smaller.prefill_slot != larger.prefill_slot
             || smaller.verification_budget != larger.verification_budget
             || left == right || left.iter().zip(right).any(|(a, b)| *a > b) {
@@ -145,6 +148,9 @@ impl RequestScheduler {
     pub fn configure_policy(&mut self, policy: PolicyConfig) -> Result<()> {
         if self.submitted != Fence(0) || self.slots.iter().any(|s| s.request.is_some()) {
             return Err("scheduling policy must be configured before admission".into());
+        }
+        if !policy.adaptive_verification_alpha.is_finite() || policy.adaptive_verification_alpha <= 0.0 {
+            return Err("adaptive verification alpha must be finite and greater than zero".into());
         }
         if !policy.output_token_value.is_finite()
             || policy.output_token_value <= 0.0
@@ -216,7 +222,7 @@ impl RequestScheduler {
             ..Default::default()
         }
     }
-    fn request_kind(&self, request: &LiveRequest) -> Option<GraphKind> {
+    pub(super) fn request_kind(&self, request: &LiveRequest) -> Option<GraphKind> {
         Some(match request.phase {
             RequestPhase::Initialize => GraphKind::Init,
             RequestPhase::Restore => GraphKind::Restore,
@@ -272,9 +278,8 @@ impl RequestScheduler {
         let start = request.consumed_tokens as usize;
         let mut end = request
             .message_boundaries
-            .iter()
+            .get(request.message_boundaries.partition_point(|&n| n <= start))
             .copied()
-            .find(|n| *n > start)
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
             .min(request.prefill_limit());
@@ -826,7 +831,7 @@ impl RequestScheduler {
             .filter(|(s, _)| selected & (1 << s) != 0)
             .map(|(_, v)| v)
             .sum();
-        let feedback = !self.costs.is_fresh(cost::Key {
+        let feedback = !self.costs.is_fresh(cost::Key { drafts: 0,
             kind, batch, tokens: capacity, prefill: 0, packed: 0,
         })
             || !matches!(kind, GraphKind::Decode | GraphKind::Prefill)
@@ -854,7 +859,7 @@ impl RequestScheduler {
                 age_price,
             )
             .unwrap_or_else(|| (selected, ValueRate::new(duration_ns, expected, age_price)));
-        output.push(Candidate { packed_token_capacity: 0, verification_budget: None,
+        output.push(Candidate { draft_tokens: 0, packed_token_capacity: 0, verification_budget: None,
             kind,
             mask: selected,
             batch,
@@ -885,9 +890,9 @@ impl RequestScheduler {
         age_price: f64,
     ) {
         output.clear();
-        self.mixed_candidates(output, values, age_price);
+        self.mixed_candidates(output, values, age_price, false);
         if self.split.is_some() {
-            self.split_candidates(output, values, age_price);
+            self.split_candidates(output, values, age_price, false);
         }
         for kind in [
             GraphKind::Prefill,
@@ -908,7 +913,9 @@ impl RequestScheduler {
                     entry
                         .request
                         .as_ref()
-                        .filter(|r| self.eligible(r) && self.request_kind(r) == Some(kind))
+                        .filter(|r| self.eligible(r) && (self.request_kind(r) == Some(kind)
+                            || (kind == GraphKind::Speculative && r.phase == RequestPhase::Decode
+                                && !self.owns_proposal(r))))
                         .map(|_| 1u64 << slot)
                 })
                 .fold(0, |a, b| a | b);
@@ -942,11 +949,12 @@ impl RequestScheduler {
         }
     }
 
-    fn mixed_candidates(
+    pub(super) fn mixed_candidates(
         &self,
         output: &mut Vec<Candidate>,
         values: &[LaneValue; REQUEST_LANES],
         age_price: f64,
+        optimistic: bool,
     ) {
         if !self.submissions.is_empty() {
             return;
@@ -970,7 +978,10 @@ impl RequestScheduler {
                 let Some(r) = entry.request.as_ref().filter(|r| self.eligible(r)) else {
                     continue;
                 };
-                match self.request_kind(r) {
+                let kind = self.request_kind(r).map(|kind| {
+                    if kind == GraphKind::Proposal && !self.owns_proposal(r) { decode } else { kind }
+                });
+                match kind {
                     Some(GraphKind::Prefill) if self.prefill_work(r, prefill) > 0 => {
                         if duration_ns == 0 && self.mixed_catalog.iter().any(|&(b, w, smaller)| {
                             b == batch && w == width && smaller < prefill
@@ -992,7 +1003,8 @@ impl RequestScheduler {
                     Some(kind) if kind == decode => {
                         decoders[count] = (
                             slot,
-                            self.lane_value(r, decode, width, duration_ns, values[slot]),
+                            if optimistic { values[slot].decode(self.optimistic_tokens(r, self.speculative_tokens(r, width)), duration_ns as f64 / 1e6) }
+                            else { self.lane_value(r, decode, width, duration_ns, values[slot]) },
                         );
                         count += 1;
                     }
@@ -1023,7 +1035,7 @@ impl RequestScheduler {
                 if mask == 0 {
                     continue;
                 }
-                output.push(Candidate { packed_token_capacity: 0, verification_budget: None,
+                output.push(Candidate { draft_tokens: 0, packed_token_capacity: 0, verification_budget: None,
                     kind: GraphKind::Mixed,
                     mask,
                     batch,
@@ -1060,6 +1072,10 @@ impl RequestScheduler {
                 .then(last(b).cmp(&last(a)))
                 .then(b.batch.cmp(&a.batch))
                 .then(b.capacity.cmp(&a.capacity))
+                .then(b.draft_tokens.cmp(&a.draft_tokens))
+                .then_with(|| if a.kind == GraphKind::PackedSpeculative && b.kind == GraphKind::PackedSpeculative {
+                    b.packed_token_capacity.cmp(&a.packed_token_capacity)
+                } else { std::cmp::Ordering::Equal })
                 .then(b.prefill_capacity.cmp(&a.prefill_capacity))
                 .then(b.mask.cmp(&a.mask))
         };
@@ -1068,11 +1084,12 @@ impl RequestScheduler {
             let mut continuations = Vec::new();
             self.refresh_verification_candidates(
                 &mut continuations, &values, age_price, episode.owned_mask(),
-                (episode.target.kind == GraphKind::Verification).then_some(episode.target),
+                episode.target.filter(|target| target.kind == GraphKind::Verification),
             );
-            let candidate = *continuations.iter().max_by(|a, b| compare(a, b))?;
+            let count = if episode.target.is_none() { self.prune_padding(&mut continuations) } else { continuations.len() };
+            let candidate = *continuations[..count].iter().max_by(|a, b| compare(a, b))?;
             return Some(self.materialize(candidate, log_scale,
-                PlanOrigin::RefreshContinuation(episode.id)));
+                episode.continuation()));
         }
         if ordinary.rate.duration_ns == 0 {
             return Some(self.materialize(ordinary, log_scale, PlanOrigin::Discovery));
@@ -1099,6 +1116,11 @@ impl RequestScheduler {
             }
             if let Some((_, target, candidate)) = best {
                 return Some(self.materialize(candidate, log_scale, PlanOrigin::RefreshStart(target)));
+            }
+        }
+        if self.refresh.acceptance_ready() && self.speculative_fixed_width.is_none() && self.submissions.is_empty() {
+            if let Some(candidate) = self.acceptance_probe(ordinary, &values, age_price) {
+                return Some(self.materialize(candidate, log_scale, PlanOrigin::AcceptanceStart));
             }
         }
         Some(self.materialize(ordinary, log_scale, PlanOrigin::Ordinary))
@@ -1129,7 +1151,9 @@ impl RequestScheduler {
                         candidate.work
                     }
                 } else {
-                    self.lane_tokens(r, kind, candidate.capacity)
+                    if kind == GraphKind::PackedSpeculative {
+                        self.speculative_tokens(r, (candidate.draft_tokens + 1).min(candidate.capacity))
+                    } else { self.lane_tokens(r, kind, candidate.capacity) }
                 },
             });
         }
@@ -1142,7 +1166,7 @@ impl RequestScheduler {
             selection_value_rate: candidate.rate.score,
             selection_log_scale: log_scale,
             verification_budget: candidate.verification_budget,
-            step: ScheduledStep { packed_token_capacity: candidate.packed_token_capacity,
+            step: ScheduledStep { draft_tokens: candidate.draft_tokens, packed_token_capacity: candidate.packed_token_capacity,
                 kind: candidate.kind,
                 batch_capacity: candidate.batch,
                 token_capacity: candidate.capacity,

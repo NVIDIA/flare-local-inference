@@ -59,13 +59,13 @@ Logprobs describe the raw next-token distribution over the complete vocabulary:
 `logit(token) - logsumexp(logits)`, with FP32 accumulation, before temperature,
 penalties, grammar masks, and top-k, top-p, or min-p filtering. Speculative output
 uses the target model's distribution at each committed position. The chosen token
-is always included, even when outside the alternatives. Alternatives are ordered
-by decreasing logprob, with increasing token ID for ties.
+is always included, even when outside the alternatives. Natural alternatives are
+ordered by decreasing logprob, with increasing token ID for ties.
 
-Every newly exported package provides up to 20 alternatives. Older packages serve
-unchanged, advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0`, and
-reject logprob requests with HTTP 400: `logprobs are not available in this model
-package`. Re-export to enable the feature.
+Every newly exported package provides up to 20 natural alternatives and supports
+explicit token IDs. Older packages retain their natural request limit (1..20),
+or advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0` when they have
+no generation logprob outputs. Unsupported requests return HTTP 400.
 
 For Chat Completions, set `logprobs: true` and optionally `top_logprobs: 0..20`.
 A positive `top_logprobs` requires `logprobs: true`; zero alone is accepted and
@@ -109,6 +109,22 @@ explicitly rejects logprob fields. Temperature zero remains rejected. Single-tok
 continuations work with `max_tokens: 1`, `continue_final_message: true`,
 `add_generation_prompt: false`, `logprobs: true`, and `top_logprobs: 20`, omitting
 temperature to use the model's prepared default.
+
+On Chat, Completions, and Responses, `logprob_token_ids: [id, ...]` replaces
+natural generation alternatives with those IDs in caller order. Existing generation
+logprob enablement is required. Supply at most 128 elements before deduplication;
+IDs must be nonnegative integers within the model vocabulary. Duplicates are
+removed in first-occurrence order. Null and empty arrays behave as omission.
+The sampled token is appended only when absent, so explicit results contain at
+most 129 entries. Values retain full-vocabulary normalization. Numeric top-k
+options still accept only 0..20 and do not truncate explicit results.
+
+Prompt scores and echoed prompt entries remain natural. Completions accepts
+validated IDs with `echo: true, max_tokens: 0`, which returns no generation
+positions. Completions maps retain their existing decoded-string collision
+behavior; use `return_tokens_as_token_ids: true` to distinguish IDs. Messages
+rejects `logprob_token_ids`. Older packages reject nonempty selections before
+admission with an explanation to re-export.
 
 ### Prompt log probabilities
 
@@ -169,6 +185,17 @@ encodings. Both encoded and decoded bodies are bounded by `max_body_bytes`
 frontend worker pool. Invalid requests receive protocol-specific JSON errors;
 failures after streaming begins produce protocol-specific terminal error events.
 
+Streaming requests return HTTP 200 and SSE headers after frontend validation and
+bounded enqueue, without waiting for GPU admission or prefill. Admission failures
+after enqueue are terminal SSE errors under HTTP 200; buffered requests retain
+the corresponding HTTP error status. Chat Completions emits its initial
+`{"role":"assistant","content":""}` delta only after the first generated token
+is available, including tokens hidden by stop matching or text decoding. Chunked
+prefill and cache restoration produce no chat data chunks before that token.
+A failure before the first token produces an error without a role chunk or
+`[DONE]`. SSE keepalive comments may precede generation during waits longer than
+15 seconds.
+
 Each completion batch reserves one admission slot per generated choice. Every
 child is prepared and validated before the group is submitted to the native
 worker. An oversized group is rejected; temporary admission exhaustion returns
@@ -209,7 +236,8 @@ instantaneous gauges.
 | `decode_weight_bytes` | Bytes of weights one decode step reads for one request, as the package's recipe declares for its checkpoint; zero when undeclared. Times verification steps per second it is the weight bandwidth the model consumes, shown as WEIGHTS on the dashboards | `flare_decode_weight_bytes` |
 | `draft_steps` | Draft positions run by the learned drafter; zero without one | none |
 | `verify_steps` | Completed speculative or verification graphs | sum of `flare_speculative_rounds_total` |
-| `verification_drafts` | Draft positions verified: verification width minus one per graph | sum of `flare_speculative_rounds_total` × (`width` − 1) |
+| `verification_drafts` | Draft positions allocated for progressing request rounds, including rejected drafts and excluding padding | `flare_verification_draft_tokens_total` |
+| `verification_rounds` | Progressing decode or verification request rounds, including zero-draft rounds | `flare_verification_request_rounds_total` |
 | `accepted_drafts` | Accepted draft tokens, excluding the bonus token | `flare_accepted_draft_tokens_total` |
 | `draft_rounds` | Request rounds that offered at least one draft | `flare_draft_request_rounds_total` |
 | `active` | Model slots with a live request | `flare_active_requests` |
@@ -231,6 +259,13 @@ instantaneous gauges.
 | `host_bytes_out` | Bytes copied from GPU checkpoints to the host store | `flare_host_cache_bytes_out_total` |
 | `host_bytes_in` | Bytes copied from the host store into GPU pages and rows | `flare_host_cache_bytes_in_total` |
 | `learned_drafter` | Boolean: the model has a learned drafter | none |
+
+Dashboard DEPTH is the change in `verification_drafts` divided by the change in
+`verification_rounds` over the sampling window. It averages each request's planned
+draft-prefix length, including zero-draft rounds, rather than graph width or batch
+capacity. For packed speculation, completion records report the prefixes allocated
+on the GPU before target verification. Prefill, resume sampling, inactive padding,
+failed lanes, and terminal rounds without progress do not enter this average.
 
 ## Conversation and tool semantics
 
@@ -558,3 +593,99 @@ tests use temporary repositories and check a real read/edit/test task. Scheduler
 regressions in `tests/server/test_scheduler.py` run against ordinary, fixed-width,
 and adaptive speculative execution. These environment variables configure tests,
 not the native server.
+
+## System One decisions
+
+`POST /v1/systemone` accepts the [TypeSafe System One schema](https://api.typesafe.ai/openapi.json)
+for `noul`, `choice`, and `score` questions:
+
+```json
+{"model":"local","state":{"message":"Charged twice"},"questions":{
+  "refund":{"type":"noul","instructions":"Is a refund requested?"},
+  "team":{"type":"choice","criteria":{"billing":null,"support":"Other help"}},
+  "urgency":{"type":"score","criteria":["Routine","Urgent"]}}}
+```
+
+The response contains the loaded `model`, a named `answers` map, and
+`usage: {input_tokens, output_tokens}`. Noul returns `noul: P(true)`; Choice
+returns `choice`, named `probabilities`, and `confidence`; Score returns the
+probability-weighted zero-based `score`, original levels in `legend`, indexed
+`probabilities`, and `confidence`. Confidence follows the
+[Jev formulas](https://docs.typesafe.ai/confidence), with first-option tie breaking
+and singleton confidence one. Normalizing label probabilities does not provide
+empirical calibration for the loaded model.
+
+Requests require a model string, a string/object/array state and 1–64 named
+questions. Instructions and descriptions preserve structured JSON. Choice has
+1–128 criteria; Score has 1–10 nonnull levels. Available single-token labels and
+prepared context/output capacities may lower these limits. Schema failures return
+Jev-style HTTP 422 `detail` entries. Malformed JSON, incompatible templates and
+unsupported packages return 400; authentication and operational errors use the
+existing generation error format.
+
+The native scorer compiles independent questions after a common state message,
+verifies distinct single-token synthetic labels after the complete rendered
+prompt, and reads raw `logprob_token_ids` with one generated token per question.
+Questions execute sequentially, allowing ordinary prefix reuse after the first
+question. Usage sums actual logical prompt counts, including cached input, and
+actual generated read tokens. No prose or streaming is returned. Dropping a
+request cancels its current child through the ordinary generation lifetime.
+
+The scorer uses the normal assistant generation prompt with thinking disabled
+where supported and an `Answer:` cue in the final user turn. Labels are verified
+as the first assistant token against the actual rendered prompt, including with
+the native DeepSeek encoders. Older packages without requested-ID outputs require
+re-export.
+
+PNG/JPEG [image assets](https://docs.typesafe.ai/images) require
+`TypeSafe-Danger-Zone-Images: true` and a vision package. Supply base64 assets or
+uncompressed multipart/form-data with an application/json `request` part first,
+followed by uniquely named image parts. An asset's `part` takes precedence over
+`data_base64`; every part must belong to exactly one asset. References replace
+string values, including nested state/instructions/criteria, with whole-value
+matches first and then nonoverlapping left-to-right matches. Keys remain text;
+legends retain original references. Unused assets are rejected. Existing body,
+context and image limits apply, including to expanded prompts. Multipart content
+encoding must be identity (or absent); compressed multipart returns HTTP 415.
+JSON supports the usual compressed encodings. Box,
+audio/video and custom question types are unsupported.
+
+## Decisions
+
+`POST /v1/decisions` adapts the System One scorer to the concrete vLLM Decisions
+text protocol. It accepts `model`, text `input` (or user messages containing text
+and `input_text` parts), and an ordered array of 1–64 `questions`:
+
+```json
+{"model":"local","input":"Charged twice","questions":[
+  {"type":"predicate","name":"refund","instructions":"Refund requested?"},
+  {"type":"choice","instructions":"Which team?","choices":[
+    {"value":"billing","description":"Payments"},{"value":false}]},
+  {"type":"score","instructions":"Urgency?","levels":[
+    {"label":"Routine"},{"label":"Urgent","description":"Act today"}]}]}
+```
+
+Instructions are required strings. Names are optional strings; omission returns
+`name: null`, explicit null is invalid, and duplicate names are permitted.
+Choices contain 2–128 distinct string/boolean values and optional string
+descriptions. Scores contain 2–10 labeled levels with optional descriptions.
+Single-token label availability and prepared capacities can further restrict
+these bounds. Text parts join with newlines and messages with blank lines.
+Nullable `safety_identifier` accepts up to 128 characters as inert caller metadata.
+Unknown fields, images/assets, other roles and unsupported question types return
+OpenAI-style HTTP 400 errors. Multipart is unsupported on this text-only route.
+
+The response has the loaded `model`, ordered `answers`, and `usage`. Predicate
+answers contain `probability`; Choice answers preserve the selected typed
+`choice` and an array of `{value, probability}` entries. Score answers contain
+`score` and `{value: index, label, probability}` entries. Choice/Score confidence
+is the winning label's full-vocabulary probability: its normalized probability
+multiplied by total raw label mass. System One retains its distinct Jev confidence
+formulas. Neither route promises empirical calibration.
+
+Usage sums actual logical input and generated read tokens across questions,
+including `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens: 0`
+and `total_tokens`. Cache writes are not measured and are reported as zero.
+The route shares System One's prompt compilation, exact-ID reads, sequential
+child lifetime, template constraints and older-package rejection; it adds no
+second scoring path.

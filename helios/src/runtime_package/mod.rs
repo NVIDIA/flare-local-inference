@@ -22,12 +22,23 @@ mod model;
 mod payload;
 mod protection;
 mod protobuf;
+pub use protobuf::wire;
+pub fn validate_sampling_defaults(value: &wire::DefaultSamplingParameters) -> crate::Result<()> {
+    protobuf::sampling_defaults(value.clone()).map(|_| ())
+}
+pub const WIRE_DESCRIPTOR: &[u8] =
+    include_bytes!(concat!(env!("OUT_DIR"), "/runtime_package_descriptor.bin"));
 mod publishers;
 #[cfg(any(test, feature = "test-tools"))]
 pub mod test_support;
-pub use protection::{AuthorizedPackage, PackageClaim, PackageLicense, Publisher, VerifiedPackage};
+pub use protection::{
+    verify_package_metadata, AuthorizedPackage, PackageClaim, PackageLicense, Publisher,
+    VerifiedPackage,
+};
 mod selection;
 mod serving;
+#[cfg(test)]
+mod shared_memory_tests;
 pub use archive::{PackageFile, package_companions};
 pub use limits::{KvCacheLimit, MemoryLimit};
 pub use model::{
@@ -577,6 +588,15 @@ impl NativeResources {
                 driver.check("cuEventCreate", (driver.event_create)(&mut event, 2))?;
                 self.events.insert(name.clone(), event);
             }
+            let mut dynamic_shared = HashMap::new();
+            for &function in self.functions.values() {
+                let mut bytes = 0;
+                driver.check(
+                    "cuFuncGetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+                    (driver.function_get_attribute)(&mut bytes, 8, function),
+                )?;
+                dynamic_shared.insert(function as usize, bytes as u32);
+            }
             for graph in &package.graphs {
                 let mut handle = null_mut();
                 driver.check("cuGraphCreate", (driver.graph_create)(&mut handle, 0))?;
@@ -604,6 +624,23 @@ impl NativeResources {
                             arguments,
                             attributes,
                         } => {
+                            let function_handle = self.functions[function];
+                            let allowance =
+                                dynamic_shared.get_mut(&(function_handle as usize)).unwrap();
+                            // Captured nodes retain their launch requirements even if later
+                            // preparation lowers the function's dynamic shared-memory allowance.
+                            if *shared > *allowance {
+                                let bytes = i32::try_from(*shared).map_err(|_| {
+                                    invalid(
+                                        "kernel shared-memory size exceeds CUDA's attribute range",
+                                    )
+                                })?;
+                                driver.check(
+                                    "cuFuncSetAttribute(MAX_DYNAMIC_SHARED_SIZE_BYTES)",
+                                    (driver.function_attribute)(function_handle, 8, bytes),
+                                )?;
+                                *allowance = *shared;
+                            }
                             let mut storage = arguments
                                 .iter()
                                 .map(|a| self.bind(a))
@@ -611,7 +648,7 @@ impl NativeResources {
                             let mut pointers: Vec<_> =
                                 storage.iter_mut().map(|a| a.as_mut_ptr().cast()).collect();
                             let mut params = KernelParams {
-                                function: self.functions[function],
+                                function: function_handle,
                                 grid: *grid,
                                 block: *block,
                                 shared: *shared,
@@ -620,10 +657,23 @@ impl NativeResources {
                                 kernel: null_mut(),
                                 context: null_mut(),
                             };
-                            driver.check(
-                                "cuGraphAddKernelNode_v2",
-                                (driver.graph_kernel)(&mut result, handle, null(), 0, &params),
-                            )?;
+                            let status =
+                                (driver.graph_kernel)(&mut result, handle, null(), 0, &params);
+                            if status != 0 {
+                                let symbol = package
+                                    .functions
+                                    .iter()
+                                    .find(|entry| entry.id == *function)
+                                    .map(|entry| entry.symbol.as_str())
+                                    .unwrap_or("unknown");
+                                driver.check(
+                                    &format!(
+                                        "cuGraphAddKernelNode_v2 for graph {} node {} kernel {symbol} (grid {grid:?}, block {block:?}, shared {shared})",
+                                        graph.name, nodes.len()
+                                    ),
+                                    status,
+                                )?;
+                            }
                             for attribute in attributes {
                                 let bytes = self.bind(&attribute.value)?;
                                 let mut value = [0u64; 8];

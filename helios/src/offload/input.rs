@@ -71,31 +71,44 @@ struct Usage {
     input: u64,
     checkpoint_pressure: u64,
     input_pressure: u64,
+    progress: u64,
 }
 /// Shared reservations for both concrete record kinds, including pending writes.
 pub struct DiskBudget {
-    limit: u64,
+    limit: std::sync::atomic::AtomicU64,
     usage: Mutex<Usage>,
 }
 impl DiskBudget {
     pub fn new(limit: u64, checkpoint: u64) -> Arc<Self> {
         Arc::new(Self {
-            limit,
+            limit: std::sync::atomic::AtomicU64::new(limit),
             usage: Mutex::new(Usage {
                 checkpoint,
                 ..Default::default()
             }),
         })
     }
+    fn limit(&self) -> u64 {
+        self.limit.load(std::sync::atomic::Ordering::Relaxed)
+    }
     pub fn checkpoint_limit(&self) -> u64 {
-        self.limit.saturating_sub(self.usage.lock().unwrap().input)
+        self.limit()
+            .saturating_sub(self.usage.lock().unwrap().input)
     }
     pub fn set_checkpoint(&self, bytes: u64) {
         self.usage.lock().unwrap().checkpoint = bytes;
     }
+    /// Lower the limit before any record is indexed, when every host's
+    /// directory must hold the same records and the smallest host bounds them.
+    pub fn set_limit(&self, limit: u64) {
+        let mut usage = self.usage.lock().unwrap();
+        self.limit
+            .store(limit, std::sync::atomic::Ordering::Relaxed);
+        usage.checkpoint = usage.checkpoint.min(limit);
+    }
     pub fn reserve_checkpoint(&self, bytes: u64) -> bool {
         let mut u = self.usage.lock().unwrap();
-        if u.checkpoint.saturating_add(u.input).saturating_add(bytes) > self.limit {
+        if u.checkpoint.saturating_add(u.input).saturating_add(bytes) > self.limit() {
             u.input_pressure = u.input_pressure.max(bytes);
             false
         } else {
@@ -112,7 +125,7 @@ impl DiskBudget {
     }
     fn reserve_input(&self, bytes: u64) -> bool {
         let mut u = self.usage.lock().unwrap();
-        if u.checkpoint.saturating_add(u.input).saturating_add(bytes) > self.limit {
+        if u.checkpoint.saturating_add(u.input).saturating_add(bytes) > self.limit() {
             u.checkpoint_pressure = u.checkpoint_pressure.max(bytes);
             false
         } else {
@@ -124,16 +137,20 @@ impl DiskBudget {
     fn clear_checkpoint_pressure(&self) {
         self.usage.lock().unwrap().checkpoint_pressure = 0;
     }
+    pub(crate) fn progress(&self) -> u64 {
+        self.usage.lock().unwrap().progress
+    }
     fn release_input(&self, bytes: u64) {
         let mut u = self.usage.lock().unwrap();
         u.input = u.input.saturating_sub(bytes);
+        u.progress += 1;
     }
     fn input_pressure(&self) -> u64 {
         self.usage.lock().unwrap().input_pressure
     }
     fn room_for_checkpoint(&self, bytes: u64) -> bool {
         let u = self.usage.lock().unwrap();
-        u.checkpoint.saturating_add(u.input).saturating_add(bytes) <= self.limit
+        u.checkpoint.saturating_add(u.input).saturating_add(bytes) <= self.limit()
     }
     fn clear_input_pressure(&self) {
         self.usage.lock().unwrap().input_pressure = 0;
@@ -767,7 +784,7 @@ impl Worker {
         let bytes = HEADER as u64
             + record.metadata.len() as u64
             + record.payload.as_ref().map_or(0, |p| p.len() as u64);
-        if bytes > self.budget.limit {
+        if bytes > self.budget.limit() {
             self.stats.lock().unwrap().skipped += 1;
             return true;
         }

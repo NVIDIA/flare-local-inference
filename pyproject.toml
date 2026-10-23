@@ -22,7 +22,7 @@ prepare = [
     "torch==2.14.1+cu132",
     "torchvision==0.29.1+cu132",
     "transformers[torch,vision,chat_template] @ git+https://github.com/huggingface/transformers.git@1d9654e78a23fb167ef539cbd699dfbd3e4830cf",
-    "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@03de0b663abe8f5dc69d4e10118587ab459b13eb",
+    "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@9c9e94ef9aff73ef60949d41d4323652617d7f0f",
     "cuda-python==13.3.1",
     "safetensors==0.8.0",
     "tokenizers==0.23.2",
@@ -51,6 +51,12 @@ include = ["ignition*"]
 "ignition.recipes.deepseek41" = ["assets/*"]
 "ignition.recipes.deepseek4" = ["assets/*"]
 "ignition.recipes.kimi3" = ["assets/*"]
+"ignition.recipes.glm53" = ["assets/*"]
+"ignition.recipes.mimo_v2" = ["assets/*"]
+"ignition.recipes.nemotron_h" = ["assets/*"]
+"ignition.recipes.qwen38" = ["assets/*"]
+"ignition.recipes.step5" = ["assets/*"]
+"ignition.recipes.minimax_m3" = ["assets/*"]
 
 [tool.pytest.ini_options]
 addopts = "--import-mode=importlib"

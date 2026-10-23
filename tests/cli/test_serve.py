@@ -1,4 +1,4 @@
-"""Preparation, package caching, and process replacement by the Rust Flare runtime."""
+"""Package export and development serving with injected preparation resources."""
 
 import json
 import os
@@ -11,24 +11,13 @@ from pathlib import Path
 import pytest
 
 from ignition import planning
-from ignition.cli import environment, main as cli_main, runtime, serve
+from ignition.cli import environment, main, serve
 from ignition.cli.config import Configuration
 from ignition.recipes import ResolvedModel, recipes, resolve
 from ignition.recipes.declaration import RankUsage
 
 GIB = 1 << 30
 FREE = 95 * GIB
-
-
-class Executed(BaseException):
-    pass
-
-
-def main(arguments):
-    try:
-        return cli_main(arguments)
-    except Executed:
-        return 0
 
 
 class Prepared:
@@ -89,7 +78,11 @@ def host(monkeypatch, tmp_path):
     class OutOfMemoryError(RuntimeError):
         pass
 
-    monkeypatch.setitem(sys.modules, "flare_heliopause", types.SimpleNamespace(CliSignals=CliSignals, Server=object))
+    import flare_heliopause
+    monkeypatch.setitem(sys.modules, "flare_heliopause", types.SimpleNamespace(
+        CliSignals=CliSignals, Server=object,
+        export_source_identity=flare_heliopause.export_source_identity,
+        export_development_publisher=flare_heliopause.export_development_publisher))
     monkeypatch.setitem(sys.modules, "torch", types.SimpleNamespace(
         cuda=types.SimpleNamespace(set_device=lambda _: None), OutOfMemoryError=OutOfMemoryError))
     monkeypatch.setattr(module_images, "ModuleImages", Scope)
@@ -115,10 +108,6 @@ def host(monkeypatch, tmp_path):
         "metadata": {"total_size": 1}, "weight_map": {"weight": "model.safetensors"}}))
     recipe = replace(model.recipe, prepare=prepare, usage=lambda prepared: prepared.usage())
     monkeypatch.setattr(serve, "resolve_model", lambda configuration, name: ResolvedModel(recipe, model.checkpoint))
-    monkeypatch.setattr(runtime, "binary", lambda: Path("/native/flare"))
-    monkeypatch.setattr(runtime, "package_key", lambda model, plan, no_compile:
-        str((plan.concurrency, plan.prefill_chunk, plan.speculation, plan.stream_overlap,
-             plan.mixed_prefill, plan.expert_scale_compression, no_compile)))
 
     def export_model(prepared, images, storage, path, *, options, publisher, progress, console, staging, shard_size):
         assert prepared is calls["prepared"] and not prepared.closed
@@ -132,16 +121,6 @@ def host(monkeypatch, tmp_path):
         path.write_bytes(b"runtime package")
     monkeypatch.setattr(model_package, "export_package", export_model)
 
-    def execute(path, arguments):
-        assert path == "/native/flare" and arguments[1] == "run"
-        assert calls["prepared"].closed
-        assert "api_key" not in calls["options"]
-        calls["exec"] = arguments
-        if "--api-key-file" in arguments:
-            key_file = arguments[arguments.index("--api-key-file") + 1]
-            calls["api_key"] = Path(key_file).read_text()
-        raise Executed
-    monkeypatch.setattr(serve.os, "execv", execute)
     return calls
 
 
@@ -151,45 +130,28 @@ def free_port():
         return probe.getsockname()[1]
 
 
-def run(*arguments):
-    return main(["run", *arguments, "--port", str(free_port())])
+def export(*arguments):
+    return main(["export", *arguments])
 
 
-def test_run_exports_then_replaces_python_with_flare_and_reuses_the_package(host):
-    assert run("qwen3.8-flash", "--no-compile") == 0
+def test_export_records_rebuild_settings_and_closes_preparation(host):
+    assert export("qwen3.8-flash", "--no-compile") == 0
     assert host["compile_forwards"] is False and host["exports"] == 1
     assert [gpu.index for gpu in host["gpus"]] == [0]
     assert host["plan"].speculation == host["plan"].recipe.speculation
     assert not host["plan"].mixed_prefill and host["plan"].mixed_shapes == ()
-    assert host["exec"][3:5] == ["--gpus", "0"]
     assert host["prepared"].closed and host["prepared"].started is None
-    from ignition.preparation.runtime_package_pb2 import RebuildManifest
-    rebuild = RebuildManifest.FromString(host['options']['rebuild_manifest'])
+    rebuild = types.SimpleNamespace(**host['options']['rebuild_manifest'])
     assert rebuild.version == 1 and rebuild.recipe == host['plan'].recipe.name
     assert rebuild.checkpoint_revision == host['plan'].checkpoint.revision
     assert rebuild.tensor_parallel == 1 and len(rebuild.source_identity) == 64
     assert rebuild.prefill_chunk == host['plan'].prefill_chunk
-    assert rebuild.speculation.draft_tokens == host['plan'].speculation.draft_tokens
+    assert rebuild.speculation['draft_tokens'] == host['plan'].speculation.draft_tokens
     assert not rebuild.compiled_forwards and not rebuild.local_checkpoint
     from ignition.preparation.rebuild_manifest import from_plan
     local = ResolvedModel(host['plan'].recipe, host['plan'].checkpoint, Path('/local/checkpoint'))
-    local_manifest = RebuildManifest.FromString(from_plan(local, host['plan'], compiled_forwards=True))
+    local_manifest = types.SimpleNamespace(**from_plan(local, host['plan'], compiled_forwards=True))
     assert local_manifest.local_checkpoint and not local_manifest.checkpoint_revision
-    assert run("qwen3.8-flash", "--no-compile") == 0
-    assert host["exports"] == 1
-
-
-def test_runtime_memory_flags_are_forwarded_without_preparing_another_package(host):
-    assert run("qwen3.8-flash") == 0
-    original = host["exec"][2]
-    assert not any(flag.startswith(("--memory-limit", "--kv-cache-limit")) for flag in host["exec"])
-    for limit, mode in [("30G", "concurrency"), ("-30G", "context"), ("0.8", "memory")]:
-        assert run("qwen3.8-flash", "--memory-limit", limit, "--kv-cache-limit", mode) == 0
-        assert host["exec"][2] == original and host["exports"] == 1
-        assert f"--memory-limit={limit}" in host["exec"]
-        if mode != "memory":
-            assert host["exec"][host["exec"].index("--kv-cache-limit") + 1] == mode
-        assert host["options"]["reserve_bytes"] == 0
 
 
 @pytest.mark.parametrize(("alias", "served_name"), [
@@ -221,18 +183,6 @@ def test_server_options_advertise_canonical_names_independently_of_checkpoint_so
     assert options["model_id"] == ("custom-checkpoint" if local else checkpoint.repository)
 
 
-def test_served_model_name_is_forwarded_without_changing_the_package_alias(host):
-    assert run("qwen3.8-flash") == 0
-    original = host["exec"][2]
-    assert "--served-model-name" not in host["exec"]
-    for alias in ("local-model", "organization/model", "local model"):
-        assert run("qwen3.8-flash", "--served-model-name", alias) == 0
-        arguments = host["exec"]
-        assert arguments[arguments.index("--served-model-name") + 1] == alias
-        assert arguments[2] == original and host["exports"] == 1
-        assert host["options"]["served_names"] == ["Qwen3.8-Flash-Next"]
-
-
 @pytest.mark.parametrize("extension", [None, types.SimpleNamespace()])
 def test_diagnostic_serving_requires_native_http_before_preparation(host, monkeypatch, capsys, extension):
     monkeypatch.setitem(sys.modules, "flare_heliopause", extension)
@@ -247,11 +197,12 @@ def test_direct_serving_does_not_require_native_http(host, monkeypatch):
 
     def discover():
         discovered.append(True)
-        raise Executed
+        raise RuntimeError("GPU discovery reached")
 
     monkeypatch.setattr(serve.Host, "discover", discover)
-    assert main(["serve", "qwen3.8-flash", "--direct", "--gpus", "0",
-                 "--port", str(free_port())]) == 0
+    with pytest.raises(RuntimeError, match="GPU discovery reached"):
+        main(["serve", "qwen3.8-flash", "--direct", "--gpus", "0",
+              "--port", str(free_port())])
     assert discovered == [True] and "prepared" not in host
 
 
@@ -331,92 +282,52 @@ def test_diagnostic_admission_rejects_insufficient_execution_backing():
         serve._diagnostic_options(model, {})
 
 
-def test_preparation_flags_select_distinct_packages(host):
-    assert run("qwen3.8-flash", "--max-concurrency", "2", "--prefill-chunk-size", "1024",
+def test_preparation_flags_reach_the_exported_plan(host):
+    assert export("qwen3.8-flash", "--max-concurrency", "2", "--prefill-chunk-size", "1024",
                "--mtp-draft-tokens", "2", "--no-mtp-adaptive-verification", "--history-drafts") == 0
     plan = host["plan"]
     assert (plan.concurrency, plan.prefill_chunk) == (2, 1024)
     assert (plan.speculation.draft_tokens, plan.speculation.adaptive, plan.speculation.history_drafts) == (2, False, True)
-    assert run("qwen3.8-flash", "--no-mtp") == 0
+    assert export("qwen3.8-flash", "--no-mtp") == 0
     assert host["exports"] == 2 and host["plan"].speculation is None
 
 
 @pytest.mark.parametrize("overlap", [False, True])
-def test_mixed_prefill_opt_in_prepares_and_reuses_a_separate_package(host, capsys, overlap):
+def test_mixed_prefill_opt_in_reaches_export(host, capsys, overlap):
     options = () if overlap else ("--no-stream-overlap",)
-    assert run("qwen3.8-flash", *options) == 0
-    ordinary_package = host["exec"][2]
-    assert run("qwen3.8-flash", "--mixed-prefill", *options) == 0
-    mixed_package = host["exec"][2]
-    assert mixed_package != ordinary_package and host["exports"] == 2
-    assert host["plan"].mixed_prefill and len(host["plan"].mixed_shapes) == 42
+    assert export("qwen3.8-flash", *options) == 0
+    assert export("qwen3.8-flash", "--mixed-prefill", *options) == 0
+    assert host["exports"] == 2
+    assert host["plan"].concurrency == 32 and host["plan"].speculative_token_capacity == 128
+    assert host["plan"].mixed_prefill and len(host["plan"].mixed_shapes) == 123
     assert host["plan"].stream_overlap == overlap
     assert "mixed prefill on" in capsys.readouterr().err
-    assert run("qwen3.8-flash", "--mixed-prefill", *options) == 0
-    assert host["exec"][2] == mixed_package and host["exports"] == 2
-    assert run("qwen3.8-flash", "--mixed-prefill", "--no-mtp", *options) == 0
+    assert export("qwen3.8-flash", "--mixed-prefill", "--no-mtp", *options) == 0
     assert host["exports"] == 3 and host["plan"].speculation is None
     assert host["plan"].stream_overlap == overlap
-    assert len(host["plan"].mixed_shapes) == 20
+    assert len(host["plan"].mixed_shapes) == 50
     assert all(not enabled for enabled, _, _, _ in host["plan"].mixed_shapes)
 
 
-@pytest.mark.parametrize("overlap", [False, True])
-def test_package_cache_key_includes_mixed_capture(overlap):
-    model = resolve("qwen3.8-flash")
-    gpu = planning.Gpu(0, "NVIDIA RTX PRO 6000 Blackwell", "GPU-test", 96 * GIB, FREE, (12, 0))
-    plan = planning.fit(model.recipe, model.checkpoint, (gpu,), concurrency=4,
-                        reserve_bytes=0, speculation=model.recipe.speculation, stream_overlap=overlap)
-    assert runtime.package_key(model, plan, False) != runtime.package_key(
-        model, replace(plan, mixed_prefill=True), False)
-
-
 @pytest.mark.parametrize("compression", [["--expert-scale-compression"], ["--expert-scale-compression", "csf"]])
-def test_expert_scale_compression_reaches_preparation_and_package_cache(host, monkeypatch, capsys, compression):
+def test_expert_scale_compression_reaches_export(host, monkeypatch, capsys, compression):
     original = serve.resolve_model(None, None)
     checkpoint = replace(original.checkpoint, scale_compressed_device_bytes={"csf": original.checkpoint.device_bytes})
     model = ResolvedModel(original.recipe, checkpoint)
     monkeypatch.setattr(serve, "resolve_model", lambda *_: model)
-    assert run("qwen3.8-flash") == 0
-    native = host["exec"][2]
-    assert run("qwen3.8-flash", *compression) == 0
-    compressed = host["exec"][2]
-    assert compressed != native and host["exports"] == 2
+    assert export("qwen3.8-flash") == 0
+    assert export("qwen3.8-flash", *compression) == 0
+    assert host["exports"] == 2
     assert host["plan"].expert_scale_compression == "csf"
     assert "expert scales csf" in capsys.readouterr().err
-    assert run("qwen3.8-flash", "--expert-scale-compression", "csf") == 0
-    assert host["exec"][2] == compressed and host["exports"] == 2
-
-
-def test_package_cache_key_includes_expert_scale_compression():
-    model = resolve("step5-preview-nvfp4")
-    gpus = tuple(planning.Gpu(i, "NVIDIA RTX PRO 6000 Blackwell", f"GPU-{i}", 96 * GIB, FREE, (12, 0))
-                 for i in range(4))
-    plan = planning.fit(model.recipe, model.checkpoint, gpus, concurrency=4,
-                        reserve_bytes=0, speculation=model.recipe.speculation)
-    assert runtime.package_key(model, plan, False) != runtime.package_key(
-        model, replace(plan, expert_scale_compression="csf"), False)
 
 
 def test_serialized_branches_reach_the_plan_and_the_startup_line(host, capsys):
-    assert run("qwen3.8-flash") == 0
+    assert export("qwen3.8-flash") == 0
     assert host["plan"].stream_overlap and "branches serialized" not in capsys.readouterr().err
-    assert run("qwen3.8-flash", "--no-stream-overlap") == 0
+    assert export("qwen3.8-flash", "--no-stream-overlap") == 0
     assert host["plan"].stream_overlap is False
     assert "branches serialized" in capsys.readouterr().err
-
-
-def test_package_cache_keys_distinguish_serialized_branches():
-    model = resolve("glm-5.3-flash")
-    sparks = tuple(planning.Gpu(index, "NVIDIA GB10", f"GPU-{index}", 121 * GIB, 110 * GIB, (12, 1))
-                   for index in range(2))
-    settings = dict(concurrency=4, reserve_bytes=0, speculation=model.recipe.speculation)
-    overlapped = planning.fit(model.recipe, model.checkpoint, sparks, **settings)
-    serial = planning.fit(model.recipe, model.checkpoint, sparks, stream_overlap=False, **settings)
-    assert overlapped.stream_overlap and not serial.stream_overlap
-    assert runtime.package_key(model, overlapped, False) != runtime.package_key(model, serial, False)
-    assert runtime.package_key(model, overlapped, False) == runtime.package_key(
-        model, replace(serial, stream_overlap=True), False)
 
 
 @pytest.mark.parametrize("reserve", [0, 2 * GIB])
@@ -428,11 +339,11 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
     config.write_text(f'[memory]\nreserve = "{reserve}"\n')
     assert main(["export", "qwen3.8-flash", "--output", str(output), "--config", str(config),
                  *(["--mixed-prefill"] if mixed else []), *([] if overlap else ["--no-stream-overlap"])]) == 0
-    assert host["exports"] == 1 and "exec" not in host
+    assert host["exports"] == 1 and host["prepared"].started is None
     assert host["plan"].prefill_chunk == 4096 and host["compile_forwards"]
     assert host["plan"].mixed_prefill == mixed
     assert host["plan"].stream_overlap == overlap
-    assert host["options"]["queue_capacity"] == 16
+    assert host["options"]["queue_capacity"] == 128
     assert host["options"]["served_names"] == ["Qwen3.8-Flash-Next"]
     assert host["options"]["reserve_bytes"] == reserve
     assert "headroom_bytes" not in host["options"]
@@ -442,61 +353,52 @@ def test_export_does_not_launch_a_server_and_preserves_the_serving_plan(host, tm
     assert host["exports"] == 1
 
 
-def test_listener_and_authentication_are_supplied_after_export(host, tmp_path):
+def test_development_listener_and_authentication_use_configuration(host, tmp_path, monkeypatch):
     port = free_port()
     config = tmp_path / "config.toml"
     config.write_text(f'[server]\nport = {port}\napi_key = "secret"\n')
-    assert main(["run", "qwen3.8-flash", "--config", str(config)]) == 0
-    assert host["api_key"] == "secret"
-    assert host["exec"][5:9] == ["--host", "127.0.0.1", "--port", str(port)]
-    assert "secret" not in host["exec"]
+    calls = []
+    monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append((bind, options)))
+    assert main(["serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config)]) == 0
+    assert calls[0][0] == f"127.0.0.1:{port}"
+    assert calls[0][1]["api_key"] == "secret"
+    assert host["exports"] == 0
 
 
-def test_listener_flags_override_configuration(host, tmp_path):
+def test_listener_flags_override_configuration(host, tmp_path, monkeypatch):
     config = tmp_path / "config.toml"
     config.write_text('[server]\nhost = "0.0.0.0"\nport = 8000\n')
     port = free_port()
-    assert main(["run", "qwen3.8-flash", "--config", str(config),
+    calls = []
+    monkeypatch.setattr(serve, "_serve_prepared", lambda prepared, bind, options: calls.append(bind))
+    assert main(["serve", "qwen3.8-flash", "--gpus", "0", "--config", str(config),
                  "--host", "127.0.0.1", "--port", str(port)]) == 0
-    assert host["exec"][5:9] == ["--host", "127.0.0.1", "--port", str(port)]
-
-
-def test_prefix_cache_settings_are_forwarded_only_when_set(host, tmp_path):
-    assert run("qwen3.8-flash") == 0
-    assert not any(flag.startswith("--prefix-cache") for flag in host["exec"])
-    config = tmp_path / "config.toml"
-    config.write_text('[prefix_cache]\nmemory = "8G"\ndisk_limit = "100G"\n[paths]\nprefix_cache = "~/records"\n')
-    assert main(["run", "qwen3.8-flash", "--config", str(config), "--port", str(free_port())]) == 0
-    arguments = host["exec"]
-    assert arguments[arguments.index("--prefix-cache-disk") + 1] == str(tmp_path / "records")
-    assert arguments[arguments.index("--prefix-cache-memory") + 1] == "8G"
-    assert arguments[arguments.index("--prefix-cache-disk-limit") + 1] == "100G"
-    assert "--prefix-cache-disk-transport" not in arguments
+    assert calls == [f"127.0.0.1:{port}"]
 
 
 def test_an_address_in_use_fails_before_preparation(host, capsys):
     with socket.socket() as occupied:
         occupied.bind(("127.0.0.1", 0))
         occupied.listen()
-        assert main(["run", "qwen3.8-flash", "--port", str(occupied.getsockname()[1])]) == 2
+        assert main(["serve", "qwen3.8-flash", "--port", str(occupied.getsockname()[1])]) == 2
     assert "cannot listen on" in capsys.readouterr().err and "prepared" not in host
-    assert run("qwen3.8-flash", "--host", "localhost") == 2
+    assert main(["serve", "qwen3.8-flash", "--host", "localhost", "--port", str(free_port())]) == 2
 
 
 @pytest.mark.parametrize("exception,code,message", [
     (RuntimeError("kernel tuning failed"), 5, "preparation failed: RuntimeError: kernel tuning failed"),
     (MemoryError("insufficient memory"), 4, "insufficient memory during model preparation"),
 ])
-def test_export_failures_prevent_native_launch(host, capsys, exception, code, message):
+def test_preparation_failures_prevent_export(host, capsys, exception, code, message):
     host["behavior"] = {"raises": exception}
-    assert run("qwen3.8-flash") == code
-    assert message in capsys.readouterr().err and "exec" not in host
+    assert export("qwen3.8-flash") == code
+    assert message in capsys.readouterr().err and host["exports"] == 0
     assert host["signals"].exited >= 1
 
 
 def test_exhausted_gpu_memory_is_a_capacity_error(host, capsys):
     host["behavior"] = {"raises": sys.modules["torch"].OutOfMemoryError("CUDA out of memory.")}
-    assert run("qwen3.8-flash") == 4
+    assert export("qwen3.8-flash") == 4
     assert "Fewer concurrent requests, --no-mtp, or more GPUs" in capsys.readouterr().err
 
 
@@ -504,16 +406,16 @@ def test_preparation_preserves_the_configured_reserve(host, tmp_path, capsys):
     config = tmp_path / "config.toml"
     config.write_text('[memory]\nreserve = "2G"\n')
     host["behavior"] = {"extra": 2 * GIB}
-    assert run("qwen3.8-flash", "--config", str(config)) == 4
+    assert export("qwen3.8-flash", "--config", str(config)) == 4
     assert "preparation left 1.0 GiB free" in capsys.readouterr().err
-    assert host["prepared"].closed and "exec" not in host
+    assert host["prepared"].closed and host["exports"] == 0
 
 
 def test_uncached_checkpoint_downloads_before_export(host, monkeypatch):
     fetched = []
     monkeypatch.setattr(ResolvedModel, "cached", lambda self, hub_cache: False)
     monkeypatch.setattr(serve, "fetch", lambda model, hub_cache, progress_bars: fetched.append(model.checkpoint.alias))
-    assert run("qwen3.8-flash") == 0
+    assert export("qwen3.8-flash") == 0
     assert fetched == ["qwen3.8-flash"]
 
 
@@ -582,21 +484,10 @@ def test_flashinfer_workspaces_separate_checkouts_without_importing_them(monkeyp
     assert environment.flashinfer_workspace(tmp_path / "kernels") == second
 
 
-def test_tensor_parallel_run_preserves_rank_selection_in_native_launch(host):
-    assert run("qwen3.8-flash", "--gpus", "0,1") == 0
+def test_tensor_parallel_export_preserves_rank_selection(host):
+    assert export("qwen3.8-flash", "--gpus", "0,1") == 0
     assert host["plan"].world_size == 2
-    assert host["exec"][3:5] == ["--gpus", "0,1"]
-
-
-def test_run_approves_only_its_export_signer_and_namespace(host):
-    assert run("qwen3.8-flash") == 0
-    signer = host["publisher"]
-    args = host["exec"]
-    assert args[args.index("--dangerously-approve-key") + 1] == signer.fingerprint.hex()
-    assert args[args.index("--dangerously-accept-publisher") + 1] == signer.namespace
-    profile = json.loads(Path(args[args.index("--publisher-keys") + 1]).read_text())[0]
-    assert bytes(profile["public_key"]) == signer.public_key
-    assert profile["namespace"] == signer.namespace
+    assert [gpu.index for gpu in host["gpus"]] == [0, 1]
 
 
 @pytest.mark.parametrize('command', ['export', 'serve'])
@@ -608,15 +499,14 @@ def test_local_tuning_gpus_cannot_change_multihost_sharding(tmp_path, capsys, co
     assert 'multi-host ranks retain their sharding' in capsys.readouterr().err
 
 
-def test_shard_policy_reaches_export_and_separates_cached_packages(host):
-    assert run("qwen3.8-flash") == 0
+def test_shard_policy_reaches_export(host):
+    assert export("qwen3.8-flash") == 0
     assert host["shard_size"] == 64 << 30
-    default = host["exec"][2]
-    assert run("qwen3.8-flash", "--shard-size", "32G") == 0
-    assert host["shard_size"] == 32 << 30 and host["exec"][2] != default
+    assert export("qwen3.8-flash", "--shard-size", "32G") == 0
+    assert host["shard_size"] == 32 << 30
     assert host["exports"] == 2
-    assert run("qwen3.8-flash", "--shard-size", "65536M") == 0
-    assert host["exec"][2] == default and host["exports"] == 2
+    assert export("qwen3.8-flash", "--shard-size", "65536M") == 0
+    assert host["shard_size"] == 64 << 30 and host["exports"] == 3
 
 
 def test_export_defaults_to_local_recipe_namespace_and_honors_repository(host, capsys):
@@ -635,3 +525,12 @@ def test_no_weights_requires_cache_before_preparation(host, tmp_path, capsys):
     assert 'existing blob cache' in capsys.readouterr().err
     assert main(['export', 'qwen3.8-flash', '--repo-id', '../escape', '--output', str(tmp_path / 'output')]) == 2
     assert host['exports'] == 0
+
+
+@pytest.mark.parametrize("effort", ["off", "low", "medium", "high", "max"])
+def test_autotune_effort_reaches_plan_and_startup_line(host, capsys, monkeypatch, effort):
+    monkeypatch.setenv("COLUMNS", "400")
+    assert export("qwen3.8-flash", "--autotune-effort", effort) == 0
+    assert host["plan"].autotune_effort == effort
+    assert host["plan"].to_dict()["autotune_effort"] == effort
+    assert f"autotune effort {effort}" in capsys.readouterr().err

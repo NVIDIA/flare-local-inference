@@ -34,11 +34,24 @@ def recipe_help(model=None):
             f"  --mtp-draft-tokens: 0..{recipe.max_draft_tokens}; default {speculation.draft_tokens}",
             f"  Verification: {'adaptive' if speculation.adaptive else 'fixed width'} by default;"
             " --no-mtp excludes draft weights and state.",
-            "  --mtp-draft-tokens 0 retains draft state and captures width-one rounds.",
-            "  --speculative-token-capacity: at least drafts + 1; default is the larger of",
-            "    power-of-two padded concurrency and drafts + 1.",
-            "    Wider graphs require batch * width <= capacity (width = draft count + 1).",
-            "    Width one covers every batch."))
+            "  --mtp-draft-tokens 0 retains draft state and captures width-one rounds."))
+        if speculation.token_capacity is None:
+            lines.extend(("  --speculative-token-capacity: at least drafts + 1; default is the larger of",
+                          "    power-of-two padded concurrency and drafts + 1."))
+        else:
+            lines.append(f"  --speculative-token-capacity: at least drafts + 1; default {speculation.token_capacity}.")
+        if speculation.packed_verification:
+            lines.extend(("    Target rows are shared across retained request prefixes.",
+                          "    Packed rounds need more target rows than active requests."))
+            if speculation.graph_budget is not None:
+                lines.extend((f"  --speculative-graph-budget: positive integer; default {speculation.graph_budget}.",
+                              "    Bounds packed round graphs; excludes mandatory width-one and ordinary graphs."))
+        else:
+            lines.append("    Wider graphs require batch * width <= capacity (width = draft count + 1).")
+        layout = "packed" if speculation.packed_verification else "rectangular"
+        lines.extend(("    Width one covers every batch.",
+                      f"  Prepared verification: {layout} rows with {speculation.draft_prefix_selection.upper()}"
+                      " prefix selection."))
     else:
         lines.append("  Multi-token speculation: unavailable.")
     optional = []

@@ -8,9 +8,10 @@ pub const VECTOR_RECORD_FIELDS: usize = 24;
 pub const MAX_OUTPUT_TOKENS: usize = 8;
 pub const REQUEST_LANES: usize = 64;
 pub const MAX_TOP_LOGPROBS: usize = 20;
+pub const MAX_LOGPROB_TOKEN_IDS: usize = 128;
 // Each token/logprob pair occupies two int32 words, starting with the chosen token.
 pub const LOGPROB_PAIR_FIELDS: usize = 2;
-pub const LOGPROB_FIELDS: usize = LOGPROB_PAIR_FIELDS * (1 + MAX_TOP_LOGPROBS);
+pub const LOGPROB_FIELDS: usize = LOGPROB_PAIR_FIELDS * (1 + MAX_LOGPROB_TOKEN_IDS);
 pub const PROMPT_FIELDS: usize = 3 + 2 * MAX_TOP_LOGPROBS;
 pub const RECORD_FIELDS: usize = 8;
 pub const BATCH_CAPACITIES: [usize; 7] = [1, 2, 4, 8, 16, 32, 64];
@@ -58,7 +59,7 @@ impl TryFrom<&str> for Dtype {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum GraphKind {
     Init,
     Restore,
@@ -71,6 +72,8 @@ pub enum GraphKind {
     Proposal,
     /// Target verification of a retained proposal prefix.
     Verification,
+    /// One proposal and GPU-allocated packed target pass with terminal feedback.
+    PackedSpeculative,
     Mixed,
     Resume,
     Vision,
@@ -89,6 +92,7 @@ impl GraphKind {
                 | Self::Decode
                 | Self::Speculative
                 | Self::Verification
+                | Self::PackedSpeculative
                 | Self::Mixed
                 | Self::Resume
         )
@@ -127,6 +131,7 @@ impl TryFrom<&str> for GraphKind {
             "speculative" => Ok(Self::Speculative),
             "proposal" => Ok(Self::Proposal),
             "verification" => Ok(Self::Verification),
+            "packed_speculative" => Ok(Self::PackedSpeculative),
             "mixed" => Ok(Self::Mixed),
             "resume" => Ok(Self::Resume),
             "vision" => Ok(Self::Vision),
@@ -157,6 +162,8 @@ pub struct InputBinding {
 
 #[derive(Clone, Debug)]
 pub struct GraphDescriptor {
+    /// Proposal depth of a packed combined round; zero for legacy operations.
+    pub draft_tokens: usize,
     pub name: String,
     pub kind: GraphKind,
     pub sampling_mode: SamplingMode,
@@ -235,15 +242,42 @@ impl ExecutionManifest {
     }
 
     pub fn max_top_logprobs(&self) -> Result<usize> {
-        let output = self.buffers.iter().find(|b| b.name == "completion_logprobs");
+        let output = self
+            .buffers
+            .iter()
+            .find(|b| b.name == "completion_logprobs");
         let flags = self.buffers.iter().find(|b| b.name == "logprob_requested");
+        let ids = self.buffers.iter().find(|b| b.name == "logprob_token_ids");
+        let counts = self
+            .buffers
+            .iter()
+            .find(|b| b.name == "logprob_token_id_counts");
+        if (ids.is_some() || counts.is_some()) && output.is_some() {
+            if !ids.is_some_and(|b| {
+                b.dtype == Dtype::Int32
+                    && b.shape == [self.request_capacity(), MAX_LOGPROB_TOKEN_IDS]
+            }) || !counts
+                .is_some_and(|b| b.dtype == Dtype::Int32 && b.shape == [self.request_capacity()])
+                || !output.is_some_and(|b| b.shape.last() == Some(&LOGPROB_FIELDS))
+            {
+                return Err(Error::execution(
+                    ExecutionError::Manifest,
+                    "generation logprobs require complete logprob_token_ids and logprob_token_id_counts inputs and widened output storage",
+                ));
+            }
+        }
         match (output, flags) {
-            (None, None) => Ok(0),
+            (None, None) if ids.is_none() && counts.is_none() => Ok(0),
             (Some(output), Some(flags)) => {
                 let fields = output.shape.last().copied().unwrap_or(0);
                 let expected = [2, self.request_capacity(), MAX_OUTPUT_TOKENS, fields];
                 if fields < LOGPROB_PAIR_FIELDS * 2
-                    || fields > LOGPROB_FIELDS
+                    || fields
+                        > if ids.is_some() {
+                            LOGPROB_FIELDS
+                        } else {
+                            2 * (1 + MAX_TOP_LOGPROBS)
+                        }
                     || fields % LOGPROB_PAIR_FIELDS != 0
                     || output.dtype != Dtype::Int32
                     || output.shape != expected
@@ -253,7 +287,9 @@ impl ExecutionManifest {
                         format!(
                             "completion_logprobs: expected Int32 shape {expected:?} with \
                              even last extent {}..={LOGPROB_FIELDS}; got {:?} shape {:?}",
-                            LOGPROB_PAIR_FIELDS * 2, output.dtype, output.shape,
+                            LOGPROB_PAIR_FIELDS * 2,
+                            output.dtype,
+                            output.shape,
                         ),
                     ));
                 }
@@ -262,21 +298,33 @@ impl ExecutionManifest {
                         ExecutionError::Manifest,
                         format!(
                             "logprob_requested: expected Int32 shape {:?}; got {:?} shape {:?}",
-                            [self.request_capacity()], flags.dtype, flags.shape,
+                            [self.request_capacity()],
+                            flags.dtype,
+                            flags.shape,
                         ),
                     ));
                 }
-                Ok(fields / LOGPROB_PAIR_FIELDS - 1)
+                Ok((fields / LOGPROB_PAIR_FIELDS - 1).min(MAX_TOP_LOGPROBS))
             }
             _ => Err(Error::execution(
                 ExecutionError::Manifest,
-                format!("generation logprobs missing buffer {}", if output.is_none() {
-                    "completion_logprobs"
-                } else {
-                    "logprob_requested"
-                }),
+                format!(
+                    "generation logprobs missing buffer {}",
+                    if output.is_none() {
+                        "completion_logprobs"
+                    } else {
+                        "logprob_requested"
+                    }
+                ),
             )),
         }
+    }
+
+    pub fn logprob_token_id_capacity(&self) -> usize {
+        self.buffers
+            .iter()
+            .find(|b| b.name == "logprob_token_ids")
+            .map_or(0, |b| b.shape[1])
     }
 
     pub fn prompt_logprob_capacity(&self) -> Result<usize> {
@@ -416,6 +464,12 @@ impl ExecutionManifest {
         }
         let logprobs = self.max_top_logprobs()? != 0;
         self.prompt_logprob_capacity()?;
+        if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "completion_speculative_survival") {
+            if self.abi_version != SPECULATIVE_ABI_VERSION || buffer.dtype != Dtype::Float32
+                || buffer.shape != [2, self.request_capacity(), MAX_OUTPUT_TOKENS - 1] {
+                return Err("completion_speculative_survival requires ABI3 and two float32 frames of seven prefixes per request slot".into());
+            }
+        }
         if let Some(buffer) = self.buffers.iter().find(|buffer| buffer.name == "readiness_timestamps") {
             if buffer.dtype != Dtype::Int64 || buffer.shape.len() != 2 || buffer.shape[0] != 2
                 || buffer.shape[1] == 0 || buffer.shape[1] % 3 != 0
@@ -427,18 +481,25 @@ impl ExecutionManifest {
         let mut names = HashSet::new();
         let mut host_spans = HashMap::<&str, (usize, usize)>::new();
         for graph in &self.graphs {
-            if graph.packed_token_capacity != 0 && (graph.kind != GraphKind::Verification
+            if graph.packed_token_capacity != 0 && (!matches!(graph.kind, GraphKind::Verification | GraphKind::PackedSpeculative)
                 || graph.packed_token_capacity < graph.batch_capacity
                 || graph.packed_token_capacity > graph.batch_capacity.saturating_mul(graph.token_capacity)) {
                 return Err("packed verification rows exceed declared request-prefix bounds".into());
             }
-            if graph.kind == GraphKind::Proposal {
+            if (graph.kind != GraphKind::PackedSpeculative && graph.draft_tokens != 0)
+                || (graph.kind == GraphKind::PackedSpeculative
+                    && (!(1..=7).contains(&graph.draft_tokens)
+                        || graph.draft_tokens + 1 > graph.token_capacity
+                        || graph.packed_token_capacity == 0)) {
+                return Err("packed combined proposal depth is outside its declared target bounds".into());
+            }
+            if matches!(graph.kind, GraphKind::Proposal | GraphKind::PackedSpeculative) {
                 let confidence = self.buffer("proposal_confidence")?;
                 if graph.token_capacity < 2
                     || confidence.dtype != Dtype::Float32
                     || confidence.shape.len() != 2
                     || confidence.shape[0] != self.request_capacity()
-                    || !(graph.token_capacity - 1..=7).contains(&confidence.shape[1])
+                    || !(if graph.kind == GraphKind::PackedSpeculative { graph.draft_tokens } else { graph.token_capacity - 1 }..=7).contains(&confidence.shape[1])
                     || confidence.strides != [confidence.shape[1], 1]
                 {
                     return Err(
@@ -466,7 +527,7 @@ impl ExecutionManifest {
                             .checked_add((graph.batch_capacity - 1) * graph.token_capacity)
                             .is_some()
                 }
-                GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification => {
+                GraphKind::Speculative | GraphKind::Proposal | GraphKind::Verification | GraphKind::PackedSpeculative => {
                     self.abi_version == SPECULATIVE_ABI_VERSION
                         && BATCH_CAPACITIES.contains(&graph.batch_capacity)
                         && graph.batch_capacity <= self.request_capacity()
@@ -494,7 +555,8 @@ impl ExecutionManifest {
             let mut bound = HashSet::new();
             for binding in &graph.input_bindings {
                 if !bound.insert(binding.buffer_name.as_str())
-                    || ["completion_records", "completion_logprobs", "prompt_logprobs", "readiness_timestamps"].contains(&binding.buffer_name.as_str())
+                    || ["completion_records", "completion_logprobs", "prompt_logprobs", "readiness_timestamps",
+                        "completion_speculative_survival"].contains(&binding.buffer_name.as_str())
                 {
                     return Err(Error::execution(
                         ExecutionError::Manifest,
@@ -530,11 +592,22 @@ impl ExecutionManifest {
             if bound.contains("prompt_target_tokens") != (graph.kind == GraphKind::ScoredPrefill) {
                 return Err("only scored prefill graphs bind prompt targets".into());
             }
-            if logprobs && graph.kind.samples() && !bound.contains("logprob_requested") {
-                return Err(Error::execution(
-                    ExecutionError::Manifest,
-                    "sampling graphs require generation logprob request flags",
-                ));
+            if logprobs && graph.kind.samples() {
+                if !bound.contains("logprob_requested") {
+                    return Err(Error::execution(
+                        ExecutionError::Manifest,
+                        "sampling graphs require the generation logprob reporting flag",
+                    ));
+                }
+                if self.logprob_token_id_capacity() != 0
+                    && (!bound.contains("logprob_token_ids")
+                        || !bound.contains("logprob_token_id_counts"))
+                {
+                    return Err(Error::execution(
+                        ExecutionError::Manifest,
+                        "sampling graphs require explicit logprob token ID inputs",
+                    ));
+                }
             }
             if !bound.contains("frame_index") || !bound.contains("submission_sequence") {
                 return Err(Error::execution(

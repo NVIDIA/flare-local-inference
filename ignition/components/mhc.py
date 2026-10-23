@@ -106,8 +106,8 @@ class PreparedMHC:
         if (weights.fn.shape != (24, 4 * hidden) or weights.fn.dtype != torch.float32
                 or weights.scale.shape != (3,) or weights.scale.dtype != torch.float32
                 or weights.base.shape != (24,) or weights.base.dtype != torch.float32
-                or weights.norm.shape != (hidden,) or weights.norm.dtype != torch.bfloat16):
-            raise ValueError("mHC weights require FP32 projection/mixes and a BF16 RMSNorm vector")
+                or weights.norm.shape != (hidden,) or weights.norm.dtype not in (torch.bfloat16, torch.float32)):
+            raise ValueError("mHC weights require FP32 projection/mixes and a BF16 or FP32 RMSNorm vector")
         self.weights, self.scratch = weights, scratch
         self.options = {"rms_eps": rms_eps, "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters,
                             "norm_weight": weights.norm, "norm_eps": norm_eps}
@@ -136,7 +136,8 @@ class PreparedMHC:
             return
         self.plan = mhc.plan(mhc.Caps(device=residual.device, max_tokens=tokens, hidden_size=hidden),
             invocation={"operation": self.operation, "output_mode": "provided", "has_norm_weight": True,
-                "norm_weight_dtype": "bfloat16", "expanded_residual": self.operation == "pre",
+                "norm_weight_dtype": str(weights.norm.dtype).removeprefix("torch."),
+                "expanded_residual": self.operation == "pre",
                 "rms_eps": rms_eps, "hc_eps": hc_eps, "sinkhorn_iters": sinkhorn_iters, "norm_eps": norm_eps,
                 "lagged_mix": pre_mix is not None})
         entry = getattr(_impl, f"_b12x_mhc_{self.operation}_impl")

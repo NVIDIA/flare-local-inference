@@ -117,6 +117,37 @@ def test_ple_fixed_buffer_contracts():
             function(*arguments)
 
 
+def test_export_metadata_preserves_hashes_encoding_scale_and_source_spans(tmp_path):
+    from types import SimpleNamespace
+    from ignition.preparation.runtime_package import FileSource
+
+    geometry = SimpleNamespace(multipliers=(13, 17, 19, 23), prime_sizes=(29, 31, 37, 41),
+                               table_offsets=(0, 29, 60, 97))
+    layout = SimpleNamespace(caps=SimpleNamespace(eos_token_id=248044), geometry=geometry)
+    for plane in ("weights", "scales"):
+        for part in range(2):
+            (tmp_path / f"{plane}-{part}").write_bytes(bytes(256))
+    sources = tuple(tuple(FileSource(tmp_path / f"{plane}-{part}", 37 + part, 90 + part)
+                          for part in range(2)) for plane in ("weights", "scales"))
+    table = PLETable(dict(vocab_size=248320, ngram_size=3, heads_per_ngram=2), layout,
+                     None, torch.tensor([0.125], dtype=torch.float32), None, None, None,
+                     None, None, sources, 0.125)
+    metadata = table.export_metadata()
+    assert metadata["pad_token_id"] == 248044
+    assert metadata["compressed_vocabulary"] == 248320
+    stored = metadata["tables"][0]
+    assert (stored["rows"], stored["embedding_width"], stored["scale_block"]) == (320001536, 160, 16)
+    assert stored["encoding"] == "NVFP4_E4M3_GLOBAL"
+    assert stored["global_scale"] == 0.125
+    assert stored["hash"] == dict(method="EOS_XOR_MODULO", orders=[2, 2, 3, 3],
+                                  multipliers=[13, 17, 19, 23], primes=[29, 31, 37, 41],
+                                  offsets=[0, 29, 60, 97])
+    for name, spans in zip(("weights", "scales"), sources, strict=True):
+        assert stored[name] == [dict(path=str(span.path), offset=span.offset, nbytes=span.nbytes) for span in spans]
+    assert len(list(tmp_path.iterdir())) == 4
+    assert all(path.read_bytes() == bytes(256) for path in tmp_path.iterdir())
+
+
 class _ReferenceTable(torch.nn.Module):
     def __init__(self, manifest):
         super().__init__()

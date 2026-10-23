@@ -96,6 +96,41 @@ device inputs before handoff. The native executor always uploads the reserved
 frame index and positive, monotonic submission sequence. Command callers
 cannot override those two values.
 
+Generation reporting uses `logprob_requested: int32[C]` as a boolean gate,
+where C is padded request capacity. New packages also bind
+`logprob_token_ids: int32[C,128]` and `logprob_token_id_counts: int32[C]`.
+Counts are cleared every submission: zero selects natural top-20; 1..128 selects
+the uploaded ID prefix. Sampling graphs require the complete input group.
+`completion_logprobs: int32[2,C,8,258]` contains a chosen pair followed by up to
+128 alternative pairs, each storing a token ID and FP32 logprob bits. Reporting
+uses raw target logits before sampling transforms, gated by slot epoch and
+committed output positions. The host retains each pending frame's selections
+and appends its chosen pair only when absent from explicit alternatives.
+
+For a reporting frame, one pitched D2H copy transfers `8C * 4(2+2W)` bytes,
+with W the larger of 20 and the frame's largest explicit count. Source pitch
+follows package storage; compact pinned decoding uses the copied pitch, while
+mapped-host decoding uses package pitch. Frames without reporting copy no
+generation payload. Natural width-20 readback remains 1,344C bytes; explicit
+width 128 uses 8,256C. Legacy packages with natural capacity k in 1..20 retain
+that capacity, request limit, source pitch, and `64C(1+k)` readback bytes.
+Prompt output geometry and readback are independent of generation width.
+
+Relative to width-20 packages, persistent generation output adds 13,824C bytes
+per rank and inputs add 516C. Each private output adds another 13,824C; two
+pinned generation frames add 13,824C on discrete GPUs. Two input staging frames
+add 1,032C before alignment. Allocator rounding and resulting KV capacity must
+be measured for the complete package.
+
+Each submission adds 4C H2D count bytes per rank and one upload descriptor even
+without explicit IDs. Explicit prefixes add `4ΣN` H2D bytes. The existing remote
+TP wire format adds `4C+24` bytes per peer for counts, plus `4ΣN` payload bytes
+and 24 bytes per uploaded prefix per peer. Same-process rank threads share
+uploads instead of using that wire format. Natural finishing adds a count load
+and branch; candidate and normalization work remain unchanged. Wider output
+strides and width-masked mixed merges require measurement. Equal readback bytes
+do not imply equal total work or efficiency.
+
 An optional `readiness_timestamps` output has dtype int64 and contiguous shape
 `[2,3*N]`, with `1 <= N <= 64`. Each frame holds one triple per embedding table:
 GPU timestamps before its external readiness wait, after readiness, and after a
@@ -146,7 +181,31 @@ one token and reports width one. Maintenance and non-sampling prefill emit
 zero tokens. Every graph in an ABI3 catalog writes the 24-field layout.
 The executor validates vector bounds, padding, epochs and transport-reserved
 fields before delivering records. The model contract validates field 12 before
-request state advances.
+request state advances. A speculative or verification completion requires a
+token vector whose verification width (field 15) equals the submitted graph's
+`token_capacity`, and its record's consumed-token increase since submission
+must equal its emitted count; such a completion without a token vector is
+invalid. Each speculative or verification graph declares one fixed
+`token_capacity`, so a finalizer writes that value into field 15 of every
+record it emits.
+
+ABI3 optionally declares `completion_speculative_survival`, a contiguous
+`float32[2,capacity,7]` output indexed by completion frame, physical request
+slot, and draft-prefix depth. Each value is the cumulative product of
+`min(1, p(token)/q(token))` through that prefix, using the distributions used
+for stochastic verification. Observed values must be finite, within `[0,1]`,
+and nonincreasing. Unobserved suffixes and inactive/error slots contain `-1`.
+Output/context limits bound logical draft depth; termination inside an accepted
+prefix censors later positions. Prefill rows in mixed graphs contain `-1`.
+The buffer cannot be an input binding.
+
+Transport reads this output only for speculative, verification, packed speculative,
+and mixed graphs with width greater than one, using the existing completion stream and
+fence. Every rank validates its values; rank zero supplies the scheduling
+observations without numeric consensus or an additional collective. Absent
+buffers preserve binary completion feedback for previously exported packages.
+The probabilities affect future scheduling only, never token sampling or the
+acceptance decision producing the completion.
 
 The lane index is the physical request slot within the configured capacity. A captured finalizer scatters
 packed model rows through the request-slot mapping. Every launch writes the

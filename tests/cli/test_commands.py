@@ -1,12 +1,12 @@
 """Command output and exit codes with injected GPUs and hub cache."""
 
-import socket
 from pathlib import Path
 
 import pytest
 
 from ignition import planning
 from ignition.cli import _parser, main, preparation
+from ignition.errors import UsageError
 from ignition.recipes import resolve
 
 GIB = 1 << 30
@@ -32,12 +32,8 @@ def configure(tmp_path, text):
     path.write_text(text)
 
 
-def run(*arguments):
-    """Run until the first failure; these cases fail before preparation would load weights."""
-    with socket.socket() as probe:
-        probe.bind(("127.0.0.1", 0))
-        port = probe.getsockname()[1]
-    return main(["run", *arguments, "--port", str(port)])
+def export(*arguments):
+    return main(["export", *arguments])
 
 
 def failure(capsys):
@@ -45,31 +41,31 @@ def failure(capsys):
     return lines[next(index for index, line in enumerate(lines) if line.startswith("error: ")):]
 
 
-def test_run_uses_the_configured_model(host, tmp_path, capsys):
-    assert run() == 2
+def test_export_uses_the_configured_model(host, tmp_path, capsys):
+    assert export() == 2
     assert "no MODEL given and defaults.model is not set" in failure(capsys)[0]
     configure(tmp_path, '[defaults]\nmodel = "nope"\n')
-    assert run() == 2
+    assert export() == 2
     assert "unknown model 'nope'" in failure(capsys)[0]
 
 
 @pytest.mark.parametrize("arguments, code, message", [
-    (["run", "nope"], 2, "supported models: qwen3.8-flash, qwen3.8-27b, glm-5.3-flash"),
-    (["run", "qwen3.8-flash", "--gpus", "x"], 2, "--gpus expects indices"),
-    (["run", "qwen3.8-flash", "--gpus", "9"], 2, "does not have"),
-    (["run", "qwen3.8-flash", "--max-concurrency", "65"], 2, "1 through 64"),
-    (["run", "glm-5.3-flash", "--gpus", "0-2"], 4, "needs 1 or 2 or 4 GPUs; 3 selected; use --gpus 0-3"),
-    (["run", "glm-5.3-flash", "--mixed-prefill"], 2,
+    (["export", "nope"], 2, "supported models: qwen3.8-flash, qwen3.8-27b, glm-5.3-flash"),
+    (["export", "qwen3.8-flash", "--gpus", "x"], 2, "--gpus expects indices"),
+    (["export", "qwen3.8-flash", "--gpus", "9"], 2, "does not have"),
+    (["export", "qwen3.8-flash", "--max-concurrency", "65"], 2, "1 through 64"),
+    (["export", "glm-5.3-flash", "--gpus", "0-2"], 4, "needs 1 or 2 or 4 GPUs; 3 selected; use --gpus 0-3"),
+    (["export", "glm-5.3-flash", "--mixed-prefill"], 2,
      "--mixed-prefill: glm-5.3-flash does not capture mixed prefill/decode graphs"),
 ])
 def test_failures_use_the_documented_exit_codes(host, capsys, arguments, code, message):
-    assert (run(*arguments[1:]) if arguments[0] == "run" else main(arguments)) == code
+    assert (export(*arguments[1:]) if arguments[0] == "export" else main(arguments)) == code
     assert message in failure(capsys)[0]
 
 
 def test_capacity_errors_exit_four_with_aligned_continuation_lines(host, tmp_path, capsys):
     configure(tmp_path, '[memory]\nreserve = "18G"\n')
-    assert run("qwen3.8-flash", "--gpus", "0") == 4
+    assert export("qwen3.8-flash", "--gpus", "0") == 4
     lines = failure(capsys)
     assert lines[0].startswith("error: needs ")
     assert all(line.startswith("       ") for line in lines[1:])
@@ -77,10 +73,10 @@ def test_capacity_errors_exit_four_with_aligned_continuation_lines(host, tmp_pat
 
 
 def test_unknown_commands_flags_and_abbreviations_are_usage_errors(host, capsys):
-    for arguments in (["run", "qwen3.8-flash", "--context", "4096"], ["run", "qwen3.8-flash", "--gpu", "0"],
-                      ["run", "qwen3.8-flash", "--max", "2"], ["join", "10.0.0.1:29600"],
+    for arguments in (["export", "qwen3.8-flash", "--context", "4096"], ["export", "qwen3.8-flash", "--gpu", "0"],
+                      ["export", "qwen3.8-flash", "--max", "2"], ["join", "10.0.0.1:29600"],
                       ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "17"], ["serve", "--ranks", "17"],
-                      ["plan", "qwen3.8-flash"],
+                      ["run", "qwen3.8-flash"], ["plan", "qwen3.8-flash"],
                       ["prepare", "qwen3.8-flash"], ["models"], ["pull"], ["status"], ["bench"], ["config"], ["skill"]):
         with pytest.raises(SystemExit) as exit:
             main(arguments)
@@ -95,25 +91,7 @@ def test_multi_host_ranks_parse_for_rank_zero_and_its_peers():
     assert (peer.rendezvous, peer.rank, peer.ranks, peer.gpu) == ("10.0.0.1:29600", 3, 4, 0)
 
 
-@pytest.mark.parametrize("limit", ["30g", "-30g", "0.8", "1", "1.5GiB", "0.001K"])
-def test_runtime_memory_flags_accept_both_value_spellings(limit):
-    for mode in ("concurrency", "context", "memory"):
-        for flags in (["--memory-limit", limit], [f"--memory-limit={limit}"]):
-            args = _parser().parse_args(["run", "qwen3.8-flash", "--kv-cache-limit", mode, *flags])
-            assert (args.memory_limit, args.kv_cache_limit) == (limit, mode)
-
-
-@pytest.mark.parametrize("limit", ["0", "0G", "-0G", "-0.8", "1.1", "30", "NaN", "inf", "1e-1", "--2G", "2P"])
-def test_invalid_runtime_memory_limits_fail_before_preparation(limit, capsys):
-    with pytest.raises(SystemExit) as error:
-        main(["run", "qwen3.8-flash", f"--memory-limit={limit}"])
-    assert error.value.code == 2
-    assert "memory limit must be" in capsys.readouterr().err
-
-
 def test_runtime_memory_flags_do_not_select_preparation_or_diagnostic_behavior(capsys):
-    defaults = _parser().parse_args(["run"])
-    assert defaults.kv_cache_limit == "memory" and defaults.memory_limit is None
     for command in (["export", "--output", "model.safetensors"], ["serve"]):
         for flags in (["--kv-cache-limit", "context"], ["--memory-limit", "30G"]):
             with pytest.raises(SystemExit) as error:
@@ -122,16 +100,7 @@ def test_runtime_memory_flags_do_not_select_preparation_or_diagnostic_behavior(c
     capsys.readouterr()
 
 
-@pytest.mark.parametrize("alias", ["", " ", "\t"])
-def test_empty_served_model_name_is_rejected_before_preparation(alias, capsys):
-    with pytest.raises(SystemExit) as error:
-        main(["run", "qwen3.8-flash", "--served-model-name", alias])
-    assert error.value.code == 2
-    assert "served model name must not be empty" in capsys.readouterr().err
-
-
 def test_served_model_name_is_a_runtime_override(capsys):
-    assert _parser().parse_args(["run"]).served_model_name is None
     for command in (["export", "--output", "model.safetensors"], ["serve"]):
         with pytest.raises(SystemExit) as error:
             main([*command, "qwen3.8-flash", "--served-model-name", "local-model"])
@@ -140,15 +109,15 @@ def test_served_model_name_is_a_runtime_override(capsys):
 
 
 def test_stream_overlap_flag_is_a_preparation_flag_that_overlapping_recipes_accept(host, tmp_path, capsys):
-    for command in (["run"], ["export", "--output", str(tmp_path / "package")], ["serve"]):
+    for command in (["export", "--output", str(tmp_path / "package")], ["serve"]):
         assert _parser().parse_args([*command, "glm-5.3-flash", "--no-stream-overlap"]).no_stream_overlap
         assert not _parser().parse_args([*command, "glm-5.3-flash"]).no_stream_overlap
     for model in ("qwen3.8-flash", "glm-5.3-flash", "deepseek-v4-flash", "deepseek-v4.1-flash"):
-        serial = _parser().parse_args(["run", model, "--no-stream-overlap"])
+        serial = _parser().parse_args(["export", model, "--no-stream-overlap"])
         assert not preparation.stream_overlap(serial, resolve(model))
-        assert preparation.stream_overlap(_parser().parse_args(["run", model]), resolve(model))
+        assert preparation.stream_overlap(_parser().parse_args(["export", model]), resolve(model))
     # MiMo composes no concurrent branches, so serializing them is rejected rather than ignored.
-    assert run("mimo-v2.6-pro-mopd", "--no-stream-overlap") == 2
+    assert export("mimo-v2.6-pro-mopd", "--no-stream-overlap") == 2
     assert "--no-stream-overlap: mimo-v2.6-pro-mopd runs no branches concurrently" in failure(capsys)[0]
 
 
@@ -165,7 +134,7 @@ def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):
     assert "--graph-times applies only to --direct" in failure(capsys)[0]
     assert main(["serve", "glm-5.3-flash", "--direct", "--eager", "--graph-times", "/nonexistent/times.json"]) == 2
     assert "graph replay with --graph-times saves it" in failure(capsys)[0]
-    for arguments in (["run", "glm-5.3-flash", "--direct"], ["export", "glm-5.3-flash", "--output", "x", "--eager"],
+    for arguments in (["export", "glm-5.3-flash", "--direct"], ["export", "glm-5.3-flash", "--output", "x", "--eager"],
                       ["join", "10.0.0.1:29600", "--rank", "1", "--ranks", "2", "--direct"]):
         with pytest.raises(SystemExit) as exit:
             main(arguments)
@@ -174,8 +143,8 @@ def test_direct_execution_is_an_explicit_serve_diagnostic(host, capsys):
 
 
 def speculation(*arguments, model="qwen3.8-flash"):
-    """Resolve the speculation settings `run` would prepare for a command line."""
-    return preparation.speculation(_parser().parse_args(["run", model, *arguments]), resolve(model))
+    """Resolve the speculation settings `export` would prepare for a command line."""
+    return preparation.speculation(_parser().parse_args(["export", model, *arguments]), resolve(model))
 
 
 def test_speculation_flags_override_the_recipe():
@@ -205,9 +174,12 @@ def test_deepseek_defaults_to_five_adaptive_drafts_and_accepts_explicit_override
     default = speculation(model="deepseek-v4.1-flash")
     assert (default.draft_tokens, default.adaptive, default.fixed_width) == (5, True, None)
     assert default.widths == tuple(range(1, 7))
-    reduced = speculation("--mtp-draft-tokens", "3", "--no-mtp-adaptive-verification",
-                          model="deepseek-v4.1-flash")
-    assert (reduced.draft_tokens, reduced.adaptive, reduced.fixed_width) == (3, False, 4)
+    reduced = speculation("--mtp-draft-tokens", "3", model="deepseek-v4.1-flash")
+    assert (reduced.draft_tokens, reduced.adaptive, reduced.fixed_width) == (3, True, None)
+    assert reduced.packed_verification and reduced.draft_prefix_selection == "gpu"
+    with pytest.raises(UsageError, match="requires adaptive verification"):
+        speculation("--mtp-draft-tokens", "3", "--no-mtp-adaptive-verification",
+                    model="deepseek-v4.1-flash")
     extended = speculation("--mtp-draft-tokens", "7", model="deepseek-v4.1-flash")
     assert extended.draft_tokens == 7 and extended.widths == tuple(range(1, 9))
     assert speculation("--mtp-draft-tokens", "0", model="deepseek-v4.1-flash").widths == (1,)
@@ -223,7 +195,7 @@ def test_deepseek_defaults_to_five_adaptive_drafts_and_accepts_explicit_override
     (["--mtp-draft-tokens", "-1"], "--mtp-draft-tokens must be 0 through 7"),
 ])
 def test_invalid_speculation_flags_are_usage_errors(host, capsys, arguments, message):
-    assert run("qwen3.8-flash", *arguments) == 2
+    assert export("qwen3.8-flash", *arguments) == 2
     assert message in failure(capsys)[0]
 
 
@@ -231,19 +203,19 @@ def test_speculation_flags_have_one_spelling(host, capsys):
     for arguments in (["--mtp-draft-tokens", "1,3"], ["--mtp-max-draft-tokens", "5"],
                       ["--mtp-fixed-draft-tokens", "2"], ["--mtp-draft-tokens", "x"]):
         with pytest.raises(SystemExit) as exit:
-            main(["run", "qwen3.8-flash", *arguments])
+            main(["export", "qwen3.8-flash", *arguments])
         assert exit.value.code == 2
     capsys.readouterr()
 
 
 def test_history_copy_flags_apply_only_to_recipes_that_support_them(host, capsys):
-    assert run("glm-5.3-flash", "--mtp-proposal-source", "copy") == 2
+    assert export("glm-5.3-flash", "--mtp-proposal-source", "copy") == 2
     assert "glm-5.3-flash drafts only with its MTP module; --mtp-proposal-source copy does not apply" in (
         failure(capsys)[0])
-    assert run("glm-5.3-flash", "--history-drafts") == 2
+    assert export("glm-5.3-flash", "--history-drafts") == 2
     assert "--history-drafts does not apply" in failure(capsys)[0]
     with pytest.raises(SystemExit):
-        main(["run", "qwen3.8-flash", "--mtp-proposal-source", "ngram"])
+        main(["export", "qwen3.8-flash", "--mtp-proposal-source", "ngram"])
     capsys.readouterr()
 
 
@@ -292,16 +264,32 @@ def test_roce_ring_requires_multiple_hosts_before_model_or_gpu_work(tmp_path, ca
     args = _parser().parse_args(["export", "qwen3.8-flash", "--output", str(tmp_path / "model"),
                                "--roce-ring", "--ranks", "4"])
     assert args.roce_ring
-    from ignition.cli.serve import _checkpoint_ring
-    assert _checkpoint_ring(args)["streams"] == 8
+    from ignition.cli.serve import _checkpoint_fabric
+    assert _checkpoint_fabric(args)["streams"] == 8
     for count in (1, 4, 8, 16, 32, 64):
         args = _parser().parse_args(["export", "glm-5.3-flash", "--roce-ring", "--ranks", "4",
-                                    "--transfer-streams", str(count), "--cluster", "ring"])
-        assert _checkpoint_ring(args)["streams"] == count
+                                    "--transfer-streams", str(count)])
+        assert _checkpoint_fabric(args)["streams"] == count
     for count in (0, 65):
         with pytest.raises(SystemExit):
             _parser().parse_args(["export", "--transfer-streams", str(count)])
     args = _parser().parse_args(["export", "--transfer-streams", "8"])
     from ignition.errors import UsageError
-    with pytest.raises(UsageError, match="require --roce-ring"):
-        _checkpoint_ring(args)
+    with pytest.raises(UsageError, match="requires multiple host ranks"):
+        _checkpoint_fabric(args)
+
+
+@pytest.mark.parametrize("ring", [False, True])
+def test_fabric_streams_do_not_require_orbit_configuration(ring):
+    from ignition.cli.serve import _checkpoint_fabric
+
+    args = _parser().parse_args(["export", "glm-5.3-flash", "--ranks", "4", "--transfer-streams", "16",
+                                *(["--roce-ring"] if ring else [])])
+    assert _checkpoint_fabric(args) == dict(ring=ring, chain=False, streams=16)
+
+
+def test_fabric_transfers_follow_the_chain_shape():
+    from ignition.cli.serve import _checkpoint_fabric
+
+    args = _parser().parse_args(["export", "glm-5.3-flash", "--ranks", "4", "--roce-chain"])
+    assert _checkpoint_fabric(args) == dict(ring=False, chain=True, streams=8)

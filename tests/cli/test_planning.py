@@ -11,6 +11,7 @@ from ignition import planning
 from ignition.cli import display
 from ignition.errors import CapacityError, UsageError
 from ignition.recipes.declaration import Checkpoint, RankCosts, Recipe, SamplingDefaults, Speculation
+from ignition.recipes import recipes
 
 GIB, MIB = 1 << 30, 1 << 20
 
@@ -97,21 +98,6 @@ def test_mla_arithmetic_is_explicit_plan_metadata_without_changing_capacity():
         planning.fit(SOLO, SOLO.checkpoints[0], (gpu(0, 95),), mla_compute_mode="bf16", **options)
 
 
-def test_explicit_mla_arithmetic_selects_a_distinct_package_cache_entry(monkeypatch, tmp_path):
-    from types import SimpleNamespace
-    from pathlib import Path
-    from ignition.cli import runtime
-
-    auto = derive()
-    bf16 = replace(auto, mla_compute_mode="bf16")
-    model = SimpleNamespace(checkpoint=SOLO.checkpoints[0], directory=None)
-    monkeypatch.setattr(runtime.metadata, "version", lambda _: "test-version")
-    monkeypatch.setattr(runtime.util, "find_spec", lambda _: SimpleNamespace(origin=str(tmp_path / "__init__.py")))
-    monkeypatch.setattr(Path, "rglob", lambda *args: ())
-    assert runtime.package_key(model, auto, False) == runtime.package_key(model, replace(auto), False)
-    assert runtime.package_key(model, auto, False) != runtime.package_key(model, bf16, False)
-
-
 def test_image_concurrency_defaults_and_explicit_capacity():
     vision = replace(SOLO, max_images=4)
     settings = dict(concurrency=32, reserve_bytes=0, speculation=None, selected=None)
@@ -193,15 +179,15 @@ def test_speculation_settings_are_validated_and_described():
     assert Speculation(0).widths == (1,) and Speculation(0, adaptive=False).fixed_width == 1
     record = derive(speculation=Speculation(5, history_drafts=True)).to_dict()["speculation"]
     assert record == {"draft_tokens": 5, "adaptive": True, "proposal_source": "mtp", "history_drafts": True,
-                      "packed_verification": False}
+                      "packed_verification": False, "draft_prefix_selection": "cpu"}
     assert derive(speculation=Speculation(5, packed_verification=True)).to_dict()["speculation"]["packed_verification"]
     assert display.speculation(None) == "off"
     assert display.speculation(DRAFTING) == "up to 3 draft tokens per round · MTP module"
     assert display.speculation(fixed) == "exactly 2 draft tokens per round · MTP module"
     assert display.speculation(Speculation(4, history_drafts=True)) == (
-        "up to 4 draft tokens per round · MTP module and request history")
+        "up to 4 draft tokens per round · MTP module and shared decoded history")
     assert display.speculation(Speculation(1, proposal_source="copy")) == (
-        "up to 1 draft token per round · request history")
+        "up to 1 draft token per round · shared decoded history")
     assert display.speculation(None, brief=True) == "speculation off"
     assert display.speculation(DRAFTING, brief=True) == "up to 3 draft tokens"
     assert display.speculation(fixed, brief=True) == "exactly 2 draft tokens"
@@ -229,6 +215,48 @@ def test_prefill_chunk_defaults_to_the_recipe_and_accepts_an_override():
     # sequence this plan allows.
     with pytest.raises(UsageError, match="65,536 exceeds the 60,288-token context"):
         derive(reserve=16, prefill_chunk=65536)
+
+
+@pytest.mark.parametrize("alias,world_size,packed", [
+    (checkpoint.alias, 8 if recipe.name == "mimo_v2" else recipe.tensor_parallel[0],
+     recipe.speculation.packed_verification)
+    for recipe in recipes() if recipe.speculation is not None for checkpoint in recipe.checkpoints
+])
+@pytest.mark.parametrize("flags,configuration_text,expected", [
+    ((), "", (32, 4096, 128)),
+    ((), '[defaults]\nmax_concurrency=16\nspeculative_token_capacity=96\n', (16, 4096, 96)),
+    (("--max-concurrency", "8", "--prefill-chunk-size", "1024", "--speculative-token-capacity", "192"),
+     '[models."{alias}"]\nmax_concurrency=16\nspeculative_token_capacity=96\n', (8, 1024, 192)),
+])
+def test_cli_plan_resolves_recipe_configuration_and_flag_defaults(tmp_path, alias, world_size, packed,
+                                                                 flags, configuration_text, expected):
+    from ignition.cli import _parser, preparation
+    from ignition.cli.config import Configuration
+    from ignition.recipes import resolve
+
+    path = tmp_path / "flare.toml"
+    path.write_text(configuration_text.format(alias=alias))
+    configuration = Configuration.load(path)
+    model = resolve(alias)
+    args = _parser().parse_args(["export", model.checkpoint.alias, *flags])
+    selected = preparation.speculation(args, model, configuration)
+    concurrency = configuration.max_concurrency(model.checkpoint.alias, model.recipe.concurrency,
+                                                args.max_concurrency)
+    devices = tuple(gpu(index, 95) for index in range(world_size))
+    if model.recipe.name != "mimo_v2":
+        devices = tuple(replace(device, total_bytes=256 * GIB, free_bytes=255 * GIB) for device in devices)
+    host = preparation.Host(devices, None)
+    plan = preparation.derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
+                              speculation=selected, prefill_chunk=args.prefill_chunk_size)
+    assert plan.world_size == world_size
+    assert (plan.concurrency, plan.prefill_chunk, plan.speculative_token_capacity) == expected
+    assert plan.speculation.draft_tokens == model.recipe.speculation.draft_tokens and plan.speculation.adaptive
+    assert plan.speculation.packed_verification is packed
+    assert plan.speculation.draft_prefix_selection == ("gpu" if packed else "cpu")
+    record = plan.to_dict()
+    assert record["speculative_token_capacity"] == expected[2]
+    assert record["speculation"]["packed_verification"] is packed
+    assert record["speculation"]["draft_prefix_selection"] == ("gpu" if packed else "cpu")
 
 
 def test_context_parallel_pages_hold_every_rank_share_unless_disabled():

@@ -10,6 +10,7 @@ output its consumers read.
 import itertools
 from math import prod
 import weakref
+from dataclasses import dataclass
 
 import torch
 import triton
@@ -208,51 +209,151 @@ class PreparedChunkedAllReduce:
         return self.output
 
 
+@dataclass(frozen=True)
+class WeightedGroupSource:
+    """Ordered weighted groups with physical [rows, groups, hidden] storage.
+
+    Weights are FP32 [rows, groups]; IDs are int32/int64 with the same shape.
+    IDs outside [0, id_limit) supply zero values before multiplication.
+    """
+
+    values: torch.Tensor
+    weights: torch.Tensor
+    ids: torch.Tensor
+    id_limit: int
+
+    def arguments(self):
+        return dict(group_weights=self.weights, group_ids=self.ids, group_id_limit=self.id_limit)
+
+
 @torch.library.custom_op("flare::pcie_all_reduce_rmsnorm", mutates_args=("residual", "output"))
 def _all_reduce_rmsnorm(source: torch.Tensor, residual: torch.Tensor, weight: torch.Tensor,
-                       output: torch.Tensor, handle: int) -> None:
+                       output: torch.Tensor, handle: int, input_addend: torch.Tensor | None = None,
+                       group_weights: torch.Tensor | None = None, group_ids: torch.Tensor | None = None) -> None:
     owner = _OWNERS[handle]
     owner.runtime.all_reduce_fused_add_rms_norm(source, residual, weight, owner.eps, plan=owner.plan,
-        out=output, residual_out=residual, zero_centered=owner.zero_centered, reduction_dtype=owner.reduction_dtype)
+        out=output, residual_out=residual, zero_centered=owner.zero_centered, reduction_dtype=owner.reduction_dtype,
+        input_addend=input_addend, group_weights=group_weights, group_ids=group_ids,
+        group_id_limit=owner.group_id_limit)
 
 
 @_all_reduce_rmsnorm.register_fake
-def _fake_all_reduce_rmsnorm(source, residual, weight, output, handle):
+def _fake_all_reduce_rmsnorm(source, residual, weight, output, handle, input_addend=None,
+                             group_weights=None, group_ids=None):
     pass
 
 
 class PreparedAllReduceRMSNorm:
-    """One-shot collective with an in-place residual update and independent output dtype."""
+    """Reduce an optional rounded source sum, update the residual, and normalize.
+
+    Weighted groups reduce in group order with separate FP32 multiplies and
+    adds, then round to source precision. An input addend shares the logical
+    [rows, hidden] geometry and dtype; its FP32 addition rounds to source
+    precision before tensor-parallel reduction.
+    """
 
     @staticmethod
     def fits(runtime, source):
         from b12x.comm import pcie
 
+        if isinstance(source, WeightedGroupSource):
+            from b12x.comm.pcie._oneshot_preparation import _grouped_inputs, _state
+
+            if not isinstance(runtime, pcie.AllReduce) or runtime.algorithm != "oneshot" or not runtime.single_channel:
+                return False
+            channel = runtime._runtime._prepared_channel_for_stream(None, None)
+            if _state(channel).eager_tables is None:
+                return False
+            source, *_ = _grouped_inputs(source.values, **source.arguments())
         return (isinstance(runtime, pcie.AllReduce) and runtime.algorithm == "oneshot"
-                and runtime.single_channel and source.ndim == 2 and 0 < source.shape[0] <= 36)
+                and runtime.single_channel and source.ndim == 2 and source.shape[0] > 0
+                and source.is_contiguous() and source.dtype in (torch.float16, torch.bfloat16, torch.float32)
+                and source.shape[1] * source.element_size() % 16 == 0
+                and 0 < source.numel() * source.element_size() <= runtime.max_size)
 
     def __init__(self, source, residual, weight, output, *, eps, runtime, session, coordinator, name,
-                 zero_centered=False, reduction_dtype=None):
+                 zero_centered=False, reduction_dtype=None, input_addend=None):
         import torch.distributed as dist
         from b12x.comm.pcie._oneshot_preparation import _prepare_fused_call
 
         if not self.fits(runtime, source):
-            raise ValueError("fused all-reduce RMSNorm requires a single-channel one-shot runtime and at most 36 rows")
+            raise ValueError("fused all-reduce RMSNorm requires a single-channel one-shot runtime within its capacity")
         self.runtime, self.residual, self.weight, self.output = runtime, residual, weight, output
+        self.input_addend = input_addend
+        grouped = source if isinstance(source, WeightedGroupSource) else None
+        group_arguments = {} if grouped is None else grouped.arguments()
+        self.group_weights = None if grouped is None else grouped.weights
+        self.group_ids = None if grouped is None else grouped.ids
+        self.group_id_limit = 0 if grouped is None else grouped.id_limit
+        source = source if grouped is None else grouped.values
         self.eps, self.zero_centered, self.reduction_dtype = eps, zero_centered, reduction_dtype
         self.plan = runtime.plan(source, operation="all_reduce_fused_add_rms_norm", residual=residual,
-            weight=weight, out=output, residual_out=residual, zero_centered=zero_centered, reduction_dtype=reduction_dtype)
+            weight=weight, out=output, residual_out=residual, zero_centered=zero_centered, reduction_dtype=reduction_dtype,
+            input_addend=input_addend, **group_arguments)
         ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
         declare(session, (self.plan.request(name=name,
             prepare_call=lambda state: _prepare_fused_call(state, inp=source, residual=residual, weight=weight,
-                out=output, residual_out=residual, epsilon=eps, owners=(runtime, source, residual, weight, output)),
+                out=output, residual_out=residual, epsilon=eps, input_addend=input_addend, **group_arguments,
+                owners=(runtime, source, residual, weight, output, input_addend, self.group_weights, self.group_ids)),
             collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
         self.handle = next(_HANDLES)
         _OWNERS[self.handle] = self
 
     def __call__(self, source, residual):
-        _all_reduce_rmsnorm(source, residual, self.weight, self.output, self.handle)
+        _all_reduce_rmsnorm(source, residual, self.weight, self.output, self.handle, self.input_addend,
+                           self.group_weights, self.group_ids)
         return self.output
+
+
+@torch.library.custom_op("flare::pcie_all_reduce_add", mutates_args=("residual",))
+def _all_reduce_add(source: torch.Tensor, residual: torch.Tensor, handle: int,
+                    input_addend: torch.Tensor | None = None,
+                    group_weights: torch.Tensor | None = None,
+                    group_ids: torch.Tensor | None = None) -> None:
+    owner = _OWNERS[handle]
+    owner.runtime.all_reduce_fused_add(source, residual, plan=owner.plan,
+        input_addend=input_addend, group_weights=group_weights,
+        group_ids=group_ids, group_id_limit=owner.group_id_limit)
+
+
+@_all_reduce_add.register_fake
+def _fake_all_reduce_add(source, residual, handle, input_addend=None, group_weights=None, group_ids=None):
+    pass
+
+
+class PreparedAllReduceAdd:
+    """Reduce weighted contributions and update every residual row in place."""
+
+    fits = staticmethod(PreparedAllReduceRMSNorm.fits)
+
+    def __init__(self, source, residual, *, runtime, session, coordinator, name,
+                 reduction_dtype=None, input_addend=None):
+        import torch.distributed as dist
+        from b12x.comm.pcie._oneshot_preparation import _prepare_fused_call
+
+        if not self.fits(runtime, source):
+            raise ValueError("residual reduction requires a single-channel one-shot runtime within capacity")
+        self.runtime, self.input_addend = runtime, input_addend
+        grouped = source if isinstance(source, WeightedGroupSource) else None
+        arguments = {} if grouped is None else grouped.arguments()
+        self.group_weights = None if grouped is None else grouped.weights
+        self.group_ids = None if grouped is None else grouped.ids
+        self.group_id_limit = 0 if grouped is None else grouped.id_limit
+        source = source if grouped is None else grouped.values
+        self.plan = runtime.plan(source, operation="all_reduce_fused_add", residual=residual,
+            residual_out=residual, reduction_dtype=reduction_dtype, input_addend=input_addend, **arguments)
+        ranks = tuple(dist.get_process_group_ranks(runtime.exchange_group))
+        declare(session, (self.plan.request(name=name,
+            prepare_call=lambda state: _prepare_fused_call(state, inp=source, residual=residual,
+                weight=None, out=None, residual_out=residual, epsilon=0.0,
+                input_addend=input_addend, **arguments,
+                owners=(runtime, source, residual, input_addend, self.group_weights, self.group_ids)),
+            collective=CollectiveRequirement(key=name, ranks=ranks)),), coordinator=coordinator)
+        self.handle = next(_HANDLES)
+        _OWNERS[self.handle] = self
+
+    def __call__(self, source, residual):
+        _all_reduce_add(source, residual, self.handle, self.input_addend, self.group_weights, self.group_ids)
 
 
 def _gather_columns(source, output, handle):

@@ -284,7 +284,9 @@ impl ThreadedExecutor {
             return Ok(None);
         }
         for (index, peer) in self.peers.iter_mut().enumerate() {
-            super::parallel::agree(
+            let agreement = if self.local.manifest().graphs[self.completion.as_ref().unwrap().graph_index].kind
+                == super::GraphKind::PackedSpeculative { super::parallel::agree_packed } else { super::parallel::agree };
+            agreement(
                 self.completion.as_ref().unwrap(),
                 peer.completion.as_ref().unwrap(),
             )
@@ -443,6 +445,7 @@ fn same_layout(a: &ExecutionManifest, b: &ExecutionManifest) -> bool {
                 && a.sampling_mode == b.sampling_mode
                 && a.batch_capacity == b.batch_capacity
                 && a.token_capacity == b.token_capacity
+                && a.draft_tokens == b.draft_tokens
                 && a.packed_token_capacity == b.packed_token_capacity
                 && a.prefill_capacity == b.prefill_capacity
                 && a.input_bindings.len() == b.input_bindings.len()

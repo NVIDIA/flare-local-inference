@@ -304,13 +304,14 @@ class DirectServer:
                 graph_ns = self.recorded.get(step.graph) if self.eager else measured
                 self.clock_ns += graph_ns or 0
                 records = self.steps.records(step.frame)
-                confidence = self.steps.confidence(step.graph) if step.graph in self.scheduler.layout.paired_graphs else None
+                confidence = self.steps.confidence(step.graph) if (step.graph in self.scheduler.layout.paired_graphs
+                    or step.kind == "packed_speculative") else None
                 with self.lock:
                     self.scheduler.advance_to(self.clock_ns)
-                    if confidence is not None:
+                    if confidence is not None and step.kind != "packed_speculative":
                         for lane, values in zip(step.lanes, confidence):
                             lane.request.acceptance.confidence(values)
-                    retired = self.scheduler.complete(step, records, graph_ns)
+                    retired = self.scheduler.complete(step, records, graph_ns, confidence=confidence)
                 if self.verbose:
                     scheduled = f" (scheduled as {graph_ns / 1e6:.2f} ms)" if self.eager and graph_ns else ""
                     print(f"step {step.sequence} {step.graph} rows {len(step.lanes)} {measured / 1e6:.2f} ms"

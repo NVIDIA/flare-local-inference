@@ -1,5 +1,7 @@
 """Prepared RMS normalization reading projection slices with explicit row strides."""
 
+from dataclasses import replace
+
 import torch
 from b12x.norm.hyperconnection import api as hyperconnection
 from b12x.preparation import PreparedCall
@@ -73,6 +75,46 @@ class PreparedRMSNorm:
         else:
             torch.ops.b12x.hyperconnection_grouped_rmsnorm(
                 source, self.weight, self.output, self.eps, self.plan.handle, self.zero_centered)
+        return self.output
+
+
+class PreparedIndexedRMSNorm:
+    """Normalize a nonnegative, in-range row selection without materializing a gather."""
+
+    def __init__(self, source, indices, weight, output, *, eps, session, name, zero_centered=False):
+        if (source.ndim != 2 or source.stride(1) != 1 or source.stride(0) < source.shape[1]
+                or source.dtype not in (torch.bfloat16, torch.float32)
+                or indices.ndim != 1 or not indices.is_contiguous()
+                or indices.dtype not in (torch.int32, torch.int64)
+                or output.shape != (indices.numel(), source.shape[1])
+                or output.dtype != torch.bfloat16 or not output.is_contiguous()
+                or weight.shape != source.shape[1:] or not weight.is_contiguous()
+                or weight.dtype not in (torch.bfloat16, torch.float32)
+                or any(t.device != source.device for t in (indices, weight, output))):
+            raise ValueError("indexed RMS normalization requires an integer row selection and contiguous BF16 output")
+        self.weight, self.output, self.eps = weight, output, float(eps)
+        self.plan = hyperconnection.plan(hyperconnection.Caps(device=source.device,
+            max_tokens=indices.numel(), hidden_size=source.shape[1], streams=1, lowrank=1, dtype=source.dtype),
+            invocation={"operation": "grouped_rmsnorm", "zero_centered": bool(zero_centered), "eps": self.eps,
+                "weight_dtype": str(weight.dtype).removeprefix("torch."),
+                "indexed_rows": source.shape[0], "index_dtype": str(indices.dtype).removeprefix("torch.")})
+
+        def benchmark(state):
+            def fixture():
+                operands = HyperconnectionBenchmarkInputs("grouped_rmsnorm", (source, weight, output))
+                rows = torch.arange(indices.numel(), device=source.device, dtype=indices.dtype) % source.shape[0]
+                return operands, rows
+            operands, rows = benchmark_resource(session, ("indexed_rms_norm", name), fixture)
+            a, w, o = operands.arguments
+            return PreparedCall(run=lambda: state.launch(a, w, o, eps=self.eps, indices=rows),
+                                output=o, produce=operands.produce, owners=(operands, rows))
+        # Priming drains before publication; private operands must not become plan owners.
+        declare(session, (self.plan.request(name=name,
+            prepare_call=lambda state: replace(benchmark(state), owners=()), benchmark_call=benchmark),))
+
+    def __call__(self, source, indices):
+        torch.ops.b12x.hyperconnection_indexed_rmsnorm(
+            source, self.weight, indices, self.output, self.eps, self.plan.handle)
         return self.output
 
 

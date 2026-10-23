@@ -120,6 +120,8 @@ class PeerStorage(CudaRTLibrary):
 
     def reset(self):
         """Reset all local signals and generation-tagged payloads after group drain."""
-        for address, size in self.owned.items():
-            if address not in self.dynamic:
-                self.cudaMemset(address, 0, size)
+        import flare_heliopause
+
+        context, _ = flare_heliopause.current_context()
+        ranges = [(address, size) for address, size in self.owned.items() if address not in self.dynamic]
+        flare_heliopause.export_reset_peer_storage(context, ranges, self)
