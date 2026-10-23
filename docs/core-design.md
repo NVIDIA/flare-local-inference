@@ -1078,12 +1078,14 @@ retain the first failure, and a failed CUDA drain retains the graph and buffer o
 ### Native frontend dependencies
 
 Helios uses Axum/Tokio for HTTP, Hugging Face `tokenizers` for tokenization,
-and MiniJinja with Python-method compatibility for chat templates. Dependency
-versions and features are specified in [Cargo.toml](../helios/Cargo.toml).
-The [template renderer](../helios/src/frontend/mod.rs) supplies Python-compatible
-JSON formatting, whitespace handling, and template exceptions. Rendering must
-match the checkpoint template's bytes and token IDs, including tool schemas and
-image content.
+and its compiled Jinja VM or a native encoder for prompt rendering. MiniJinja is
+a development-only differential and benchmark reference. Dependency versions and
+features are specified in [Cargo.toml](../helios/Cargo.toml).
+The [native frontend](../helios/src/frontend/mod.rs) preserves the authoritative
+renderer's prompt bytes, token IDs, tool serialization, and image order. Jinja
+evaluation supplies Python-compatible JSON formatting, whitespace handling, and
+template exceptions. Model integrations must satisfy the
+[renderer contract and validation requirements](model-development.md#prompt-renderers-and-checkpoint-boundaries).
 
 The [native image processor](../helios/src/frontend/images/mod.rs) is checked
 against the checkpoint's Transformers processor. Compare resized and normalized
@@ -1346,16 +1348,21 @@ Only consumed history can define a checkpoint.
 
 ### Exact endpoint capture
 
-The shared frontend renders each message prefix without a generation header or
-assistant continuation. It accepts every nonempty rendered token sequence that
-is a strict prefix of the complete prompt, irrespective of message roles. A
-prefix may contain a template-generated preamble or end after any system,
-developer, user, assistant, or tool message. Templates can reject an incomplete
-conversation after emitting a complete prefix; only emitted tokens matching the
-validated full prompt are eligible. Context-dependent rendering that changes
-previous tokens cannot create a checkpoint for that prefix. Equal endpoints are
-deduplicated. Image placeholder expansion shifts endpoints to their positions in
-the prepared token stream; no endpoint may split an atomic image span.
+The shared frontend renders the complete normalized conversation once. Annotated
+Jinja templates record zero-output byte marks, segmented templates record counts
+of completed segments, and native encoders record normalized-message byte ends
+as they append output. Completed preambles and messages of every supported role
+are eligible; the open assistant generation header is excluded.
+
+Shared mapping converts those positions through the full prompt encoding's
+untrimmed token offsets. An exact cut requires every preceding token to end at
+or before it and every following token to start at or after it. BPE tokens
+crossing a mark and overlapping Unicode spans cannot create partial-token cuts.
+Continuation truncation excludes later positions. Token endpoints are sorted,
+deduplicated, and strictly inside the prompt. Image placeholder expansion shifts
+them into the prepared token stream without splitting atomic image spans. Cache
+reuse depends on the actual prepared prefix identity; context-dependent changes
+to earlier tokens cannot reuse a checkpoint for different tokens.
 
 Endpoints are not rounded to token groups or KV pages. The scheduler obtains a
 snapshot destination when it reaches an endpoint, using normal cache eviction.

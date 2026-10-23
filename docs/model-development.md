@@ -49,6 +49,148 @@ Performance changes also require [GPU performance work](performance-work.md).
   tokenizer, processor, or model configuration files. Helios consumes prepared
   settings without per-model sampling policy or config-file interpretation.
 
+## Prompt renderers and checkpoint boundaries
+
+Every model integration must provide prompt rendering, tokenization, image
+ordering, and reusable-prefix endpoints through the shared native frontend.
+These requirements apply to text Jinja, segmented Jinja, and programmatic Rust
+encoders. A plausible generated answer does not establish frontend correctness.
+Follow the [frontend metadata contract](../helios/model-contract.md#frontend-implementations)
+and [native frontend interfaces](../helios/README.md#native-frontend).
+
+### Canonical prompt semantics
+
+- Identify the exact checkpoint tokenizer and authoritative template or encoder
+  revision. Preserve prompt bytes, token IDs, special-token treatment, whitespace,
+  tool serialization, reasoning history, generation headers, and continuation
+  behavior. A deliberate inference transformation needs an explicit semantic
+  requirement and independent reference tests.
+- Render the normalized conversation supplied by the shared request path.
+  Protocol decoding, instruction lowering, and tool-result normalization belong
+  in shared code. Renderer selection describes prompt syntax; it must not select
+  scheduling, cache policy, or model execution behavior.
+- Return image sources in the same order as their rendered placeholders. If
+  normalization reorders tool results, move each result's images with its text.
+  Preserve the tokenizer's distinction between ordinary text and special tokens,
+  including literal special-token spellings in user and tool content.
+- Explicit request options override packaged defaults. Validate unsupported
+  options and malformed content explicitly. Preserve previously exported
+  packages' renderer selection, absent-field defaults, and packaged semantics.
+
+### Complete-message endpoints
+
+- Render the conversation once and record endpoints while producing its output.
+  Tokenize each required text or ordinary/special-token segment once. Do not
+  recover boundaries by rendering or tokenizing every conversation prefix,
+  searching for message text, or inserting marker text into the prompt.
+- Record the completed preamble and every completed normalized message in output
+  order, including system, assistant, and tool messages where supported. A merged
+  user run has the endpoint of the merged message; reordered results have
+  endpoints in rendered order. Include closing wrappers and separators belonging
+  to a completed message, and exclude the open assistant generation header.
+- Text renderers report UTF-8 byte positions, not character counts or token IDs;
+  segmented Jinja reports segment counts as specified below. Shared boundary
+  mapping uses the full encoding's untrimmed offsets and accepts
+  an exact cut only when every preceding token ends at or before it and every
+  following token starts at or after it. Omit an exact cut crossed by a BPE token
+  or overlapping Unicode spans; do not round it to a nearby token or cache page.
+- The frontend's final token endpoints must be sorted, unique, and strictly
+  inside the prompt. Continuation truncation must exclude later endpoints. Image
+  expansion must shift endpoints with the token stream without splitting an
+  atomic image span. The scheduler owns prompt/terminal checkpoints and complete
+  state capture; renderers supply positions, not cache-management instructions.
+
+### Jinja integration
+
+- Package an annotated recipe template. Removing its mark annotations must
+  reproduce the authoritative template bytes, including any explicitly supported
+  inference transformation. Preserve Jinja whitespace-control behavior and test
+  actual rendered output; source equality alone does not validate placement.
+- Text templates use `{% mark %}` to record a zero-output byte position.
+  Templates producing token segments use `{% mark expression %}`, where the
+  expression is the number of completed segments. For example,
+  `{% mark ns.segments | length %}` refers to segment entries, not bytes in the
+  serialized JSON representation. Preserve each segment's `allow_special` value.
+- Place marks at root output sites after a completed preamble or message.
+  Marks inside macros, captured assignments, or filter blocks are forbidden;
+  mark the root call site after the helper returns. Handle each output branch,
+  including tool-only messages and empty content with nonempty framing.
+- Verify the recipe exports the annotated asset and Helios loads it through the
+  shared compiler. Do not bypass the missing-annotation error or add a broad
+  template fallback. Compatibility substitutions must match the exact template
+  bytes of an existing supported package.
+
+### Programmatic encoder integration
+
+- Use the authoritative encoder where available. Expose normalized-message byte
+  endpoints from its actual append loop, and adapt them through the shared
+  tokenizer/boundary path. Avoid a parallel implementation of the encoder's
+  formatting or normalization solely to discover positions.
+- Carry positions through system insertion, adjacent-message merging, tool-result
+  sorting, and wrapper emission. Keep image sources, message text, and endpoint
+  ownership together through those operations. Both Jinja and native encoders
+  must satisfy the same complete-message and token-boundary invariants.
+- Maintain required upstream changes as focused commits in a pinned dependency
+  fork. Keep related crates' revisions and shared types coherent, preserve the
+  upstream license, and document dependency updates. Compare against the
+  independent upstream renderer when changing prompt behavior; calling the same
+  patched encoder through another adapter is not an independent reference.
+
+### Content-block checkpoint hints
+
+For requests carrying advisory block hints, every supported rendering mode must
+satisfy these requirements:
+
+- Decode protocol-specific fields into neutral message/block positions before
+  rendering. Hints must not alter prompt bytes, token IDs, image order, reasoning
+  state, or explicit request options, and must not reach model-visible output.
+  Requests from protocols that do not supply hints retain their ordinary behavior.
+- Preserve block identity through normalization and rendering. Carry positions
+  through byte-preserving concatenation, captures, macros, segment construction,
+  and trimming where their output positions remain defined. Repeated equal text
+  must not cause a hint to move to a different block. Never guess a position after
+  an unmappable transformation.
+- Cover text blocks, supported image blocks, and whole tool results. A tool-result
+  endpoint includes its closing wrapper; an image endpoint must survive atomic
+  image expansion. Text-only coverage does not establish image or segmented
+  renderer support. Report unsupported cases explicitly rather than silently
+  treating an accepted hint as implemented.
+- Keep advisory cuts distinct from exact message marks. A hint may use the last
+  safe complete-token prefix before its byte endpoint; it must not weaken exact
+  message-boundary validation or change scheduler/cache policy.
+- Preserve an unhinted path without hint-specific string copies or per-value
+  hint allocations. Measure unhinted latency and allocations when changing shared
+  rendering machinery; protocol-specific decoding alone does not isolate its cost.
+
+### Required validation
+
+1. Compare the production renderer with the pinned authoritative reference using
+   the actual template/encoder and checkpoint tokenizer. Check rendered bytes,
+   token IDs, image order, supported options, and expected errors. Exercise
+   system/developer lowering, user and assistant turns, reasoning on/off where
+   supported, tool choices, multiple/reordered results, and continuation.
+2. Test boundary behavior with empty and repeated content, UTF-8, whitespace/BPE
+   joins, merged users, wrappers, generation headers, and image expansion.
+   For block hints, include a stable history plus a changing suffix inside one
+   user message; assert the expected extra cut and identical hinted/unhinted
+   prompts. Exercise captures and macros with the real recipe template, and
+   segmented and image paths where supported. Synthetic tokenizers are useful
+   edge-case tests but do not establish checkpoint-tokenizer parity.
+3. Exercise the native request preparation used by each supported HTTP protocol
+   and load the exported package's frontend assets/settings. Validate older
+   packages when changing their loading or default semantics.
+4. Demonstrate repeated-prompt and changed-suffix cache reuse through the actual
+   service, including ordinary and speculative execution where supported. Check
+   consumed-prefix accounting and continuation correctness. Frontend CPU tests
+   alone do not establish runtime cache reuse or a serving performance gain.
+   Report missing checkpoints, unrun hardware paths, and skipped tests explicitly.
+
+Use [frontend fixtures](../tests/frontend),
+[native boundary tests](../helios/tests/message_boundaries.rs),
+[native encoder/request tests](../helios/tests/deepseek_requests.rs), and
+[HTTP protocol tests](../tests/server/test_protocols.py) as starting points.
+Keep ordinary tests and measurements; do not add development audit artifacts.
+
 ## Weight formats and arithmetic precision
 
 - **Read quantization from checkpoint metadata.** Use `config.json` declarations

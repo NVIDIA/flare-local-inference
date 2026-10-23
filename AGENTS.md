@@ -95,6 +95,8 @@ and hardware sections of the preparation guide.
 
 For sampling or frontend metadata changes, also read
 [sampling and frontend metadata](docs/model-development.md#sampling-and-frontend-metadata).
+Model onboarding and changes to tokenizers, chat templates, or native prompt
+encoders must satisfy the [renderer contract and validation requirements](docs/model-development.md#prompt-renderers-and-checkpoint-boundaries).
 
 ## Build and run model checkpoints
 
