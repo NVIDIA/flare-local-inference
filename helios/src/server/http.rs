@@ -264,7 +264,7 @@ pub(super) async fn generate(
     let observation = decoded.observation;
     let continuous_usage = decoded.stream && observation.continuous_usage
         && matches!(protocol, Protocol::Chat | Protocol::Completions);
-    let ingress_ns = observation.timestamps.then_some(ingress_ns);
+    let observation_ingress_ns = observation.timestamps.then_some(ingress_ns);
     let prompt_ids = observation
         .token_ids
         .then(|| prepared[0].prompt.tokens.clone());
@@ -286,6 +286,15 @@ pub(super) async fn generate(
             prompts.push(p.prompt);
         }
     }
+    let choices = decoded.request.choices;
+    let explicit_max = decoded.request.options.output_limit;
+    let group_count = size / choices;
+    let mut group_remaining = vec![0usize; group_count];
+    let group_of_generation = generation_groups(size, choices, &zero);
+    for group in &group_of_generation {
+        group_remaining[*group] += 1;
+    }
+    let mut group_max = vec![0u64; group_count];
     let prefix = match protocol {
         Protocol::Chat => "chatcmpl",
         Protocol::Completions => "cmpl",
@@ -300,14 +309,16 @@ pub(super) async fn generate(
     let submitted = if prompts.is_empty() {
         Ok(vec![])
     } else if continuous_usage {
-        state.model.generate_many_observed(prompts, observation.timestamps)
+        state
+            .model
+            .generate_many_observed(prompts, observation.timestamps, Some(ingress_ns))
     } else if observation.token_ids && size == 1 {
         state
             .model
-            .generate_observed(prompts.remove(0), observation.timestamps)
+            .generate_observed(prompts.remove(0), observation.timestamps, Some(ingress_ns))
             .map(|g| vec![g])
     } else {
-        state.model.generate_many(prompts)
+        state.model.generate_many(prompts, Some(ingress_ns))
     };
     let mut generation = match submitted {
         Ok(g) => g,
@@ -486,6 +497,16 @@ pub(super) async fn generate(
                     ..
                 } => {
                     reused_total += reused_prompt_tokens;
+                    let group = group_of_generation[index];
+                    group_max[group] = group_max[group].max(generated_tokens as u64);
+                    group_remaining[group] -= 1;
+                    if group_remaining[group] == 0 {
+                        state.model.metrics().group_params(
+                            choices as u64,
+                            explicit_max,
+                            group_max[group],
+                        );
+                    }
                     let result = decoders[index]
                         .finish(termination)
                         .and_then(|events| encoder.apply(index, events))
@@ -506,7 +527,7 @@ pub(super) async fn generate(
                                             &mut frame.data,
                                             &encoder.usage_value(),
                                             reused_prompt_tokens,
-                                            (ingress_ns, enqueue_ns),
+                                            (observation_ingress_ns, enqueue_ns),
                                             true,
                                         );
                                     }
@@ -546,7 +567,7 @@ pub(super) async fn generate(
                 &mut response,
                 &encoder.usage_value(),
                 reused_total,
-                (ingress_ns, enqueue_ns),
+                (observation_ingress_ns, enqueue_ns),
                 false,
             );
         }
@@ -588,10 +609,25 @@ pub(super) async fn generate(
     }
 }
 
+/// Map each submitted generation to its prompt-major choice group.
+fn generation_groups(size: usize, choices: usize, zero: &[usize]) -> Vec<usize> {
+    (0..size)
+        .filter(|index| !zero.contains(index))
+        .map(|index| index / choices)
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn zero_token_groups_keep_later_group_indices() {
+        assert_eq!(generation_groups(4, 2, &[0, 1]), vec![1, 1]);
+        assert_eq!(generation_groups(3, 1, &[1]), vec![0, 2]);
+    }
+
     #[test]
     fn failure_logs_include_utc_time_request_stage_and_typed_code() {
         let error = Error::admission(AdmissionError::Capacity, "full\nretry");

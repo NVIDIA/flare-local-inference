@@ -149,6 +149,26 @@ separate proposal work by batch capacity and draft depth. The corresponding
 `flare_speculative_*` metrics cover combined or verification graphs by batch
 capacity and verification width; their GPU duration excludes separate proposals.
 
+## Request timing metrics
+
+`Incoming.arrival_ns` records engine arrival and continues to drive scheduling and
+age pricing. The HTTP layer also supplies `metrics_ingress_ns`, which only the
+request latency and first-token histograms read. Queue time runs from engine
+arrival to first admission. TTFT runs from metrics ingress to the first committed
+token and is observed when that token is committed, so a later abort does not
+erase it. Prefill runs from first admission to the first committed token; decode
+and inference end at the last committed token, not at the later finish event. E2E
+runs from metrics ingress to finish. ITL is observed once per completion per
+request, not once per token, so a speculative burst contributes one sample. TPOT
+divides decode time by the number of generated tokens after the first.
+
+`Carried` preserves the original prompt and cached-token counts, first admission,
+first and last token times, and the preemption count across readmission. Only
+`park_if_preempted` increments that count; a host-restore `requeue` does not.
+Prompt token counters are recorded once at the first committed token. Group
+`n`, explicit `max_tokens`, and the maximum actually generated token count are
+observed once when the group finishes.
+
 ## Useful service and selection
 
 Prompt progress counts consumed uncached prompt tokens. Output progress counts

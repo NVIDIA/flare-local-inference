@@ -188,6 +188,7 @@ impl Fixture {
             Incoming {
                 _capacity: None,
                 arrival_ns: super::super::observation::monotonic_ns(),
+                metrics_ingress_ns: None,
                 publications: Default::default(),
                 prompt: Prompt {
                     tokens,
@@ -1629,7 +1630,7 @@ fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacit
     let good = fixture.incoming(vec![1, 2], 4).0.prompt;
     let mut bad = fixture.incoming(vec![1, 2], 4).0.prompt;
     bad.tokens.clear();
-    assert!(runtime.generate_many(vec![good, bad]).is_err());
+    assert!(runtime.generate_many(vec![good, bad], None).is_err());
     assert!(matches!(
         receiver.try_recv(),
         Err(mpsc::TryRecvError::Empty)
@@ -1638,14 +1639,14 @@ fn grouped_submission_validates_all_children_before_enqueue_and_releases_capacit
     let prompts = (0..3)
         .map(|_| fixture.incoming(vec![1, 2], 4).0.prompt)
         .collect();
-    let generations = runtime.generate_many(prompts).unwrap();
+    let generations = runtime.generate_many(prompts, None).unwrap();
     let group = receiver.try_recv().unwrap();
     assert_eq!(group.len(), 3);
     assert_eq!(runtime.capacity.available_permits(), 1);
     let prompts = (0..2)
         .map(|_| fixture.incoming(vec![1, 2], 4).0.prompt)
         .collect();
-    assert!(runtime.generate_many(prompts).is_err());
+    assert!(runtime.generate_many(prompts, None).is_err());
     assert!(matches!(
         receiver.try_recv(),
         Err(mpsc::TryRecvError::Empty)
@@ -2330,7 +2331,7 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
     use std::io::{Read, Write};
     let (sender, _receiver) = mpsc::sync_channel(4);
     let state = http_state(sender, Some("serving-key".into()));
-    state.model.metrics().progress(10, 3, 0, 0, 0, 0);
+    state.model.metrics().progress(10, 3, 0, 0, 0, 0, 0);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let router = super::super::router(state, &[], 65536);
@@ -2370,6 +2371,8 @@ async fn metrics_route_serves_prometheus_or_json_without_the_api_key() {
         "{body}"
     );
     assert!(body.contains("\nflare_prefill_tokens_total 10\n"));
+    assert!(body.contains("\nflare_time_to_first_token_seconds_count 0\n"));
+    assert!(body.contains("\nflare_request_success_total{finished_reason=\"stop\"} 0\n"));
     for (path, accept) in [
         ("/metrics", Some("application/json")),
         ("/metrics?format=json", Some("text/plain")),
@@ -2536,6 +2539,11 @@ fn failed_host_restore_replans_all_images_from_the_shallower_prefix() {
         reused_prompt_tokens: Some(56),
         generated_tokens: 7,
         seed: Some(99),
+        admitted_ns: None,
+        first_token_ns: None,
+        last_token_ns: None,
+        preemptions: 0,
+        prompt_observed: false,
     };
     worker.active[0].as_mut().unwrap().last_token = Some(2);
     let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();

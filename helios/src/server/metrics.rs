@@ -44,6 +44,124 @@ use crate::{
     scheduler::SchedulerStats,
 };
 
+const REQUEST_LATENCY_SECONDS: &[f64] = &[
+    0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0,
+    120.0, 240.0, 480.0, 960.0, 1920.0, 7680.0,
+];
+const TTFT_SECONDS: &[f64] = REQUEST_LATENCY_SECONDS;
+const ITL_SECONDS: &[f64] = REQUEST_LATENCY_SECONDS;
+const ITERATION_TOKENS: &[u64] = &[
+    1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
+];
+const REQUEST_PARAMS_N: &[u64] = &[1, 2, 4, 8, 16];
+const REQUEST_PREEMPTIONS: &[u64] = &[1, 2, 4, 8, 16];
+
+fn nanos(bounds: &[f64]) -> Vec<u64> {
+    bounds
+        .iter()
+        .map(|seconds| (*seconds * 1_000_000_000.0).round() as u64)
+        .collect()
+}
+
+fn token_buckets(context_tokens: u64) -> Vec<u64> {
+    let mut bounds = Vec::new();
+    let mut decade = 1u64;
+    while decade <= context_tokens {
+        for multiple in [1u64, 2, 5] {
+            let value = decade.saturating_mul(multiple);
+            if value <= context_tokens {
+                bounds.push(value);
+            }
+        }
+        decade = decade.saturating_mul(10);
+    }
+    bounds
+}
+
+#[derive(Clone, Copy)]
+enum HistogramScale {
+    Unit,
+    Nanos,
+}
+
+struct Histogram {
+    bounds: Vec<u64>,
+    /// One more entry than `bounds`; the last entry is `+Inf`.
+    buckets: Vec<AtomicU64>,
+    sum: AtomicU64,
+}
+
+impl Default for Histogram {
+    fn default() -> Self {
+        Self::new(Vec::new())
+    }
+}
+
+impl Histogram {
+    fn new(bounds: Vec<u64>) -> Self {
+        let buckets = (0..=bounds.len()).map(|_| AtomicU64::new(0)).collect();
+        Self {
+            bounds,
+            buckets,
+            sum: AtomicU64::new(0),
+        }
+    }
+
+    fn observe(&self, value: u64) {
+        let index = self.bounds.partition_point(|bound| *bound < value);
+        self.buckets[index].fetch_add(1, Ordering::Relaxed);
+        self.sum.fetch_add(value, Ordering::Relaxed);
+    }
+
+    fn render(&self, text: &mut String, name: &str, help: &str, scale: HistogramScale) {
+        let _ = writeln!(
+            text,
+            "# HELP flare_{name} {help}\n# TYPE flare_{name} histogram"
+        );
+        let mut cumulative = 0;
+        for (index, bound) in self.bounds.iter().enumerate() {
+            cumulative += self.buckets[index].load(Ordering::Relaxed);
+            let le = match scale {
+                HistogramScale::Unit => bound.to_string(),
+                HistogramScale::Nanos => format_bound(*bound),
+            };
+            let _ = writeln!(text, "flare_{name}_bucket{{le=\"{le}\"}} {cumulative}");
+        }
+        cumulative += self
+            .buckets
+            .last()
+            .map(|value| value.load(Ordering::Relaxed))
+            .unwrap_or(0);
+        let _ = writeln!(text, "flare_{name}_bucket{{le=\"+Inf\"}} {cumulative}");
+        let sum = self.sum.load(Ordering::Relaxed);
+        let sum = match scale {
+            HistogramScale::Unit => sum.to_string(),
+            HistogramScale::Nanos => format!("{}", sum as f64 / 1_000_000_000.0),
+        };
+        let _ = writeln!(text, "flare_{name}_sum {sum}");
+        let _ = writeln!(text, "flare_{name}_count {cumulative}");
+    }
+}
+
+fn format_bound(nanos: u64) -> String {
+    format!("{}", nanos as f64 / 1_000_000_000.0)
+}
+
+/// One request's timing and size at the `Finished` boundary.
+pub(super) struct RequestTiming {
+    pub ingress_ns: u64,
+    pub arrival_ns: u64,
+    pub admitted_ns: Option<u64>,
+    pub first_token_ns: Option<u64>,
+    pub last_token_ns: Option<u64>,
+    pub finished_ns: u64,
+    pub prompt_tokens: u64,
+    pub cached_tokens: u64,
+    pub generated_tokens: u64,
+    pub preemptions: u64,
+    pub reason: &'static str,
+}
+
 #[derive(Default)]
 struct RoundMetrics {
     rounds: AtomicU64,
@@ -282,20 +400,76 @@ pub(super) struct Metrics {
     host_inbound_rate: AtomicU64,
     host_inbound_waiting: AtomicU64,
     learned_draft_steps: AtomicU64,
+    offered_drafts: AtomicU64,
+    prompt_tokens: AtomicU64,
+    prompt_tokens_cached: AtomicU64,
+    request_success: [AtomicU64; 5],
+    request_prompt_tokens: Histogram,
+    request_generation_tokens: Histogram,
+    request_max_num_generation_tokens: Histogram,
+    request_params_n: Histogram,
+    request_params_max_tokens: Histogram,
+    time_to_first_token: Histogram,
+    inter_token_latency: Histogram,
+    request_time_per_output_token: Histogram,
+    e2e_request_latency: Histogram,
+    request_queue_time: Histogram,
+    request_inference_time: Histogram,
+    request_prefill_time: Histogram,
+    request_decode_time: Histogram,
+    request_prefill_kv_computed_tokens: Histogram,
+    request_num_preemptions: Histogram,
+    iteration_tokens: Histogram,
 }
 
 impl Metrics {
-    pub fn new(total_pages: u32, page_tokens: usize, decode_weight_bytes: u64) -> Self {
-        Self {
+    pub fn new(
+        total_pages: u32,
+        page_tokens: usize,
+        decode_weight_bytes: u64,
+        context_tokens: u64,
+    ) -> Self {
+        let mut metrics = Self {
             total_pages: total_pages as u64,
             page_tokens: page_tokens as u64,
             decode_weight_bytes,
             ..Self::default()
-        }
+        };
+        let tokens = token_buckets(context_tokens);
+        metrics.request_prompt_tokens = Histogram::new(tokens.clone());
+        metrics.request_generation_tokens = Histogram::new(tokens.clone());
+        metrics.request_prefill_kv_computed_tokens = Histogram::new(tokens);
+        metrics.write_static_histograms();
+        metrics
     }
 
-    pub fn progress(&self, prefill: u64, generated: usize, accepted: u64, rounds: u64,
-        verification_drafts: u64, verification_rounds: u64) {
+    fn write_static_histograms(&mut self) {
+        let latency = nanos(REQUEST_LATENCY_SECONDS);
+        self.request_max_num_generation_tokens = Histogram::new(ITERATION_TOKENS.to_vec());
+        self.request_params_max_tokens = Histogram::new(ITERATION_TOKENS.to_vec());
+        self.request_params_n = Histogram::new(REQUEST_PARAMS_N.to_vec());
+        self.time_to_first_token = Histogram::new(nanos(TTFT_SECONDS));
+        self.inter_token_latency = Histogram::new(nanos(ITL_SECONDS));
+        self.request_time_per_output_token = Histogram::new(latency.clone());
+        self.e2e_request_latency = Histogram::new(latency.clone());
+        self.request_queue_time = Histogram::new(latency.clone());
+        self.request_inference_time = Histogram::new(latency.clone());
+        self.request_prefill_time = Histogram::new(latency.clone());
+        self.request_decode_time = Histogram::new(latency);
+        self.request_num_preemptions = Histogram::new(REQUEST_PREEMPTIONS.to_vec());
+        self.iteration_tokens = Histogram::new(ITERATION_TOKENS.to_vec());
+    }
+
+    pub fn progress(
+        &self,
+        prefill: u64,
+        generated: usize,
+        accepted: u64,
+        rounds: u64,
+        verification_drafts: u64,
+        verification_rounds: u64,
+        offered: u64,
+    ) {
         for (counter, value) in [
             (&self.prefill_tokens, prefill),
             (&self.generated_tokens, generated as u64),
@@ -303,10 +477,72 @@ impl Metrics {
             (&self.draft_rounds, rounds),
             (&self.verification_drafts, verification_drafts),
             (&self.verification_rounds, verification_rounds),
+            (&self.offered_drafts, offered),
         ] {
             if value != 0 {
                 counter.fetch_add(value, Ordering::Relaxed);
             }
+        }
+    }
+
+    pub fn prompt_tokens(&self, prompt: u64, cached: u64) {
+        self.prompt_tokens.fetch_add(prompt, Ordering::Relaxed);
+        self.prompt_tokens_cached
+            .fetch_add(cached, Ordering::Relaxed);
+    }
+
+    pub fn first_token(&self, latency_ns: u64) {
+        self.time_to_first_token.observe(latency_ns);
+    }
+
+    pub fn inter_token(&self, latency_ns: u64) {
+        self.inter_token_latency.observe(latency_ns);
+    }
+
+    pub fn iteration_tokens(&self, tokens: u64) {
+        self.iteration_tokens.observe(tokens);
+    }
+
+    pub fn request_finished(&self, timing: RequestTiming) {
+        let index = match timing.reason {
+            "stop" => 0,
+            "length" => 1,
+            _ => return,
+        };
+        self.e2e_request_latency
+            .observe(timing.finished_ns.saturating_sub(timing.ingress_ns));
+        if let Some(admitted) = timing.admitted_ns {
+            self.request_queue_time
+                .observe(admitted.saturating_sub(timing.arrival_ns));
+        }
+        self.request_prompt_tokens.observe(timing.prompt_tokens);
+        self.request_generation_tokens
+            .observe(timing.generated_tokens);
+        self.request_prefill_kv_computed_tokens
+            .observe(timing.prompt_tokens.saturating_sub(timing.cached_tokens));
+        self.request_num_preemptions.observe(timing.preemptions);
+        if let (Some(admitted), Some(first)) = (timing.admitted_ns, timing.first_token_ns) {
+            self.request_prefill_time
+                .observe(first.saturating_sub(admitted));
+            if let Some(last) = timing.last_token_ns {
+                self.request_inference_time
+                    .observe(last.saturating_sub(admitted));
+                self.request_decode_time.observe(last.saturating_sub(first));
+                if timing.generated_tokens > 1 {
+                    self.request_time_per_output_token
+                        .observe(last.saturating_sub(first) / (timing.generated_tokens - 1));
+                }
+            }
+        }
+        self.request_success[index].fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn group_params(&self, choices: u64, max_tokens: Option<u64>, max_generated: u64) {
+        self.request_params_n.observe(choices);
+        self.request_max_num_generation_tokens
+            .observe(max_generated);
+        if let Some(max_tokens) = max_tokens {
+            self.request_params_max_tokens.observe(max_tokens);
         }
     }
 
@@ -1095,6 +1331,159 @@ impl Metrics {
         }
         text
     }
+
+    /// Prometheus text for request latency, size, and outcome metrics.
+    pub fn render_requests(&self, text: &mut String) {
+        metric(
+            text,
+            "prompt_tokens_total",
+            "counter",
+            "Prompt tokens processed, including cached tokens.",
+            self.prompt_tokens.load(Ordering::Relaxed),
+        );
+        metric(
+            text,
+            "prompt_tokens_cached_total",
+            "counter",
+            "Prompt tokens served from cache.",
+            self.prompt_tokens_cached.load(Ordering::Relaxed),
+        );
+        let _ = writeln!(
+            text,
+            "# HELP flare_request_success_total Requests that finished normally, by reason.\n# TYPE flare_request_success_total counter"
+        );
+        for (index, reason) in ["stop", "length", "abort", "error", "repetition"]
+            .into_iter()
+            .enumerate()
+        {
+            let _ = writeln!(
+                text,
+                "flare_request_success_total{{finished_reason=\"{reason}\"}} {}",
+                self.request_success[index].load(Ordering::Relaxed)
+            );
+        }
+        metric(
+            text,
+            "spec_decode_num_drafts_total",
+            "counter",
+            "Progressing speculative-decoding request rounds that offered a draft.",
+            self.draft_rounds.load(Ordering::Relaxed),
+        );
+        metric(
+            text,
+            "spec_decode_num_draft_tokens_total",
+            "counter",
+            "Speculative draft tokens offered.",
+            self.offered_drafts.load(Ordering::Relaxed),
+        );
+        metric(
+            text,
+            "spec_decode_num_accepted_tokens_total",
+            "counter",
+            "Speculative draft tokens accepted.",
+            self.accepted_drafts.load(Ordering::Relaxed),
+        );
+        for (name, help, histogram, scale) in [
+            (
+                "request_prompt_tokens",
+                "Prompt tokens per request.",
+                &self.request_prompt_tokens,
+                HistogramScale::Unit,
+            ),
+            (
+                "request_generation_tokens",
+                "Generated tokens per request.",
+                &self.request_generation_tokens,
+                HistogramScale::Unit,
+            ),
+            (
+                "request_max_num_generation_tokens",
+                "Largest generated token count in a request group.",
+                &self.request_max_num_generation_tokens,
+                HistogramScale::Unit,
+            ),
+            (
+                "request_params_n",
+                "Requested number of generations per group.",
+                &self.request_params_n,
+                HistogramScale::Unit,
+            ),
+            (
+                "request_params_max_tokens",
+                "Requested max_tokens when the user set it.",
+                &self.request_params_max_tokens,
+                HistogramScale::Unit,
+            ),
+            (
+                "time_to_first_token_seconds",
+                "Time from request ingress to the first committed token.",
+                &self.time_to_first_token,
+                HistogramScale::Nanos,
+            ),
+            (
+                "inter_token_latency_seconds",
+                "Time between committed tokens within a completion.",
+                &self.inter_token_latency,
+                HistogramScale::Nanos,
+            ),
+            (
+                "request_time_per_output_token_seconds",
+                "Decode time divided by the number of generated tokens after the first.",
+                &self.request_time_per_output_token,
+                HistogramScale::Nanos,
+            ),
+            (
+                "e2e_request_latency_seconds",
+                "Time from request ingress to finish.",
+                &self.e2e_request_latency,
+                HistogramScale::Nanos,
+            ),
+            (
+                "request_queue_time_seconds",
+                "Time from engine arrival to first admission.",
+                &self.request_queue_time,
+                HistogramScale::Nanos,
+            ),
+            (
+                "request_inference_time_seconds",
+                "Time from first admission to the last committed token.",
+                &self.request_inference_time,
+                HistogramScale::Nanos,
+            ),
+            (
+                "request_prefill_time_seconds",
+                "Time from first admission to the first committed token.",
+                &self.request_prefill_time,
+                HistogramScale::Nanos,
+            ),
+            (
+                "request_decode_time_seconds",
+                "Time from the first committed token to the last.",
+                &self.request_decode_time,
+                HistogramScale::Nanos,
+            ),
+            (
+                "request_prefill_kv_computed_tokens",
+                "Prompt tokens computed rather than served from cache.",
+                &self.request_prefill_kv_computed_tokens,
+                HistogramScale::Unit,
+            ),
+            (
+                "request_num_preemptions",
+                "Preemptions per finished request.",
+                &self.request_num_preemptions,
+                HistogramScale::Unit,
+            ),
+            (
+                "iteration_tokens",
+                "Tokens processed in one engine step.",
+                &self.iteration_tokens,
+                HistogramScale::Unit,
+            ),
+        ] {
+            histogram.render(text, name, help, scale);
+        }
+    }
 }
 
 pub(super) fn metric(text: &mut String, name: &str, kind: &str, help: &str, value: u64) {
@@ -1276,8 +1665,8 @@ mod tests {
 
     #[test]
     fn snapshot_json_round_trips_beside_the_prometheus_counters() {
-        let metrics = Metrics::new(100, 128, 0);
-        metrics.progress(40, 3, 2, 1, 5, 2);
+        let metrics = Metrics::new(100, 128, 0, 0);
+        metrics.progress(40, 3, 2, 1, 5, 2, 0);
         metrics.scheduler(SchedulerStats {
             active_requests: 2,
             free_pages: 10,
@@ -1308,6 +1697,80 @@ mod tests {
             "flare_active_requests 2",
             "flare_free_kv_pages 10",
             "flare_total_kv_pages 100",
+        ] {
+            assert!(text.lines().any(|value| value == line), "{line}");
+        }
+    }
+
+    #[test]
+    fn request_histograms_render_cumulative_buckets_and_derived_count() {
+        let metrics = Metrics::new(100, 128, 0, 4096);
+        metrics.first_token(1_500_000);
+        metrics.group_params(2, Some(256), 7);
+        let mut text = String::new();
+        metrics.render_requests(&mut text);
+        for line in [
+            "flare_time_to_first_token_seconds_bucket{le=\"0.001\"} 0",
+            "flare_time_to_first_token_seconds_bucket{le=\"0.0025\"} 1",
+            "flare_time_to_first_token_seconds_sum 0.0015",
+            "flare_time_to_first_token_seconds_count 1",
+            "flare_request_params_n_bucket{le=\"2\"} 1",
+            "flare_request_max_num_generation_tokens_bucket{le=\"8\"} 1",
+            "flare_request_params_max_tokens_bucket{le=\"256\"} 1",
+            "flare_iteration_tokens_bucket{le=\"+Inf\"} 0",
+            "flare_prompt_tokens_cached_total 0",
+        ] {
+            assert!(text.lines().any(|value| value == line), "{line}");
+        }
+        assert!(text.contains("# TYPE flare_prompt_tokens_total counter\n"));
+        assert!(!text.contains("# TYPE flare_prompt_tokens counter\n"));
+        assert!(text.contains("# TYPE flare_iteration_tokens histogram\n"));
+    }
+
+    #[test]
+    fn request_finish_uses_original_prompt_and_last_token_times() {
+        let metrics = Metrics::new(100, 128, 0, 4096);
+        metrics.request_finished(RequestTiming {
+            ingress_ns: 0,
+            arrival_ns: 5,
+            admitted_ns: Some(10),
+            first_token_ns: Some(20),
+            last_token_ns: Some(30),
+            finished_ns: 40,
+            prompt_tokens: 100,
+            cached_tokens: 40,
+            generated_tokens: 10,
+            preemptions: 1,
+            reason: "stop",
+        });
+        metrics.request_finished(RequestTiming {
+            ingress_ns: 0,
+            arrival_ns: 5,
+            admitted_ns: Some(10),
+            first_token_ns: Some(20),
+            last_token_ns: Some(30),
+            finished_ns: 40,
+            prompt_tokens: 100,
+            cached_tokens: 40,
+            generated_tokens: 10,
+            preemptions: 1,
+            reason: "abort",
+        });
+        let mut text = String::new();
+        metrics.render_requests(&mut text);
+        for line in [
+            "flare_e2e_request_latency_seconds_count 1",
+            "flare_request_queue_time_seconds_bucket{le=\"0.001\"} 1",
+            "flare_request_prefill_time_seconds_bucket{le=\"0.001\"} 1",
+            "flare_request_decode_time_seconds_bucket{le=\"0.001\"} 1",
+            "flare_request_inference_time_seconds_bucket{le=\"0.001\"} 1",
+            "flare_request_time_per_output_token_seconds_bucket{le=\"0.001\"} 1",
+            "flare_request_prompt_tokens_bucket{le=\"100\"} 1",
+            "flare_request_generation_tokens_bucket{le=\"10\"} 1",
+            "flare_request_prefill_kv_computed_tokens_bucket{le=\"100\"} 1",
+            "flare_request_num_preemptions_bucket{le=\"1\"} 1",
+            "flare_request_success_total{finished_reason=\"stop\"} 1",
+            "flare_request_success_total{finished_reason=\"abort\"} 0",
         ] {
             assert!(text.lines().any(|value| value == line), "{line}");
         }
@@ -1360,7 +1823,7 @@ mod tests {
 
     #[test]
     fn counters_expose_fixed_names_without_request_payloads() {
-        let metrics = Metrics::new(100, 128, 0);
+        let metrics = Metrics::new(100, 128, 0, 0);
         metrics.scheduler(SchedulerStats {
             cache_lookups: 5,
             cache_hits: 2,
