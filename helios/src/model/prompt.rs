@@ -701,6 +701,7 @@ mod tests {
             let rendered = RenderedPrompt {
                 message_boundaries: Vec::new(),
                 image_sources: vec![],
+                image_checkpoint_hints: vec![],
                 text: text.clone(),
                 token_ids: vec![],
             };
