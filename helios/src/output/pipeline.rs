@@ -286,7 +286,7 @@ mod tests {
         let tools = vec![
             json!({"function":{"name":"lookup","parameters":{"properties":{"n":{"type":"integer"}}}}}),
         ];
-        let text = "</mm:think><mm:think>café 世界</mm:think>Searching. ]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name='lookup'>]<]minimax[>[<n>3]<]minimax[>[</n>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=lookup>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>";
+        let text = "</mm:think><mm:think>café 世界</mm:think>Searching. ]<]minimax[>[<tool_call>\n]<]minimax[>[<invoke name='lookup'>]<]minimax[>[<n>3]<]minimax[>[</n>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=lookup>]<]minimax[>[</invoke>\n]<]minimax[>[<invoke name=search>]<]minimax[>[<q>7]<]minimax[>[</q>]<]minimax[>[</invoke>\n]<]minimax[>[</tool_call>";
         for split in text.char_indices().map(|(at, _)| at) {
             let config = OutputConfig {
                 syntax: syntax.clone(),
@@ -316,6 +316,11 @@ mod tests {
                 "{\"n\":3}"
             );
             assert_eq!(result["tool_calls"][1]["function"]["arguments"], "{}");
+            assert_eq!(result["tool_calls"][2]["function"]["name"], "search");
+            assert_eq!(
+                result["tool_calls"][2]["function"]["arguments"],
+                "{\"q\":\"7\"}"
+            );
         }
         assert_eq!(
             run(
