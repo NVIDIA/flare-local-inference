@@ -147,6 +147,97 @@ fn every_role_transition_and_empty_message_has_a_boundary() {
 }
 
 #[test]
+fn gemma_templates_preserve_size_specific_thinking_prefixes() {
+    let messages = [json!({"role":"user","content":"Hi"})];
+    for (template, empty_thought) in [
+        (include_str!("../../ignition/recipes/gemma4/assets/chat_template.google.jinja"), true),
+        (include_str!("../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"), false),
+    ] {
+        let frontend = frontend(template, TemplateEncoding::Text);
+        for thinking in [false, true] {
+            let options = json!({"bos_token":"<bos>","add_generation_prompt":true,"enable_thinking":thinking});
+            let rendered = frontend.render_chat(&messages, options.as_object().unwrap()).unwrap();
+            let mut expected = "<bos>".to_owned();
+            if thinking {
+                expected.push_str("<|turn>system\n<|think|>\n<turn|>\n");
+            }
+            expected.push_str("<|turn>user\nHi<turn|>\n<|turn>model\n");
+            if empty_thought && !thinking {
+                expected.push_str("<|channel>thought\n<channel|>");
+            }
+            assert_eq!(rendered.text, expected);
+            let prefix = expected.find("<|turn>model").unwrap();
+            let ids = frontend.encode(&expected[..prefix], false).unwrap();
+            assert_eq!(rendered.message_boundaries.last(), Some(&ids.len()));
+        }
+    }
+}
+
+#[test]
+fn gemma_templates_preserve_reasoning_and_assistant_continuations() {
+    let messages = json!([
+        {"role":"user","content":"Question"},
+        {"role":"assistant","reasoning_content":"Reason","content":"A"},
+        {"role":"assistant","content":"B"}
+    ]);
+    for template in [
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google.jinja"),
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"),
+    ] {
+        let frontend = frontend(template, TemplateEncoding::Text);
+        let rendered = frontend.render_chat(messages.as_array().unwrap(), &Map::new()).unwrap();
+        assert_eq!(rendered.text, concat!(
+            "<|turn>user\nQuestion<turn|>\n<|turn>model\n",
+            "<|channel>thought\nReason\n<channel|>AB<turn|>\n"
+        ));
+    }
+}
+
+#[test]
+fn gemma_templates_checkpoint_preamble_messages_and_tool_rounds() {
+    let messages = json!([
+        {"role":"system","content":"Instructions"},
+        {"role":"user","content":"Question"},
+        {"role":"assistant","content":"","tool_calls":[
+            {"id":"call_1","type":"function","function":{"name":"lookup","arguments":{"q":null}}}
+        ]},
+        {"role":"tool","tool_call_id":"call_1","content":"Result"},
+        {"role":"assistant","content":"Answer"},
+        {"role":"user","content":"Follow-up"}
+    ]);
+    let messages = messages.as_array().unwrap();
+    let options = |generation: bool, thinking: bool| {
+        json!({
+            "bos_token": "<bos>",
+            "add_generation_prompt": generation,
+            "enable_thinking": thinking,
+            "tools": [{"type":"function","function":{"name":"lookup","description":"Look up a value",
+                "parameters":{"type":"object","properties":{"q":{"type":"string"}},"required":["q"]}}}]
+        })
+        .as_object()
+        .unwrap()
+        .clone()
+    };
+    for template in [
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google.jinja"),
+        include_str!("../../ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja"),
+    ] {
+        let frontend = frontend(template, TemplateEncoding::Text);
+        for thinking in [false, true] {
+            let full = frontend.render_chat(messages, &options(true, thinking)).unwrap();
+            assert!(full.text.contains("<|tool_call>call:lookup{q:null}<tool_call|>"));
+            // An assistant tool call is complete only after the tool responses inlined into its turn.
+            for count in [1, 2, 4, 5, 6] {
+                let prefix = frontend.render_chat(&messages[..count], &options(false, thinking)).unwrap();
+                assert!(full.text.starts_with(&prefix.text), "{count}");
+                assert!(full.message_boundaries.contains(&prefix.token_ids.len()), "{count}");
+            }
+            assert_eq!(full.message_boundaries.len(), 5);
+        }
+    }
+}
+
+#[test]
 fn segmented_xtml_preserves_boundaries_before_seeded_assistant_and_later_turns() {
     let frontend = frontend(
         include_str!("../../ignition/recipes/kimi3/assets/chat_template.jinja"),

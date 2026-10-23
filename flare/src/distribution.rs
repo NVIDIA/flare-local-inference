@@ -193,13 +193,14 @@ pub fn root(
         }
     }
     phase.finish(format!("{} peer ranks", world - 1));
-    let topology = Topology::plan(
+    let topology = Topology::plan_shape(
         &endpoints
             .iter()
             .map(|e| e.record.clone())
             .collect::<Vec<_>>(),
         &endpoints.iter().map(|e| e.port).collect::<Vec<_>>(),
         args.roce_ring,
+        args.roce_chain,
     )?;
     let relay = Relay::start(0, streams, topology.clone(), network, source.port)?;
     for rank in 1..world {
@@ -326,10 +327,14 @@ pub fn peer(args: &mut Run, progress: &mut StartupProgress) -> Result<Received, 
     if args.roce_ring && !plan.topology.ring {
         return Err("rank zero did not select --roce-ring".into());
     }
+    if args.roce_chain && !plan.topology.chain {
+        return Err("rank zero did not select --roce-chain".into());
+    }
     if args.stage_only && !plan.stage_only {
         return Err("rank zero did not select --stage-only".into());
     }
     args.roce_ring = plan.topology.ring;
+    args.roce_chain = plan.topology.chain;
     args.stage_only = plan.stage_only;
     let relay = Relay::start(rank, plan.streams, plan.topology.clone(), network, 0)?;
     write(&mut control, &"ready")?;

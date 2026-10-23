@@ -14,9 +14,13 @@ pub struct Link {
 }
 
 /// Per-source, per-destination links; non-neighbor entries are empty in a ring.
+/// A chain is a ring without the link between the first and last rank. A peer whose topology
+/// has no `chain` field reads a chain as direct mode and rejects it as missing links.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Topology {
     pub ring: bool,
+    #[serde(default)]
+    pub chain: bool,
     pub links: Vec<Vec<Vec<Link>>>,
 }
 
@@ -31,7 +35,21 @@ pub fn discover() -> Result<Vec<u8>, Failure> {
 }
 
 impl Topology {
+    #[cfg(test)]
     pub fn plan(records: &[Vec<u8>], ports: &[u16], ring: bool) -> Result<Self, Failure> {
+        Self::plan_shape(records, ports, ring, false)
+    }
+
+    /// Plans direct, ring or chain links; at most one of `ring` and `chain` is set.
+    pub fn plan_shape(
+        records: &[Vec<u8>],
+        ports: &[u16],
+        ring: bool,
+        chain: bool,
+    ) -> Result<Self, Failure> {
+        if ring && chain {
+            return Err("fabric transfers use a ring or a chain, not both".into());
+        }
         let world = records.len();
         if !(2..=16).contains(&world) || ports.len() != world || ports.contains(&0) {
             return Err("fabric transfers need 2..16 ranks and their listener ports".into());
@@ -45,6 +63,9 @@ impl Topology {
         for from in 0..world {
             for to in from + 1..world {
                 if ring && to != from + 1 && !(from == 0 && to == world - 1) {
+                    continue;
+                }
+                if chain && to != from + 1 {
                     continue;
                 }
                 let pair = vec![endpoints[from].clone(), endpoints[to].clone()];
@@ -73,7 +94,7 @@ impl Topology {
                 }
             }
         }
-        let topology = Self { ring, links };
+        let topology = Self { ring, chain, links };
         topology.validate()?;
         Ok(topology)
     }
@@ -83,10 +104,14 @@ impl Topology {
         if !(2..=16).contains(&world) || self.links.iter().any(|row| row.len() != world) {
             return Err("invalid fabric topology dimensions".into());
         }
+        if self.ring && self.chain {
+            return Err("fabric topology is both a ring and a chain".into());
+        }
         for from in 0..world {
             for to in 0..world {
                 let connected = from != to
                     && (!self.ring || to == (from + 1) % world || from == (to + 1) % world);
+                let connected = connected && (!self.chain || from.abs_diff(to) == 1);
                 let links = &self.links[from][to];
                 if connected != !links.is_empty() || links.len() > roce_fabric::MAX_RAILS {
                     return Err("fabric links differ from the selected topology".into());
@@ -116,6 +141,14 @@ impl Topology {
         let world = self.links.len();
         if source >= world || destination >= world || source == destination {
             return Err("invalid fabric transfer ranks".into());
+        }
+        if self.chain {
+            // A chain has one route: every rank between the two, in order.
+            return Ok(if source < destination {
+                (source..=destination).collect()
+            } else {
+                (destination..=source).rev().collect()
+            });
         }
         if !self.ring {
             return Ok(vec![source, destination]);
@@ -217,5 +250,54 @@ mod tests {
         assert_eq!(topology.links[0][1].len(), 1);
         assert_eq!(topology.path(0, 2).unwrap(), [0, 1, 2]);
         assert!(Topology::plan(&records, &[29900; 4], false).is_err());
+    }
+
+    #[test]
+    fn chain_paths_walk_every_rank_between_the_ends() {
+        for world in 2..=16 {
+            let records = (1..=world)
+                .map(|rank| format!("a 10.0.0.{rank}/24\n").into_bytes())
+                .collect::<Vec<_>>();
+            let topology =
+                Topology::plan_shape(&records, &vec![29900; world], false, true).unwrap();
+            assert_eq!(topology.links[0][world - 1].is_empty(), world > 2);
+            for source in 0..world {
+                for destination in 0..world {
+                    if source == destination {
+                        assert!(topology.path(source, destination).is_err());
+                        continue;
+                    }
+                    let path = topology.path(source, destination).unwrap();
+                    assert_eq!(path.len() - 1, source.abs_diff(destination));
+                    assert_eq!((path[0], *path.last().unwrap()), (source, destination));
+                    for edge in path.windows(2) {
+                        assert!(topology.hop(edge[0], edge[1], 0).is_ok());
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn physical_chain_plans_without_a_closing_link() {
+        // Ranks 0 and 3 share no subnet: a ring cannot close, a chain does not need to.
+        let records = [
+            "a 10.0.0.1/24\n",
+            "a 10.0.1.1/24\nb 10.0.0.2/24\n",
+            "a 10.0.2.1/24\nb 10.0.1.2/24\n",
+            "b 10.0.2.2/24\n",
+        ]
+        .map(|s| s.as_bytes().to_vec());
+        let topology = Topology::plan_shape(&records, &[29900; 4], false, true).unwrap();
+        assert_eq!(topology.path(3, 0).unwrap(), [3, 2, 1, 0]);
+        assert!(topology.hop(0, 3, 0).is_err());
+        assert!(Topology::plan(&records, &[29900; 4], true).is_err());
+        assert!(Topology::plan_shape(&records, &[29900; 4], true, true).is_err());
+        let mut both = topology.clone();
+        both.ring = true;
+        assert!(both.validate().is_err());
+        let mut direct = topology;
+        direct.chain = false;
+        assert!(direct.validate().is_err());
     }
 }

@@ -118,18 +118,20 @@ pub(super) fn scalar_parameter_value(raw: &str, schema: Option<&Value>) -> Value
         }
         value = match kind {
             "null" if raw.eq_ignore_ascii_case("null") => Some(Value::Null),
-            "integer" => raw
-                .trim()
-                .parse::<i64>()
+            "integer" => integer_value(raw),
+            "number" => parsed
+                .as_ref()
                 .ok()
-                .map(Value::from)
-                .or_else(|| raw.trim().parse::<u64>().ok().map(Value::from)),
-            "number" => raw
-                .trim()
-                .parse::<f64>()
-                .ok()
-                .and_then(serde_json::Number::from_f64)
-                .map(Value::Number),
+                .filter(|value| value.is_number())
+                .cloned()
+                .or_else(|| integer_value(raw))
+                .or_else(|| {
+                    raw.trim()
+                        .parse::<f64>()
+                        .ok()
+                        .and_then(serde_json::Number::from_f64)
+                        .map(Value::Number)
+                }),
             "boolean" => match raw.trim().to_ascii_lowercase().as_str() {
                 "true" | "1" => Some(Value::Bool(true)),
                 "false" | "0" => Some(Value::Bool(false)),
@@ -179,6 +181,14 @@ fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value> {
         }
     }
     Ok(value)
+}
+
+fn integer_value(raw: &str) -> Option<Value> {
+    let raw = raw.trim();
+    raw.parse::<i64>()
+        .ok()
+        .map(Value::from)
+        .or_else(|| raw.parse::<u64>().ok().map(Value::from))
 }
 
 pub(super) fn parameter_types<'a>(schema: Option<&'a Value>, kinds: &mut Vec<&'a str>) {
@@ -400,6 +410,21 @@ mod tests {
                 json!({"type":"object","properties":{"count":{"type":"integer"}}}),
                 json!({"count":3}),
             ),
+            ("25000", json!({"type":"number"}), json!(25000)),
+            ("1.5", json!({"type":"number"}), json!(1.5)),
+            ("2.0", json!({"type":"number"}), json!(2.0)),
+            ("1e3", json!({"type":"number"}), json!(1000.0)),
+            ("0003", json!({"type":"number"}), json!(3)),
+            (
+                r#"{"n":25000}"#,
+                json!({"type":"object","properties":{"n":{"type":"number"}}}),
+                json!({"n":25000}),
+            ),
+            (
+                r#"[1,2.5]"#,
+                json!({"type":"array","items":{"type":"number"}}),
+                json!([1, 2.5]),
+            ),
         ] {
             assert_eq!(
                 parameter_value(raw, Some(&schema)).unwrap(),
@@ -407,6 +432,28 @@ mod tests {
                 "{raw} / {schema}"
             );
         }
+    }
+
+    #[test]
+    fn integral_number_arguments_serialize_without_fraction() {
+        let mut parser = Harness::new(
+            OutputConfig {
+                structured: false,
+                start: crate::output::tagged::OutputStart::Content,
+                tools: vec![json!({"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"},"yield_time_ms":{"type":"number"}}}}})],
+            },
+            "number".into(),
+        );
+        parser
+            .push("<tool_call>\n<function=shell>\n<parameter=command>\nsleep 25\n</parameter>\n<parameter=yield_time_ms>\n25000\n</parameter>\n</function>\n</tool_call>")
+            .unwrap();
+        parser.finish().unwrap();
+        let arguments = parser.message()["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(arguments.contains(r#""yield_time_ms":25000"#), "{arguments}");
+        assert!(!arguments.contains("25000.0"), "{arguments}");
     }
 
     #[test]

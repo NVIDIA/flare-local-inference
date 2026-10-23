@@ -239,9 +239,11 @@ impl<'a> Value<'a> {
             Self::UInt(v) => {
                 let _ = write!(output, "{v}");
             }
-            Self::Float(v) => {
-                let _ = write!(output, "{v:?}");
+            Self::Float(v) if v.is_nan() => output.push_str("nan"),
+            Self::Float(v) if v.is_infinite() => {
+                output.push_str(if v.is_sign_negative() { "-inf" } else { "inf" })
             }
+            Self::Float(v) => output.push_str(&super::super::json::python_float(*v)),
             Self::Str(s) => output.push_str(s),
             Self::String(s) => output.push_str(&s.0),
             _ => self.write_repr(output),

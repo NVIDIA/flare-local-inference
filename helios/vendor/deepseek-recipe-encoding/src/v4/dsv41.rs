@@ -1,14 +1,14 @@
 use deepseek_recipe_core::conversation::ReasoningEffort;
 
 use super::{EncodingV4, SYSTEM_SP_TOKEN};
-use crate::TokenizerEncoder;
+use crate::{EncodingError, TokenizerEncoder};
 
-fn reasoning_effort_template(effort: Option<ReasoningEffort>) -> String {
-    let effort_score = match effort {
+fn reasoning_effort_template(effort: Option<ReasoningEffort>, score: Option<u8>) -> String {
+    let effort_score = score.unwrap_or_else(|| match effort {
         Some(ReasoningEffort::Low) => 50,
         None | Some(ReasoningEffort::High) | Some(ReasoningEffort::Xhigh) => 75,
         Some(ReasoningEffort::Max) => 100,
-    };
+    });
     format!(
         "Reasoning Effort: {effort_score} (range 1-100, the higher the value, the more thorough the reasoning)\n\n"
     )
@@ -17,6 +17,7 @@ fn reasoning_effort_template(effort: Option<ReasoningEffort>) -> String {
 /// Prompt rendering and token encoding for DeepSeek V4.1.
 pub struct DeepseekV41Encoding {
     tokenizer: Option<Box<dyn TokenizerEncoder>>,
+    reasoning_effort_score: Option<u8>,
 }
 
 impl DeepseekV41Encoding {
@@ -24,13 +25,27 @@ impl DeepseekV41Encoding {
     ///
     /// Token encoding requires a tokenizer, attached with `with_tokenizer`.
     pub fn new() -> Self {
-        Self { tokenizer: None }
+        Self {
+            tokenizer: None,
+            reasoning_effort_score: None,
+        }
     }
 
     /// Attach the tokenizer used by token encoding.
     pub fn with_tokenizer(mut self, tokenizer: impl TokenizerEncoder + 'static) -> Self {
         self.tokenizer = Some(Box::new(tokenizer));
         self
+    }
+
+    /// Override the conversation's named effort with a score from 1 through 100.
+    ///
+    /// The score is rendered only in thinking mode, at the conversation's start.
+    pub fn with_reasoning_effort_score(mut self, score: u8) -> Result<Self, EncodingError> {
+        if !(1..=100).contains(&score) {
+            return Err(EncodingError::InvalidReasoningEffortScore(score));
+        }
+        self.reasoning_effort_score = Some(score);
+        Ok(self)
     }
 }
 
@@ -72,7 +87,7 @@ impl EncodingV4 for DeepseekV41Encoding {
         effort: Option<ReasoningEffort>,
     ) -> String {
         if index == 0 && thinking_mode {
-            return reasoning_effort_template(effort);
+            return reasoning_effort_template(effort, self.reasoning_effort_score);
         }
         String::new()
     }

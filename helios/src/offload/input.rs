@@ -71,6 +71,7 @@ struct Usage {
     input: u64,
     checkpoint_pressure: u64,
     input_pressure: u64,
+    progress: u64,
 }
 /// Shared reservations for both concrete record kinds, including pending writes.
 pub struct DiskBudget {
@@ -136,9 +137,13 @@ impl DiskBudget {
     fn clear_checkpoint_pressure(&self) {
         self.usage.lock().unwrap().checkpoint_pressure = 0;
     }
+    pub(crate) fn progress(&self) -> u64 {
+        self.usage.lock().unwrap().progress
+    }
     fn release_input(&self, bytes: u64) {
         let mut u = self.usage.lock().unwrap();
         u.input = u.input.saturating_sub(bytes);
+        u.progress += 1;
     }
     fn input_pressure(&self) -> u64 {
         self.usage.lock().unwrap().input_pressure

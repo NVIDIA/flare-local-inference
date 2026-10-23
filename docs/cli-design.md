@@ -1158,7 +1158,7 @@ cannot honor the settings reports a capacity error in the section 6 form.
 
 ### Experimental RoCE ring configuration
 
-`ignition export` and `ignition serve` accept `--roce-ring` with `--ranks N`;
+`ignition export` and `ignition serve` accept `--roce-ring` or `--roce-chain` with `--ranks N`;
 `flare run` and `flare orbit run` accept it with a multi-host package. Rank
 order defines the ring, including the cluster's node order when agents launch
 ranks. The transport accepts 2..16

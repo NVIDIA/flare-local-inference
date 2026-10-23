@@ -66,6 +66,7 @@ impl Fixture {
         Self {
             config: ModelConfig {
                 max_top_logprobs: 0,
+                logprob_token_id_capacity: 0,
                 prepared_sequence_tokens: 128,
                 contract: crate::model::testing::metadata(),
                 identity: [23; 32],
@@ -199,6 +200,7 @@ impl Fixture {
                     stop_sequences: vec![],
                     stop_strings: vec![],
                     logprobs: false,
+                    logprob_token_ids: vec![],
                     prompt_logprobs: false,
                     ignore_eos: false,
                     grammar: None,
@@ -1171,6 +1173,8 @@ fn fatal_broadcast_preserves_first_failure_and_reaches_pending_and_ingress() {
 struct FakeStore {
     hit: Option<crate::offload::HostHit>,
     reject_fetch: bool,
+    store_outcomes: VecDeque<crate::offload::StoreOutcome>,
+    progress: u64,
     stored: Vec<crate::offload::PublishedCheckpoint>,
     fetched: Vec<(crate::offload::HostHit, crate::offload::InboundTicket)>,
     events: VecDeque<crate::offload::StoreEvent>,
@@ -1186,6 +1190,8 @@ impl FakeStore {
         Self {
             hit,
             reject_fetch: false,
+            store_outcomes: VecDeque::new(),
+            progress: 0,
             stored: Vec::new(),
             fetched: Vec::new(),
             events: VecDeque::new(),
@@ -1203,14 +1209,24 @@ impl crate::offload::PrefixStore for FakeStore {
         &mut self,
         history: &crate::cache::PrefixHistory,
         resident: u64,
+        before: u64,
     ) -> Option<crate::offload::HostHit> {
         self.hit.clone().filter(|hit| {
-            hit.consumed_tokens > resident && hit.consumed_tokens <= history.token_count()
+            history.key_at(hit.consumed_tokens) == Some(hit.key)
+                && hit.consumed_tokens > resident
+                && hit.consumed_tokens <= history.token_count()
+                && hit.consumed_tokens < before
         })
     }
-    fn store(&mut self, checkpoint: &crate::offload::PublishedCheckpoint) -> Result<bool> {
+    fn store(
+        &mut self,
+        checkpoint: &crate::offload::PublishedCheckpoint,
+    ) -> Result<crate::offload::StoreOutcome> {
         self.stored.push(checkpoint.clone());
-        Ok(true)
+        Ok(self
+            .store_outcomes
+            .pop_front()
+            .unwrap_or(crate::offload::StoreOutcome::Queued))
     }
     fn fetch(
         &mut self,
@@ -1231,7 +1247,10 @@ impl crate::offload::PrefixStore for FakeStore {
         Ok(())
     }
     fn stats(&self) -> crate::offload::StoreStats {
-        crate::offload::StoreStats::default()
+        crate::offload::StoreStats {
+            progress: self.progress,
+            ..Default::default()
+        }
     }
     fn close(&mut self) -> Result<()> {
         self.close_calls.fetch_add(1, Ordering::Relaxed);
@@ -1442,10 +1461,7 @@ fn host_hit_holds_the_request_inbound_until_the_restore_completes() {
         (RequestPhase::Restore, 1)
     );
     let restored = live.prefix().unwrap();
-    // The restored checkpoint became ready during this pass; the next pass
-    // drains its publication and copies it out under its own pin.
-    assert_eq!(fake_store(&mut worker).stored.len(), 0);
-    assert!(worker.service_store().unwrap());
+    // Polling the restore publishes it and admits its copy-out in the same pass.
     assert_eq!(fake_store(&mut worker).stored.len(), 1);
     let publication = fake_store(&mut worker).stored[0].clone();
     assert_eq!(
@@ -2893,4 +2909,172 @@ fn zero_output_budget_requires_prompt_scoring_at_both_admission_checks() {
         &incoming.prompt, false).unwrap();
     admission.prompt_logprobs = false;
     assert!(admission.validate(config).is_err());
+}
+
+#[test]
+fn publication_retries_wait_for_progress_and_pin_only_admitted_copies() {
+    use crate::offload::{StoreOutcome, StoreReason};
+    let mut fixture = Fixture::new();
+    fixture.config.limits.snapshots = 1;
+    let (_sender, receiver) = mpsc::channel();
+    let mut worker = fixture.worker(receiver);
+    let mut store = FakeStore::new(None);
+    store
+        .store_outcomes
+        .push_back(StoreOutcome::Retry(StoreReason::Slabs));
+    worker.attach_store(Some(Box::new(store)));
+    let spec = RequestSpec {
+        prompt: vec![0; 70],
+        message_boundaries: vec![],
+        conditioning: vec![],
+        max_new_tokens: 1,
+        grammar_constrained: false,
+        host_stops: false,
+        prompt_logprobs: false,
+        growable_output: true,
+    };
+    let plan = worker.scheduler.plan_admission(&spec).unwrap();
+    let key = plan.history().key_at(64).unwrap();
+    let admitted = worker
+        .scheduler
+        .admit_planned(
+            spec.clone(),
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: 64,
+                pages: 1,
+            }),
+        )
+        .unwrap();
+    worker.scheduler.finish_inbound(key, true).unwrap();
+    let id = worker
+        .scheduler
+        .request(admitted.handle)
+        .unwrap()
+        .prefix()
+        .unwrap();
+    assert!(worker.service_store().unwrap());
+    assert_eq!(worker.deferred_stores, [id]);
+    assert_eq!(
+        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
+        1
+    );
+    assert!(!worker.service_store().unwrap());
+    assert_eq!(fake_store(&mut worker).stored.len(), 1);
+    fake_store(&mut worker).progress += 1;
+    assert!(worker.service_store().unwrap());
+    assert!(worker.deferred_stores.is_empty());
+    assert_eq!(fake_store(&mut worker).stored.len(), 2);
+    assert_eq!(
+        worker.scheduler.cache().checkpoint(id).unwrap().pin_count(),
+        2
+    );
+    assert_eq!(
+        fixture.metrics.host_retry_success.load(Ordering::Relaxed),
+        1
+    );
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Deferred { checkpoint: id });
+    worker.service_store().unwrap();
+    assert_eq!(worker.deferred_stores, [id]);
+    worker.scheduler.cancel(admitted.handle).unwrap();
+    let mut other = spec;
+    other.prompt.fill(1);
+    let plan = worker.scheduler.plan_admission(&other).unwrap();
+    let key = plan.history().key_at(64).unwrap();
+    worker
+        .scheduler
+        .admit_planned(
+            other,
+            plan,
+            Some(crate::scheduler::InboundRequest {
+                key,
+                consumed_tokens: 64,
+                pages: 1,
+            }),
+        )
+        .unwrap();
+    assert!(worker.scheduler.cache().checkpoint(id).is_err());
+    worker.service_store().unwrap();
+    assert!(worker.deferred_stores.is_empty());
+    assert_eq!(
+        fixture.metrics.host_retry_abandoned.load(Ordering::Relaxed),
+        1
+    );
+}
+
+#[test]
+fn completed_copyout_retries_capacity_waiters_without_a_new_model_fence() {
+    let mut fixture = Fixture::new();
+    fixture.config.limits.pages = 2;
+    let (sender, receiver) = mpsc::channel();
+    let (incoming, _generation) = fixture.incoming(vec![0; 70], 1);
+    let mut history = crate::cache::PrefixHistory::new(fixture.config.identity);
+    history.append(&incoming.prompt.tokens, &[]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    worker.attach_store(Some(Box::new(FakeStore::new(Some(host_hit(&history, 64))))));
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    let handle = worker.active[0].as_ref().unwrap().request;
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Fetched {
+            key: history.key_at(64).unwrap(),
+            result: Ok(4096),
+        });
+    worker.service_store().unwrap();
+    let publication = fake_store(&mut worker).stored[0].clone();
+    worker.scheduler.cancel(handle).unwrap();
+    worker.active[0] = None;
+    let (incoming, _other_generation) = fixture.incoming(vec![1; 64], 1);
+    sender.send(vec![incoming]).unwrap();
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert_eq!(worker.pending.len(), 1);
+    assert!(worker.pending[0].blocked.is_some());
+    let fence = worker.scheduler.completed();
+    fake_store(&mut worker)
+        .events
+        .push_back(crate::offload::StoreEvent::Stored {
+            checkpoint: publication.id,
+            key: publication.key,
+            result: Ok(4096),
+        });
+    worker.service_store().unwrap();
+    assert_eq!(worker.scheduler.completed(), fence);
+    assert!(worker.pending[0].blocked.is_none());
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    assert!(worker.pending.is_empty());
+    assert_eq!(worker.scheduler.stats().active_requests, 1);
+}
+
+#[test]
+fn native_prompt_rejects_invalid_requested_logprob_ids() {
+    let mut fixture = Fixture::new();
+    let (mut incoming, _generation) = fixture.incoming(vec![0, 1], 1);
+    incoming.prompt.logprobs = true;
+    incoming.prompt.logprob_token_ids = vec![0, 1];
+    let validate = |config: &ModelConfig, prompt: &Prompt| {
+        crate::model::admission::validate_prompt(config, prompt)
+    };
+    assert!(
+        validate(&fixture.config, &incoming.prompt)
+            .unwrap_err()
+            .to_string()
+            .contains("re-export")
+    );
+    fixture.config.logprob_token_id_capacity = crate::execution::MAX_LOGPROB_TOKEN_IDS;
+    validate(&fixture.config, &incoming.prompt).unwrap();
+    for ids in [
+        vec![0, 0],
+        vec![fixture.config.contract.vocabulary as u32],
+        vec![0; 129],
+    ] {
+        incoming.prompt.logprob_token_ids = ids;
+        assert!(validate(&fixture.config, &incoming.prompt).is_err());
+    }
+    incoming.prompt.logprob_token_ids = vec![0];
+    incoming.prompt.logprobs = false;
+    assert!(validate(&fixture.config, &incoming.prompt).is_err());
 }

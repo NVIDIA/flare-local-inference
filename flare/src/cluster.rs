@@ -1,5 +1,6 @@
 //! Ranks of one model on separate hosts: rendezvous at rank zero and connect their RoCE transport.
 
+pub use flare_helios::execution::roce_fabric::Shape;
 use std::sync::Arc;
 
 use flare_helios::{
@@ -45,7 +46,7 @@ fn open(
     owner: &NativeModel,
     fabric: &flare_helios::execution::roce_fabric::Fabric,
     endpoints: &[Vec<u8>],
-    ring: bool,
+    shape: Shape,
 ) -> Result<RoceTransport, Failure> {
     use flare_helios::execution::roce_fabric;
 
@@ -56,11 +57,7 @@ fn open(
         .iter()
         .map(|bytes| roce_fabric::decode(bytes))
         .collect::<flare_helios::Result<Vec<_>>>()?;
-    let topology = if ring {
-        fabric.ring_topology(&endpoints, spec.rank)?
-    } else {
-        fabric.topology(&endpoints, spec.rank)?
-    };
+    let topology = fabric.topology(&endpoints, spec.rank, shape)?;
     // SAFETY: The package restored the region at its recorded address; owner outlives the
     // transport, and no graph runs before every rank connected.
     Ok(unsafe { RoceTransport::open(spec, &topology)? })
@@ -71,13 +68,33 @@ fn connected(transport: &RoceTransport) -> String {
     format!(
         "{} rails per {} over {}",
         transport.topology().rails,
-        if transport.topology().ring {
-            "neighbor (experimental CPU relay ring)"
-        } else {
-            "peer"
+        match transport.topology().shape {
+            Shape::Mesh => "peer",
+            Shape::Ring => "neighbor (experimental CPU relay ring)",
+            Shape::Chain => "neighbor (experimental CPU relay chain)",
         },
         transport.topology().hcas.join(",")
     )
+}
+
+/// The transport shape a rank was started with, as the ranks exchange it before planning routes.
+fn shape_record(shape: Shape) -> Vec<u8> {
+    shape.name().as_bytes().to_vec()
+}
+
+/// Every rank must select the same shape: a chain rank plans no route to the far end that a ring
+/// rank would wait for.
+fn agree_shape(records: &[Vec<u8>], shape: Shape) -> Result<(), Failure> {
+    let local = shape_record(shape);
+    if let Some(rank) = records.iter().position(|record| *record != local) {
+        return Err(format!(
+            "rank {rank} selected RoCE transport shape {} where this rank selected {}",
+            String::from_utf8_lossy(&records[rank]),
+            String::from_utf8_lossy(&local)
+        )
+        .into());
+    }
+    Ok(())
 }
 
 /// A rank's admitted connections to the rest of its cluster, made before it loads.
@@ -114,18 +131,20 @@ pub fn rank_zero(
     owner: &NativeModel,
     mut streams: Vec<RankStream>,
     progress: &StartupProgress,
-    ring: bool,
+    shape: Shape,
 ) -> Result<Joined<Vec<RankStream>>, Failure> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
         use flare_helios::execution::{rendezvous, roce_fabric};
 
         let phase = progress.phase("Connect RoCE transport", None);
-        // Every rank learns every rank's devices, then plans the same routes from them.
+        // Every rank learns every rank's devices and the shape, then plans the same routes from them.
         let fabric = roce_fabric::discover()?;
+        let shapes = rendezvous::share_records(&mut streams, shape_record(shape))?;
+        agree_shape(&shapes, shape)?;
         let endpoints =
             rendezvous::share_records(&mut streams, roce_fabric::encode(&fabric.endpoints))?;
-        let mut transport = open(owner, &fabric, &endpoints, ring)?;
+        let mut transport = open(owner, &fabric, &endpoints, shape)?;
         let records = rendezvous::share_records(&mut streams, transport.local_record()?)?;
         transport.connect(&records)?;
         rendezvous::await_connected(&mut streams)?;
@@ -143,7 +162,7 @@ pub fn rank_zero(
     }
     #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
     {
-        let _ = (owner, streams, progress, ring);
+        let _ = (owner, streams, progress, shape);
         Err("this flare build has no RoCE transport for multi-host packages".into())
     }
 }
@@ -154,7 +173,7 @@ pub fn peer(
     cluster: &ClusterRank,
     mut stream: RankStream,
     progress: &StartupProgress,
-    ring: bool,
+    shape: Shape,
 ) -> Result<Joined<RankStream>, Failure> {
     #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
     {
@@ -162,12 +181,14 @@ pub fn peer(
 
         let phase = progress.phase("Connect RoCE transport", None);
         let fabric = roce_fabric::discover()?;
+        let shapes = rendezvous::exchange_record(&mut stream, &shape_record(shape), cluster.world)?;
+        agree_shape(&shapes, shape)?;
         let endpoints = rendezvous::exchange_record(
             &mut stream,
             &roce_fabric::encode(&fabric.endpoints),
             cluster.world,
         )?;
-        let mut transport = open(owner, &fabric, &endpoints, ring)?;
+        let mut transport = open(owner, &fabric, &endpoints, shape)?;
         let records =
             rendezvous::exchange_record(&mut stream, &transport.local_record()?, cluster.world)?;
         transport.connect(&records)?;
@@ -192,7 +213,7 @@ pub fn peer(
     }
     #[cfg(not(all(target_os = "linux", target_arch = "aarch64")))]
     {
-        let _ = (owner, cluster, stream, progress, ring);
+        let _ = (owner, cluster, stream, progress, shape);
         Err("this flare build has no RoCE transport for multi-host packages".into())
     }
 }

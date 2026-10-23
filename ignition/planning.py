@@ -178,6 +178,7 @@ class Plan:
     expert_scale_compression: str | None = None
     mla_compute_mode: str = "auto"
     roce_ring: bool = False
+    roce_chain: bool = False
     compile_workers: int | None = None
     autotune_effort: str = "medium"
     hub_cache: Path | None = None
@@ -286,7 +287,7 @@ class Plan:
                       "total_bytes": gpu.total_bytes} for gpu in self.gpus],
             "tensor_parallel": self.world_size, "max_concurrency": self.concurrency,
             "image_concurrency": self.image_concurrency,
-            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "context_parallel": self.context_parallel,
+            "prefill_chunk": self.prefill_chunk, "roce_ring": self.roce_ring, "roce_chain": self.roce_chain, "context_parallel": self.context_parallel,
             "stream_overlap": self.stream_overlap,
             "mixed_prefill": self.mixed_prefill,
             "prompt_logprobs": self.prompt_logprobs,
@@ -325,6 +326,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
         context_parallel: bool = True, stream_overlap: bool = True, cache_states: int | None = None,
         mixed_prefill: bool = False, prompt_logprobs: bool = False,
         expert_scale_compression: str | None = None, roce_ring: bool = False,
+        roce_chain: bool = False,
         image_concurrency: int | None = None, online_mxfp8: bool = False,
         language_model_only: bool = False, mla_compute_mode: str = "auto") -> Plan:
     """Size pages and the prefix cache to the supply; the result may not fit.
@@ -356,7 +358,7 @@ def fit(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, concur
                 recipe.weights_bytes(checkpoint, len(gpus), speculation, expert_scale_compression), costs.graph_bytes,
                 context_parallel=context_parallel and costs.page_tokens is not None,
                 stream_overlap=stream_overlap and recipe.stream_overlap, mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
-                expert_scale_compression=expert_scale_compression, roce_ring=roce_ring,
+                expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                 mla_compute_mode=mla_compute_mode,
                 # Language-only plans prepare no vision encoder, so no image feature slots.
                 image_concurrency=0 if language_model_only else (min(4, concurrency) if recipe.max_images else 0)
@@ -394,11 +396,26 @@ def _shortfall(plan: Plan, options: list[str], scope: str) -> CapacityError:
     return CapacityError("\n".join(lines))
 
 
+
+def host_shape_error(roce_ring: bool, roce_chain: bool, hosts: int | None) -> str | None:
+    """Why a ring or chain cannot be formed over ``hosts`` ranks on separate hosts, or None when it can.
+
+    A ring or a chain needs 2 to 16 ranks in rank order on separate hosts; the two shapes exclude each
+    other. ``hosts`` is the rank count, or None when ranks share one host."""
+    if roce_ring and roce_chain:
+        return "--roce-ring and --roce-chain exclude each other"
+    if not (roce_ring or roce_chain):
+        return None
+    flag = "--roce-ring" if roce_ring else "--roce-chain"
+    if hosts is None or not 2 <= hosts <= 16:
+        return f"{flag} requires at least two hosts in rank order, at most 16, each rank on its own host"
+    return None
+
 def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selected: tuple[int, ...] | None,
          concurrency: int, reserve_bytes: int, speculation: Speculation | None,
          prefill_chunk: int | None = None, context_parallel: bool = True, stream_overlap: bool = True,
          cache_states: int | None = None, mixed_prefill: bool = False, prompt_logprobs: bool = False,
-         expert_scale_compression: str | None = None, roce_ring: bool = False,
+         expert_scale_compression: str | None = None, roce_ring: bool = False, roce_chain: bool = False,
          image_concurrency: int | None = None, online_mxfp8: bool = False,
          language_model_only: bool = False, mla_compute_mode: str = "auto") -> Plan:
     """Select GPUs and size the plan, or raise a capacity error that lists working settings.
@@ -451,7 +468,7 @@ def plan(recipe: Recipe, checkpoint: Checkpoint, gpus: tuple[Gpu, ...], *, selec
                    speculation=speculation, prefill_chunk=chunk, context_parallel=context_parallel,
                    stream_overlap=stream_overlap, cache_states=cache_states,
                    mixed_prefill=mixed_prefill, prompt_logprobs=prompt_logprobs,
-                   expert_scale_compression=expert_scale_compression, roce_ring=roce_ring,
+                   expert_scale_compression=expert_scale_compression, roce_ring=roce_ring, roce_chain=roce_chain,
                    image_concurrency=None if image_concurrency is None else min(image_concurrency, concurrency),
                    online_mxfp8=online_mxfp8, language_model_only=language_model_only,
                    mla_compute_mode=mla_compute_mode)

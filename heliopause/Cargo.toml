@@ -37,6 +37,10 @@ openssl = "0.10"
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7.11"
 
+# sha2 0.10 gates ARM SHA-256 instructions behind its asm feature.
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+sha2 = { version = "0.10.9", features = ["asm"] }
+
 [target.'cfg(windows)'.dependencies]
 openssl = { version = "0.10", features = ["vendored"] }
 openssl-src = { version = "300", features = ["legacy"] }

@@ -56,6 +56,56 @@ pub struct Fabric {
     pub endpoints: Vec<Endpoint>,
 }
 
+/// How the ranks of a multi-host package link over RoCE.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Shape {
+    /// Every rank links to every other rank.
+    Mesh,
+    /// Experimental ring in rank order: each rank links to its two neighbors and the native proxy
+    /// forwards writes to every other rank around the shorter arc.
+    Ring,
+    /// Experimental chain in rank order: a ring with no link between rank 0 and the last rank, so
+    /// the ends have one neighbor and the proxy forwards along the chain.
+    Chain,
+}
+
+impl Shape {
+    /// The shape two command-line flags select; the chain flag wins because it implies relaying.
+    pub fn from_flags(ring: bool, chain: bool) -> Self {
+        if chain {
+            Shape::Chain
+        } else if ring {
+            Shape::Ring
+        } else {
+            Shape::Mesh
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Shape::Mesh => "mesh",
+            Shape::Ring => "ring",
+            Shape::Chain => "chain",
+        }
+    }
+
+    /// Whether the native proxy relays writes between ranks that hold no direct link.
+    pub fn relays(self) -> bool {
+        self != Shape::Mesh
+    }
+
+    /// Whether `rank` holds a direct link to `peer` among `world` ranks; a rank never links to itself.
+    pub fn linked(self, rank: usize, peer: usize, world: usize) -> bool {
+        match self {
+            Shape::Mesh => peer != rank,
+            Shape::Ring => {
+                peer != rank && (peer == (rank + 1) % world || peer == (rank + world - 1) % world)
+            }
+            Shape::Chain => peer + 1 == rank || peer == rank + 1,
+        }
+    }
+}
+
 /// The devices this rank opens and, per peer, the (local, remote) device indexes of each rail.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Topology {
@@ -64,7 +114,7 @@ pub struct Topology {
     pub traffic_class: u32,
     pub rails: usize,
     pub routes: Vec<Vec<(u32, u32)>>,
-    pub ring: bool,
+    pub shape: Shape,
 }
 
 fn read(path: &Path) -> Option<String> {
@@ -368,21 +418,23 @@ pub fn plan_routes(
     Ok(routes)
 }
 
-/// Experimental ring in rank order. Only adjacent ranks need a
-/// physical link; the native proxy forwards writes to every other rank.
-/// The same plan works over a switch while keeping non-neighbor QPs unconnected.
-pub fn plan_ring_routes(
+/// The routes of `shape` for `rank`: a mesh routes to every rank; a ring or chain routes only to
+/// the ranks `shape` links, and the native proxy forwards writes to the others. The same plan works
+/// over a switch while keeping unlinked QPs unconnected.
+pub fn plan_shape_routes(
     endpoints: &[Vec<Endpoint>],
     rank: usize,
     rails: usize,
+    shape: Shape,
 ) -> Result<Vec<Vec<(u32, u32)>>> {
+    if shape == Shape::Mesh {
+        return plan_routes(endpoints, rank, rails);
+    }
     if !(2..=16).contains(&endpoints.len()) || rank >= endpoints.len() {
         return Err(failure("experimental RoCE ring requires 2..16 ranks"));
     }
     let world = endpoints.len();
-    let peers: Vec<_> = (0..world)
-        .filter(|p| *p == rank || *p == (rank + 1) % world || *p == (rank + world - 1) % world)
-        .collect();
+    let peers: Vec<_> = (0..world).filter(|p| *p == rank || shape.linked(rank, *p, world)).collect();
     let subset: Vec<_> = peers.iter().map(|p| endpoints[*p].clone()).collect();
     let local = peers.iter().position(|p| *p == rank).unwrap();
     let planned = plan_routes(&subset, local, rails)?;
@@ -397,23 +449,8 @@ pub fn plan_ring_routes(
 }
 
 impl Fabric {
-    pub fn ring_topology(&self, endpoints: &[Vec<Endpoint>], rank: usize) -> Result<Topology> {
-        if endpoints.get(rank) != Some(&self.endpoints) || endpoints.iter().any(Vec::is_empty) {
-            return Err(failure("every ring rank needs at least one RoCE device"));
-        }
-        let rails = endpoints.iter().map(Vec::len).min().unwrap().min(MAX_RAILS);
-        Ok(Topology {
-            hcas: self.endpoints.iter().map(|e| e.name.clone()).collect(),
-            gid_index: self.gid_index,
-            traffic_class: self.traffic_class,
-            rails,
-            routes: plan_ring_routes(endpoints, rank, rails)?,
-            ring: true,
-        })
-    }
-
-    /// The topology this rank opens, from every rank's endpoints in rank order.
-    pub fn topology(&self, endpoints: &[Vec<Endpoint>], rank: usize) -> Result<Topology> {
+    /// The topology this rank opens for `shape`, from every rank's endpoints in rank order.
+    pub fn topology(&self, endpoints: &[Vec<Endpoint>], rank: usize, shape: Shape) -> Result<Topology> {
         if endpoints.get(rank) != Some(&self.endpoints) || endpoints.iter().any(Vec::is_empty) {
             return Err(failure("every rank needs at least one RoCE device"));
         }
@@ -423,8 +460,8 @@ impl Fabric {
             gid_index: self.gid_index,
             traffic_class: self.traffic_class,
             rails,
-            routes: plan_routes(endpoints, rank, rails)?,
-            ring: false,
+            routes: plan_shape_routes(endpoints, rank, rails, shape)?,
+            shape,
         })
     }
 }
@@ -637,7 +674,7 @@ mod tests {
                     assert!(plan_routes(&endpoints, 0, 2).is_err());
                 }
                 let plans: Vec<_> = (0..world)
-                    .map(|r| plan_ring_routes(&endpoints, r, 2).unwrap())
+                    .map(|r| plan_shape_routes(&endpoints, r, 2, Shape::Ring).unwrap())
                     .collect();
                 for rank in 0..world {
                     assert!(plans[rank][rank].is_empty());
@@ -663,10 +700,29 @@ mod tests {
 
     #[test]
     fn ring_rejects_wrong_world_size_and_missing_neighbor_links() {
-        assert!(plan_ring_routes(&[], 0, 2).is_err());
+        assert!(plan_shape_routes(&[], 0, 2, Shape::Ring).is_err());
         let endpoints = vec![vec![endpoint("f0", "10.0.0.1/30")]; 4];
-        assert!(plan_ring_routes(&endpoints, 4, 2).is_err());
-        assert!(plan_ring_routes(&endpoints, 0, 2).is_err());
+        assert!(plan_shape_routes(&endpoints, 4, 2, Shape::Ring).is_err());
+        assert!(plan_shape_routes(&endpoints, 0, 2, Shape::Ring).is_err());
+    }
+
+    #[test]
+    fn a_line_connects_neighbors_only_and_needs_no_link_between_its_ends() {
+        // Four hosts cabled 0-1, 1-2, 2-3 on distinct /30 subnets; the ends share no subnet.
+        let endpoints = vec![
+            vec![endpoint("a", "10.0.0.1/30")],
+            vec![endpoint("b", "10.0.0.2/30"), endpoint("c", "10.0.1.1/30")],
+            vec![endpoint("d", "10.0.1.2/30"), endpoint("e", "10.0.2.1/30")],
+            vec![endpoint("f", "10.0.2.2/30")],
+        ];
+        let routes = plan_shape_routes(&endpoints, 0, 1, Shape::Chain).unwrap();
+        assert_eq!(routes, vec![vec![], vec![(0, 0)], vec![], vec![]]);
+        let routes = plan_shape_routes(&endpoints, 3, 1, Shape::Chain).unwrap();
+        assert_eq!(routes, vec![vec![], vec![], vec![(0, 1)], vec![]]);
+        let routes = plan_shape_routes(&endpoints, 1, 1, Shape::Chain).unwrap();
+        assert_eq!(routes, vec![vec![(0, 0)], vec![], vec![(1, 0)], vec![]]);
+        // The same hosts as a ring need the missing 3-0 link.
+        assert!(plan_shape_routes(&endpoints, 0, 1, Shape::Ring).is_err());
     }
 
     #[test]
@@ -678,7 +734,7 @@ mod tests {
         };
         let peer = vec![endpoint("c", "10.0.0.2/24")];
         let topology = fabric
-            .topology(&[fabric.endpoints.clone(), peer], 0)
+            .topology(&[fabric.endpoints.clone(), peer], 0, Shape::Mesh)
             .unwrap();
         assert_eq!(
             (
@@ -690,7 +746,7 @@ mod tests {
         );
         assert!(
             fabric
-                .topology(&[fabric.endpoints.clone(), vec![]], 0)
+                .topology(&[fabric.endpoints.clone(), vec![]], 0, Shape::Mesh)
                 .is_err()
         );
     }

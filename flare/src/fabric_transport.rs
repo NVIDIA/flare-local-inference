@@ -22,6 +22,8 @@ struct Config {
     rank: usize,
     world: usize,
     ring: bool,
+    #[serde(default)]
+    chain: bool,
     streams: usize,
     source_port: u16,
 }
@@ -53,6 +55,7 @@ impl Relay {
             rank,
             world: topology.links.len(),
             ring: topology.ring,
+            chain: topology.chain,
             streams,
             source_port,
         };
@@ -294,7 +297,7 @@ pub fn run(path: &Path) -> Result<(), Failure> {
     }
     let ports = endpoints.iter().map(|e| e.port).collect::<Vec<_>>();
     let records = endpoints.into_iter().map(|e| e.record).collect::<Vec<_>>();
-    let topology = Topology::plan(&records, &ports, config.ring)?;
+    let topology = Topology::plan_shape(&records, &ports, config.ring, config.chain)?;
     network.set_nonblocking(true)?;
     local_listener.set_nonblocking(true)?;
     reply(serde_json::json!({"ready": true}))?;
@@ -390,7 +393,12 @@ mod tests {
 
     #[test]
     fn concurrent_direct_and_relayed_channels_preserve_both_directions_and_drain() {
-        for (world, ring) in [(2, false), (4, false), (4, true)] {
+        for (world, ring, chain) in [
+            (2, false, false),
+            (4, false, false),
+            (4, true, false),
+            (4, false, true),
+        ] {
             let temporary = tempfile::tempdir().unwrap();
             let source = TcpListener::bind("127.0.0.1:0").unwrap();
             let source_port = source.local_addr().unwrap().port();
@@ -402,7 +410,7 @@ mod tests {
                 .map(|s| s.local_addr().unwrap().port())
                 .collect::<Vec<_>>();
             let records = vec![b"a 127.0.0.1/8\n".to_vec(); world];
-            let topology = Topology::plan(&records, &ports, ring).unwrap();
+            let topology = Topology::plan_shape(&records, &ports, ring, chain).unwrap();
             let stopping = AtomicBool::new(false);
             let streams = 4;
             thread::scope(|scope| {
@@ -438,6 +446,7 @@ mod tests {
                                 rank,
                                 world,
                                 ring,
+                                chain,
                                 streams,
                                 source_port: if rank == 0 { source_port } else { 0 },
                             },
@@ -503,6 +512,7 @@ mod tests {
                     rank: 1,
                     world: 2,
                     ring: false,
+                    chain: false,
                     streams: 2,
                     source_port: 0,
                 },

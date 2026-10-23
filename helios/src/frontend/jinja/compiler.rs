@@ -456,7 +456,13 @@ impl Parser {
         let token = self.peek().clone();
         self.at += 1;
         match token {
-            Token::String(s) => Ok(Expr::Constant(s.into())),
+            Token::String(mut s) => {
+                while let Token::String(next) = self.peek().clone() {
+                    s.push_str(&next);
+                    self.at += 1;
+                }
+                Ok(Expr::Constant(s.into()))
+            }
             Token::Number(n) => Ok(Expr::Constant(
                 serde_json::from_str(&n).map_err(|_| Error::new("invalid number"))?,
             )),

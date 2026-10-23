@@ -1087,6 +1087,10 @@ evaluation supplies Python-compatible JSON formatting, whitespace handling, and
 template exceptions. Model integrations must satisfy the
 [renderer contract and validation requirements](model-development.md#prompt-renderers-and-checkpoint-boundaries).
 
+Recipes normally use the checkpoint template. Gemma 4 uses Google's canonical
+templates across quantization publishers as specified in
+[frontend metadata](model-development.md#sampling-and-frontend-metadata).
+
 The [native image processor](../helios/src/frontend/images/mod.rs) is checked
 against the checkpoint's Transformers processor. Compare resized and normalized
 pixels, patch order, image grids, placeholder expansion, and positions before

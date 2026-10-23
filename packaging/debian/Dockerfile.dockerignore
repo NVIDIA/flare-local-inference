@@ -13,6 +13,10 @@
 !helios/proto/**
 !helios/native/
 !helios/native/**
+!ignition/recipes/qwen38/assets/
+!ignition/recipes/qwen38/assets/**
+!ignition/recipes/step5/assets/
+!ignition/recipes/step5/assets/**
 !LICENSE
 !NOTICE
 !packaging/

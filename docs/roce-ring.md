@@ -14,7 +14,8 @@ runtime compilation, or steady-state GPU allocation.
 
 Checkpoint reads, prepared exports, and package distribution use multi-stream
 TCP on the discovered CX7 interfaces independently of the RDMA proxy. Direct
-mode connects to the peer rank; `--roce-ring` selects neighbor relays. Preparation
+mode connects to the peer rank; `--roce-ring` and `--roce-chain` select neighbor
+relays. Preparation
 owns one native transfer helper per rank and needs no Orbit agents. Serving
 owns its package receiver and relay, whether ranks start manually, through
 `flare run --hosts`, or through Orbit. Agent-based prestaging uses the existing
@@ -70,6 +71,29 @@ links for the selected rail count.
 Flare does not configure interfaces, addresses, cables, switch forwarding, or
 firewall rules. A physical ring needs both neighbor links and suitable RoCEv2
 addressing already configured.
+
+## Chains
+
+`--roce-chain` serves the same packages over ranks cabled directly as a chain in
+rank order: rank 0 and the last rank have one neighbor each and share no link.
+Routes connect neighbors only, and a transfer to a non-neighbor always moves
+toward its target along the chain, so every rank between the two relays it. The
+ends relay nothing. A four-rank chain on hosts cabled `0-1`, `1-2`, `2-3`:
+
+| Transfer | Path | Forwarding |
+| --- | --- | --- |
+| Rank 0 to rank 1 | `0 → 1` | Direct |
+| Rank 0 to rank 3 | `0 → 1 → 2 → 3` | Ranks 1 and 2 relay the transfer |
+| Rank 3 to rank 1 | `3 → 2 → 1` | Rank 2 relays the transfer |
+
+A chain is any contiguous stretch of a larger cabled ring, so a group that
+leaves part of the ring to other work is a chain even when the whole ring is a
+cycle. Relay mailboxes, credits, acknowledgments and the two-shot release wait
+are the ring's. Every rank must select the same shape: the ranks exchange it
+before planning routes and refuse a mismatch, since a chain rank plans no
+route to the far end that a ring rank would wait for. `--roce-ring` and
+`--roce-chain` exclude each other. Checkpoint reads, prepared exports and package
+distribution follow the same chain routes.
 
 ## Transfer progress and buffer ownership
 
@@ -129,8 +153,9 @@ uv sync --locked --extra prepare --extra test
 cargo build --release --manifest-path flare/Cargo.toml
 ```
 
-Preparation and serving use proxy ABI 9. Packages prepared with an earlier RoCE
-proxy ABI require re-export; startup rejects a mismatch before replay.
+Preparation and serving use proxy ABI 10, whose region holds eight packets in flight per sender and
+rail. A package prepared with RoCE proxy ABI 9, which holds one, requires re-export. The chain topology
+is a mode of the ABI 10 layout, and startup rejects a mismatch before replay.
 
 ### Prepare across four hosts
 
@@ -211,10 +236,12 @@ Ranks that disagree about ring mode fail during transport record exchange.
 
 Select ring mode explicitly during serving, including for a package prepared
 with the option. The serving flag chooses routing independently of the
-package's graph catalog. A compatible ABI 9 package can use ring or direct peer
-routing without changing its captured addresses or collective algorithms.
-Preparation on a physical ring also needs `--roce-ring`, because non-neighbor
-direct routes are unavailable during warmup and capture.
+package's graph catalog. A compatible ABI 10 package can use either transport
+without changing its captured addresses or collective algorithms. Preparation
+on a physical ring also needs `--roce-ring`, because non-neighbor direct routes
+are unavailable during warmup and capture. A chain (`--roce-chain`) uses the
+neighbor transport for collectives, but its checkpoint loading and preparation
+export use the preparation rendezvous rather than the agent transfers below.
 
 ## TCP data distribution
 

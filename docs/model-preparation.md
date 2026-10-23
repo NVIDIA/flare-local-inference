@@ -416,8 +416,12 @@ accepts images within its image-token budget and has no offloaded embedding tabl
 Exports use the native DeepSeek V4 prompt encoder, carry only the tokenizer asset,
 and bind the atomic `<｜deepseek_image｜>` placeholder as token 129264.
 Both native DeepSeek encoders default to thinking enabled and high effort, accept
-`low`, `high`, `xhigh`, and `max`, and reject numeric effort, `drop_thinking`,
-assistant continuation, and `add_generation_prompt=false`. System-prefix caching
+`low`, `high`, `xhigh`, and `max`, and reject `drop_thinking`, assistant
+continuation, and `add_generation_prompt=false`. DeepSeek V4 rejects numeric
+effort. DeepSeek V4.1 also accepts integer scores from 1 through 100 in
+`reasoning_effort` or `chat_template_kwargs.reasoning_effort`; these are prompt
+hints rather than token budgets. See [reasoning controls](api.md#reasoning-sampling-and-usage)
+for request examples and named-level mappings. System-prefix caching
 derives reusable token prefixes from the official encoder's rendered conversations.
 Previously exported Jinja packages retain their
 packaged rendering behavior and require both tokenizer and template assets.

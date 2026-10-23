@@ -44,7 +44,7 @@ ryu = { version = "1.0", optional = true }
 png = { version = "0.18.1", optional = true }
 image-webp = { version = "0.2.4", optional = true }
 turbojpeg = { version = "=1.5.1", default-features = false, features = ["cmake"], optional = true }
-axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio"], optional = true }
+axum = { version = "0.8.9", default-features = false, features = ["http1", "json", "tokio", "multipart"], optional = true }
 tokio = { version = "1.53.1", default-features = false, features = ["rt-multi-thread", "net", "sync", "time", "macros"], optional = true }
 async-stream = { version = "0.3.6", optional = true }
 base64 = { version = "0.22.1", optional = true }
@@ -127,6 +127,10 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+
+# sha2 0.10 gates ARM SHA-256 instructions behind its asm feature.
+[target.'cfg(all(target_os = "linux", target_arch = "aarch64"))'.dependencies]
+sha2 = { version = "0.10.9", features = ["asm"], optional = true }
 
 [[bin]]
 name = "test_kimi3_images"

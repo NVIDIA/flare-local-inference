@@ -75,6 +75,7 @@ class PreparationConfig:
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
     roce_ring: bool = False
+    roce_chain: bool = False
     compile_decoder: bool = True
     retain_graphs: bool = False
     max_active: int = 4
@@ -99,8 +100,11 @@ class PreparationConfig:
         from ignition.components.capacity import image_capacity
 
         object.__setattr__(self, "image_concurrency", image_capacity(self.max_active, self.image_concurrency))
-        if self.roce_ring and (self.hosts is None or not 2 <= len(self.hosts) <= 16):
-            raise ValueError("RoCE ring requires 2..16 ranks on separate hosts")
+        from ignition.planning import host_shape_error
+
+        error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
+        if error:
+            raise ValueError(error)
         if self.devices is not None and (
                 not isinstance(self.devices, tuple) or len(self.devices) not in (1, 2, 4)
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
@@ -278,7 +282,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
         # one-shot, prefill chunks through the pipelined two-shot path.
         collective = vocabulary_collective = create_roce_runtime(group, device,
             max_tokens=max(config.request_capacity, sample_rows), pipe_tokens=config.token_capacity, hidden_size=2560,
-            gather_bytes=sample_rows * (248320 // shard.world_size) * 2, package_storage=package_storage, ring=config.roce_ring)
+            gather_bytes=sample_rows * (248320 // shard.world_size) * 2, package_storage=package_storage, ring=config.roce_ring, ring_open=config.roce_chain)
     elif group is not None:
         collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity, hidden_size=2560, ipc=ipc)
         vocabulary_collective = create_all_gather_runtime(group, device, max_rows=sample_rows, columns=248320, ipc=ipc)

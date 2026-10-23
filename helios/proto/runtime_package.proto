@@ -96,6 +96,8 @@ message RebuildManifest {
   uint64 reserve_bytes = 20;
   // Local checkpoint overrides have no asserted upstream revision.
   bool local_checkpoint = 21;
+  // Neighbor relays over a chain in rank order; exclusive with roce_ring.
+  bool roce_chain = 22;
 }
 message RebuildSpeculation {
   uint32 draft_tokens = 1;

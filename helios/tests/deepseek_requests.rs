@@ -82,6 +82,10 @@ fn tokenizer_asset() -> Asset {
 
 impl Fixture {
     fn new(encoder: PromptEncoder) -> Self {
+        Self::with_defaults(encoder, json!({}))
+    }
+
+    fn with_defaults(encoder: PromptEncoder, defaults: Value) -> Self {
         let asset = tokenizer_asset();
         let template = (encoder == PromptEncoder::Jinja).then(|| {
             let text = "{% mark %}{{ messages | tojson }}\n{{ tools | default([]) | tojson }}\n{{ tool_choice | default('auto') }}";
@@ -105,7 +109,7 @@ impl Fixture {
                 tokens: TokenizerSettings::default(),
                 chat_template: template,
             },
-            Map::new(),
+            defaults.as_object().unwrap().clone(),
             &settings,
         )
         .unwrap();
@@ -157,6 +161,14 @@ impl Fixture {
             .chain(self.config.eos_token_ids.iter().copied())
             .all(|token| grammar.advance(token).is_ok())
     }
+}
+
+fn boundary_effort_options(encoder: PromptEncoder) -> Vec<Value> {
+    let mut options = vec![json!({})];
+    if encoder == PromptEncoder::DeepseekV41 {
+        options.push(json!({"reasoning_effort":80}));
+    }
+    options
 }
 
 #[test]
@@ -211,13 +223,15 @@ fn native_encoders_checkpoint_each_message_prefix() {
             {"role":"assistant","reasoning_content":"Thought", "content":"Answer"},
             {"role":"user","content":"Follow-up"}
         ]);
-        let prepared = fixture.prepare(json!({"messages":messages})).unwrap();
-        for count in 1..=messages.as_array().unwrap().len() {
-            let prefix = native_prefix::without_generation(&fixture.frontend,
-                &messages.as_array().unwrap()[..count], &Map::new());
-            assert!(prepared.prompt.tokens.starts_with(&prefix.token_ids));
-            assert!(prepared.prompt.message_boundaries.contains(&prefix.token_ids.len()),
-                "{encoder:?}, message {count}");
+        for options in boundary_effort_options(encoder) {
+            let prepared = fixture.prepare(json!({"messages":messages,"chat_template_kwargs":options})).unwrap();
+            for count in 1..=messages.as_array().unwrap().len() {
+                let prefix = native_prefix::without_generation(&fixture.frontend,
+                    &messages.as_array().unwrap()[..count], options.as_object().unwrap());
+                assert!(prepared.prompt.tokens.starts_with(&prefix.token_ids));
+                assert!(prepared.prompt.message_boundaries.contains(&prefix.token_ids.len()),
+                    "{encoder:?}, options {options}, message {count}");
+            }
         }
     }
 }
@@ -237,17 +251,20 @@ fn native_boundaries_follow_merged_users_and_sorted_tool_results() {
             {"role":"tool","tool_call_id":"b","content":"Result B"},
             {"role":"tool","tool_call_id":"a","content":"Result A"}
         ]);
-        let prepared = fixture.prepare(json!({"messages":messages})).unwrap();
-        let text = &prepared.rendered_prompt;
-        assert!(text.contains("First user\n\nSecond user"));
-        assert!(text.find("Result A").unwrap() < text.find("Result B").unwrap());
-        let token_end = |suffix: &str| {
-            let byte = text.find(suffix).unwrap() + suffix.len();
-            fixture.frontend.encode(&text[..byte], false).unwrap().len()
-        };
-        assert!(!prepared.prompt.message_boundaries.contains(&token_end("First user")));
-        for suffix in ["Policy", "Second user", "Result A</tool_result>", "Result B</tool_result>"] {
-            assert!(prepared.prompt.message_boundaries.contains(&token_end(suffix)), "{encoder:?}: {suffix}");
+        for options in boundary_effort_options(encoder) {
+            let prepared = fixture.prepare(json!({"messages":messages,"chat_template_kwargs":options})).unwrap();
+            let text = &prepared.rendered_prompt;
+            assert!(text.contains("First user\n\nSecond user"));
+            assert!(text.find("Result A").unwrap() < text.find("Result B").unwrap());
+            let token_end = |suffix: &str| {
+                let byte = text.find(suffix).unwrap() + suffix.len();
+                fixture.frontend.encode(&text[..byte], false).unwrap().len()
+            };
+            assert!(!prepared.prompt.message_boundaries.contains(&token_end("First user")));
+            for suffix in ["Policy", "Second user", "Result A</tool_result>", "Result B</tool_result>"] {
+                assert!(prepared.prompt.message_boundaries.contains(&token_end(suffix)),
+                    "{encoder:?}, options {options}: {suffix}");
+            }
         }
     }
 }
@@ -385,7 +402,7 @@ fn native_reasoning_options_are_validated_through_request_preparation() {
             assert!(f.prepare(json!({"reasoning_effort":effort})).is_ok());
         }
         for extra in [
-            json!({"chat_template_kwargs":{"reasoning_effort":75}}),
+            json!({"chat_template_kwargs":{"reasoning_effort":101}}),
             json!({"chat_template_kwargs":{"drop_thinking":true}}),
             json!({"chat_template_kwargs":{"continue_final_message":true}}),
             json!({"chat_template_kwargs":{"add_generation_prompt":false}}),
@@ -396,10 +413,91 @@ fn native_reasoning_options_are_validated_through_request_preparation() {
     }
 }
 
+fn assert_request_effort(fixture: &Fixture, request: &PreparedRequest, score: u8) {
+    assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")));
+    assert_eq!(request.rendered_prompt.matches("Reasoning Effort:").count(), 1);
+    assert_eq!(request.prompt.tokens,
+        fixture.frontend.encode(&request.rendered_prompt, false).unwrap());
+    assert_eq!(request.output.content.start, OutputStart::Reasoning);
+}
+
+#[test]
+fn numeric_scores_reach_the_encoded_prompt_through_both_chat_option_paths() {
+    let fixture = Fixture::new(PromptEncoder::DeepseekV41);
+    for score in [1u8, 80, 100] {
+        let direct = fixture.prepare(json!({"reasoning_effort":score})).unwrap();
+        let kwargs = fixture.prepare(json!({"chat_template_kwargs":{"reasoning_effort":score}})).unwrap();
+        assert_request_effort(&fixture, &direct, score);
+        assert_eq!(direct.rendered_prompt, kwargs.rendered_prompt);
+        assert_eq!(direct.prompt.tokens, kwargs.prompt.tokens);
+    }
+    let eighty = fixture.prepare(json!({"reasoning_effort":80})).unwrap();
+    let high = fixture.prepare(json!({"reasoning_effort":"high"})).unwrap();
+    assert_ne!(eighty.prompt.tokens, high.prompt.tokens);
+    let nested_override = fixture.prepare(json!({"reasoning_effort":50,
+        "chat_template_kwargs":{"reasoning_effort":80}})).unwrap();
+    assert_eq!(nested_override.rendered_prompt, eighty.rendered_prompt);
+    assert_eq!(nested_override.prompt.tokens, eighty.prompt.tokens);
+    for (name, score) in [("low", 50), ("high", 75), ("xhigh", 75), ("max", 100)] {
+        let named = fixture.prepare(json!({"reasoning_effort":name})).unwrap();
+        let numeric = fixture.prepare(json!({"reasoning_effort":score})).unwrap();
+        assert_eq!(numeric.rendered_prompt, named.rendered_prompt, "{name}");
+        assert_eq!(numeric.prompt.tokens, named.prompt.tokens);
+    }
+}
+
+#[test]
+fn invalid_scores_and_v4_numeric_requests_fail_before_admission() {
+    let invalid = [json!(0), json!(101), json!(-1), json!(80.0), json!(80.5),
+        json!(true), json!(false), json!("80"), json!(u64::MAX),
+        serde_json::from_str::<Value>("18446744073709551616").unwrap()];
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let fixture = Fixture::new(encoder);
+        for score in &invalid {
+            for extra in [json!({"reasoning_effort":score}),
+                          json!({"chat_template_kwargs":{"reasoning_effort":score}})] {
+                assert!(fixture.prepare(extra.clone()).is_err(), "{encoder:?}: {extra}");
+            }
+        }
+    }
+    let v4 = Fixture::new(PromptEncoder::DeepseekV4);
+    for score in [1, 80, 100] {
+        assert!(v4.prepare(json!({"reasoning_effort":score})).is_err());
+        assert!(v4.prepare(json!({"chat_template_kwargs":{"reasoning_effort":score}})).is_err());
+    }
+}
+
+#[test]
+fn numeric_defaults_null_and_named_requests_preserve_request_isolation() {
+    let fixture = Fixture::with_defaults(PromptEncoder::DeepseekV41, json!({"reasoning_effort":80}));
+    for (extra, score) in [
+        (json!({}), 80),
+        (json!({"reasoning_effort":1}), 1),
+        (json!({"chat_template_kwargs":{"reasoning_effort":"low"}}), 50),
+        (json!({"reasoning_effort":null}), 75),
+        (json!({"chat_template_kwargs":{"reasoning_effort":null}}), 75),
+        (json!({}), 80),
+    ] {
+        assert_request_effort(&fixture, &fixture.prepare(extra).unwrap(), score);
+    }
+    let named = Fixture::with_defaults(PromptEncoder::DeepseekV41, json!({"reasoning_effort":"low"}));
+    assert_request_effort(&named, &named.prepare(json!({})).unwrap(), 50);
+    let off = fixture.prepare(json!({"reasoning_effort":80,"enable_thinking":false})).unwrap();
+    assert!(!off.rendered_prompt.contains("Reasoning Effort:"));
+    assert!(off.rendered_prompt.ends_with("</think>"));
+    assert_eq!(off.output.content.start, OutputStart::Content);
+    assert_request_effort(&fixture, &fixture.prepare(json!({})).unwrap(), 80);
+}
+
 #[test]
 fn base64_images_follow_the_rendered_placeholder_order() {
     use base64::Engine;
-    use flare_helios::frontend::images::{ImageLimits, ImageProcessor, ImageSettings};
+    use flare_helios::frontend::images::{
+        DeepseekRowMajorImageSettings, ImageLimits, ImageProcessor, ImageSettings,
+    };
+    use flare_helios::model::contract::{
+        ImageLayoutKind, ImagePreparationKind, ImageSpan, ImageTokenLayout,
+    };
 
     fn encoded_image(rgb: [u8; 3]) -> (Vec<u8>, String) {
         let mut bytes = Vec::new();
@@ -416,48 +514,117 @@ fn base64_images_follow_the_rendered_placeholder_order() {
         );
         (bytes, url)
     }
-    let mut f = Fixture::new(PromptEncoder::DeepseekV4);
-    f.config.contract = support::contract("deepseek4");
-    let processor =
-        ImageProcessor::load(ImageSettings::Deepseek4 {}, ImageLimits::default()).unwrap();
-    let (red, red_url) = encoded_image([255, 0, 0]);
-    let (green, green_url) = encoded_image([0, 255, 0]);
-    let messages = json!([{"role":"user","content":[
-        {"type":"image_url","image_url":{"url":green_url}},
-        {"type":"text","text":"First"},
-        {"type":"image_url","image_url":{"url":red_url}},
-        {"type":"text","text":"Second"}
-    ]}]);
-    let rendered = f
-        .frontend
-        .render_chat(messages.as_array().unwrap(), &Map::new())
-        .unwrap();
-    assert_eq!(rendered.image_sources, vec![green_url, red_url]);
-    let request = prepare_request(
-        &f.frontend,
-        Some(&processor),
-        &f.compiler,
-        &f.config,
-        json!({"model":f.config.model_id,"messages":messages}),
-    )
-    .unwrap();
-    let expected = processor
-        .process(&[
-            processor.decode_png(&green).unwrap(),
-            processor.decode_png(&red).unwrap(),
-        ])
-        .unwrap();
-    let mut actual = flare_helios::frontend::images::ProcessedImages::default();
-    for image in &request.prompt.conditioned_inputs {
-        actual.append(image.materialize().unwrap());
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let mut f = Fixture::new(encoder);
+        let settings = if encoder == PromptEncoder::DeepseekV41 {
+            // This support fixture is text-only; declare the recipe's row-major image inputs locally.
+            let image_start = f.config.contract.vocabulary as u32;
+            f.config.contract.input_vocabulary = f.config.contract.vocabulary + 4;
+            f.config.contract.vision = model::VisionCapabilities {
+                feature_slots: 4,
+                features_per_request: 4096,
+                max_images: 4,
+                patches_per_feature: 9,
+                patch_capacities: vec![576, 1152, 2304, 4608, 9216],
+            };
+            let syntax = &mut f.config.contract.frontend;
+            syntax.image_preparation = Some(ImagePreparationKind::DeepseekRowMajor);
+            syntax.image_layout = Some(ImageLayoutKind::DeepseekRowMajor);
+            syntax.rejected_tokens.clear();
+            syntax.image_tokens = Some(ImageTokenLayout {
+                feature_token: image_start + 1,
+                span: Some(ImageSpan {
+                    start_token: image_start,
+                    end_token: image_start + 3,
+                    max_tokens: 1024,
+                    interior_tokens: vec![image_start + 2],
+                    unscoped_tokens: vec![],
+                }),
+            });
+            ImageSettings::DeepseekRowMajor(DeepseekRowMajorImageSettings {
+                min_pixels: 46656,
+                max_tokens: 1024,
+                max_width_height_ratio: None,
+            })
+        } else {
+            ImageSettings::Deepseek4 {}
+        };
+        let processor = ImageProcessor::load(settings, ImageLimits::default()).unwrap();
+        for options in boundary_effort_options(encoder) {
+            let (red, red_url) = encoded_image([255, 0, 0]);
+            let (green, green_url) = encoded_image([0, 255, 0]);
+            let messages = json!([{"role":"user","content":[
+                {"type":"image_url","image_url":{"url":green_url}},
+                {"type":"text","text":"First"},
+                {"type":"image_url","image_url":{"url":red_url}},
+                {"type":"text","text":"Second"}
+            ]}]);
+            let rendered = f
+                .frontend
+                .render_chat(messages.as_array().unwrap(), options.as_object().unwrap())
+                .unwrap();
+            assert_eq!(rendered.image_sources, vec![green_url, red_url]);
+            let request = prepare_request(
+                &f.frontend,
+                Some(&processor),
+                &f.compiler,
+                &f.config,
+                json!({"model":f.config.model_id,"messages":messages,"chat_template_kwargs":options}),
+            )
+            .unwrap();
+            let expected = processor
+                .process(&[
+                    processor.decode_png(&green).unwrap(),
+                    processor.decode_png(&red).unwrap(),
+                ])
+                .unwrap();
+            let mut actual = flare_helios::frontend::images::ProcessedImages::default();
+            for image in &request.prompt.conditioned_inputs {
+                actual.append(image.materialize().unwrap());
+            }
+            assert_eq!(actual.pixel_values, expected.pixel_values);
+            assert_eq!(actual.geometry.len(), 2);
+            assert_eq!(request.rendered_prompt, rendered.text);
+            if encoder == PromptEncoder::DeepseekV41 {
+                let score = options["reasoning_effort"].as_u64().unwrap_or(75);
+                assert!(request.rendered_prompt.contains(&format!("Reasoning Effort: {score} (range 1-100")));
+            }
+            let complete_message = native_prefix::without_generation(&f.frontend, messages.as_array().unwrap(), options.as_object().unwrap());
+            let complete_message = flare_helios::model::prepare_input(&f.config, &f.frontend,
+                Some(&processor), &complete_message,
+                vec![processor.decode_png(&green).unwrap(), processor.decode_png(&red).unwrap()]).unwrap();
+            assert!(request.prompt.tokens.starts_with(&complete_message.tokens));
+            assert!(request.prompt.message_boundaries.contains(&complete_message.tokens.len()));
+        }
     }
-    assert_eq!(actual.pixel_values, expected.pixel_values);
-    assert_eq!(actual.geometry.len(), 2);
-    assert_eq!(request.rendered_prompt, rendered.text);
-    let complete_message = native_prefix::without_generation(&f.frontend, messages.as_array().unwrap(), &Map::new());
-    let complete_message = flare_helios::model::prepare_input(&f.config, &f.frontend,
-        Some(&processor), &complete_message,
-        vec![processor.decode_png(&green).unwrap(), processor.decode_png(&red).unwrap()]).unwrap();
-    assert!(request.prompt.tokens.starts_with(&complete_message.tokens));
-    assert!(request.prompt.message_boundaries.contains(&complete_message.tokens.len()));
+}
+
+#[test]
+fn decision_generation_prompt_prepares_a_nonthinking_first_assistant_token() {
+    for encoder in [PromptEncoder::DeepseekV4, PromptEncoder::DeepseekV41] {
+        let mut fixture = Fixture::new(encoder);
+        fixture.config.max_top_logprobs = 1;
+        let prepared = fixture
+            .prepare(json!({
+                "messages":[
+                    {"role":"system","content":"Select one label."},
+                    {"role":"user","content":"State: charged twice"},
+                    {"role":"assistant","content":"State received."},
+                    {"role":"user","content":"Question: refund? A: false B: true\nAnswer:"}
+                ],
+                "chat_template_kwargs":{"enable_thinking":false,"add_generation_prompt":true},
+                "max_tokens":1,"ignore_eos":true,"logprobs":true
+            }))
+            .unwrap();
+        assert!(prepared.rendered_prompt.contains("Answer:"));
+        assert!(prepared.rendered_prompt.ends_with("</think>"));
+        assert_eq!(
+            prepared.prompt.tokens,
+            fixture
+                .frontend
+                .encode(&prepared.rendered_prompt, false)
+                .unwrap()
+        );
+        assert_eq!(prepared.output.content.start, OutputStart::Content);
+    }
 }

@@ -59,13 +59,13 @@ Logprobs describe the raw next-token distribution over the complete vocabulary:
 `logit(token) - logsumexp(logits)`, with FP32 accumulation, before temperature,
 penalties, grammar masks, and top-k, top-p, or min-p filtering. Speculative output
 uses the target model's distribution at each committed position. The chosen token
-is always included, even when outside the alternatives. Alternatives are ordered
-by decreasing logprob, with increasing token ID for ties.
+is always included, even when outside the alternatives. Natural alternatives are
+ordered by decreasing logprob, with increasing token ID for ties.
 
-Every newly exported package provides up to 20 alternatives. Older packages serve
-unchanged, advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0`, and
-reject logprob requests with HTTP 400: `logprobs are not available in this model
-package`. Re-export to enable the feature.
+Every newly exported package provides up to 20 natural alternatives and supports
+explicit token IDs. Older packages retain their natural request limit (1..20),
+or advertise `allow_logprobs: false` and `flare.max_top_logprobs: 0` when they have
+no generation logprob outputs. Unsupported requests return HTTP 400.
 
 For Chat Completions, set `logprobs: true` and optionally `top_logprobs: 0..20`.
 A positive `top_logprobs` requires `logprobs: true`; zero alone is accepted and
@@ -109,6 +109,22 @@ explicitly rejects logprob fields. Temperature zero remains rejected. Single-tok
 continuations work with `max_tokens: 1`, `continue_final_message: true`,
 `add_generation_prompt: false`, `logprobs: true`, and `top_logprobs: 20`, omitting
 temperature to use the model's prepared default.
+
+On Chat, Completions, and Responses, `logprob_token_ids: [id, ...]` replaces
+natural generation alternatives with those IDs in caller order. Existing generation
+logprob enablement is required. Supply at most 128 elements before deduplication;
+IDs must be nonnegative integers within the model vocabulary. Duplicates are
+removed in first-occurrence order. Null and empty arrays behave as omission.
+The sampled token is appended only when absent, so explicit results contain at
+most 129 entries. Values retain full-vocabulary normalization. Numeric top-k
+options still accept only 0..20 and do not truncate explicit results.
+
+Prompt scores and echoed prompt entries remain natural. Completions accepts
+validated IDs with `echo: true, max_tokens: 0`, which returns no generation
+positions. Completions maps retain their existing decoded-string collision
+behavior; use `return_tokens_as_token_ids: true` to distinguish IDs. Messages
+rejects `logprob_token_ids`. Older packages reject nonempty selections before
+admission with an explanation to re-export.
 
 ### Prompt log probabilities
 
@@ -475,11 +491,36 @@ are included in the system prompt as well as enforced by token masks.
 Anthropic thinking budgets are advisory effort hints, not independent token
 budgets. Budgets up to 5,000 map to low effort, up to 20,000 to high effort, and
 larger budgets to maximum effort. Responses and Anthropic named effort settings
-map into the same neutral levels. The frontend resolves those levels against the
-effort vocabulary accepted by the packaged template: for example Qwen uses
+(`reasoning.effort` and `output_config.effort`) accept named levels and map into
+the same neutral levels. They do not accept numeric scores. The frontend resolves
+those levels against the effort vocabulary accepted by the packaged template: for example Qwen uses
 `low/medium/xhigh`. Native DeepSeek V4 and V4.1 prompt encoders accept
-`low/high/xhigh/max` and default to thinking enabled and high effort. They reject numeric
-effort, `drop_thinking`, assistant continuation, and `add_generation_prompt=false`.
+`low/high/xhigh/max` and default to thinking enabled and high effort.
+DeepSeek V4 rejects numeric effort. DeepSeek V4.1 additionally accepts a JSON
+integer from **1 through 100** in the native `reasoning_effort` option, either
+at the request's top level or in `chat_template_kwargs`. Its named levels map
+to scores `low=50`, `high=75`, `xhigh=75`, and `max=100`.
+For `POST /v1/chat/completions`, for example:
+
+```json
+{
+  "model": "DeepSeek-V4.1-Flash",
+  "messages": [{"role": "user", "content": "Explain why this algorithm terminates."}],
+  "reasoning_effort": 80,
+  "max_tokens": 1024
+}
+```
+
+Alternatively, replace `"reasoning_effort": 80` with
+`"chat_template_kwargs": {"reasoning_effort": 80}`. Values outside 1–100,
+floating-point numbers such as `80.0`, booleans, and numeric strings such as
+`"80"` are rejected. Omitted values retain prepared defaults; explicit `null`
+selects the encoder's high default. Disabling thinking suppresses the effort
+prefix. The score is a prompt hint, not a token count or hard reasoning budget;
+Anthropic `thinking.budget_tokens` retains the threshold mapping described above.
+
+Both native DeepSeek encoders reject `drop_thinking`, assistant continuation,
+and `add_generation_prompt=false`.
 Explicit values are validated by the selected encoder. Packages exported with
 Jinja templates retain their packaged template semantics.
 Kimi K3 always uses thinking: its template ignores `enable_thinking=false` and
@@ -577,3 +618,99 @@ tests use temporary repositories and check a real read/edit/test task. Scheduler
 regressions in `tests/server/test_scheduler.py` run against ordinary, fixed-width,
 and adaptive speculative execution. These environment variables configure tests,
 not the native server.
+
+## System One decisions
+
+`POST /v1/systemone` accepts the [TypeSafe System One schema](https://api.typesafe.ai/openapi.json)
+for `noul`, `choice`, and `score` questions:
+
+```json
+{"model":"local","state":{"message":"Charged twice"},"questions":{
+  "refund":{"type":"noul","instructions":"Is a refund requested?"},
+  "team":{"type":"choice","criteria":{"billing":null,"support":"Other help"}},
+  "urgency":{"type":"score","criteria":["Routine","Urgent"]}}}
+```
+
+The response contains the loaded `model`, a named `answers` map, and
+`usage: {input_tokens, output_tokens}`. Noul returns `noul: P(true)`; Choice
+returns `choice`, named `probabilities`, and `confidence`; Score returns the
+probability-weighted zero-based `score`, original levels in `legend`, indexed
+`probabilities`, and `confidence`. Confidence follows the
+[Jev formulas](https://docs.typesafe.ai/confidence), with first-option tie breaking
+and singleton confidence one. Normalizing label probabilities does not provide
+empirical calibration for the loaded model.
+
+Requests require a model string, a string/object/array state and 1–64 named
+questions. Instructions and descriptions preserve structured JSON. Choice has
+1–128 criteria; Score has 1–10 nonnull levels. Available single-token labels and
+prepared context/output capacities may lower these limits. Schema failures return
+Jev-style HTTP 422 `detail` entries. Malformed JSON, incompatible templates and
+unsupported packages return 400; authentication and operational errors use the
+existing generation error format.
+
+The native scorer compiles independent questions after a common state message,
+verifies distinct single-token synthetic labels after the complete rendered
+prompt, and reads raw `logprob_token_ids` with one generated token per question.
+Questions execute sequentially, allowing ordinary prefix reuse after the first
+question. Usage sums actual logical prompt counts, including cached input, and
+actual generated read tokens. No prose or streaming is returned. Dropping a
+request cancels its current child through the ordinary generation lifetime.
+
+The scorer uses the normal assistant generation prompt with thinking disabled
+where supported and an `Answer:` cue in the final user turn. Labels are verified
+as the first assistant token against the actual rendered prompt, including with
+the native DeepSeek encoders. Older packages without requested-ID outputs require
+re-export.
+
+PNG/JPEG [image assets](https://docs.typesafe.ai/images) require
+`TypeSafe-Danger-Zone-Images: true` and a vision package. Supply base64 assets or
+uncompressed multipart/form-data with an application/json `request` part first,
+followed by uniquely named image parts. An asset's `part` takes precedence over
+`data_base64`; every part must belong to exactly one asset. References replace
+string values, including nested state/instructions/criteria, with whole-value
+matches first and then nonoverlapping left-to-right matches. Keys remain text;
+legends retain original references. Unused assets are rejected. Existing body,
+context and image limits apply, including to expanded prompts. Multipart content
+encoding must be identity (or absent); compressed multipart returns HTTP 415.
+JSON supports the usual compressed encodings. Box,
+audio/video and custom question types are unsupported.
+
+## Decisions
+
+`POST /v1/decisions` adapts the System One scorer to the concrete vLLM Decisions
+text protocol. It accepts `model`, text `input` (or user messages containing text
+and `input_text` parts), and an ordered array of 1–64 `questions`:
+
+```json
+{"model":"local","input":"Charged twice","questions":[
+  {"type":"predicate","name":"refund","instructions":"Refund requested?"},
+  {"type":"choice","instructions":"Which team?","choices":[
+    {"value":"billing","description":"Payments"},{"value":false}]},
+  {"type":"score","instructions":"Urgency?","levels":[
+    {"label":"Routine"},{"label":"Urgent","description":"Act today"}]}]}
+```
+
+Instructions are required strings. Names are optional strings; omission returns
+`name: null`, explicit null is invalid, and duplicate names are permitted.
+Choices contain 2–128 distinct string/boolean values and optional string
+descriptions. Scores contain 2–10 labeled levels with optional descriptions.
+Single-token label availability and prepared capacities can further restrict
+these bounds. Text parts join with newlines and messages with blank lines.
+Nullable `safety_identifier` accepts up to 128 characters as inert caller metadata.
+Unknown fields, images/assets, other roles and unsupported question types return
+OpenAI-style HTTP 400 errors. Multipart is unsupported on this text-only route.
+
+The response has the loaded `model`, ordered `answers`, and `usage`. Predicate
+answers contain `probability`; Choice answers preserve the selected typed
+`choice` and an array of `{value, probability}` entries. Score answers contain
+`score` and `{value: index, label, probability}` entries. Choice/Score confidence
+is the winning label's full-vocabulary probability: its normalized probability
+multiplied by total raw label mass. System One retains its distinct Jev confidence
+formulas. Neither route promises empirical calibration.
+
+Usage sums actual logical input and generated read tokens across questions,
+including `input_tokens_details.cached_tokens`, `output_tokens_details.reasoning_tokens: 0`
+and `total_tokens`. Cache writes are not measured and are reported as zero.
+The route shares System One's prompt compilation, exact-ID reads, sequential
+child lifetime, template constraints and older-package rejection; it adds no
+second scoring path.

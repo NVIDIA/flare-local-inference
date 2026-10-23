@@ -11,6 +11,7 @@ use crate::{
         store::Node,
     },
 };
+use flare_helios::execution::roce_fabric::Shape;
 use flare_helios::runtime_package::{self, AuthorizedPackage, Publisher};
 use serde_json::{Value, json};
 use std::{
@@ -108,7 +109,9 @@ impl Peers {
         args.rank = Some(0);
         let issued = orbit::now();
         let group = format!("manual-{}-{}", issued, orbit::hex(&orbit::random(4)?));
-        let mut serving = args.serving.rank_options(args.roce_ring);
+        let mut serving = args
+            .serving
+            .rank_options(Shape::from_flags(args.roce_ring, args.roce_chain));
         if args.hub.offline {
             serving.push("--offline".into());
         }
@@ -134,6 +137,7 @@ impl Peers {
             serving,
             rank_zero: Vec::new(),
             roce_ring: args.roce_ring,
+            roce_chain: args.roce_chain,
             transfer_fabric: None,
             single_host: false,
             issued,

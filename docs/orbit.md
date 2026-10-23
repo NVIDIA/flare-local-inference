@@ -479,7 +479,7 @@ alone may reclaim little space when hardlinks still exist in the blob store.
 
 ## Prestaging
 
-`flare orbit push PACKAGE --to NODE,... [--roce-ring]` places a package on nodes ahead of
+`flare orbit push PACKAGE --to NODE,... [--roce-ring | --roce-chain]` places a package on nodes ahead of
 any launch. It starts no ranks and sends no executable. With one node per
 multi-host rank, the first node receives the complete package and each peer
 receives its rank's data, in the

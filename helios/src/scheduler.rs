@@ -112,6 +112,7 @@ pub struct SchedulerStats {
     pub retiring_slots: usize,
     pub free_pages: usize,
     pub free_snapshots: usize,
+    pub snapshot_capacity: usize,
     pub snapshot_backing_pages: usize,
     pub cached_checkpoints: usize,
     pub cached_pages: usize,
@@ -1031,6 +1032,7 @@ impl RequestScheduler {
             retiring_slots: self.slots.iter().filter(|slot| slot.retiring).count(),
             free_pages: self.free_pages.len(),
             free_snapshots: self.free_snapshots.len(),
+            snapshot_capacity: self.limits.snapshots as usize,
             cached_checkpoints: cache.published_checkpoints,
             cached_pages: cache.cached_pages,
             inbound_waiting: if self.tickets.is_empty() {
@@ -1098,9 +1100,16 @@ impl RequestScheduler {
             if need_pages == 0 && need_snapshots == 0 {
                 return Ok(());
             }
+            // Defer admission while enough backing is already fenced for reclamation.
+            if self.pending_resources(pages, snapshots) {
+                return Err(crate::Error::admission(
+                    crate::AdmissionError::Capacity,
+                    "request resources are awaiting GPU retirement",
+                ));
+            }
             let evicted = self.cache.evict(EvictionTarget {
-                pages: 0,
-                snapshots: 1,
+                pages: need_pages,
+                snapshots: need_snapshots,
             });
             self.stats.snapshot_evictions += evicted.retired.len() as u64;
             let update = self.cache.advance_completed(self.completed)?;
@@ -1179,7 +1188,10 @@ impl RequestScheduler {
             if want == 0 {
                 continue;
             }
-            if self.free_pages.len() < want {
+            while self.free_pages.len() < want {
+                if self.pending_page_count() >= want {
+                    break;
+                }
                 let evicted = self.cache.evict(EvictionTarget {
                     pages: want - self.free_pages.len(),
                     snapshots: 0,
@@ -1187,6 +1199,9 @@ impl RequestScheduler {
                 self.stats.snapshot_evictions += evicted.retired.len() as u64;
                 let update = self.cache.advance_completed(self.completed)?;
                 self.apply_completion(update);
+                if evicted.retired.is_empty() {
+                    break;
+                }
             }
             let take = want.min(self.free_pages.len());
             // Reserved pages are taken from the back, so new pages go behind the remaining ones.
@@ -1206,7 +1221,9 @@ impl RequestScheduler {
                 .pages_through(request, request.scheduled_consumed + self.decode_horizon())
                 - request.reserved_pages.len();
             if held + missing <= self.limits.pages as usize {
-                starved = true;
+                if self.pending_page_count() < missing {
+                    starved = true;
+                }
             } else if request.pending == 0 {
                 // No other request's pages would let it continue: finish it at this length.
                 let handle = request.handle;
@@ -1624,7 +1641,7 @@ impl RequestScheduler {
             .collect()
     }
 
-    fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
+    pub(crate) fn publication(&self, id: CheckpointId) -> Option<PublishedCheckpoint> {
         let checkpoint = self.cache.checkpoint(id).ok()?;
         let parent = match checkpoint.parent() {
             Some(parent) => Some(self.cache.checkpoint(parent).ok()?.prefix()),

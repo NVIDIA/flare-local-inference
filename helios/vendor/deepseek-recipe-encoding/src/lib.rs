@@ -28,6 +28,9 @@ pub struct RenderedPrompt {
 /// Failure to encode a conversation.
 #[derive(Debug, thiserror::Error)]
 pub enum EncodingError {
+    /// A numeric reasoning effort is outside the supported range.
+    #[error("reasoning effort score must be in 1..=100, got {0}")]
+    InvalidReasoningEffortScore(u8),
     /// The rendered prompt could not be encoded.
     #[error("failed to encode conversation: {0}")]
     Encode(String),

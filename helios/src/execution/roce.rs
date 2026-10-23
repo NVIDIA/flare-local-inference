@@ -10,6 +10,7 @@ use std::ffi::{CStr, CString, c_char, c_int, c_void};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use super::roce_fabric::Topology;
+use super::roce_fabric::Shape;
 use crate::runtime_package::RoceSpec;
 use crate::{ExecutionError, Failure, Result};
 
@@ -49,6 +50,7 @@ unsafe extern "C" {
         err_len: u64,
     ) -> *mut Context;
     fn roce_enable_ring(c: *mut Context) -> c_int;
+    fn roce_enable_ring_open(c: *mut Context) -> c_int;
     fn roce_local_blob(c: *mut Context, out: *mut c_void, out_len: u64) -> c_int;
     fn roce_connect(
         c: *mut Context,
@@ -134,22 +136,34 @@ impl RoceTransport {
                 "package RoCE region differs from the proxy's layout for its geometry",
             ));
         }
-        if (topology.ring && !(2..=16).contains(&spec.world))
+        if (topology.shape.relays() && !(2..=16).contains(&spec.world))
             || topology.routes.len() != spec.world
             || !(1..=super::roce_fabric::MAX_RAILS).contains(&topology.rails)
-            || topology.routes.iter().enumerate().any(|(peer, links)| {
-                let absent = peer == spec.rank
-                    || topology.ring
-                        && peer != (spec.rank + 1) % spec.world
-                        && peer != (spec.rank + spec.world - 1) % spec.world;
-                absent != links.is_empty()
-                    || (!absent && links.len() != topology.rails)
-                    || links
-                        .iter()
-                        .any(|(local, _)| *local as usize >= topology.hcas.len())
-            })
         {
-            return Err(failure("RoCE topology does not match the package's ranks"));
+            return Err(failure(format!(
+                "RoCE topology does not match the package's ranks: {} routes and {} rails for {} ranks",
+                topology.routes.len(),
+                topology.rails,
+                spec.world
+            )));
+        }
+        for (peer, links) in topology.routes.iter().enumerate() {
+            let absent = !topology.shape.linked(spec.rank, peer, spec.world);
+            if absent != links.is_empty()
+                || (!absent && links.len() != topology.rails)
+                || links
+                    .iter()
+                    .any(|(local, _)| *local as usize >= topology.hcas.len())
+            {
+                return Err(failure(format!(
+                    "RoCE topology does not match the package's ranks: rank {} has {} links to rank {peer},                      expected {} ({} rails, {} HCAs)",
+                    spec.rank,
+                    links.len(),
+                    if absent { 0 } else { topology.rails },
+                    topology.rails,
+                    topology.hcas.len()
+                )));
+            }
         }
         let names = topology
             .hcas
@@ -183,7 +197,12 @@ impl RoceTransport {
             let text = unsafe { CStr::from_ptr(message.as_ptr()) }.to_string_lossy();
             return Err(failure(format!("RoCE transport setup failed: {text}")));
         }
-        if topology.ring && unsafe { roce_enable_ring(context) } != 0 {
+        let enabled = match topology.shape {
+            Shape::Mesh => 0,
+            Shape::Ring => unsafe { roce_enable_ring(context) },
+            Shape::Chain => unsafe { roce_enable_ring_open(context) },
+        };
+        if enabled != 0 {
             let message = unsafe { CStr::from_ptr(roce_error(context)) }
                 .to_string_lossy()
                 .into_owned();
@@ -233,7 +252,7 @@ impl RoceTransport {
         for (peer, links) in self.topology.routes.iter().enumerate() {
             for rail in 0..rails {
                 let (local, remote) =
-                    if peer == self.spec.rank || self.topology.ring && links.is_empty() {
+                    if peer == self.spec.rank || self.topology.shape.relays() && links.is_empty() {
                         (0, 0)
                     } else {
                         links[rail]
@@ -352,7 +371,7 @@ mod tests {
             traffic_class: 0,
             rails: 2,
             routes: vec![vec![], vec![(0, 0), (1, 1)], vec![], vec![(0, 0), (1, 1)]],
-            ring: true,
+            shape: Shape::Ring,
         };
         (region, spec, topology)
     }

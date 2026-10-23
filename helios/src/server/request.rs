@@ -97,9 +97,19 @@ pub(super) fn prepare_inference_cached(
         }
         if top > crate::execution::MAX_TOP_LOGPROBS { return Err("prompt_logprobs exceeds 20".into()); }
     }
-    if let Some(logprobs) = opts.logprobs {
+    if let Some(logprobs) = &opts.logprobs {
+        if !logprobs.ids.is_empty() && config.logprob_token_id_capacity == 0 {
+            return Err("logprob_token_ids are not available in this model package; re-export to enable them".into());
+        }
         if config.max_top_logprobs == 0 {
             return Err("logprobs are not available in this model package".into());
+        }
+        if logprobs
+            .ids
+            .iter()
+            .any(|id| *id as usize >= config.contract.vocabulary)
+        {
+            return Err("logprob_token_ids contains an ID outside the model vocabulary".into());
         }
         if logprobs.top > config.max_top_logprobs {
             return Err(format!("top_logprobs exceeds this package's maximum of {}", config.max_top_logprobs).into());
@@ -346,6 +356,10 @@ pub(super) fn prepare_inference_cached(
             grammar,
             ignore_eos,
             logprobs: opts.logprobs.is_some(),
+            logprob_token_ids: opts
+                .logprobs
+                .as_ref()
+                .map_or_else(Vec::new, |options| options.ids.clone()),
             prompt_logprobs: opts.prompt_logprobs.is_some(),
         },
         output,

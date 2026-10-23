@@ -180,7 +180,7 @@ def _parse_json(raw: bytes, source: str) -> dict:
 
 
 _DTYPE_BYTES = {"BF16": 2, "F32": 4, "F8_E4M3": 1, "F8_E8M0": 1,
-                "I8": 1, "U8": 1, "U16": 2, "U32": 4, "I64": 8}
+                "I8": 1, "U8": 1, "U16": 2, "I32": 4, "U32": 4, "I64": 8}
 
 
 def _read_header(path: Path, shard: str) -> tuple[ShardMetadata, dict[str, TensorMetadata]]:

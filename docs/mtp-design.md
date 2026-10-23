@@ -78,17 +78,20 @@ accepted next-token IDs.
 | Responsibility | Existing library interface | Bound or invariant |
 | --- | --- | --- |
 | MTP feedback | `b12x.sequence.mtp_feedback` prepared plan/bind/run | Four streams; caller-owned output and scratch |
-| Target recurrent verification | `b12x.sequence.gdn_decode` | At most eight state-index columns; each token writes its post-token state |
+| Target recurrent verification | `b12x.sequence.gdn_decode`, or Ignition `PreparedRecoveredRecurrence` with `PreparedGDNCommit` | At most eight inputs; checkpoint columns or per-token correction records followed by accepted-prefix commit |
 | Target sparse attention | Ordinary prepared `b12x.attention.qsa` | Exact accepted-count, raw-tag and compression-group semantics |
 | Draft selector reuse | QSA `DraftSelectionState`, `run(reuse=DraftSelectionReuse(...))` | Proposal-only; reset on round or request identity changes |
 | Convolution history | `b12x.sequence.short_conv` and PLE operators | Speculative history extent and accepted-token selection |
 | Stochastic chain verification | `flashinfer.sampling.chain_speculative_sampling` | Draft probabilities `[B,K,V]`, target probabilities `[B,K+1,V]`; explicit device RNG |
 
 GDN's ordinary checkpoint path supports Qwen's 16 key heads and 48 value heads.
-Its KDA recovery mode requires equal head counts. FlashInfer's separate
-ReplaySSM cache/commit implementation is restricted to SM100/103. Neither is
-a Qwen SM120 compact rollback implementation. Public QSA draft reuse omits
-selection work and must never be used in target verification.
+Ignition's [GDN recovery component](../ignition/components/gdn_recovery.py) also
+supports that geometry: verification retains correction vectors, normalized keys
+and decays, and commit replays only the accepted prefix into the live recurrent
+row. The Qwen recipe uses this path for wider rounds and updates the live state
+directly for width one. b12x's KDA recovery mode requires equal head counts;
+FlashInfer's separate ReplaySSM implementation is restricted to SM100/103.
+Public QSA draft reuse omits selection work and must never be used in target verification.
 
 Library kernels remain the compute implementation. Server-owned captured
 operations pack metadata, select committed state and update request records.
@@ -246,12 +249,13 @@ by the draft model. Preparation reports exact persistent, graph-pool and scratch
 costs before allocating KV pages, preserving configured headroom and snapshot
 budgets.
 
-Compact recurrence would retain one committed matrix plus per-row K/V,
-normalization, and gate records, then apply accepted updates before the following
-round. A Qwen-compatible b12x contract must reproduce the recurrence arithmetic
-and materialize accepted updates before checkpoint publication. Full checkpoint
-columns provide the component reference. Capacity and write-traffic savings
-must be measured in complete rounds before replacing the representation.
+The current compact recurrence retains one committed matrix plus per-token
+correction vectors, normalized keys and decay records. `PreparedGDNCommit`
+applies accepted updates before the following round or checkpoint publication.
+The [recovery tests](../tests/recipes/test_qwen38_gdn_recovery_cuda.py) compare
+this arithmetic with b12x checkpointed decode. Full checkpoint columns remain
+the component reference; capacity and write-traffic savings still require
+complete-round measurements.
 
 ## Graph catalog, control and scheduling
 

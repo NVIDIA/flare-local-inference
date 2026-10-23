@@ -49,6 +49,18 @@ Performance changes also require [GPU performance work](performance-work.md).
   tokenizer, processor, or model configuration files. Helios consumes prepared
   settings without per-model sampling policy or config-file interpretation.
 
+Gemma 4 exports Google's canonical chat templates for every supported publisher
+and quantization. `ignition/recipes/gemma4/assets/chat_template.google-e2b-e4b.jinja`
+serves E2B/E4B; `chat_template.google.jinja` serves 12B/26B-A4B/31B. The sources are
+[Google E4B at ee0ef602](https://huggingface.co/google/gemma-4-E4B-it/blob/ee0ef6023621cff504d758262d4e04895a5af4a2/chat_template.jinja)
+and [Google 26B-A4B at 4d7ae498](https://huggingface.co/google/gemma-4-26B-A4B-it/blob/4d7ae4984b7db7de8f8457170b3f1a419ee76d52/chat_template.jinja),
+with message-boundary annotations. Preparation selects by model hidden size:
+1536/2560 for E2B/E4B and 2816/3840/5376 for 26B-A4B/12B/31B. The larger models
+append an empty thought channel when thinking is disabled. Publisher-supplied
+templates do not select rendering behavior. Helios normalizes JSON-string tool
+arguments into objects before rendering. Tests compare the assets with the pinned
+Google sources and exercise prompt bytes, reasoning, tool rounds, and cache boundaries.
+
 ## Prompt renderers and checkpoint boundaries
 
 Every model integration must provide prompt rendering, tokenization, image

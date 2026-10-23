@@ -1,0 +1,58 @@
+{
+  "reference": "https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash-1017/blob/1bae0e1088993b9b82de08f59de5be5a34e42170/encoding/encoding.py",
+  "messages": [
+    {
+      "role": "system",
+      "content": "Be concise."
+    },
+    {
+      "role": "user",
+      "content": "Explain café and ☕."
+    }
+  ],
+  "options": {
+    "reasoning_effort": 80
+  },
+  "rendered": "<｜begin▁of▁sentence｜><｜System｜>Reasoning Effort: 80 (range 1-100, the higher the value, the more thorough the reasoning)\n\nBe concise.<｜User｜>Explain café and ☕.<｜Assistant｜><think>",
+  "token_ids": [
+    0,
+    128799,
+    77666,
+    288,
+    9504,
+    482,
+    28,
+    223,
+    1892,
+    343,
+    16801,
+    223,
+    19,
+    15,
+    1457,
+    14,
+    270,
+    4077,
+    270,
+    1990,
+    14,
+    270,
+    850,
+    15146,
+    270,
+    22805,
+    868,
+    7153,
+    47468,
+    16,
+    128803,
+    65106,
+    57664,
+    305,
+    29907,
+    246,
+    16,
+    128804,
+    128821
+  ]
+}

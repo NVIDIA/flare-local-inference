@@ -184,3 +184,28 @@ def test_restart_separates_draft_state_and_streams_prefixes_larger_than_ram(tmp_
         assert counters['flare_graph_launches_total{kind="init"}'] == 1
         assert counters["flare_prefill_tokens_total"] > 32000
         assert service.ask(fresh) == recomputed
+
+
+@pytest.mark.parametrize("tier", ["memory", "disk", "composite"])
+def test_message_checkpoint_pressure_keeps_complete_continuations(tmp_path, tier):
+    flags = []
+    if tier in ("memory", "composite"):
+        flags += ["--prefix-cache-memory", "1G"]
+    if tier in ("disk", "composite"):
+        flags += ["--prefix-cache-disk", str(tmp_path / "records"),
+                  "--prefix-cache-disk-limit", "8G"]
+    with server(tmp_path, f"message-pressure-{tier}", flags=flags) as service:
+        before = service.metrics()
+        capacity = int(before["flare_snapshot_capacity"])
+        messages = [{"role": "system", "content": "Remember the access code 7319."}]
+        for index in range(capacity + 8):
+            messages += [{"role": "user", "content": f"Log entry {index}: the status is unchanged."},
+                         {"role": "assistant", "content": "Recorded."}]
+        messages += [{"role": "user", "content": "What is the access code? Reply with only the number."}]
+        assert "7319" in service.ask(messages)
+        first = service.settled()
+        assert first["flare_snapshot_evictions_total"] > before["flare_snapshot_evictions_total"]
+        assert "7319" in service.ask(messages)
+        after = service.settled()
+        assert after["flare_host_cache_fetch_failed_total"] == 0
+        assert after["flare_cache_reused_tokens_total"] > first["flare_cache_reused_tokens_total"]

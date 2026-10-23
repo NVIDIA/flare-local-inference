@@ -73,6 +73,7 @@ class PreparationConfig:
     # Each rank's host when ranks run on separate hosts; devices are then host-local ordinals.
     hosts: tuple[str, ...] | None = None
     roce_ring: bool = False
+    roce_chain: bool = False
     context: int = 262144
     prefill_chunk_size: int = 4096
     max_active: int = 4
@@ -103,8 +104,11 @@ class PreparationConfig:
     def __post_init__(self):
         if self.expert_activation not in ("auto", "a4", "a16"):
             raise ValueError("GLM expert activation must be auto, a4, or a16")
-        if self.roce_ring and (self.hosts is None or not 2 <= len(self.hosts) <= 16):
-            raise ValueError("RoCE ring requires 2..16 ranks on separate hosts")
+        from ignition.planning import host_shape_error
+
+        error = host_shape_error(self.roce_ring, self.roce_chain, None if self.hosts is None else len(self.hosts))
+        if error:
+            raise ValueError(error)
         if type(self.mtp) is not bool:
             raise TypeError("mtp must be a boolean")
         self.speculative_shapes
@@ -337,7 +341,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
                 varlen_bytes = min(WINDOW_RECORDS, blocks * 256) * 528
             collective = prefill_collective = vocabulary_collective = create_roce_runtime(
                 group, device, max_tokens=decode_tokens, pipe_tokens=config.token_capacity, hidden_size=4096,
-                gather_bytes=gather_bytes, ring=config.roce_ring, package_storage=package_storage, varlen_bytes=varlen_bytes)
+                gather_bytes=gather_bytes, ring=config.roce_ring, ring_open=config.roce_chain, package_storage=package_storage, varlen_bytes=varlen_bytes)
         elif group is not None:
             collective = create_all_reduce_runtime(group, device, max_tokens=config.token_capacity,
                                                    hidden_size=4096, ipc=ipc)

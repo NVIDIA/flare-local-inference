@@ -492,8 +492,8 @@ impl PrefixCheckpointCache {
         Ok(self.retire_leaf(id))
     }
 
-    /// Retire unlocked leaves, then single-child ancestor snapshots under pressure.
-    /// Returned records are pending retirement; only advance_completed frees IDs.
+    /// Retire the oldest eligible leaf or compactable ancestor under either pressure.
+    /// Only advance_completed permits reuse of the returned storage.
     pub fn evict(&mut self, target: EvictionTarget) -> EvictionReport {
         let mut report = EvictionReport::default();
         while report.pages_scheduled < target.pages || report.snapshots_scheduled < target.snapshots
@@ -501,30 +501,34 @@ impl PrefixCheckpointCache {
             let candidate = self
                 .nodes
                 .values()
-                .filter(|node| node.ready && node.pins == 0 && node.child_count == 0)
+                .filter(|node| {
+                    node.ready
+                        && ((node.pins == 0 && node.child_count == 0)
+                            || (node.direct_pins == 0 && node.child_count == 1))
+                })
                 .min_by_key(|node| (node.accessed, node.id))
                 .map(|node| node.id);
-            let retired = if let Some(id) = candidate {
-                self.retire_leaf(id)
-            } else if report.snapshots_scheduled < target.snapshots {
-                let ancestor = self
-                    .nodes
-                    .values()
-                    .filter(|node| node.ready && node.direct_pins == 0 && node.child_count == 1)
-                    .min_by_key(|node| (node.accessed, node.id))
-                    .map(|node| node.id);
-                let Some(id) = ancestor else {
-                    break;
-                };
-                self.compact_ancestor(id)
-            } else {
+            let Some(id) = candidate else {
                 break;
+            };
+            let retired = if self.nodes[&id].child_count == 0 {
+                self.retire_leaf(id)
+            } else {
+                self.compact_ancestor(id)
             };
             report.pages_scheduled += retired.pages.len();
             report.snapshots_scheduled += 1;
             report.retired.push(retired);
+            // Snapshot aliases can release KV pages; let the scheduler recheck actual backing.
+            if target.pages != 0 && report.snapshots_scheduled >= target.snapshots {
+                break;
+            }
         }
         report
+    }
+
+    pub(crate) fn pending_retirement(&self) -> &[RetiredResources] {
+        &self.retirement
     }
 
     /// Publish completed snapshots and release retired IDs on an ordered fence.

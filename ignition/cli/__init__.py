@@ -45,6 +45,9 @@ def _parser() -> argparse.ArgumentParser:
         hosts = spanning.add_argument_group("multi-host tensor parallelism")
         hosts.add_argument("--roce-ring", action="store_true",
                            help="route collectives and fabric TCP through neighbors in rank order")
+        hosts.add_argument("--roce-chain", action="store_true",
+                           help="like --roce-ring for hosts cabled as a chain, with no link between the first and"
+                                " last rank")
         hosts.add_argument("--transfer-streams", type=int, choices=range(1, 65), metavar="N",
                            help="checkpoint and export fabric TCP streams per peer, 1..64 (default: 8)")
         hosts.add_argument("--ranks", type=int, default=1, choices=range(1, 17), metavar="N",
@@ -108,7 +111,7 @@ def _preparation_arguments(running):
 
     running.usage = "%(prog)s [MODEL] [options]"
     running.epilog = recipe_help()
-    running.set_defaults(roce_ring=False)
+    running.set_defaults(roce_ring=False, roce_chain=False)
     running.add_argument("--official-source", metavar="URL", help="published checkpoint repository URL")
     running.add_argument("model", nargs="?", metavar="MODEL",
                          help="recipe alias, repository id, or checkpoint directory (default: defaults.model)")

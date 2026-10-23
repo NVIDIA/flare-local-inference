@@ -811,3 +811,69 @@ def test_concurrent_speculative_logprobs_keep_request_lengths_and_flags_separate
                 assert choice['logprobs'] is None
         with ThreadPoolExecutor(max_workers=4) as executor:
             list(executor.map(generate, range(4)))
+
+
+@pytest.mark.parametrize('protocol', ['chat', 'completions', 'responses'])
+@pytest.mark.parametrize('streaming', [False, True])
+@pytest.mark.parametrize('count', [0, 1, 20, 21, 127, 128])
+def test_requested_logprob_ids_replace_natural_alternatives(clients, protocol, streaming, count):
+    _, _, http = clients
+    ids = list(reversed(range(count)))
+    body = {'max_tokens': 1, 'return_tokens_as_token_ids': True,
+            'logprob_token_ids': ids + (ids[:1] if count < 128 else []), 'stream': streaming,
+            'ignore_eos': True, **EXTRA}
+    if protocol == 'completions':
+        path = '/v1/completions'
+        body.update(prompt='Answer:', logprobs=1)
+    elif protocol == 'chat':
+        path = '/v1/chat/completions'
+        body.update(messages=[{'role': 'user', 'content': 'Pick a letter.'},
+                              {'role': 'assistant', 'content': 'Answer:'}],
+                    continue_final_message=True, add_generation_prompt=False,
+                    logprobs=True, top_logprobs=1)
+    else:
+        path = '/v1/responses'
+        body.pop('max_tokens')
+        body.update(input='Pick a letter.', max_output_tokens=1, top_logprobs=1,
+                    include=['message.output_text.logprobs'])
+    frames = []
+    if streaming:
+        with http.stream('POST', path, json=body) as response:
+            assert response.status_code == 200, response.read()
+            for line in response.iter_lines():
+                if line.startswith('data: ') and line[6:] != '[DONE]':
+                    frames.append(json.loads(line[6:]))
+    else:
+        response = http.post(path, json=body)
+        assert response.status_code == 200, response.text
+        frames = [response.json()]
+    entries = []
+    for frame in frames:
+        if protocol == 'responses':
+            if streaming and frame.get('type') == 'response.output_text.delta':
+                entries.extend(frame['logprobs'])
+            elif not streaming:
+                entries.extend(entry for item in frame['output']
+                               for part in item.get('content', [])
+                               for entry in part.get('logprobs', []))
+        else:
+            for choice in frame.get('choices', []):
+                values = choice.get('logprobs') or {}
+                if protocol == 'chat':
+                    entries.extend(values.get('content', []))
+                else:
+                    entries.extend({'token': token, 'top_logprobs': top}
+                                   for token, top in zip(values.get('tokens', []),
+                                                         values.get('top_logprobs', [])))
+    if protocol != 'responses':
+        assert len(entries) == 1
+    for entry in entries:
+        top = entry['top_logprobs']
+        actual = list(top) if isinstance(top, dict) else [item['token'] for item in top]
+        expected = [f'token_id:{id}' for id in ids]
+        if ids:
+            if entry['token'] not in expected:
+                expected.append(entry['token'])
+            assert actual == expected
+        else:
+            assert len(actual) == 1

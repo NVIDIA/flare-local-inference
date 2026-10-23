@@ -380,18 +380,9 @@ fn ancestor_compaction_preserves_pins_page_order_and_pending_gpu_reads() {
             .is_empty()
     );
     cache.unpin(middle).unwrap();
-    assert!(
-        cache
-            .evict(EvictionTarget {
-                pages: 1,
-                snapshots: 0
-            })
-            .retired
-            .is_empty()
-    );
     let retired = cache.evict(EvictionTarget {
-        pages: 0,
-        snapshots: 1,
+        pages: 1,
+        snapshots: 0,
     });
     assert_eq!(retired.retired[0].checkpoint, middle);
     assert_eq!(retired.pages_scheduled, 0);
@@ -455,10 +446,10 @@ fn ancestor_compaction_preserves_pins_page_order_and_pending_gpu_reads() {
             .is_empty()
     );
     let reclaimed = cache.advance_completed(Fence(20)).unwrap().reusable;
-    assert_eq!(reclaimed.pages, [PageId(1), PageId(2), PageId(0)]);
+    assert_eq!(reclaimed.pages, [PageId(0), PageId(1), PageId(2)]);
     assert_eq!(
         reclaimed.snapshots,
-        [SnapshotId(1), SnapshotId(2), SnapshotId(0)]
+        [SnapshotId(1), SnapshotId(0), SnapshotId(2)]
     );
     assert_eq!(cache.stats().owned_pages, 0);
     assert_eq!(cache.stats().owned_snapshots, 0);
@@ -597,8 +588,8 @@ fn cancelled_request_unpins_but_shared_pages_wait_for_gpu_retirement() {
     );
     assert_eq!(cache.stats().owned_snapshots, 2);
     let reusable = cache.advance_completed(Fence(20)).unwrap().reusable;
-    assert_eq!(reusable.pages, [PageId(1), PageId(0)]);
-    assert_eq!(reusable.snapshots, [SnapshotId(1), SnapshotId(0)]);
+    assert_eq!(reusable.pages, [PageId(0), PageId(1)]);
+    assert_eq!(reusable.snapshots, [SnapshotId(0), SnapshotId(1)]);
     assert_eq!(cache.stats().owned_pages, 0);
     assert!(
         cache
@@ -880,4 +871,29 @@ fn bucket_digest_names_the_aligned_boundary_at_or_below_the_endpoint() {
     assert_eq!(history.bucket_at(150), Some(block));
     assert_ne!(root, block);
     assert_ne!(cache.checkpoint(unaligned).unwrap().prefix().digest, block);
+}
+
+#[test]
+fn oldest_ancestor_compacts_before_a_newer_unpinned_leaf() {
+    for target in [
+        EvictionTarget {
+            pages: 0,
+            snapshots: 1,
+        },
+        EvictionTarget {
+            pages: 1,
+            snapshots: 0,
+        },
+    ] {
+        let full = history(4, 0);
+        let mut cache = cache();
+        let root = created(&mut cache, &full, &proposal(None, 64, &[0], 0, 0));
+        let child = created(&mut cache, &full, &proposal(Some(root), 128, &[1], 1, 0));
+        let other = history(4, 9);
+        let leaf = created(&mut cache, &other, &proposal(None, 64, &[2], 2, 0));
+        let report = cache.evict(target);
+        assert_eq!(report.retired[0].checkpoint, root);
+        assert!(cache.checkpoint(leaf).is_ok());
+        assert_eq!(cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
+    }
 }

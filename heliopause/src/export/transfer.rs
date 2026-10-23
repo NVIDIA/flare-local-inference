@@ -19,6 +19,12 @@ use super::{RankOutput, Result, invalid};
 const BLOCK_BYTES: usize = 4 << 20;
 const METADATA_BYTES: usize = 256 << 20;
 const PROTOCOL: u32 = 1;
+/// Longest a channel may stay silent before its peer is treated as dead. Both
+/// ends have silent stretches that are legitimate work, not stalls: a sender
+/// hashes every payload source before sending its manifest, and a coordinator
+/// verifies each cached blob before answering it. The largest supported recipe
+/// hashes about 750 GB per rank at TP2, roughly 400 s on local NVMe at 1.9 GB/s.
+const SOCKET_QUIET_MILLIS: libc::c_int = 900_000;
 
 #[derive(Clone, Copy)]
 enum FileDirection {
@@ -141,7 +147,7 @@ impl Socket {
             revents: 0,
         };
         loop {
-            let result = unsafe { libc::poll(&mut poll, 1, 30_000) };
+            let result = unsafe { libc::poll(&mut poll, 1, SOCKET_QUIET_MILLIS) };
             if result > 0 {
                 return Ok(());
             }
