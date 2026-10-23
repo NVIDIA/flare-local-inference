@@ -337,6 +337,29 @@ impl<L> Index<L> {
         Ok(removed)
     }
 
+    /// Remove only this leaf; a mirror follows explicit manager removals.
+    pub fn remove_one(&mut self, key: &PrefixKey) -> Result<Node<L>> {
+        let node = self
+            .nodes
+            .get(key)
+            .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
+        if node.children != 0 || node.pins != 0 {
+            return Err(invalid(
+                "cannot remove a pinned host record or one with children",
+            ));
+        }
+        let node = self.nodes.remove(key).unwrap();
+        let keys = self.buckets.get_mut(&node.bucket).unwrap();
+        keys.retain(|candidate| candidate != key);
+        if keys.is_empty() {
+            self.buckets.remove(&node.bucket);
+        }
+        if let Some(parent) = node.parent {
+            self.nodes.get_mut(&parent).unwrap().children -= 1;
+        }
+        Ok(node)
+    }
+
     /// Retire the oldest eligible leaf or, when `need_row`, compactable ancestor.
     pub fn evict(
         &mut self,

@@ -8,10 +8,11 @@
 //! worker, the scheduler, and the recipes see no difference between a checkpoint
 //! produced by prefill and one restored from the host.
 //!
-//! Three stores implement [`PrefixStore`]: [`memory::MemoryStore`] retains records
+//! Four stores implement [`PrefixStore`]: [`memory::MemoryStore`] retains records
 //! in registered host memory, [`disk_store::DiskStore`] retains record files, and
 //! [`composite::CompositeStore`] composes the two with write-through and
-//! read-through. Every store is driven from the model worker thread and never
+//! read-through. The optional pool client delegates retention to an external manager.
+//! Every store is driven from the model worker thread and never
 //! blocks it: `store` and `fetch` enqueue work, `poll` drains completions.
 
 pub mod composite;
@@ -21,6 +22,8 @@ pub mod geometry;
 pub mod index;
 pub mod input;
 pub mod memory;
+#[cfg(all(unix, feature = "selene"))]
+pub mod pool;
 pub mod record;
 pub mod shard;
 pub mod slab;
@@ -64,6 +67,10 @@ pub enum Transport {
 /// staged transport.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PrefixCacheOffload {
+    /// Unix socket of the shared prefix cache manager.
+    pub manager: Option<PathBuf>,
+    /// Tenant label separating records of co-located replicas; empty when unset.
+    pub tenant: Option<String>,
     /// Host retention budget shared by registered checkpoints and ordinary CPU inputs.
     /// Zero selects no memory retention.
     pub memory_bytes: Option<u64>,
@@ -76,7 +83,9 @@ pub struct PrefixCacheOffload {
 
 impl PrefixCacheOffload {
     pub fn enabled(&self) -> bool {
-        self.memory_bytes.unwrap_or(0) != 0 || (self.disk.is_some() && self.disk_limit != Some(0))
+        self.manager.is_some()
+            || self.memory_bytes.unwrap_or(0) != 0
+            || (self.disk.is_some() && self.disk_limit != Some(0))
     }
 
     /// Future device and host bytes, sized from the actual record layout. A registered host
@@ -95,9 +104,13 @@ impl PrefixCacheOffload {
         if !self.enabled() {
             return Ok((0, 0));
         }
-        let memory = self.memory_bytes.unwrap_or(0);
+        let memory = if self.manager.is_some() {
+            0
+        } else {
+            self.memory_bytes.unwrap_or(0)
+        };
         let disk = self.disk.is_some() && self.disk_limit != Some(0);
-        let staging = if disk {
+        let staging = if disk || self.manager.is_some() {
             layout
                 .page_record_bytes
                 .checked_mul(slab::STAGING_PAGE_SLABS as u64)
@@ -116,7 +129,7 @@ impl PrefixCacheOffload {
             .ok_or("prefix cache host memory overflows the device budget")?;
         let ordinary = input_memory_bytes(memory, slab::SlabPool::minimum_bytes(layout), inputs);
         let pinned = memory - ordinary;
-        let mapped = if disk {
+        let mapped = if disk || self.manager.is_some() {
             pinned + staging
         } else {
             pinned.div_ceil(ranks.max(1) as u64)
@@ -161,9 +174,28 @@ fn invalid_size(text: &str) -> String {
     format!("size {text:?} must be a number with an optional K, M, G, or T suffix, such as \"16G\"")
 }
 
+/// Validate a tenant label: 1 to 64 bytes of `[A-Za-z0-9._-]`. An absent label
+/// is the empty tenant, which shares records only with other unlabelled replicas.
+pub fn validate_tenant(value: Option<&str>) -> Result<String> {
+    let Some(value) = value else {
+        return Ok(String::new());
+    };
+    if value.is_empty()
+        || value.len() > 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        return Err("prefix cache tenant must be 1..=64 bytes of [A-Za-z0-9._-]".into());
+    }
+    Ok(value.to_owned())
+}
+
 /// Settings after defaults are applied and the record directory is resolved.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Resolved {
+    pub manager: Option<PathBuf>,
+    pub tenant: String,
     pub memory_bytes: u64,
     /// The model's record directory, or `None` for no disk store.
     pub directory: Option<PathBuf>,
@@ -366,6 +398,19 @@ pub fn prepare_with_inputs(
     if !options.enabled() {
         return Ok(Preparation::None("disabled".to_owned()));
     }
+    if options.manager.is_some() {
+        if options.memory_bytes.unwrap_or(0) != 0 || options.disk.is_some() {
+            return Err("the cache manager replaces the local host tiers".into());
+        }
+        if shard.is_some() {
+            return Err("a multi-host package keeps host prefix records per host; the cache manager is not available".into());
+        }
+        #[cfg(not(unix))]
+        return Err("the cache manager requires a Unix socket".into());
+        #[cfg(all(unix, not(feature = "selene")))]
+        return Err("the cache manager requires a build with the selene feature".into());
+    }
+    let tenant = validate_tenant(options.tenant.as_deref())?;
     let _ = package;
     let layout = Layout::new(&geometry)?;
     let fingerprint = match (shard, geometry.as_slice()) {
@@ -386,6 +431,37 @@ pub fn prepare_with_inputs(
     let transport = options.transport.unwrap_or(Transport::Staged);
     if transport == Transport::Direct {
         return Err("the direct prefix cache transport is not available".into());
+    }
+    if let Some(socket) = &options.manager {
+        let context = contexts
+            .first()
+            .ok_or("the host prefix store requires at least one rank")?
+            .0;
+        let mut pool = slab::SlabPool::staging(&layout)?;
+        pool.register(context)?;
+        let disk_budget = input::DiskBudget::new(0, 0);
+        return Ok(Preparation::Store(Box::new(Prepared {
+            inputs: None,
+            disk_budget,
+            resolved: Resolved {
+                manager: Some(socket.clone()),
+                tenant: tenant.clone(),
+                memory_bytes: 0,
+                directory: None,
+                disk_limit: 0,
+                transport,
+            },
+            identity,
+            fingerprint,
+            geometry,
+            layout,
+            contexts,
+            memory_pool: None,
+            staging_pool: Some(pool),
+            scanned: Vec::new(),
+            directory_lock: None,
+            shards: Vec::new(),
+        })));
     }
     let mut notes = Vec::new();
     let directory = match options
@@ -470,6 +546,8 @@ pub fn prepare_with_inputs(
         inputs,
         disk_budget,
         resolved: Resolved {
+            manager: None,
+            tenant,
             memory_bytes,
             directory,
             disk_limit,
@@ -571,6 +649,28 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
             .or(staging_pool.as_ref())
             .ok_or("prefix transfers require a slab pool")?,
     )?));
+    if let Some(socket) = resolved.manager {
+        #[cfg(all(unix, feature = "selene"))]
+        return Ok(Box::new(pool::PoolStore::new(
+            socket,
+            resolved.tenant,
+            identity,
+            fingerprint,
+            geometry,
+            staging_pool.ok_or("the cache manager requires staging")?,
+            transfers,
+        )?));
+        #[cfg(not(all(unix, feature = "selene")))]
+        {
+            let _ = socket;
+            return Err(if cfg!(unix) {
+                "the cache manager requires a build with the selene feature"
+            } else {
+                "the cache manager requires a Unix socket"
+            }
+            .into());
+        }
+    }
     let disk = directory_lock
         .map(|directory| {
             let disk_transfers = if memory_pool.is_some() {
@@ -917,6 +1017,88 @@ mod tests {
         );
         drop(lock);
         std::fs::remove_dir_all(base).unwrap();
+    }
+
+    #[test]
+    fn manager_preparation_refuses_local_tiers_and_shards_before_allocation() {
+        let base = PrefixCacheOffload {
+            manager: Some("/run/selene/default.sock".into()),
+            ..Default::default()
+        };
+        for (options, shard, expected) in [
+            (
+                PrefixCacheOffload {
+                    memory_bytes: Some(1),
+                    ..base.clone()
+                },
+                None,
+                "the cache manager replaces the local host tiers",
+            ),
+            (
+                PrefixCacheOffload {
+                    disk: Some(test_directory()),
+                    disk_limit: Some(0),
+                    ..base.clone()
+                },
+                None,
+                "the cache manager replaces the local host tiers",
+            ),
+            (
+                base.clone(),
+                Some((0, 2)),
+                "a multi-host package keeps host prefix records per host; the cache manager is not available",
+            ),
+        ] {
+            let error = prepare_with_inputs(
+                &options,
+                std::path::Path::new("missing"),
+                [0; 32],
+                Vec::new(),
+                Vec::new(),
+                0,
+                shard,
+            )
+            .err()
+            .unwrap();
+            assert_eq!(error.to_string(), expected);
+            if let Some(directory) = options.disk {
+                assert!(!directory.exists());
+            }
+        }
+        let layout = Layout {
+            page_tokens: 64,
+            ranks: Vec::new(),
+            page_record_bytes: 8192,
+            row_record_bytes: 4096,
+        };
+        assert!(base.enabled());
+        let staging = 256 * 8192 + 4 * 4096;
+        assert_eq!(
+            base.headroom_with_inputs(2, &layout, true).unwrap(),
+            (staging / 512 + STORE_DEVICE_MARGIN_BYTES, staging)
+        );
+        for options in [
+            PrefixCacheOffload::default(),
+            PrefixCacheOffload {
+                memory_bytes: Some(0),
+                disk_limit: Some(0),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                options.headroom_with_inputs(2, &layout, true).unwrap(),
+                (0, 0)
+            );
+            let prepared = prepare(
+                &options,
+                std::path::Path::new("missing"),
+                [0; 32],
+                Vec::new(),
+                Vec::new(),
+            )
+            .unwrap();
+            assert!(matches!(prepared, Preparation::None(reason) if reason == "disabled"));
+        }
     }
 
     #[test]

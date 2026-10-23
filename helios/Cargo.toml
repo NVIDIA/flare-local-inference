@@ -17,7 +17,9 @@ runtime-package = ["dep:serde", "dep:serde_json", "dep:prost", "dep:prost-build"
 frontend = ["dep:serde", "dep:tokenizers", "dep:serde_json", "dep:sha2", "dep:ryu", "dep:deepseek-recipe-core", "dep:deepseek-recipe-encoding"]
 images = ["frontend", "dep:png", "dep:turbojpeg", "dep:image-webp"]
 grammar = ["frontend", "dep:llguidance"]
-server = ["dep:serde", "images", "grammar", "dep:axum", "dep:tokio", "dep:async-stream", "dep:base64", "dep:ratatui", "dep:crossterm", "dep:futures-util", "dep:flate2", "dep:zstd", "dep:brotli", "dep:httpdate", "dep:deepseek-recipe"]
+server = ["dep:serde", "images", "grammar", "dep:axum", "dep:tokio", "dep:async-stream", "dep:base64", "dep:ratatui", "dep:crossterm", "dep:futures-util", "dep:flate2", "dep:zstd", "dep:brotli", "dep:httpdate", "dep:deepseek-recipe", "selene"]
+selene = ["dep:prost", "dep:prost-build", "dep:tonic", "dep:tonic-prost",
+              "dep:tonic-prost-build", "dep:tower", "dep:hyper-util", "dep:tokio"]
 # RoCEnante's RDMA proxy for ranks on separate hosts; links libibverbs.
 roce = ["dep:cc", "runtime-package"]
 
@@ -34,6 +36,10 @@ ring = { version = "0.17.14", optional = true }
 thiserror = "2.0"
 serde = { version = "1.0", features = ["derive"], optional = true }
 prost = { version = "0.14", optional = true }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen"], optional = true }
+tonic-prost = { version = "0.14", optional = true }
+tower = { version = "0.5", default-features = false, features = ["util"], optional = true }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"], optional = true }
 blake2 = "0.10"
 libloading = "0.8.9"
 libc = "0.2.189"
@@ -54,11 +60,14 @@ crossterm = { version = "0.28", default-features = false, optional = true }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 
 [dev-dependencies]
+# Test-only fake servers use tonic's router to mount the generated service.
+tonic = { version = "0.14", default-features = false, features = ["router"] }
 minijinja = { version = "=2.24.0", features = ["loader", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
 
 [build-dependencies]
 prost-build = { version = "0.14", optional = true }
+tonic-prost-build = { version = "0.14", optional = true }
 cc = { version = "1.6", optional = true }
 
 [[bench]]

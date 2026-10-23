@@ -1,0 +1,158 @@
+syntax = "proto3";
+package selene.v1;
+
+service LocalCache {
+  rpc Hello(HelloRequest) returns (HelloReply);
+  rpc Subscribe(SubscribeRequest) returns (stream CatalogEvent);
+  rpc Put(stream PutMessage) returns (stream PutReply);
+  rpc Get(stream GetMessage) returns (stream GetReply);
+  rpc Locate(LocateRequest) returns (LocateReply);   // P2; nothing in Flare calls it
+}
+
+service PeerCache {
+  rpc PeerHello(PeerHelloRequest) returns (PeerHelloReply);
+  rpc Subscribe(SubscribeRequest) returns (stream CatalogEvent);
+  rpc Put(stream PutMessage) returns (stream PutReply);
+  rpc Get(stream GetMessage) returns (stream GetReply);
+}
+
+service Admin {                                      // P1b
+  rpc Stats(StatsRequest) returns (StatsReply);
+  rpc Pin(PinRequest) returns (PinReply);
+  rpc Purge(PurgeRequest) returns (PurgeReply);
+  rpc SetQuota(QuotaRequest) returns (QuotaReply);
+}
+
+message Key { uint64 consumed_tokens = 1; bytes digest = 2; }        // digest exactly 16
+message RankPlanes { repeated uint64 plane_bytes = 1; uint64 row_bytes = 2; }
+message Descriptor {
+  bytes identity = 1; bytes fingerprint = 2; uint64 page_tokens = 3;
+  repeated RankPlanes ranks = 4; uint64 page_record_bytes = 5;
+  uint64 row_record_bytes = 6; string tenant = 7;
+}
+
+message HelloRequest { uint32 protocol = 1; string replica = 2; Descriptor descriptor = 3; }
+message HelloReply {
+  bytes namespace_id = 1; uint64 generation = 2;
+  string arena_path = 3; uint64 arena_bytes = 4;
+  string staging_path = 5; uint64 staging_bytes = 6;
+  uint32 max_open_puts = 7; uint32 max_open_gets = 8;
+  uint64 max_window_bytes = 9; uint32 window_credits = 10;
+}
+
+message SubscribeRequest {
+  bytes namespace_id = 1; uint64 generation = 2; Descriptor descriptor = 3;
+}
+message CatalogEntry {
+  Key key = 1; Key parent = 2; bool has_parent = 3;
+  bytes bucket = 4;                 // exactly 16
+  uint64 tail_pages = 5; bool row = 6;
+  Tier tier = 7; bool durable = 8;
+  uint64 bytes = 9;                 // envelope-inclusive, as in v1
+  bool unreadable = 10;             // true only for a retained ancestry anchor
+}
+enum Tier { TIER_UNSPECIFIED = 0; DRAM = 1; NVME = 2; REMOTE = 3; }
+message CatalogEvent {
+  uint64 sequence = 1;              // +1 per emitted event in this stream
+  oneof event {
+    SnapshotBegin snapshot_begin = 2;
+    CatalogEntry entry = 3;         // snapshot entries, parents before children
+    SnapshotEnd snapshot_end = 4;
+    CatalogEntry added = 5;
+    CatalogEntry changed = 6;       // tier/durable/row/unreadable; never geometry
+    Key removed = 7;                // exactly one node, never cascaded
+    Room room = 8;                  // this connection's armed reservation fits
+  }
+}
+message SnapshotBegin { uint64 seq0 = 1; }
+message SnapshotEnd {}
+message Room { uint64 bytes = 1; }
+
+message WindowRef { Region region = 1; uint64 offset = 2; uint64 length = 3; }
+message WindowGrant {
+  uint64 transfer = 1; uint32 index = 2;   // index: window ordinal within the call, from 0
+  uint32 record = 3;
+  uint64 record_offset = 4;         // record-relative, multiple of 4096
+  uint64 length = 5;                // multiple of 4096, 1..=64 whole pages and/or the row
+  WindowRef memory = 6;
+  uint64 page_first = 7;            // page index within the chain (the key's full page span); row grants: 0
+  uint32 page_count = 8;            // 0 only for a row-only grant
+  bool row = 9;                     // this grant carries the whole row
+}
+enum Region { REGION_UNSPECIFIED = 0; ARENA = 1; STAGING = 2; }
+
+message PutMessage {
+  oneof m { PutBegin begin = 1; WindowFilled filled = 2; PutCommit commit = 3; Cancel cancel = 4; }
+}
+message PutBegin {
+  bytes namespace_id = 1; Key key = 2; uint64 chain_pages = 3; bool row = 4;
+  Key published_parent = 5; bool has_published_parent = 6;
+  bytes bucket = 7;                 // exactly 16
+  uint64 published_tail_pages = 8;
+  Descriptor descriptor = 9;        // required on both services; checked against Hello
+}
+message WindowFilled {
+  uint64 transfer = 1; uint32 index = 2;
+  repeated uint64 page_xxh3 = 3; uint64 row_xxh3 = 4; bool has_row = 5;
+}
+message PutCommit {
+  uint64 transfer = 1; uint64 metadata_offset = 2; bytes metadata = 3;
+  // Concatenate every metadata fragment in offset order: the first 4096 bytes are
+  // the Header, the rest is the padded checksum segment.
+}
+message PutReply { oneof r { PutAccept accept = 1; WindowGrant grant = 2; Stored stored = 3; Refused refused = 4; } }
+message PutAccept { uint64 transfer = 1; uint64 first_page = 2; Key parent = 3; bool has_parent = 4; uint64 record_bytes = 5; }
+message Stored { uint64 bytes = 1; }
+message Refused { Reason reason = 1; string detail = 2; }
+enum Reason { REASON_UNSPECIFIED = 0; PRESENT = 1; INFLIGHT = 2; BUDGET = 3; OVERSIZE = 4; QUOTA = 5; INVALID = 6; QUEUE = 7; IO = 8; }
+
+message GetMessage {
+  oneof m { GetBegin begin = 1; WindowReleased released = 2; Cancel cancel = 3; }
+}
+message GetDestination {
+  uint32 record = 1;                // chain index
+  Region region = 2;                // the origin's region
+  uint64 offset = 3;                // reserved destination base
+  uint64 bytes = 4;                 // reservation for this record's page/row payload
+}
+message GetBegin {
+  bytes namespace_id = 1; repeated Key chain = 2;
+  uint64 skip_pages = 3; uint64 expected_pages = 4; bool row = 5;
+  repeated GetDestination destinations = 6;   // PeerCache.Get only; must be empty on LocalCache
+  uint64 transfer = 7;                        // PeerCache.Get only; the origin assigns it
+}
+message WindowReleased { uint64 transfer = 1; uint32 index = 2; }
+message GetReply {
+  oneof r { GetLeased leased = 1; RecordMeta meta = 2; WindowGrant ready = 3; GetDone done = 4; Refused refused = 5; }
+}
+message GetLeased { uint64 transfer = 1; repeated uint64 record_bytes = 2; }
+message RecordMeta {
+  uint32 record = 1; uint64 metadata_offset = 2; bytes metadata = 3;
+  Tier source = 4;                  // where this record's bytes are served from
+  // Concatenate in offset order: Header (4096 bytes) then the padded checksum segment.
+}
+message GetDone {}
+message Cancel {}
+
+message LocateRequest { bytes namespace_id = 1; repeated Key keys = 2; }
+message LocateReply { repeated Location locations = 1; }
+message Location { Key key = 1; Tier tier = 2; string node = 3; }
+
+message PeerHelloRequest {
+  uint32 protocol = 1; string node = 2; repeated string transports = 3; bytes rdma = 4;
+  uint64 arena_bytes = 5; uint64 staging_bytes = 6;
+}
+message PeerHelloReply {
+  uint64 generation = 1; string transport = 2; bytes stream_token = 3;
+  string stream_addr = 4; bytes rdma = 5;
+  uint64 arena_bytes = 6; uint64 staging_bytes = 7;
+}
+
+message StatsRequest {}
+message StatsReply { string prometheus = 1; }
+message PinRequest { bytes namespace_id = 1; repeated Key keys = 2; bool pin = 3; }
+message PinReply { uint32 changed = 1; }
+message PurgeRequest { bytes namespace_id = 1; bool all_namespaces = 2; }
+message PurgeReply { uint64 records = 1; uint64 bytes = 2; }
+message QuotaRequest { bytes namespace_id = 1; uint64 dram_bytes = 2; uint64 nvme_bytes = 3; }
+message QuotaReply { uint64 blocked_bytes = 1; }   // >0: reduction blocked by pins/leases

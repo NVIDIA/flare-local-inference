@@ -759,6 +759,77 @@ confirmed, the peer retains its transport, transfer threads, disk thread, and
 registered staging together and exits with the error, rather than releasing
 memory its transfers may still use.
 
+## Pooled checkpoint client
+
+`flare run PACKAGE --prefix-cache-manager /run/selene/default.sock` uses
+`PoolStore` instead of the local host tiers. This Linux client is model-independent:
+records carry the same complete padded pages and continuation rows as the local
+stores, including every rank's planes. Layout fingerprints separate TP widths.
+The manager owns record shape, admission, deduplication, eviction, compaction,
+leases, durability and recovery. Flare owns only a lookup mirror and GPU transfers.
+
+Startup refuses local memory retention, a local disk directory, and multi-host
+packages before allocating staging. It registers `SlabPool::staging` only, with
+no retaining pool, directory creation, lock or record scan. `Prepared` retains an
+inert zero-limit `DiskBudget` to preserve its existing shape; manager mode never
+charges it or opens a `DiskStore`. Prepared CPU inputs stay local and unpooled.
+Host headroom is staging bytes; device headroom is its mapping cost plus the
+existing transfer margin. Omission of the manager option adds no serving work.
+
+Lookup never performs IPC: the worker calls the existing `Index::lookup_below`
+on the mirror. The receiver builds parent-first snapshots off the worker, and
+`poll` swaps completed snapshots and applies at most 4096 deltas. Sequence gaps,
+decode errors and a backlog beyond 65536 entries clear the mirror and request a
+new snapshot. A removal affects only the named node; manager pins and eviction
+policy never run in the mirror. Retired indexes and queued snapshots are destroyed
+on background threads through a single bounded retirement slot. Tier gauges also
+come from the mirror; the cost estimate uses a per-tier measured EWMA, initially
+the existing memory/staged-disk rates.
+
+Every GPU checkpoint publication is offered under its existing GPU pin. The
+manager confirms even apparent duplicates. `Accept` selects the bytes to copy;
+the wire reply includes the selected parent as well as `first_page`, so zero-page
+parents and compacted replacements have an unambiguous header. D2H windows are
+checksummed after the transfer reply, then sent with the row and encoded
+`record::Header` plus its variable checksum segment. `Present` succeeds
+with zero transferred bytes. Retry, Cancel, disconnect and deadline defer a
+publication only after its D2H replies drain. Oversize and rejected records report
+errors. Deferred publications still on GPU are reoffered on availability progress;
+a steady Budget refusal produces no retry traffic until availability changes.
+
+Restores name ascending chain nodes and skip resident pages. The client checks
+namespace, geometry, key, parent, metadata and each requested page/row checksum,
+then submits bounded H2D windows into the scheduler's ticket IDs. Success requires
+both `Done{Ok}` and all H2D replies. Stale keys, corrupt or short streams, deadlines
+and disconnects fail only after outstanding H2D work drains, allowing recompute.
+
+One `selene-io` thread owns a current-thread tokio runtime, one gRPC
+connection over the manager's Unix socket, and both manager region mappings. The
+worker queues publications and restores with nonblocking sends and drains
+completions from `poll`; the io thread never calls CUDA and hands transfer jobs
+to the existing per-rank threads. `Hello` returns the shared arena and staging
+files, and Put and Get move whole padded pages and rows through checked windows
+in those mappings. `Subscribe` feeds the parent-first mirror; each catalog event
+carries the session generation and subscription epoch, so work from a replaced
+subscription is discarded. There are at most four open operations per direction,
+with two negotiated 64-page window credits per direction: 256 page slabs and
+four row slabs total. Every operation has a three-second no-progress deadline; a
+timeout closes the connection and rebuilds the session with backoff. Shutdown
+disconnects and drains within `transfer::CLOSE_TIMEOUT`; a failed drain retains
+resources rather than releasing memory still in use. Connection generations
+fence replies across reconnects.
+
+Publication is visible at the manager's Added/Changed delta. A DRAM acknowledgment
+does not promise durability: manager death before the entire ancestor chain reaches
+NVMe can lose an acknowledged record, which Flare has already unpinned. Recovery,
+chain-closed durability and parent-first disk writes belong to the manager.
+
+The ignored `offload::pool::cuda_tests::real_manager_cuda_round_trips_and_recovery`
+test uses one GPU and a real manager, without loading a model. Set
+`FLARE_POOL_TEST_MANAGER` to the manager executable and `FLARE_POOL_TEST_DIR` to a
+local NVMe directory, then run the test with `--ignored --nocapture`. It checks
+exact page/row bytes, partial tails, tenant isolation, streaming and recovery.
+
 ## 3. Implementation sequence
 
 Each step is independently testable and leaves the build green. Steps 1

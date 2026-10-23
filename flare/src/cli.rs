@@ -720,6 +720,14 @@ pub struct ServingOptions {
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_memory: Option<u64>,
 
+    /// Unix socket of the shared prefix cache manager; replaces local host tiers.
+    #[arg(long, value_name = "SOCKET", help_heading = "Prefix cache options")]
+    pub prefix_cache_manager: Option<PathBuf>,
+
+    /// Tenant label for pooled records; 1-64 bytes of [A-Za-z0-9._-] [default: empty].
+    #[arg(long, value_name = "LABEL", value_parser = tenant_label, help_heading = "Prefix cache options")]
+    pub prefix_cache_tenant: Option<String>,
+
     /// Directory for prefix checkpoints and prepared inputs on disk [default: disabled].
     #[arg(long, value_name = "DIR", help_heading = "Prefix cache options")]
     pub prefix_cache_disk: Option<PathBuf>,
@@ -741,6 +749,10 @@ fn served_model_name(value: &str) -> Result<String, String> {
     } else {
         Ok(value.to_owned())
     }
+}
+
+fn tenant_label(value: &str) -> Result<String, String> {
+    flare_helios::offload::validate_tenant(Some(value)).map_err(|error| error.to_string())
 }
 
 fn verification_alpha(value: &str) -> Result<f64, String> {
@@ -849,6 +861,12 @@ impl ServingOptions {
         }
         // Every rank keeps its own records under its host's directory; rank zero's store drives
         // all of them, so every rank needs the same settings.
+        if let Some(socket) = &self.prefix_cache_manager {
+            options.extend(["--prefix-cache-manager".into(), socket.display().to_string()]);
+        }
+        if let Some(tenant) = &self.prefix_cache_tenant {
+            options.extend(["--prefix-cache-tenant".into(), tenant.clone()]);
+        }
         if let Some(bytes) = self.prefix_cache_memory {
             options.extend(["--prefix-cache-memory".into(), bytes.to_string()]);
         }
@@ -903,6 +921,8 @@ impl ServingOptions {
             },
             device_labels: (!self.gpus.is_empty()).then(|| self.gpus.clone()),
             prefix_cache: PrefixCacheOffload {
+                manager: self.prefix_cache_manager.clone(),
+                tenant: self.prefix_cache_tenant.clone(),
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
@@ -1223,6 +1243,8 @@ mod tests {
         assert_eq!(
             options.prefix_cache,
             PrefixCacheOffload {
+                manager: None,
+                tenant: None,
                 memory_bytes: Some(3 << 29),
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
@@ -1511,6 +1533,8 @@ mod tests {
             "flare",
             "run",
             "model.safetensors",
+            "--prefix-cache-manager",
+            "/run/selene/default.sock",
             "--prefix-cache-memory",
             "0",
             "--prefix-cache-disk",
@@ -1524,6 +1548,8 @@ mod tests {
         assert_eq!(
             options,
             [
+                "--prefix-cache-manager",
+                "/run/selene/default.sock",
                 "--prefix-cache-memory",
                 "0",
                 "--prefix-cache-disk",

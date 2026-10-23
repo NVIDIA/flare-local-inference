@@ -13,6 +13,16 @@ fn main() {
             .compile_protos(&["proto/runtime_package.proto"], &["proto"])
             .expect("compile runtime package protobuf schema");
     }
+    #[cfg(feature = "selene")]
+    {
+        println!("cargo:rerun-if-changed=proto/selene.proto");
+        tonic_prost_build::configure()
+            .build_client(true)
+            .build_server(true) // server stubs back the #[cfg(test)] fake
+            .server_mod_attribute(".", "#[cfg(test)]")
+            .compile_protos(&["proto/selene.proto"], &["proto"])
+            .expect("compile selene protobuf schema");
+    }
     #[cfg(feature = "roce")]
     {
         println!("cargo:rerun-if-changed=native/roce_proxy.c");

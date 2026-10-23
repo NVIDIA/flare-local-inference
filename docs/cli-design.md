@@ -478,6 +478,24 @@ favor shorter prefixes. Confidence observations and token acceptance remain
 unchanged. This serving option uses existing package graphs and does not enable
 adaptive verification when fixed-width selection is configured.
 
+`--prefix-cache-manager SOCKET` selects an external shared checkpoint cache over
+one Linux Unix stream socket per replica. It replaces local checkpoint retention:
+nonzero `--prefix-cache-memory` and any `--prefix-cache-disk` are rejected.
+Multi-host packages are rejected before staging allocation. The option is
+forwarded to every rank, so the same refusal applies to distributed launches.
+`--prefix-cache-tenant LABEL` selects the manager namespace shared by replicas;
+the label is 1 to 64 bytes of `[A-Za-z0-9._-]` and defaults to empty, which
+shares records only with other unlabelled replicas. It is forwarded to every
+rank. Without the option, local stores and disabled serving follow their
+existing paths.
+
+The manager and replica must share effective uid/gid; the manager records the
+connecting process from Unix peer credentials and opens a pidfd for window
+reclamation. Containers sharing the socket must share the relevant PID
+namespace. See the
+[pooled checkpoint client](prefix-cache-offload.md#pooled-checkpoint-client) for
+staging, reconnection, cancellation, durability and validation limits.
+
 `--embedding-table-workers 1|2|4|8` controls Windows disk-reader workers.
 Workers share 128 I/O slots and 8 MiB of direct-read staging per embedding table.
 Windows defaults to four workers; other platforms retain one. Explicit worker
