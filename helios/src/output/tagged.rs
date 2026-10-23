@@ -27,6 +27,11 @@ pub trait ToolDialect {
     const FUNCTION: Option<(&'static str, &'static str)> = None;
     const TOOL_ENDS_REASONING: bool = false;
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>>;
+    /// Whether text beginning with `OPEN` or the function opener starts a call
+    /// rather than mentioning the tag in prose; `None` until more text decides.
+    fn starts_call(_text: &str) -> Option<bool> {
+        Some(true)
+    }
 }
 
 pub struct ThinkReasoning<D: ToolDialect> {
@@ -38,6 +43,7 @@ pub struct ThinkReasoning<D: ToolDialect> {
     tools: bool,
     trim_wrap: bool,
     tool_ends_reasoning: bool,
+    finishing: bool,
 }
 impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
     fn push(&mut self, input: Input<'_>) -> Result<Progress> {
@@ -58,11 +64,21 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
             .buffer
             .find(&self.close)
             .map(|at| (at, self.close.len()));
+        let mut undecided = None;
         if self.tools && self.tool_ends_reasoning {
-            if let Some(at) = self.buffer.find(D::OPEN) {
-                if boundary.is_none_or(|(end, _)| at < end) {
-                    boundary = Some((at, 0));
+            for (at, _) in self.buffer.match_indices(D::OPEN) {
+                if boundary.is_some_and(|(end, _)| end < at) {
+                    break;
                 }
+                match D::starts_call(&self.buffer[at..]) {
+                    Some(false) => continue,
+                    None if !self.finishing => {
+                        undecided = Some(at);
+                        boundary = None;
+                    }
+                    _ => boundary = Some((at, 0)),
+                }
+                break;
             }
         }
         if let Some((end, consumed)) = boundary {
@@ -91,6 +107,10 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
                 if self.tools {
                     hold = hold.max(partial_marker(&self.buffer, &[D::OPEN]));
                 }
+            }
+            if let Some(at) = undecided {
+                let line = self.buffer[..at].trim_end_matches('\n').len();
+                hold = hold.max(self.buffer.len() - line);
             }
             let visible = self.buffer.len() - hold;
             let text: String = self.buffer.drain(..visible).collect();
@@ -210,6 +230,7 @@ pub struct TaggedOutput<D: ToolDialect> {
     reasoning: ThinkReasoning<D>,
     tool: Option<TaggedTools<D>>,
     calls: usize,
+    finishing: bool,
 }
 impl<D: ToolDialect> TaggedOutput<D> {
     pub fn with_reasoning(
@@ -257,6 +278,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 tools,
                 trim_wrap: D::TRIM_NEWLINES,
                 tool_ends_reasoning: D::TOOL_ENDS_REASONING,
+                finishing: false,
                 dialect: std::marker::PhantomData,
             },
             tool: (config.start == OutputStart::ToolBody).then(|| TaggedTools {
@@ -266,6 +288,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 index: 0,
             }),
             calls: 0,
+            finishing: false,
         }
     }
     #[cfg(feature = "server")]
@@ -430,19 +453,31 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                         .flatten()
                         .map(|at| (at, false));
                     let mut bare_function = false;
+                    let mut undecided = None;
                     if !self.tools.is_empty() {
-                        if let Some(at) = self.buffer.find(D::OPEN) {
-                            if marker.is_none_or(|(first, _)| at < first) {
-                                marker = Some((at, true));
+                        let mut openers: Vec<_> = self
+                            .buffer
+                            .match_indices(D::OPEN)
+                            .chain(
+                                D::FUNCTION
+                                    .into_iter()
+                                    .flat_map(|(open, _)| self.buffer.match_indices(open)),
+                            )
+                            .collect();
+                        openers.sort_unstable();
+                        for (at, opener) in openers {
+                            if marker.is_some_and(|(first, _)| first < at) {
+                                break;
                             }
-                        }
-                        if let Some((open, _)) = D::FUNCTION {
-                            if let Some(at) = self.buffer.find(open) {
-                                if marker.is_none_or(|(first, _)| at < first) {
+                            match D::starts_call(&self.buffer[at..]) {
+                                Some(false) => continue,
+                                None if !self.finishing => undecided = Some(at),
+                                _ => {
                                     marker = Some((at, true));
-                                    bare_function = true;
+                                    bare_function = opener != D::OPEN;
                                 }
                             }
+                            break;
                         }
                     }
                     if let Some((at, tool)) = marker {
@@ -488,6 +523,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                                 trim_wrap: self.reasoning.trim_wrap,
                                 tool_ends_reasoning: self.reasoning.tool_ends_reasoning,
                                 tools: !self.tools.is_empty(),
+                                finishing: self.finishing,
                             };
                         }
                     } else {
@@ -517,6 +553,11 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                         {
                             hold = hold.max(partial_marker(&self.buffer, &[open, D::CLOSE]));
                         }
+                        if let Some(at) = undecided {
+                            hold = hold.max(
+                                self.buffer.len() - self.buffer[..at].trim_end_matches('\n').len(),
+                            );
+                        }
                         let start = self.received - self.buffer.len();
                         let text: String = self.buffer.drain(..self.buffer.len() - hold).collect();
                         if !text.is_empty() {
@@ -538,6 +579,8 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 _ => Ok(vec![]),
             };
         }
+        self.finishing = true;
+        self.reasoning.finishing = true;
         let mut output = self.push(Input::Text(""))?;
         match self.mode {
             Mode::Reasoning => output.extend(self.reasoning.finish(cause)?),

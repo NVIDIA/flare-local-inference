@@ -307,6 +307,10 @@ Shared runtime handling owns token accounting, stop filtering, and termination.
 
 Qwen treats `<tool_call>` as an implicit end to reasoning. Function-tag calls
 complete at `</function>` and accept omitted outer tool tags in answer content.
+A `<tool_call>` or `<function=` tag starts a call only when followed by a
+`<function=NAME>` header and a parameter or `</function>` tag; other mentions,
+such as a quoted tag in prose, remain reasoning or answer text. A tag still
+undecided when generation ends is parsed as an incomplete call.
 A missing `</parameter>` is closed by the next parameter or function boundary.
 Parameter schemas guide
 best-effort type conversion; non-strict schemas do not reject invalid values.

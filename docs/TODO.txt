@@ -7,6 +7,10 @@
     to host cache tiers and image-request preemption, cancellation, and shallower
     restore. See prefix-cache-offload.md.
 
+[ ] Confirm GLM argument-tag calls before leaving answer text. Its `<tool_call>`
+    is a non-special token, so a prose mention still opens a call and fails at
+    EOS; function tags confirm via ToolDialect::starts_call in output/tagged.rs.
+
 [ ] Make test_cache_memory.py's reservation workload force checkpoint backing
     reclamation under growable admission. Large output limits alone do not
     reserve their full page extent; the resident-prompts case exercises pressure.
