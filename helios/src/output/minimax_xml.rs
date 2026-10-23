@@ -152,10 +152,13 @@ impl super::tagged::ToolDialect for MiniMaxXml {
                 .split_once('>')
                 .ok_or("unterminated XML function name")?;
             let name = name.trim().trim_matches(['\'', '"']);
-            let tool = tools
+            if name.is_empty() {
+                return Err("tool function name is empty".into());
+            }
+            let schema = tools
                 .iter()
                 .find(|t| t["function"]["name"].as_str() == Some(name))
-                .ok_or_else(|| format!("model called unregistered tool {name:?}"))?;
+                .and_then(|tool| tool["function"].get("parameters"));
             let (mut parameters, tail) = tail
                 .split_once(INVOKE_END)
                 .ok_or("unterminated XML invocation")?;
@@ -164,10 +167,7 @@ impl super::tagged::ToolDialect for MiniMaxXml {
                 values.push((name, value));
                 parameters = tail;
             }
-            calls.push((
-                name.to_owned(),
-                object(values, tool["function"].get("parameters")).to_string(),
-            ));
+            calls.push((name.to_owned(), object(values, schema).to_string()));
             rest = tail.trim_start();
         }
         Ok(calls)
@@ -235,14 +235,29 @@ mod tests {
     }
 
     #[test]
-    fn function_name_quotes_and_unregistered_calls() {
+    fn function_name_quotes_undeclared_and_empty_calls() {
         for name in ["lookup", "'lookup'", "\"lookup\""] {
             let body = format!("{INVOKE}{name}>{INVOKE_END}");
             assert_eq!(
                 MiniMaxXml::parse(&body, &[json!({"function":{"name":"lookup"}})]).unwrap(),
                 vec![("lookup".into(), "{}".into())]
             );
-            assert!(MiniMaxXml::parse(&body, &[]).is_err());
+            assert_eq!(
+                MiniMaxXml::parse(&body, &[]).unwrap(),
+                vec![("lookup".into(), "{}".into())]
+            );
+        }
+        let body = format!("{INVOKE}search>{ELEMENT}n>3{NAMESPACE}</n>{INVOKE_END}");
+        let tools = [
+            json!({"function":{"name":"lookup","parameters":{"properties":{"n":{"type":"integer"}}}}}),
+        ];
+        assert_eq!(
+            MiniMaxXml::parse(&body, &tools).unwrap(),
+            vec![("search".into(), "{\"n\":\"3\"}".into())]
+        );
+        for name in ["", "''", "\"\""] {
+            let body = format!("{INVOKE}{name}>{INVOKE_END}");
+            assert!(MiniMaxXml::parse(&body, &tools).is_err());
         }
     }
 }
