@@ -1265,15 +1265,11 @@ impl<'a> Worker<'a> {
                     let Some(active) = &self.active[slot] else {
                         continue;
                     };
-                    if self.scheduler.request(active.request)?.phase == RequestPhase::Inbound {
+                    let request = self.scheduler.request(active.request)?;
+                    if request.phase == RequestPhase::Inbound || request.image_slot.is_none() {
                         continue;
                     }
-                    if active.next_image
-                        >= self
-                            .scheduler
-                            .request(active.request)?
-                            .conditioned_input_end()
-                    {
+                    if active.next_image >= request.conditioned_input_end() {
                         continue;
                     }
                     let Some(image) = active.selected_images.get(active.next_image) else {

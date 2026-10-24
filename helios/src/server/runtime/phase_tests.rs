@@ -231,7 +231,7 @@ impl Fixture {
 }
 
 #[test]
-fn image_admission_queues_excess_images_and_admits_text() {
+fn image_admission_waits_for_features_inside_scheduler_and_admits_text() {
     use crate::frontend::images::{
         ImageDescription, ImageGeometry, ImageInput, ImageLimits, ImageProcessor, ImageSettings,
         ImageSource, PreparedImageInput, RgbImage,
@@ -286,8 +286,13 @@ fn image_admission_queues_excess_images_and_admits_text() {
         worker.admit().unwrap(),
         ControlFlow::Continue(true)
     ));
-    assert_eq!(worker.pending.len(), 1);
-    assert_eq!(worker.active.iter().flatten().count(), 2);
+    assert!(worker.pending.is_empty());
+    assert_eq!(worker.active.iter().flatten().count(), 3);
+    let owner = worker.active[0].as_ref().unwrap().request;
+    let waiter = worker.active[1].as_ref().unwrap().request;
+    assert_eq!(worker.scheduler.request(owner).unwrap().image_slot, Some(0));
+    assert_eq!(worker.scheduler.request(waiter).unwrap().image_slot, None);
+    assert!(worker.active[1].as_ref().unwrap().prepared_image.is_none());
     assert!(
         worker
             .active
@@ -303,6 +308,7 @@ fn image_admission_queues_excess_images_and_admits_text() {
     ));
     assert!(worker.pending.is_empty());
     assert_eq!(worker.active.iter().flatten().count(), 2);
+    assert_eq!(worker.scheduler.request(waiter).unwrap().image_slot, Some(0));
     assert!(!worker.scheduler.has_available_image_slot());
     waiting_generation.cancelled.store(true, Ordering::Release);
     assert!(matches!(
@@ -2485,7 +2491,8 @@ fn host_prefix_selects_whole_required_images_and_compacts_feature_indices() {
         let live = worker.scheduler.request(active.request).unwrap();
         assert_eq!(live.consumed_tokens, consumed);
         assert_eq!(active.selected_images.len(), expected);
-        assert_eq!(live.image_slot.is_some(), expected != 0);
+        assert_eq!(live.phase, RequestPhase::Inbound);
+        assert!(live.image_slot.is_none(), "host I/O must not pin image feature storage");
         assert_eq!(active.incoming.prompt.data.vision_token_indices, canonical);
         if expected == 1 {
             assert_eq!(active.selected_images[0].feature_range, 16..32);
@@ -2496,6 +2503,16 @@ fn host_prefix_selects_whole_required_images_and_compacts_feature_indices() {
             assert!(active.prepared_image.is_none());
             assert!(worker.image_preparation.is_none());
         }
+        let handle = active.request;
+        let (_, ticket) = fake_store(&mut worker).fetched.pop().unwrap();
+        fake_store(&mut worker).events.push_back(crate::offload::StoreEvent::Fetched {
+            key: ticket.key,
+            result: Ok(1 << 20),
+        });
+        assert!(worker.service_store().unwrap());
+        let live = worker.scheduler.request(handle).unwrap();
+        assert_eq!(live.phase, RequestPhase::Restore);
+        assert_eq!(live.image_slot.is_some(), expected != 0);
     }
 }
 

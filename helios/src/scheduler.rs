@@ -179,6 +179,7 @@ pub(crate) struct ConditionedInput {
 struct ConditionedWindow {
     inputs: std::ops::Range<usize>,
     token_start: usize,
+    token_end: usize,
     prefill_end: usize,
     features: Vec<std::ops::Range<usize>>,
     patches: VecDeque<usize>,
@@ -602,6 +603,7 @@ pub struct RequestScheduler {
     slots: Vec<Slot>,
     free_pages: BTreeSet<PageId>,
     free_image_slots: BTreeSet<usize>,
+    image_waiters: VecDeque<RequestHandle>,
     free_snapshots: BTreeSet<SnapshotId>,
     snapshot_pages: Vec<std::ops::Range<u32>>,
     page_snapshot_refs: Vec<u32>,
@@ -664,6 +666,7 @@ impl RequestScheduler {
             plan_owner: Arc::new(()),
             limits,
             free_image_slots: (0..capabilities.vision.feature_slots).collect(),
+            image_waiters: VecDeque::new(),
             capabilities,
             identity,
             cache,
@@ -1612,6 +1615,7 @@ impl RequestScheduler {
             request.shared_pages = shared_pages.clone();
             request.phase = RequestPhase::Restore;
         }
+        self.refresh_image_slots();
         Ok(Vec::new())
     }
 
@@ -1770,6 +1774,8 @@ impl RequestScheduler {
         let request = self.request(handle)?;
         if request.last_use != Fence(0)
             || request.conditioned_features.is_some()
+            || request.image_slot.is_some()
+            || !request.vision_patches.is_empty()
             || inputs.windows(2).any(|pair| {
                 pair[0].token_span.end > pair[1].token_span.start
                     || pair[0].feature_range.end > pair[1].feature_range.start
@@ -1792,13 +1798,18 @@ impl RequestScheduler {
         let mut windows: VecDeque<ConditionedWindow> = VecDeque::new();
         let mut features = 0usize;
         for (index, input) in inputs.iter().enumerate() {
-            if windows.is_empty() || features + input.feature_range.len() > capacity {
+            let horizon_reached = windows.back().is_some_and(|window|
+                input.token_span.end.saturating_sub(window.token_start) > self.limits.prefill_chunk_size
+                    && !request.prefill_spans.iter().any(|span|
+                        span.start < input.token_span.start && input.token_span.start < span.end));
+            if windows.is_empty() || features + input.feature_range.len() > capacity || horizon_reached {
                 if let Some(previous) = windows.back_mut() {
                     previous.prefill_end = input.token_span.start;
                 }
                 windows.push_back(ConditionedWindow {
                     inputs: index..index,
                     token_start: input.token_span.start,
+                    token_end: input.token_span.end,
                     prefill_end: request.prompt_tokens,
                     features: vec![],
                     patches: VecDeque::new(),
@@ -1807,6 +1818,7 @@ impl RequestScheduler {
             }
             let window = windows.back_mut().unwrap();
             window.inputs.end = index + 1;
+            window.token_end = input.token_span.end;
             window.features.push(input.feature_range.clone());
             window.patches.push_back(input.patches);
             features += input.feature_range.len();
@@ -1823,9 +1835,6 @@ impl RequestScheduler {
             .is_none_or(|generation| generation > i64::MAX as u64)
         {
             return Err("request generation cannot cover its conditioned input windows".into());
-        }
-        if let Some(window) = windows.front() {
-            self.set_vision_images(handle, &window.patches.iter().copied().collect::<Vec<_>>())?;
         }
         if windows.len() > 1 {
             // Unsubmitted page reservations may be rebound around the snapshot's backing pages.
@@ -1881,8 +1890,55 @@ impl RequestScheduler {
                 .map_or_else(Vec::new, |window| window.features.clone()),
         );
         request.conditioned_inputs_ready = inputs.is_empty();
+        request.vision_patches = windows
+            .front()
+            .map_or_else(VecDeque::new, |window| window.patches.clone());
         request.conditioned_windows = windows;
+        if !inputs.is_empty() {
+            self.image_waiters.push_back(handle);
+            self.refresh_image_slots();
+        }
         Ok(())
+    }
+
+    fn refresh_image_slots(&mut self) {
+        // Public message snapshots can leave later consumers of this window.
+        for slot in &mut self.slots {
+            let Some(request) = slot.request.as_mut() else { continue; };
+            let consumers_complete = request.conditioned_windows.front().is_some_and(|window|
+                request.consumed_tokens >= window.token_end as u64);
+            if consumers_complete
+                && request.vision_patches.is_empty()
+                && request.pending == 0
+                && request.last_use <= self.completed
+                && request.error_code.is_none()
+            {
+                if let Some(image_slot) = request.image_slot.take() {
+                    self.free_image_slots.insert(image_slot);
+                    request.epoch += 1;
+                }
+            }
+        }
+        while !self.free_image_slots.is_empty() {
+            let next = self.image_waiters.iter().position(|handle| {
+                self.request(*handle).is_ok_and(|request| {
+                    request.image_slot.is_none()
+                        && !request.vision_patches.is_empty()
+                        && matches!(request.phase,
+                            RequestPhase::Initialize | RequestPhase::Restore | RequestPhase::Vision)
+                        && !request.window_snapshot_ready
+                        && request.error_code.is_none()
+                        && request.pending == 0
+                        && request.last_use <= self.completed
+                })
+            });
+            let Some(index) = next else { break; };
+            let handle = self.image_waiters.remove(index).unwrap();
+            let slot = self.free_image_slots.pop_first().unwrap();
+            let request = self.request_mut(handle).unwrap();
+            request.image_slot = Some(slot);
+            request.epoch += 1;
+        }
     }
 
     pub(crate) fn resume_conditioned_window(
@@ -1920,6 +1976,8 @@ impl RequestScheduler {
         request.window_snapshot_ready = false;
         request.window_restore = true;
         request.phase = RequestPhase::Restore;
+        self.image_waiters.push_back(next_handle);
+        self.refresh_image_slots();
         self.reconcile_refresh();
         Ok(next_handle)
     }
@@ -2552,6 +2610,7 @@ impl RequestScheduler {
         }
         self.observe_service(fence, &submission.participants, &useful_tokens, timing);
         self.refill_reservations()?;
+        self.refresh_image_slots();
         self.reconcile_refresh();
         Ok(generated)
     }
@@ -2715,6 +2774,7 @@ impl RequestScheduler {
             None => None,
         };
         let mut request = self.slots[handle.slot as usize].request.take().unwrap();
+        self.image_waiters.retain(|waiter| *waiter != handle);
         if let Some(split) = &mut self.split {
             split.retained[handle.slot as usize] = None;
         }
@@ -2748,6 +2808,7 @@ impl RequestScheduler {
         });
         self.advance_retirement(self.completed)?;
         self.refill_reservations()?;
+        self.refresh_image_slots();
         self.reconcile_refresh();
         Ok(result.map(PublishResult::id).or(request.prefix))
     }

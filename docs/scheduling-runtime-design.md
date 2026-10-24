@@ -261,7 +261,9 @@ use the individual continuation index. The stationary rate-utility result does
 not establish optimality for those multistage decisions.
 
 Image dependencies are grouped into whole-image windows bounded by prepared
-feature storage. Vision prerequisites populate the active window; prefill stops
+feature storage and softly limited to one prefill-chunk horizon. An individual
+image or atomic dependency group can exceed the soft horizon without exceeding
+physical feature storage. Vision prerequisites populate the active window; prefill stops
 before the following window's first dependency. Atomic image spans remain within
 one prefill chunk. A request spanning multiple windows reserves one private
 snapshot row. At each window boundary, submitted work drains before snapshotting
@@ -272,9 +274,20 @@ usage counters. Private window snapshots neither publish prefix-cache entries
 nor require host caching. Existing snapshot and restore operations preserve
 partial pages and every declared continuation history.
 
+Feature slots are leased per working window rather than per logical request.
+Admission, initialization, and restore need no lease; CPU input preparation and
+vision do. After the current window's last full image dependency span is consumed
+and submitted uses drain, the lease returns to the oldest eligible waiter. Text
+tails, checkpoint copies, and decode do not pin raw features. The restored owner
+queues its next window only after its private checkpoint completes and its
+execution generation advances. An ordinary message snapshot does not release
+features needed later in the same window. Cancellation and failed work retain fenced ownership.
+
 A terminal snapshot enables the visible response completion and frees the
 request's execution resources. It contributes a delivery with zero output
-tokens. Its delivery-rate reference comes from applicable snapshot graphs.
+tokens, plus one output-token-equivalent of intrinsic completion value. That
+value does not credit an emitted token. Its delivery-rate reference comes from
+applicable snapshot graphs.
 The completion event's price can grow while other requests run. Error and
 cancellation paths preserve fenced resource ownership regardless of utility.
 
