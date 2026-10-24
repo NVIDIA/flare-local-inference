@@ -36,8 +36,8 @@ def continuation_layout(layer_types, world_size, *, mtp=False):
             raise ValueError(f"unsupported canonical GLM attention type: {kind}")
     if mtp:
         regions.extend((("draft.index_tail", (2, 12, 128), torch.bfloat16),
-                        ("draft.latent_page", (4, 64, 528), torch.uint8),
-                        ("draft.index_page", (64, 132), torch.uint8)))
+                        ("draft.latent_page", (2, 4, 64, 528), torch.uint8),
+                        ("draft.index_page", (2, 64, 132), torch.uint8)))
     regions.extend((("last_hidden", (4096,), torch.bfloat16), ("consumed_tokens", (1,), torch.int64)))
     return StateLayout.from_specs(regions)
 

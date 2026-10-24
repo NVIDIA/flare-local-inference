@@ -145,12 +145,16 @@ def test_rejected_commands_preserve_every_state_and_cache_byte(transfers, fault)
         assert torch.equal(cache, caches[name])
 
 
-@pytest.mark.parametrize("endpoint", [1, 4, 255, 256, 257, 512])
+@pytest.mark.parametrize("endpoint", [1, 2, 4, 255, 256, 257, 258, 511, 512, 513])
 def test_mtp_trailing_partial_page_restores_at_target_page_boundaries(endpoint):
     pool = ContinuationPool.allocate(("linear_attention", "indexed_attention"), 4, 8, 6, "cuda:0", mtp=True)
     commands = StateCommands.allocate("cuda:0")
     tables = torch.tensor([[0, 1, 2], [3, 4, 5], [-1, -1, -1], [-1, -1, -1]], device="cuda:0", dtype=torch.int32)
-    draft_tables = tables.clone()
+    # Helios shares complete target pages and shifts the draft view by one.
+    shared = endpoint // 256
+    tables[1, :shared] = tables[0, :shared]
+    draft_tables = torch.full_like(tables, -1)
+    draft_tables[:, :-1] = tables[:, 1:]
     requests = DeviceRequestState.allocate("cuda:0", vocab_size=128, consumed_tokens=pool.consumed_tokens[1:5, 0])
     state_rows = torch.arange(1, 5, device="cuda:0")[:, None].expand(4, 8).contiguous()
     operation = PreparedStateTransfer(pool, commands, tables, pages=pool.partial_pages(), page_tokens=256, state_rows=state_rows, requests=requests,
@@ -160,7 +164,11 @@ def test_mtp_trailing_partial_page_restores_at_target_page_boundaries(endpoint):
     pool.consumed_tokens[1] = endpoint
     for _, cache in (*pool.partial_pages(), *pool.draft_pages()):
         cache.random_(0, 256)
-    expected = {name: cache[(endpoint - 1) // 256].clone() for name, cache in pool.draft_pages()}
+    logical = [endpoint // 256 - 1] if endpoint > 1 and endpoint // 256 > 0 else []
+    if endpoint > 1 and endpoint % 256 >= 2:
+        logical.append(endpoint // 256)
+    expected = {(name, page): cache[draft_tables[0, page]].clone()
+                for name, cache in pool.draft_pages() for page in logical}
     graph = torch.cuda.CUDAGraph()
     _commands(commands, [(1, 5, 0, endpoint)])
     with torch.cuda.graph(graph):
@@ -174,12 +182,50 @@ def test_mtp_trailing_partial_page_restores_at_target_page_boundaries(endpoint):
     torch.cuda.synchronize()
     assert not commands.errors.count_nonzero()
     for name, cache in pool.draft_pages():
-        if (endpoint - 1) % 256:
-            torch.testing.assert_close(cache[3 + (endpoint - 1) // 256], expected[name], rtol=0, atol=0)
-    if (endpoint - 1) % 256:
+        for page in logical:
+            torch.testing.assert_close(cache[draft_tables[1, page]], expected[name, page], rtol=0, atol=0)
+    if logical:
         before = pool.backing.clone()
-        draft_tables[1, (endpoint - 1) // 256] = -1
+        draft_tables[1, logical[-1]] = -1
         graph.replay()
         torch.cuda.synchronize()
         assert commands.errors[0] == 6
         torch.testing.assert_close(pool.backing, before, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("snapshot", [False, True])
+def test_shifted_draft_boundary_aliases_are_validated_across_both_saved_pages(snapshot):
+    pool = ContinuationPool.allocate(("indexed_attention",), 4, 8, 6, "cuda:0", mtp=True)
+    commands = StateCommands.allocate("cuda:0")
+    tables = torch.tensor([[0, 1, 2], [3, 4, 5], [-1, -1, -1], [-1, -1, -1]],
+                          device="cuda", dtype=torch.int32)
+    # A preceding full page in lane zero aliases lane one's current partial page.
+    draft_tables = torch.tensor([[4, 2, -1], [4, 5, -1], [-1, -1, -1], [-1, -1, -1]],
+                                device="cuda", dtype=torch.int32)
+    requests = DeviceRequestState.allocate("cuda:0", vocab_size=128,
+                                          consumed_tokens=pool.consumed_tokens[1:5, 0])
+    state_rows = torch.arange(1, 5, device="cuda")[:, None].expand(4, 8).contiguous()
+    operation = PreparedStateTransfer(pool, commands, tables, pages=pool.partial_pages(),
+        page_tokens=256, state_rows=state_rows, requests=requests,
+        trailing_pages=pool.draft_pages(), trailing_tables=draft_tables)
+    operation.prepare()
+    pool.backing.random_(0, 256)
+    for _, cache in (*pool.partial_pages(), *pool.draft_pages()):
+        cache.random_(0, 256)
+    for live, saved, endpoint in ((1, 5, 257), (2, 6, 2)):
+        pool.consumed_tokens[live if snapshot else saved] = endpoint
+    rows = [(1, 5, 0, 257), (2, 6, 0, 2)] if snapshot else [(5, 1, 0, 257), (6, 2, 0, 2)]
+    _commands(commands, rows)
+    before = pool.backing.clone()
+    caches = {name: cache.clone() for name, cache in (*pool.partial_pages(), *pool.draft_pages())}
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        operation.validate()
+        operation.apply()
+    graph.replay()
+    torch.cuda.synchronize()
+    assert commands.errors[:2].tolist() == ([0, 0] if snapshot else [4, 4])
+    if not snapshot:
+        torch.testing.assert_close(pool.backing, before, rtol=0, atol=0)
+    for name, cache in (*pool.partial_pages(), *pool.draft_pages()):
+        torch.testing.assert_close(cache, caches[name], rtol=0, atol=0)
