@@ -303,18 +303,23 @@ class RecordedPreparationSession(PreparationSession):
                 bounded = max(1, bounded)
             if bounded < self.compile_workers:
                 self.configure_compile_workers(bounded)
-            with ExitStack() as display_stack:
-                update = progress
-                if show_progress:
-                    display = display_stack.enter_context(PreparationDisplay(
-                        global_rank=0, console=console, transient=True))
+            jobs = self._jobs(requests)
+            for index, job in enumerate(jobs, 1):
+                # A completed b12x job stops its live display. Each job needs its own lifecycle.
+                with ExitStack() as display_stack:
+                    update = progress
+                    if show_progress:
+                        title = "b12x / kernel autotuning"
+                        if len(jobs) > 1:
+                            title += f" · job {index}/{len(jobs)}"
+                        display = display_stack.enter_context(PreparationDisplay(
+                            global_rank=0, console=console, transient=True, title=title))
 
-                    def update(status):
-                        display.update(status)
-                        if progress is not None:
-                            progress(status)
+                        def update(status):
+                            display.update(status)
+                            if progress is not None:
+                                progress(status)
 
-                for job in self._jobs(requests):
                     results.append(self._prepare_job(job, progress=update, autotune=self.autotune))
             if self._stop.is_set():
                 raise RuntimeError("b12x tuning was cancelled before serving preparation completed")
@@ -398,7 +403,7 @@ class RecordedPreparationSession(PreparationSession):
             finally:
                 result = None
                 results.clear()
-                requests = job = ()
+                requests = job = jobs = ()
                 request = None
                 callback = None
                 self._benchmark_resources.clear()

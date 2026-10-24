@@ -145,6 +145,11 @@ device memory can reduce it; local preparation ranks share the budget. Set
 overrides that setting. Omitting both retains automatic sizing, including
 shared-memory limits on DGX Spark.
 
+On integrated GPUs, kernel tuning is divided into memory-bounded jobs. The
+terminal dashboard shows the active job number and total job count, with a
+separate live display for each job. Redirecting output records plain kernel
+progress milestones instead of the terminal dashboard.
+
 `--tuning-gpus LIST` adds local GPU replicas for benchmarking b12x candidates.
 The list begins with `--gpus` and continues in complete TP groups: for example,
 `--gpus 0 --tuning-gpus 0-3 --compile-workers 24` prepares a TP1 package with

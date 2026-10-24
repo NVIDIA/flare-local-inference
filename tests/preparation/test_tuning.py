@@ -219,6 +219,53 @@ def test_preparation_failure_prevents_binding_or_capture(backend):
         session.freeze()
 
 
+def test_terminal_progress_remains_live_for_every_tuning_job(backend, monkeypatch):
+    from io import StringIO
+
+    from b12x.preparation import PreparationProgress
+    from rich.console import Console
+
+    from ignition.preparation import tuning
+    from ignition.progress import StartupProgress, phase
+
+    session = make_session(device=0, checkpoint="terminal-progress")
+    requests = (declaration("first"), declaration("second"))
+    session.declare(requests)
+    monkeypatch.setattr(session, "_jobs", lambda requests: tuple((item,) for item in requests))
+    displays, statuses = [], []
+    display_type = tuning.PreparationDisplay
+
+    def display(**options):
+        instance = display_type(**options)
+        displays.append(instance)
+        return instance
+
+    monkeypatch.setattr(tuning, "PreparationDisplay", display)
+    prepare = session._prepare_job
+
+    def prepare_job(requests, *, progress, autotune):
+        status = PreparationProgress(False, False, (), False,
+                                     request_name=requests[0].name, phase="planning")
+        progress(status)
+        assert displays[-1]._live.is_started
+        result = prepare(requests, progress=progress, autotune=autotune)
+        progress(replace(status, done=True))
+        assert not displays[-1]._live.is_started
+        return result
+
+    monkeypatch.setattr(session, "_prepare_job", prepare_job)
+    startup = StartupProgress()
+    startup.console = Console(file=StringIO(), force_terminal=True, width=120)
+    with phase(startup, "Prepare and tune kernels") as stage:
+        session.tune(progress=statuses.append, show_progress=True, console=stage.console)
+        assert stage.live.is_started
+    assert len(displays) == 2
+    assert [item._title for item in displays] == [
+        "b12x / kernel autotuning · job 1/2", "b12x / kernel autotuning · job 2/2"]
+    assert [(status.request_name, status.done) for status in statuses] == [
+        ("first", False), ("first", True), ("second", False), ("second", True)]
+
+
 def test_standalone_preparation_still_precedes_binding(backend):
     session = PreparationSession(device=0, namespace={}, autotune=True, compile_workers=0)
     events = []
