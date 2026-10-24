@@ -370,7 +370,7 @@ fn atomic_prefill_respects_spans_without_a_duration_cap() {
 }
 
 #[test]
-fn short_prefill_does_not_explore_padding_after_the_smallest_shape_is_measured() {
+fn short_prefill_absorbs_a_tiny_final_segment_after_the_smallest_shape_is_measured() {
     let mut s = cold_engine(1, false);
     s.prefill_graphs(&[64, 128, 512]).unwrap();
     let h = add(&mut s, 1, 130, 32);
@@ -379,11 +379,12 @@ fn short_prefill_does_not_explore_padding_after_the_smallest_shape_is_measured()
     let first = measured_step(&mut s, MS, 0);
     assert_eq!((first.token_capacity, first.lanes[0].tokens), (64, 17));
     assert_eq!(measured_step(&mut s, MS / 10, 0).kind, GraphKind::Snapshot);
+    // The 48-token final message segment rides along with the 65-token middle
+    // segment instead of paying a prefill graph of its own.
     let second = measured_step(&mut s, 2 * MS, 0);
-    assert_eq!((second.token_capacity, second.lanes[0].tokens), (128, 65));
+    assert_eq!((second.token_capacity, second.lanes[0].tokens), (128, 113));
     assert_eq!(measured_step(&mut s, MS / 10, 0).kind, GraphKind::Snapshot);
-    let tail = s.plan().unwrap();
-    assert_eq!((tail.token_capacity, tail.lanes[0].tokens), (64, 48));
+    assert_ne!(s.plan().unwrap().kind, GraphKind::Prefill);
 }
 
 #[test]

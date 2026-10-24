@@ -274,15 +274,35 @@ impl RequestScheduler {
         if kind == GraphKind::ScoredPrefill { &self.scored_prefill_catalog } else { &self.prefill_catalog }
     }
 
+    /// A trailing message segment shorter than this is absorbed into the
+    /// preceding chunk instead of running as its own prefill graph. One extra
+    /// graph costs about as much as a full chunk's worth of short-batch work,
+    /// so a chat turn whose final message is a few dozen tokens otherwise pays
+    /// that fixed cost for every request.
+    fn prefill_tail_merge_limit(capacity: usize) -> usize {
+        (capacity / 16).clamp(64, 512)
+    }
+
     pub(super) fn prefill_work(&self, request: &LiveRequest, capacity: usize) -> usize {
         let start = request.consumed_tokens as usize;
+        let limit = request.prefill_limit();
         let mut end = request
             .message_boundaries
             .get(request.message_boundaries.partition_point(|&n| n <= start))
             .copied()
             .unwrap_or(request.prompt_tokens)
             .min(start.saturating_add(capacity))
-            .min(request.prefill_limit());
+            .min(limit);
+        // Absorb a short final message segment when the whole remainder fits in
+        // this chunk. The prompt-end checkpoint is still published, so the only
+        // loss is the boundary checkpoint between the last two messages, which
+        // the next turn's longer prompt-end checkpoint supersedes.
+        if end < request.prompt_tokens
+            && request.prompt_tokens <= start.saturating_add(capacity).min(limit)
+            && request.prompt_tokens - end <= Self::prefill_tail_merge_limit(capacity)
+        {
+            end = request.prompt_tokens;
+        }
         if let Some(span) = request
             .prefill_spans
             .iter()

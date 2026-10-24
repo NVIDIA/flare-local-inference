@@ -270,12 +270,12 @@ fn prompt_6459_retains_exact_prompt_and_terminal_with_immutable_admission_reuse(
 #[test]
 fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
     let mut s = scheduler(2, false);
-    let h = s.admit(spec(Some(10), 70, 3)).unwrap();
+    let h = s.admit(spec(Some(10), 200, 3)).unwrap();
     assert_eq!(s.free_snapshot_count(), 2);
     assert_eq!(s.stats().active_requests, 1);
     finish(&mut s, h);
     let mut s = scheduler(3, false);
-    let h = s.admit(spec(Some(10), 70, 3)).unwrap();
+    let h = s.admit(spec(Some(10), 200, 3)).unwrap();
     assert_eq!(s.free_snapshot_count(), 3);
     stop_at_capture(&mut s, h, 10);
     let step = s.plan().unwrap();
@@ -301,8 +301,8 @@ fn boundary_snapshots_are_optional_and_cancel_behind_fence() {
 #[test]
 fn duplicate_boundary_publication_does_not_remap_live_partial_pages() {
     let mut s = scheduler(6, false);
-    let a = s.admit(spec(Some(10), 70, 2)).unwrap();
-    let b = s.admit(spec(Some(10), 70, 2)).unwrap();
+    let a = s.admit(spec(Some(10), 200, 2)).unwrap();
+    let b = s.admit(spec(Some(10), 200, 2)).unwrap();
     stop_at_capture(&mut s, a, 10);
     run_step(&mut s);
     stop_at_capture(&mut s, b, 10);
@@ -466,8 +466,8 @@ fn message_and_prompt_checkpoints_evict_complete_page_chains_under_pressure() {
         let turns = capacity + 3;
         let mut lengths = Vec::new();
         for turn in 0..turns {
-            let length = 160 + 64 * turn;
-            let mut request = spec(Some(length - 10), length, 1);
+            let length = 192 + 64 * turn;
+            let mut request = spec(Some(length - 128), length, 1);
             request.prompt[0] = (turn + 1) as u32;
             let handle = s.admit(request).unwrap();
             while s.request(handle).unwrap().phase != RequestPhase::Finishing {
@@ -479,7 +479,7 @@ fn message_and_prompt_checkpoints_evict_complete_page_chains_under_pressure() {
         let pairs = capacity / 2;
         let mut pages: usize = lengths[lengths.len() - pairs..].iter().map(|n| n / 64).sum();
         if capacity % 2 != 0 {
-            pages += (lengths[lengths.len() - pairs - 1] - 10) / 64;
+            pages += lengths[lengths.len() - pairs - 1] / 64;
         }
         assert_eq!(s.stats().cached_checkpoints, capacity);
         assert_eq!(s.stats().cached_pages, pages);
