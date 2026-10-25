@@ -86,6 +86,33 @@ def test_payload_promotion_preserves_rank_and_rebuild_metadata(tmp_path):
     assert after_deployment.rebuild.SerializeToString(deterministic=True) == index.rebuild.SerializeToString(deterministic=True)
 
 
+def test_payload_promotion_carries_the_exported_license(tmp_path):
+    """Signing rewrites publisher identity only; the checkpoint's recorded license survives."""
+    from dataclasses import replace
+    from ignition.preparation.protection import License
+    from tests.preparation.test_package_protection import development_publisher, development_profile
+
+    license_link = 'https://huggingface.co/example/model/blob/abcdef/LICENSE'
+    original = replace(development_publisher(), license=License('apache-2.0', license_link))
+    source = rank_source(tmp_path / 'source')
+    output = tmp_path / 'development'
+    combine(output, [source], [], publisher=original)
+    recorded = schema()('PackageBody').FromString(manifest(output).package_body).publisher
+    assert (recorded.license_name, recorded.license_link) == ('apache-2.0', license_link)
+    target = publisher()
+    promoted = tmp_path / 'production'
+    payload_promote(output, promoted, publisher=target, profiles=[development_profile(original)],
+                    accepted=original.namespace, target_accepted=target.namespace,
+                    target_publisher=dict(namespace=target.namespace, official_source=target.official_source,
+                                          development=False, license_name='', license_link=''))
+    envelope = verify_signatures(promoted, Ed25519PublicKey.from_public_bytes(target.public_key))
+    publisher_metadata = schema()('PackageBody').FromString(envelope.package_body).publisher
+    assert publisher_metadata.namespace == target.namespace
+    assert publisher_metadata.official_source == target.official_source
+    assert not publisher_metadata.development
+    assert (publisher_metadata.license_name, publisher_metadata.license_link) == ('apache-2.0', license_link)
+
+
 @pytest.mark.parametrize('operation', ['convert', 'sign'])
 def test_cli_rejects_legacy_publication_without_creating_output(tmp_path, operation):
     from types import SimpleNamespace

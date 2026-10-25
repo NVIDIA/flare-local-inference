@@ -173,3 +173,42 @@ def test_password_change_reports_replacement_when_directory_sync_fails(tmp_path,
         signing.change_password(path)
     serialization.load_pem_private_key(path.read_bytes(), new)
     assert not list(directory.glob('.signing-key.pem-*'))
+
+
+def test_sign_promotes_the_identity_and_keeps_the_exported_license(tmp_path, monkeypatch):
+    """A signed package shows the same license terms the export recorded from the model card."""
+    from dataclasses import replace
+    from types import SimpleNamespace
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
+    from ignition.cli import publishing
+    from ignition.preparation.protection import License
+    from tests.preparation.payload_fixture import manifest, publish, schema, verify_signatures
+    from tests.preparation.test_package_protection import development_publisher
+
+    license_link = 'https://huggingface.co/example/model/blob/abcdef/LICENSE'
+    signer = replace(development_publisher(), license=License('apache-2.0', license_link))
+    source = publish(tmp_path / 'exported', signer)
+
+    password = b'fixture-passphrase-not-a-production-secret'
+    monkeypatch.setattr(signing, 'passphrase', lambda prompt: password)
+    keys = tmp_path / 'keys'
+    signing.generate(keys, 'Example publisher', 'example', password)
+    profile_path = tmp_path / 'development-publisher.json'
+    profile_path.write_text(json.dumps([{'namespace': signer.namespace, 'development': signer.development,
+                                         'public_key': list(signer.public_key)}]))
+    config = tmp_path / 'config.toml'
+    config.write_text('')
+    output = tmp_path / 'signed'
+    args = SimpleNamespace(package=source, output=output, config=config,
+                           signing_key=keys / 'signing-key.pem', namespace='example',
+                           official_source='https://huggingface.co/example/model',
+                           development_publisher=profile_path)
+    publishing.sign(args)
+
+    publisher = schema()('PackageBody').FromString(manifest(output).package_body).publisher
+    assert publisher.namespace == 'example'
+    assert publisher.official_source == 'https://huggingface.co/example/model'
+    assert not publisher.development
+    assert (publisher.license_name, publisher.license_link) == ('apache-2.0', license_link)
+    profile = json.loads((keys / 'publisher.json').read_text())[0]
+    verify_signatures(output, Ed25519PublicKey.from_public_bytes(bytes(profile['public_key'])))

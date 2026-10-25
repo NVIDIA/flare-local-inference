@@ -7480,10 +7480,11 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(
-            verified.package().publisher.as_ref().unwrap().namespace,
-            "other"
-        );
+        let publisher = verified.package().publisher.as_ref().unwrap();
+        assert_eq!(publisher.namespace, "other");
+        assert_eq!(publisher.official_source, "https://huggingface.co/other/model");
+        assert_eq!(publisher.license_name, "Example");
+        assert_eq!(publisher.license_link, "");
         let authorized = verified.authorize("other").unwrap();
         let payloads = metadata
             .payloads(
