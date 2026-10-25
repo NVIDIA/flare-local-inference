@@ -440,7 +440,11 @@ pub(crate) fn install_blob(temporary: &Path, destination: &Path) -> Result<()> {
             )
         } != 0
         {
-            return Err(std::io::Error::last_os_error().into());
+            return install_blob_after_rename_error(
+                temporary,
+                destination,
+                std::io::Error::last_os_error(),
+            );
         }
     }
     #[cfg(windows)]
@@ -458,6 +462,22 @@ pub(crate) fn install_blob(temporary: &Path, destination: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+#[cfg(any(target_os = "linux", test))]
+fn install_blob_after_rename_error(
+    temporary: &Path,
+    destination: &Path,
+    error: std::io::Error,
+) -> Result<()> {
+    if error
+        .raw_os_error()
+        .is_some_and(|code| code == libc::EINVAL || code == libc::ENOTSUP)
+    {
+        std::fs::hard_link(temporary, destination)?;
+        std::fs::remove_file(temporary)?;
+        return Ok(());
+    }
+    Err(error.into())
 }
 pub(crate) fn remove_temporary(path: &Path) -> Result<()> {
     #[cfg(unix)]
@@ -583,6 +603,70 @@ pub(crate) fn sync_directory(path: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn unsupported_noreplace_rename_installs_blob_with_a_hard_link() {
+        for code in [libc::EINVAL, libc::ENOTSUP] {
+            let directory = tempfile::tempdir().unwrap();
+            let temporary = directory.path().join("blob.tmp");
+            let destination = directory.path().join("blob");
+            std::fs::write(&temporary, b"payload").unwrap();
+
+            install_blob_after_rename_error(
+                &temporary,
+                &destination,
+                std::io::Error::from_raw_os_error(code),
+            )
+            .unwrap();
+
+            assert_eq!(std::fs::read(&destination).unwrap(), b"payload");
+            assert!(!temporary.exists());
+        }
+    }
+    #[test]
+    fn unsupported_noreplace_rename_does_not_replace_an_existing_blob() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("blob.tmp");
+        let destination = directory.path().join("blob");
+        std::fs::write(&temporary, b"new payload").unwrap();
+        std::fs::write(&destination, b"existing payload").unwrap();
+
+        let error = install_blob_after_rename_error(
+            &temporary,
+            &destination,
+            std::io::Error::from_raw_os_error(libc::EINVAL),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::AlreadyExists)
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"existing payload");
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"new payload");
+    }
+    #[test]
+    fn other_rename_errors_are_preserved_without_installing_the_blob() {
+        let directory = tempfile::tempdir().unwrap();
+        let temporary = directory.path().join("blob.tmp");
+        let destination = directory.path().join("blob");
+        std::fs::write(&temporary, b"payload").unwrap();
+
+        let error = install_blob_after_rename_error(
+            &temporary,
+            &destination,
+            std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        )
+        .unwrap_err();
+
+        assert!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied)
+        );
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"payload");
+    }
     #[test]
     fn blob_header_preserves_python_content_identity() {
         use sha2::{Digest, Sha256};
