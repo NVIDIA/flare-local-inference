@@ -166,12 +166,13 @@ def sign(args):
             raise UsageError('legacy package format is unsupported; re-export the model with Ignition')
         publisher = _publisher(args, configuration)
         source_profile = _source_profile(args, configuration)
+        # The license describes the checkpoint, not the publisher: the native
+        # promotion carries the name and link the export recorded over to the
+        # signed package, so the target identity rewrites namespace and key only.
         target = {
             'namespace': publisher.namespace,
             'official_source': publisher.official_source,
             'development': publisher.development,
-            'license_name': '' if publisher.license is None else publisher.license.name,
-            'license_link': '' if publisher.license is None else publisher.license.link,
         }
         result = payload_promote(args.package, args.output, publisher=publisher,
                                  profiles=[source_profile],

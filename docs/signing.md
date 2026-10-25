@@ -105,8 +105,9 @@ with `--development-publisher PATH`. The development private key is unnecessary.
 
 Signing a payload-format package verifies its source signatures and stored
 payloads, then signs its deployments and ranks under the production identity
-with a fresh package ID. Weight bytes and prepared execution contracts are
-preserved. Executable resources are authenticated, decoded, and re-encoded as
+with a fresh package ID. Weight bytes, the model license the export recorded
+from the model card, and prepared execution contracts are preserved.
+Executable resources are authenticated, decoded, and re-encoded as
 independent zstd level-3 frames; decoded bytes remain exact, while compressed
 frame bytes may change.
 

@@ -134,8 +134,11 @@ def test_payload_cache_convert_combine_and_promote(tmp_path):
     replay(combined, "combined")
 
     promoted = tmp_path / "promoted"
-    target = {"namespace": publisher().namespace, "official_source": publisher().official_source,
-              "development": False, "license_name": "", "license_link": ""}
+    target = {
+        "namespace": publisher().namespace,
+        "official_source": publisher().official_source,
+        "development": False,
+    }
     payload_promote(combined, promoted, publisher=publisher(), profiles=[profile()],
                     accepted=publisher().namespace, target_accepted=publisher().namespace,
                     target_publisher=target)

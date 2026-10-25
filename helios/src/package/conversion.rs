@@ -2510,14 +2510,14 @@ fn publish_staged_file(staging: &Path, destination: &Path) -> Result<()> {
 /// Inputs for producing one signed package containing several prepared TP
 /// deployments. The canonical deployment is chosen internally as the lowest
 /// exported tensor-parallel size, never from caller order.
-/// Publisher identity written into a promoted or combined package.
+/// Publisher identity written into a promoted or combined package. The model
+/// license describes the checkpoint, not the publisher, so promotion carries
+/// it over from the source package instead of accepting one here.
 #[derive(Clone, Debug, serde::Deserialize)]
 pub struct TargetPublisher {
     pub namespace: String,
     pub official_source: String,
     pub development: bool,
-    pub license_name: String,
-    pub license_link: String,
 }
 
 pub struct CombineRequest<'a> {
@@ -3206,12 +3206,15 @@ pub fn combine(request: &CombineRequest<'_>) -> Result<crate::package::export::P
         package.payloads.clear();
         package.deployments.clear();
         if let Some(target) = request.target_publisher {
+            // The license belongs to the checkpoint, so the identity rewrite
+            // keeps the name and link the export recorded from the model card.
+            let recorded = canonical_source.package.publisher.as_ref();
             package.publisher = Some(wire::PublisherMetadata {
                 namespace: target.namespace.clone(),
                 official_source: target.official_source.clone(),
                 development: target.development,
-                license_name: target.license_name.clone(),
-                license_link: target.license_link.clone(),
+                license_name: recorded.map_or_else(String::new, |p| p.license_name.clone()),
+                license_link: recorded.map_or_else(String::new, |p| p.license_link.clone()),
                 ranks: 0,
             });
         }
@@ -7457,8 +7460,6 @@ mod tests {
             namespace: "other".into(),
             official_source: "https://huggingface.co/other/model".into(),
             development: false,
-            license_name: "Other".into(),
-            license_link: String::new(),
         };
         promote(
             &source,
@@ -7482,7 +7483,10 @@ mod tests {
         .unwrap();
         let publisher = verified.package().publisher.as_ref().unwrap();
         assert_eq!(publisher.namespace, "other");
-        assert_eq!(publisher.official_source, "https://huggingface.co/other/model");
+        assert_eq!(
+            publisher.official_source,
+            "https://huggingface.co/other/model"
+        );
         assert_eq!(publisher.license_name, "Example");
         assert_eq!(publisher.license_link, "");
         let authorized = verified.authorize("other").unwrap();

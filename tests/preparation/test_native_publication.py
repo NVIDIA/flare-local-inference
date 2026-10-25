@@ -77,7 +77,7 @@ def test_payload_promotion_preserves_rank_and_rebuild_metadata(tmp_path):
     payload_promote(output, promoted, publisher=target, profiles=[development_profile(original)],
                     accepted=original.namespace, target_accepted=target.namespace,
                     target_publisher=dict(namespace=target.namespace, official_source=target.official_source,
-                                          development=False, license_name='', license_link=''))
+                                          development=False))
     after = verify_signatures(promoted, Ed25519PublicKey.from_public_bytes(target.public_key))
     assert [rank.body for rank in before.ranks] == [rank.body for rank in after.ranks]
     before_deployment = schema()('DeploymentBody').FromString(before.deployments[0].body)
@@ -104,7 +104,7 @@ def test_payload_promotion_carries_the_exported_license(tmp_path):
     payload_promote(output, promoted, publisher=target, profiles=[development_profile(original)],
                     accepted=original.namespace, target_accepted=target.namespace,
                     target_publisher=dict(namespace=target.namespace, official_source=target.official_source,
-                                          development=False, license_name='', license_link=''))
+                                          development=False))
     envelope = verify_signatures(promoted, Ed25519PublicKey.from_public_bytes(target.public_key))
     publisher_metadata = schema()('PackageBody').FromString(envelope.package_body).publisher
     assert publisher_metadata.namespace == target.namespace
