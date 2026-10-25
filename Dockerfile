@@ -13,6 +13,8 @@ RUN apt-get update \
 WORKDIR /src
 COPY flare/ flare/
 COPY helios/ helios/
+# Local patch: helios include!s chat templates from ignition/recipes at compile time.
+COPY ignition/recipes/ ignition/recipes/
 
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

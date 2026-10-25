@@ -18,3 +18,7 @@ helios/**
 !helios/proto/**
 !helios/native/
 !helios/native/**
+!ignition/
+ignition/**
+!ignition/recipes/
+!ignition/recipes/**
