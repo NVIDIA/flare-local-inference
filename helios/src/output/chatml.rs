@@ -18,6 +18,43 @@ impl<const WRAPPING_NEWLINES: bool> ToolDialect for FunctionTags<WRAPPING_NEWLIN
     fn parse(body: &str, tools: &[Value]) -> Result<Vec<(String, String)>> {
         Ok(vec![parse_tool(body, tools, WRAPPING_NEWLINES)?])
     }
+    fn starts_call(text: &str) -> Option<bool> {
+        // Calls continue with `<function=NAME>` and a parameter or closing tag; quoted
+        // or inline tags followed by prose remain text.
+        let text = text.strip_prefix(Self::OPEN).map_or(text, str::trim_start);
+        let Some(header) = text.strip_prefix("<function=") else {
+            return if "<function=".starts_with(text) {
+                None
+            } else {
+                Some(false)
+            };
+        };
+        let end = header.find(|c: char| c == '>' || c == '<' || c.is_whitespace())?;
+        let Some(body) = header[end..].strip_prefix('>') else {
+            return Some(false);
+        };
+        let body = body.trim_start();
+        if body.is_empty() {
+            return None;
+        }
+        let Some(tag) = body.strip_prefix('<') else {
+            return Some(false);
+        };
+        let tag = tag.trim_start();
+        if ["parameter", "/function>"]
+            .iter()
+            .any(|next| tag.starts_with(next))
+        {
+            Some(true)
+        } else if ["parameter", "/function>"]
+            .iter()
+            .any(|next| next.starts_with(tag))
+        {
+            None
+        } else {
+            Some(false)
+        }
+    }
 }
 pub type ChatMlOutput = TaggedOutput<FunctionTags<true>>;
 pub type CompactChatMlOutput = TaggedOutput<FunctionTags<false>>;
@@ -482,6 +519,82 @@ mod tests {
             )
             .unwrap();
             assert_eq!(args["city"], "\n    café\n\n", "split {split}");
+        }
+    }
+    #[test]
+    fn prose_tool_tag_mentions_remain_text_with_registered_tools() {
+        let call = "<tool_call>\n<function=lookup>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>";
+        for (start, text, reasoning, content, calls) in [
+            (
+                crate::output::tagged::OutputStart::Content,
+                "The parser chokes on a literal `<tool_call>` tag in normal text. END".to_owned(),
+                None,
+                "The parser chokes on a literal `<tool_call>` tag in normal text. END",
+                0,
+            ),
+            (
+                crate::output::tagged::OutputStart::Content,
+                "Write `<function=lookup>` or <tool_call>\nliterally, or `<tool_call><function=shell>` inline.".to_owned(),
+                None,
+                "Write `<function=lookup>` or <tool_call>\nliterally, or `<tool_call><function=shell>` inline.",
+                0,
+            ),
+            (
+                crate::output::tagged::OutputStart::Content,
+                format!("Quote `<tool_call>` first.\n\n{call}"),
+                None,
+                "Quote `<tool_call>` first.",
+                1,
+            ),
+            (
+                crate::output::tagged::OutputStart::Reasoning,
+                format!("Mention `<tool_call>` here.\n</think>\n\nThen `<function=x>`.\n\n{call}"),
+                Some("Mention `<tool_call>` here."),
+                "Then `<function=x>`.",
+                1,
+            ),
+        ] {
+            for split in text.char_indices().map(|(at, _)| at) {
+                let mut parser = Harness::new(OutputConfig { start, ..config() }, "x".into());
+                parser.push(&text[..split]).unwrap();
+                parser.push(&text[split..]).unwrap();
+                parser.finish().unwrap();
+                let message = parser.message();
+                assert_eq!(message["content"], content, "{text:?} at {split}");
+                assert_eq!(
+                    message.get("reasoning_content").and_then(Value::as_str),
+                    reasoning,
+                    "{text:?} at {split}"
+                );
+                assert_eq!(
+                    message["tool_calls"].as_array().map_or(0, Vec::len),
+                    calls,
+                    "{text:?} at {split}"
+                );
+            }
+        }
+    }
+    #[test]
+    fn compact_calls_directly_after_text_still_parse() {
+        let text = "Checking.<tool_call><function=lookup><parameter=city>Paris</parameter></function></tool_call>";
+        for split in text.char_indices().map(|(at, _)| at) {
+            let mut parser = CompactChatMlOutput::new(OutputConfig {
+                start: crate::output::tagged::OutputStart::Content,
+                ..config()
+            });
+            let mut output = Accumulator::new("compact".into());
+            for part in [&text[..split], &text[split..]] {
+                output
+                    .apply(parser.push(Input::Text(part)).unwrap())
+                    .unwrap();
+            }
+            output
+                .apply(parser.finish(Termination::Eos).unwrap())
+                .unwrap();
+            output.finish().unwrap();
+            let message = output.message();
+            assert_eq!(message["content"], "Checking.", "split {split}");
+            assert_eq!(message["tool_calls"][0]["function"]["name"], "lookup");
         }
     }
     #[test]

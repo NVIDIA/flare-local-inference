@@ -1083,7 +1083,7 @@ mod logprob_retention_tests {
     use crate::{execution::TokenLogprobs, output::{OutputConfig, OutputPipeline, tagged::{OutputConfig as Tags, OutputStart}}};
     #[test]
     fn responses_discard_unfinished_tool_body_entries_as_the_body_arrives() {
-        let frontend = super::tests::frontend(&["<tool_call>", "<function=lookup>", "xxxxxxxx"]);
+        let frontend = super::tests::frontend(&["<tool_call>", "<function=lookup>", "<parameter=q>", "xxxxxxxx"]);
         let mut syntax = crate::model::testing::metadata().frontend;
         syntax.tools = Some(crate::model::contract::ToolParser {
             kind: crate::model::contract::ToolParserKind::QwenCoder,
@@ -1095,9 +1095,10 @@ mod logprob_retention_tests {
         } };
         let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
         decoder.track_logprobs(&frontend, true);
-        for token in [vec![0,1],vec![2;1024]].concat() {
+        for (index, token) in [vec![0,1,2],vec![3;1024]].concat().into_iter().enumerate() {
             decoder.push_logprob(TokenLogprobs { token, logprob: -1., top: vec![] }).unwrap();
-            assert!(decoder.pending_entries.is_empty());
+            // The opener and header stay pending until the parameter tag confirms the call.
+            assert_eq!(decoder.pending_entries.is_empty(), index >= 2);
         }
         assert!(decoder.finish(Termination::OutputLimit).unwrap().is_empty());
     }
