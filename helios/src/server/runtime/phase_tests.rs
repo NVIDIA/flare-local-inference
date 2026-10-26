@@ -716,6 +716,39 @@ fn exact_system_and_prompt_checkpoints_publish_only_after_snapshot_completion() 
 }
 
 #[test]
+fn ignored_eos_at_the_output_limit_finishes_for_length() {
+    let fixture = Fixture::new();
+    let (sender, receiver) = mpsc::channel();
+    let (mut incoming, mut generation) = fixture.incoming(vec![0], 2);
+    incoming.prompt.ignore_eos = true;
+    sender.send(vec![incoming]).unwrap();
+    let mut worker = fixture.worker(receiver);
+    assert_eq!(worker.admit().unwrap(), ControlFlow::Continue(true));
+    advance(&mut worker, GraphKind::Init, 1, None);
+    advance(&mut worker, GraphKind::Prefill, 2, Some(5));
+    advance(&mut worker, GraphKind::Snapshot, 3, None);
+    advance(&mut worker, GraphKind::Decode, 4, Some(5));
+    advance(&mut worker, GraphKind::Snapshot, 5, None);
+    assert!(worker.publish().unwrap());
+    let mut finished = Vec::new();
+    while let Ok(event) = generation.events.try_recv() {
+        if let GenerationEvent::Finished {
+            generated_tokens,
+            reason,
+            termination,
+            ..
+        } = event
+        {
+            finished.push((generated_tokens, reason, termination));
+        }
+    }
+    assert_eq!(
+        finished,
+        vec![(2, "length", crate::output::Termination::OutputLimit)]
+    );
+}
+
+#[test]
 fn disabled_host_store_preserves_decode_prefix_reuse_and_cancellation() {
     let fixture = Fixture::new();
     let (sender, receiver) = mpsc::channel();
