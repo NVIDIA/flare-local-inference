@@ -26,12 +26,10 @@ eos/**
 !eos/src/**
 !selene/
 selene/**
-!selene/selene/
-selene/selene/**
-!selene/selene/Cargo.toml
-!selene/selene/Cargo.lock
-!selene/selene/src/
-!selene/selene/src/**
+!selene/Cargo.toml
+!selene/Cargo.lock
+!selene/src/
+!selene/src/**
 !ignition/recipes/qwen38/assets/
 !ignition/recipes/qwen38/assets/**
 !ignition/recipes/step5/assets/

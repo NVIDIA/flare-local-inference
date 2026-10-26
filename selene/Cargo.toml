@@ -16,7 +16,7 @@ default = []
 test-support = []
 
 [dependencies]
-flare-eos = { path = "../../eos" }
+flare-eos = { path = "../eos" }
 blake2 = "0.10"
 libc = "0.2.189"
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
