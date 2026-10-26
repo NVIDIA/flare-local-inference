@@ -13,7 +13,7 @@ struct Slot {
     pending: bool,
 }
 
-pub(crate) struct Queue {
+pub struct Queue {
     port: HANDLE,
     slots: Box<[Slot]>,
 }
@@ -22,7 +22,7 @@ pub(crate) struct Queue {
 unsafe impl Send for Queue {}
 
 impl Queue {
-    pub(crate) fn new(depth: usize) -> io::Result<Self> {
+    pub fn new(depth: usize) -> io::Result<Self> {
         let port =
             unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
         if port.is_null() {
@@ -40,7 +40,7 @@ impl Queue {
         })
     }
 
-    pub(crate) fn attach(&self, file: &File) -> io::Result<()> {
+    pub fn attach(&self, file: &File) -> io::Result<()> {
         if unsafe { CreateIoCompletionPort(file.as_raw_handle(), self.port, 0, 0) }.is_null() {
             return Err(io::Error::last_os_error());
         }
@@ -48,7 +48,7 @@ impl Queue {
     }
 
     /// The file must be attached to this queue. Retain it and the buffer until completion.
-    pub(crate) unsafe fn submit(
+    pub unsafe fn submit(
         &mut self,
         slot: usize,
         file: &File,
@@ -102,11 +102,11 @@ impl Queue {
         Ok(())
     }
 
-    pub(crate) fn pending(&self) -> usize {
+    pub fn pending(&self) -> usize {
         self.slots.iter().filter(|slot| slot.pending).count()
     }
 
-    pub(crate) fn wait(&mut self) -> io::Result<(usize, io::Result<usize>)> {
+    pub fn wait(&mut self) -> io::Result<(usize, io::Result<usize>)> {
         let mut bytes = 0;
         let mut key = 0;
         let mut operation = std::ptr::null_mut();
@@ -145,7 +145,7 @@ impl Queue {
         ))
     }
 
-    pub(crate) fn cancel(&mut self) {
+    pub fn cancel(&mut self) {
         for slot in &self.slots {
             if slot.pending {
                 unsafe {
@@ -155,7 +155,7 @@ impl Queue {
         }
     }
 
-    pub(crate) fn cancel_and_drain(&mut self) {
+    pub fn cancel_and_drain(&mut self) {
         self.cancel();
         // Cancellation is only a request. Keep buffers and OVERLAPPED records live until completion.
         while self.pending() != 0 {

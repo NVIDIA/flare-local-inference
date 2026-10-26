@@ -23,13 +23,13 @@ fn check(status: i32) -> io::Result<()> {
 }
 
 #[derive(Default)]
-pub(crate) struct Timings {
+pub struct Timings {
     pub submit: u64,
     pub wait: u64,
     pub complete: u64,
 }
 
-pub(crate) struct ReadRing {
+pub struct ReadRing {
     pub timings: Timings,
     handle: HIORING,
     event: HANDLE,
@@ -52,7 +52,7 @@ impl ReadRing {
     /// # Safety
     /// The depth * chunk_bytes writable bytes at address must remain valid until
     /// this ring is dropped. Do not read or reuse a slot before its completion.
-    pub(crate) unsafe fn new(
+    pub unsafe fn new(
         files: Vec<File>,
         address: usize,
         depth: usize,
@@ -224,7 +224,7 @@ impl ReadRing {
     /// consume the bytes before returning, when that slot becomes reusable.
     /// Complete every submitted read, including errors, before returning normally.
     /// An API failure poisons the ring: its slots cannot be reused before Drop drains.
-    pub(crate) fn read_all(
+    pub fn read_all(
         &mut self,
         reads: impl ExactSizeIterator<Item = (usize, u64, u32)>,
         mut complete: impl FnMut(usize, usize, io::Result<usize>),
@@ -290,7 +290,7 @@ impl ReadRing {
 }
 
 impl ReadRing {
-    pub(crate) fn cancel_and_drain(&mut self) {
+    pub fn cancel_and_drain(&mut self) {
         // CloseIoRing does NOT cancel or drain in-flight I/O. Cancel against the
         // private reader handle and retain all descriptors and buffers until drained.
         if self.in_flight != 0 {
@@ -331,8 +331,8 @@ mod tests {
             std::env::temp_dir().join(format!("flare-ioring-panic-{}.bin", std::process::id()));
         std::fs::write(&path, [0x71; 8192]).unwrap();
         let source = File::open(&path).unwrap();
-        let file = crate::os::direct_reopen(&source).unwrap();
-        let address = crate::os::allocate_aligned(8192).unwrap();
+        let file = crate::direct_reopen(&source).unwrap();
+        let address = crate::allocate_aligned(8192).unwrap();
         let mut ring = unsafe { ReadRing::new(vec![file], address, 2, 4096) }.unwrap();
         let failure = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _ = ring.read_all([(0, 0, 4096), (0, 4096, 4096)].into_iter(), |_, _, _| {
@@ -347,7 +347,7 @@ mod tests {
         );
         drop(ring);
         unsafe {
-            crate::os::free_aligned(address, 8192);
+            crate::free_aligned(address, 8192);
         }
         drop(source);
         std::fs::remove_file(path).unwrap();
@@ -359,9 +359,9 @@ mod tests {
         let bytes: Vec<u8> = (0..4096 * 256).map(|i| (i / 4096) as u8).collect();
         std::fs::write(&path, &bytes).unwrap();
         let source = File::open(&path).unwrap();
-        let file = crate::os::direct_reopen(&source).unwrap();
+        let file = crate::direct_reopen(&source).unwrap();
         let depth = 128;
-        let address = crate::os::allocate_aligned(depth * 4096).unwrap();
+        let address = crate::allocate_aligned(depth * 4096).unwrap();
         let mut ring = unsafe { ReadRing::new(vec![file], address, depth, 4096) }.unwrap();
         for (round, count) in [128, 0, 1, 641, 77, 257].into_iter().enumerate() {
             let mut seen = vec![false; count];
@@ -424,7 +424,7 @@ mod tests {
         drop(ring);
         unsafe {
             std::ptr::write_bytes(address as *mut u8, 0xa5, depth * 4096);
-            crate::os::free_aligned(address, depth * 4096);
+            crate::free_aligned(address, depth * 4096);
         }
         drop(source);
         std::fs::remove_file(path).unwrap();
@@ -436,8 +436,8 @@ mod tests {
             std::env::temp_dir().join(format!("flare-ioring-refill-{}.bin", std::process::id()));
         std::fs::write(&path, [0x71; 8192]).unwrap();
         let source = File::open(&path).unwrap();
-        let file = crate::os::direct_reopen(&source).unwrap();
-        let address = crate::os::allocate_aligned(8192).unwrap();
+        let file = crate::direct_reopen(&source).unwrap();
+        let address = crate::allocate_aligned(8192).unwrap();
         let mut ring = unsafe { ReadRing::new(vec![file], address, 2, 4096) }.unwrap();
         let mut completions = 0;
         assert!(
@@ -459,7 +459,7 @@ mod tests {
         drop(ring);
         unsafe {
             std::ptr::write_bytes(address as *mut u8, 0xa5, 8192);
-            crate::os::free_aligned(address, 8192);
+            crate::free_aligned(address, 8192);
         }
         drop(source);
         std::fs::remove_file(path).unwrap();

@@ -22,6 +22,7 @@ server = ["dep:serde", "images", "grammar", "dep:axum", "dep:tokio", "dep:async-
 roce = ["dep:cc", "runtime-package"]
 
 [dependencies]
+flare-eos = { path = "../eos" }
 deepseek-recipe = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
 deepseek-recipe-core = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }
 deepseek-recipe-encoding = { git = "https://github.com/local-inference-lab/deepseek-recipe", rev = "6a2d2aaed79c9cd4eebaaf9471635ca09b93ae0e", optional = true }

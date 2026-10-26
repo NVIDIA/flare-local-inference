@@ -5,11 +5,10 @@ use std::{
     path::Path,
 };
 
-pub(crate) fn cuda_library() -> Result<libloading::Library, libloading::Error> {
-    unsafe { libloading::Library::new("libcuda.so.1") }
-}
-
-pub(crate) unsafe fn read_at_raw(
+/// # Safety
+///
+/// `address` must be valid for writes of `bytes` bytes for the call.
+pub unsafe fn read_at_raw(
     file: &File,
     address: *mut u8,
     bytes: usize,
@@ -28,7 +27,7 @@ pub(crate) unsafe fn read_at_raw(
     }
 }
 
-pub(crate) fn direct_file(path: &Path, write: bool) -> io::Result<File> {
+pub fn direct_file(path: &Path, write: bool) -> io::Result<File> {
     OpenOptions::new()
         .read(!write)
         .write(write)
@@ -39,24 +38,24 @@ pub(crate) fn direct_file(path: &Path, write: bool) -> io::Result<File> {
         .open(path)
 }
 
-pub(crate) fn direct_reopen(file: &File) -> io::Result<File> {
+pub fn direct_reopen(file: &File) -> io::Result<File> {
     direct_file(
         Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())),
         false,
     )
 }
 
-pub(crate) fn release_page_cache(file: &File) {
+pub fn release_page_cache(file: &File) {
     unsafe {
         libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED);
     }
 }
 
-pub(crate) fn page_size() -> usize {
+pub fn page_size() -> usize {
     usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap_or(4096)
 }
 
-pub(crate) fn lower_priority(nice: i32) {
+pub fn lower_priority(nice: i32) {
     unsafe {
         let param = std::mem::zeroed();
         libc::sched_setscheduler(0, libc::SCHED_BATCH, &param);
@@ -64,26 +63,7 @@ pub(crate) fn lower_priority(nice: i32) {
     }
 }
 
-pub(crate) fn terminal_size() -> (usize, usize) {
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::ioctl(libc::STDERR_FILENO, libc::TIOCGWINSZ, &mut size);
-    }
-    (
-        if size.ws_col == 0 {
-            80
-        } else {
-            size.ws_col as usize
-        },
-        if size.ws_row == 0 {
-            24
-        } else {
-            size.ws_row as usize
-        },
-    )
-}
-
-pub(crate) fn map_host(bytes: usize) -> io::Result<usize> {
+pub fn map_host(bytes: usize) -> io::Result<usize> {
     let ptr = unsafe {
         libc::mmap(
             std::ptr::null_mut(),
@@ -103,8 +83,32 @@ pub(crate) fn map_host(bytes: usize) -> io::Result<usize> {
     Ok(ptr as usize)
 }
 
-pub(crate) unsafe fn unmap_host(address: usize, bytes: usize) {
+/// # Safety
+///
+/// `address` and `bytes` must describe a mapping made by `map_host` that nothing else
+/// references any longer, such as one the driver has already unregistered.
+pub unsafe fn unmap_host(address: usize, bytes: usize) {
     unsafe {
         libc::munmap(address as *mut _, bytes);
     }
+}
+
+/// Free bytes on the filesystem holding `path`.
+pub fn free_space(path: &Path) -> io::Result<u64> {
+    let text = std::ffi::CString::new(path.as_os_str().as_encoded_bytes()).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "record directory path contains a NUL byte",
+        )
+    })?;
+    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
+    // SAFETY: Both pointers are valid for the call; statvfs fills the struct.
+    if unsafe { libc::statvfs(text.as_ptr(), &mut stats) } != 0 {
+        return Err(io::Error::other(format!(
+            "cannot inspect the filesystem of {}: {}",
+            path.display(),
+            io::Error::last_os_error()
+        )));
+    }
+    Ok(stats.f_bavail * stats.f_frsize)
 }

@@ -4,6 +4,11 @@
 !flare/Cargo.lock
 !flare/src/
 !flare/src/**
+!eos/
+!eos/Cargo.toml
+!eos/Cargo.lock
+!eos/src/
+!eos/src/**
 !helios/
 !helios/Cargo.toml
 !helios/build.rs

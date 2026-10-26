@@ -530,19 +530,7 @@ pub fn input_memory_bytes(memory: u64, checkpoint_minimum: u64, enabled: bool) -
 /// Free bytes on the filesystem holding `path`.
 #[cfg(unix)]
 fn free_space(path: &std::path::Path) -> Result<u64> {
-    let text = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-        .map_err(|_| "record directory path contains a NUL byte")?;
-    let mut stats: libc::statvfs = unsafe { std::mem::zeroed() };
-    // SAFETY: Both pointers are valid for the call; statvfs fills the struct.
-    if unsafe { libc::statvfs(text.as_ptr(), &mut stats) } != 0 {
-        return Err(format!(
-            "cannot inspect the filesystem of {}: {}",
-            path.display(),
-            std::io::Error::last_os_error()
-        )
-        .into());
-    }
-    Ok(stats.f_bavail * stats.f_frsize)
+    crate::os::free_space(path).map_err(|e| e.to_string().into())
 }
 
 /// Open the configured store over the prepared resources, starting its

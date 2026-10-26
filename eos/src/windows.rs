@@ -11,10 +11,10 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Storage::FileSystem::*,
-    System::{Console::*, IO::*, Memory::*, SystemInformation::*, Threading::*},
+    System::{IO::*, Memory::*, SystemInformation::*, Threading::*},
 };
 
-pub(crate) fn wide(path: &Path) -> io::Result<Vec<u16>> {
+pub fn wide(path: &Path) -> io::Result<Vec<u16>> {
     let mut text: Vec<_> = path.as_os_str().encode_wide().collect();
     if text.contains(&0) {
         return Err(io::Error::new(
@@ -26,17 +26,10 @@ pub(crate) fn wide(path: &Path) -> io::Result<Vec<u16>> {
     Ok(text)
 }
 
-pub(crate) fn cuda_library() -> Result<libloading::Library, libloading::Error> {
-    unsafe {
-        libloading::os::windows::Library::load_with_flags(
-            "nvcuda.dll",
-            windows_sys::Win32::System::LibraryLoader::LOAD_LIBRARY_SEARCH_SYSTEM32,
-        )
-        .map(Into::into)
-    }
-}
-
-pub(crate) unsafe fn read_at_raw(
+/// # Safety
+///
+/// `address` must be valid for writes of `bytes` bytes for the call.
+pub unsafe fn read_at_raw(
     file: &File,
     address: *mut u8,
     bytes: usize,
@@ -112,7 +105,7 @@ fn check_alignment(file: File) -> io::Result<File> {
     Ok(file)
 }
 
-pub(crate) fn direct_file(path: &Path, write: bool) -> io::Result<File> {
+pub fn direct_file(path: &Path, write: bool) -> io::Result<File> {
     let file = OpenOptions::new()
         .read(!write)
         .write(write)
@@ -123,12 +116,12 @@ pub(crate) fn direct_file(path: &Path, write: bool) -> io::Result<File> {
     check_alignment(file)
 }
 
-pub(crate) fn direct_reopen(file: &File) -> io::Result<File> {
+pub fn direct_reopen(file: &File) -> io::Result<File> {
     reopen_direct(file, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
 }
 
 /// Keep a package immutable without retaining a buffered handle alongside its direct readers.
-pub(crate) fn direct_read_guard(file: &File) -> io::Result<File> {
+pub fn direct_read_guard(file: &File) -> io::Result<File> {
     reopen_direct(file, FILE_SHARE_READ)
 }
 
@@ -147,9 +140,9 @@ fn reopen_direct(file: &File, sharing: u32) -> io::Result<File> {
     check_alignment(unsafe { File::from_raw_handle(handle) })
 }
 
-pub(crate) fn release_page_cache(_: &File) {}
+pub fn release_page_cache(_: &File) {}
 
-pub(crate) fn page_size() -> usize {
+pub fn page_size() -> usize {
     let mut info: SYSTEM_INFO = unsafe { std::mem::zeroed() };
     unsafe {
         GetSystemInfo(&mut info);
@@ -157,24 +150,13 @@ pub(crate) fn page_size() -> usize {
     info.dwPageSize as usize
 }
 
-pub(crate) fn lower_priority(_: i32) {
+pub fn lower_priority(_: i32) {
     unsafe {
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
     }
 }
 
-pub(crate) fn terminal_size() -> (usize, usize) {
-    let mut info: CONSOLE_SCREEN_BUFFER_INFO = unsafe { std::mem::zeroed() };
-    if unsafe { GetConsoleScreenBufferInfo(GetStdHandle(STD_ERROR_HANDLE), &mut info) } == 0 {
-        return (80, 24);
-    }
-    (
-        (info.srWindow.Right - info.srWindow.Left + 1) as usize,
-        (info.srWindow.Bottom - info.srWindow.Top + 1) as usize,
-    )
-}
-
-pub(crate) fn map_host(bytes: usize) -> io::Result<usize> {
+pub fn map_host(bytes: usize) -> io::Result<usize> {
     let ptr = unsafe {
         VirtualAlloc(
             std::ptr::null(),
@@ -195,13 +177,17 @@ pub(crate) fn map_host(bytes: usize) -> io::Result<usize> {
     Ok(ptr as usize)
 }
 
-pub(crate) unsafe fn unmap_host(address: usize, _: usize) {
+/// # Safety
+///
+/// `address` and `bytes` must describe a mapping made by `map_host` that nothing else
+/// references any longer, such as one the driver has already unregistered.
+pub unsafe fn unmap_host(address: usize, _: usize) {
     unsafe {
         VirtualFree(address as *mut _, 0, MEM_RELEASE);
     }
 }
 
-pub(crate) fn free_space(path: &Path) -> io::Result<u64> {
+pub fn free_space(path: &Path) -> io::Result<u64> {
     let text = wide(path)?;
     let mut available = 0;
     if unsafe {
@@ -221,7 +207,7 @@ pub(crate) fn free_space(path: &Path) -> io::Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::os::{FileReadAt, completion::Queue};
+    use crate::{FileReadAt, completion::Queue};
 
     #[test]
     fn direct_package_guard_preserves_immutability_after_buffered_reader_closes() {

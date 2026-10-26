@@ -778,6 +778,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "flare-eos"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "flare-helios"
 version = "0.1.0"
 dependencies = [
@@ -790,6 +798,7 @@ dependencies = [
  "deepseek-recipe",
  "deepseek-recipe-core",
  "deepseek-recipe-encoding",
+ "flare-eos",
  "flate2",
  "futures-util",
  "httpdate",

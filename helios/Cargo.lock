@@ -755,6 +755,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d674e81391d1e1ab681a28d99df07927c6d4aa5b027d7da16ba32d1d21ecd99"
 
 [[package]]
+name = "flare-eos"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "flare-helios"
 version = "0.1.0"
 dependencies = [
@@ -768,6 +776,7 @@ dependencies = [
  "deepseek-recipe",
  "deepseek-recipe-core",
  "deepseek-recipe-encoding",
+ "flare-eos",
  "flate2",
  "futures-util",
  "httpdate",
