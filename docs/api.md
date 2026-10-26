@@ -352,6 +352,13 @@ or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
 Shared runtime handling owns token accounting, stop filtering, and termination.
 
+Termination supplies the client finish reason: `length` at the output limit,
+`tool_calls` when parsed calls complete an answer that the user did not stop, and
+`stop` for a matched token or string stop or a terminating end-of-sequence token.
+A request admitted with `ignore_eos` does not treat end-of-sequence tokens as
+terminating, so one that exhausts its output limit reports `length` even when its
+last generated token is end-of-sequence.
+
 A reasoning delimiter that the tokenizer encodes as one token, such as
 `<think>`, `</think>`, `</mm:think>`, or Gemma 4's `<channel|>`, opens or
 closes reasoning only when the model generates that token. When a model writes

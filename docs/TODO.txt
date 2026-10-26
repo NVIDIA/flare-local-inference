@@ -98,9 +98,6 @@
 [ ] Qualify prompt scoring on remaining recipes and cache lifecycles;
     see docs/logprobs-design.md for TP4 costs and numerical limits.
 
-[ ] Respect ignore_eos when classifying EOS at the output limit;
-    see helios/src/server/runtime.rs.
-
 [ ] Validate embedding readiness timestamps in full Qwen3.8 PLE serving and
     cross-node RoCEnante TP packages for Qwen3.8 and DeepSeek V4.1.
 
