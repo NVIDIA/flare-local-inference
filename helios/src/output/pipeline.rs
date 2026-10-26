@@ -13,6 +13,7 @@ use crate::{
 pub struct OutputConfig {
     pub syntax: FrontendContract,
     pub content: TaggedConfig,
+    /// Delimiters that occupy one tokenizer token and count only when generated as it.
     pub control_tokens: Vec<(u32, String)>,
 }
 
@@ -65,14 +66,14 @@ impl OutputPipeline {
             .map(|t| (t.kind, t.wrapping_newlines, t.tag_separator.as_str()))
         {
             Some((ToolParserKind::QwenCoder, 0, _)) => Self::CompactFunctionTags(
-                TaggedOutput::new(config.content).with_reasoning(reasoning),
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
             ),
-            Some((ToolParserKind::QwenCoder, _, _)) => {
-                Self::FunctionTags(TaggedOutput::new(config.content).with_reasoning(reasoning))
-            }
-            Some((ToolParserKind::GlmArgumentTags, _, _)) => {
-                Self::ArgumentTags(TaggedOutput::new(config.content).with_reasoning(reasoning))
-            }
+            Some((ToolParserKind::QwenCoder, _, _)) => Self::FunctionTags(
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
+            ),
+            Some((ToolParserKind::GlmArgumentTags, _, _)) => Self::ArgumentTags(
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
+            ),
             Some((ToolParserKind::Dsml, _, " ")) => {
                 Self::SpacedDsml(super::dsml::DsmlOutput::new(config.content))
             }
@@ -83,13 +84,31 @@ impl OutputPipeline {
                 config.content,
                 config.control_tokens,
             )),
-            Some((ToolParserKind::MiniMaxXml, _, _)) => {
-                Self::MiniMaxXml(TaggedOutput::new(config.content).with_reasoning(reasoning))
-            }
-            Some((ToolParserKind::GemmaCall, _, _)) => {
-                Self::GemmaCall(TaggedOutput::new(config.content).with_reasoning(reasoning))
-            }
-            None => Self::Text(TaggedOutput::new(config.content).with_reasoning(reasoning)),
+            Some((ToolParserKind::MiniMaxXml, _, _)) => Self::MiniMaxXml(
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
+            ),
+            Some((ToolParserKind::GemmaCall, _, _)) => Self::GemmaCall(
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
+            ),
+            None => Self::Text(
+                TaggedOutput::new(config.content).with_reasoning(reasoning, &config.control_tokens),
+            ),
+        }
+    }
+
+    /// Whether the parser `new` selects gates reasoning delimiters by token identity.
+    /// DSML recognizes its markup in the recipe crate's text state machine, and XTML
+    /// carries its own control tokens.
+    pub fn gates_reasoning_tokens(syntax: &FrontendContract) -> bool {
+        match syntax.tools.as_ref().map(|t| t.kind) {
+            Some(ToolParserKind::Dsml | ToolParserKind::Xtml) => false,
+            Some(
+                ToolParserKind::QwenCoder
+                | ToolParserKind::GlmArgumentTags
+                | ToolParserKind::MiniMaxXml
+                | ToolParserKind::GemmaCall,
+            )
+            | None => true,
         }
     }
 
@@ -443,5 +462,419 @@ mod tests {
         assert_eq!(envelope.reasoning_end, Some("<channel|>"));
         assert_eq!(envelope.tool, Some(("<|tool_call>", "<tool_call|>")));
         assert!(envelope.tool_ends_reasoning);
+    }
+
+    /// Pieces marked `true` arrive as their delimiter token and then its text.
+    /// Feed 0 sends each text after its token, feed 1 delays delimiter text into
+    /// the next push, and feed 2 sends one character per push.
+    fn delimited(
+        syntax: &FrontendContract,
+        start: crate::output::tagged::OutputStart,
+        tools: &[serde_json::Value],
+        pieces: &[(bool, &str)],
+        feed: usize,
+    ) -> serde_json::Value {
+        let reasoning = syntax.reasoning.as_ref().unwrap();
+        let control_tokens = [(1, reasoning.open.clone()), (2, reasoning.close.clone())];
+        delimited_by(syntax, &control_tokens, start, tools, pieces, feed)
+    }
+
+    fn delimited_by(
+        syntax: &FrontendContract,
+        control_tokens: &[(u32, String)],
+        start: crate::output::tagged::OutputStart,
+        tools: &[serde_json::Value],
+        pieces: &[(bool, &str)],
+        feed: usize,
+    ) -> serde_json::Value {
+        let control_tokens = control_tokens.to_vec();
+        let mut parser = OutputPipeline::new(OutputConfig {
+            syntax: syntax.clone(),
+            control_tokens: control_tokens.clone(),
+            content: TaggedConfig {
+                structured: false,
+                start,
+                tools: tools.to_vec(),
+            },
+        });
+        let mut output = Accumulator::new("delimited".into());
+        let mut push = |input: Input<'_>| {
+            output.apply(parser.push(input).unwrap()).unwrap();
+        };
+        let mut delayed = String::new();
+        for &(token, text) in pieces {
+            if token {
+                let id = control_tokens.iter().find(|(_, m)| m == text).unwrap().0;
+                push(Input::Token(id));
+            }
+            match feed {
+                0 => push(Input::Text(text)),
+                1 if token => delayed.push_str(text),
+                1 => push(Input::Text(&(std::mem::take(&mut delayed) + text))),
+                _ => {
+                    for character in text.chars() {
+                        push(Input::Text(&character.to_string()));
+                    }
+                }
+            }
+        }
+        push(Input::Text(&delayed));
+        output
+            .apply(parser.finish(Termination::Eos).unwrap())
+            .unwrap();
+        output.finish().unwrap();
+        output.message()
+    }
+
+    #[test]
+    fn finish_releases_text_held_for_a_delimiter_token() {
+        use crate::output::tagged::OutputStart;
+        let qwen = serde_json::from_str::<crate::model::PreparedContract>(include_str!(
+            "../../tests/support/contracts/qwen38.json"
+        ))
+        .unwrap()
+        .frontend;
+        let reasoning = qwen.reasoning.as_ref().unwrap();
+        let control_tokens = vec![(1, reasoning.open.clone()), (2, reasoning.close.clone())];
+        for (start, token, held) in [
+            (OutputStart::Reasoning, 2, "</thi"),
+            (OutputStart::Content, 1, "<thi"),
+        ] {
+            for cause in [
+                Termination::Eos,
+                Termination::OutputLimit,
+                Termination::UserStop,
+                Termination::Cancelled,
+                Termination::ExecutionError,
+            ] {
+                let mut parser = OutputPipeline::new(OutputConfig {
+                    syntax: qwen.clone(),
+                    control_tokens: control_tokens.clone(),
+                    content: TaggedConfig {
+                        structured: false,
+                        start,
+                        tools: vec![],
+                    },
+                });
+                let mut events = parser.push(Input::Text("plan")).unwrap();
+                events.extend(parser.push(Input::Token(token)).unwrap());
+                events.extend(parser.push(Input::Text(held)).unwrap());
+                events.extend(parser.finish(cause).unwrap());
+                let text: String = events
+                    .iter()
+                    .map(|event| match event {
+                        Event::Reasoning(text) if start == OutputStart::Reasoning => text.as_str(),
+                        Event::Content(text) if start == OutputStart::Content => text.as_str(),
+                        event => panic!("{event:?} for {start:?} {cause:?}"),
+                    })
+                    .collect();
+                let discarded =
+                    matches!(cause, Termination::Cancelled | Termination::ExecutionError);
+                let expected = if discarded {
+                    "plan".to_owned()
+                } else {
+                    format!("plan{held}")
+                };
+                assert_eq!(text, expected, "{start:?} {cause:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn single_token_reasoning_delimiters_leave_spelled_tags_as_text() {
+        use crate::output::tagged::OutputStart;
+        let contract = |source: &str| {
+            serde_json::from_str::<crate::model::PreparedContract>(source)
+                .unwrap()
+                .frontend
+        };
+        let qwen = contract(include_str!("../../tests/support/contracts/qwen38.json"));
+        let glm = contract(include_str!("../../tests/support/contracts/glm53.json"));
+        let mimo = contract(include_str!("../../tests/support/contracts/mimo_v2.json"));
+        let (open, close) = ((true, "<think>"), (true, "</think>"));
+        let text = |text| (false, text);
+        let cases: &[(&[(bool, &str)], &str, &str)] = &[
+            (
+                &[
+                    text("Closes with </think> first.\nKeep it short."),
+                    close,
+                    text("The answer is 42."),
+                ],
+                "Closes with </think> first.\nKeep it short.",
+                "The answer is 42.",
+            ),
+            (
+                &[text("Mention <think> here."), close, text("OK")],
+                "Mention <think> here.",
+                "OK",
+            ),
+            (
+                &[text("plan"), close, text("Write </think> to close.")],
+                "plan",
+                "Write </think> to close.",
+            ),
+            (
+                &[
+                    text("plan"),
+                    close,
+                    text("Write <think> to open, then text."),
+                ],
+                "plan",
+                "Write <think> to open, then text.",
+            ),
+            (
+                &[
+                    text("plan"),
+                    close,
+                    text("The `<think>` and `</think>` tags mark reasoning."),
+                ],
+                "plan",
+                "The `<think>` and `</think>` tags mark reasoning.",
+            ),
+            (
+                &[
+                    text("plan"),
+                    close,
+                    text("answer "),
+                    open,
+                    text("more"),
+                    close,
+                    text("done"),
+                ],
+                "planmore",
+                "answer done",
+            ),
+        ];
+        for syntax in [&qwen, &glm, &mimo] {
+            for (pieces, reasoning, content) in cases {
+                for feed in 0..3 {
+                    let message = delimited(syntax, OutputStart::Reasoning, &[], pieces, feed);
+                    assert_eq!(
+                        message["reasoning_content"], *reasoning,
+                        "{pieces:?} feed {feed}"
+                    );
+                    assert_eq!(message["content"], *content, "{pieces:?} feed {feed}");
+                }
+            }
+        }
+        for feed in 0..3 {
+            let message = delimited(
+                &qwen,
+                OutputStart::Reasoning,
+                &[],
+                &[
+                    text("Closes with </think> first.\n"),
+                    close,
+                    text("\n\nThe answer is 42."),
+                ],
+                feed,
+            );
+            assert_eq!(message["reasoning_content"], "Closes with </think> first.");
+            assert_eq!(message["content"], "The answer is 42.");
+        }
+
+        let tools = [json!({"type":"function","function":{"name":"lookup"}})];
+        let call = "<tool_call><function=lookup></function></tool_call>";
+        let implicit = format!("Look up Paris.{call}");
+        let tool_cases: &[(&[(bool, &str)], &str, &str, usize)] = &[
+            (
+                &[open, text("Look up Paris."), close, close, text(call)],
+                "Look up Paris.",
+                "",
+                1,
+            ),
+            (&[open, text(&implicit)], "Look up Paris.", "", 1),
+            (
+                &[text("plan"), close, text("Note: </think> stays.")],
+                "plan",
+                "Note: </think> stays.",
+                0,
+            ),
+            (
+                &[text("Use <think> literally."), close, text("ok")],
+                "Use <think> literally.",
+                "ok",
+                0,
+            ),
+        ];
+        for syntax in [&qwen, &mimo] {
+            for (pieces, reasoning, content, calls) in tool_cases {
+                for feed in 0..3 {
+                    let message = delimited(syntax, OutputStart::Reasoning, &tools, pieces, feed);
+                    assert_eq!(
+                        message["reasoning_content"], *reasoning,
+                        "{pieces:?} feed {feed}"
+                    );
+                    assert_eq!(
+                        message["content"].as_str().unwrap_or_default(),
+                        *content,
+                        "{pieces:?} feed {feed}"
+                    );
+                    assert_eq!(
+                        message
+                            .get("tool_calls")
+                            .map_or(0, |c| c.as_array().unwrap().len()),
+                        *calls,
+                        "{pieces:?} feed {feed}"
+                    );
+                }
+            }
+        }
+
+        let mut minimax = crate::model::testing::metadata().frontend;
+        minimax.tools = Some(ToolParser {
+            kind: ToolParserKind::MiniMaxXml,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        minimax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::MmThink,
+            open: "<mm:think>".into(),
+            close: "</mm:think>".into(),
+            wrapping_newlines: 0,
+            terminal_markers: vec![],
+        });
+        for (pieces, reasoning, content) in [
+            (
+                &[(true, "</mm:think>"), text("answer</mm:think>")][..],
+                None,
+                "answer</mm:think>",
+            ),
+            (&[text("</mm:think>answer")][..], None, "</mm:think>answer"),
+            (
+                &[
+                    (true, "<mm:think>"),
+                    text("Quote </mm:think> here."),
+                    (true, "</mm:think>"),
+                    text("done"),
+                ][..],
+                Some("Quote </mm:think> here."),
+                "done",
+            ),
+        ] {
+            for feed in 0..3 {
+                let message = delimited(&minimax, OutputStart::Content, &[], pieces, feed);
+                assert_eq!(
+                    message.get("reasoning_content").and_then(|r| r.as_str()),
+                    reasoning,
+                    "{pieces:?} feed {feed}"
+                );
+                assert_eq!(message["content"], content, "{pieces:?} feed {feed}");
+            }
+        }
+    }
+
+    #[test]
+    fn channel_thought_gates_only_its_single_token_close() {
+        use crate::output::tagged::OutputStart;
+        let mut syntax = crate::model::testing::metadata().frontend;
+        syntax.tools = Some(ToolParser {
+            kind: ToolParserKind::GemmaCall,
+            wrapping_newlines: 0,
+            tag_separator: String::new(),
+        });
+        syntax.reasoning = Some(ReasoningParser {
+            kind: ReasoningParserKind::ChannelThought,
+            open: "<|channel>thought".into(),
+            close: "<channel|>".into(),
+            wrapping_newlines: 1,
+            terminal_markers: vec!["<|tool_call>".into()],
+        });
+        let control_tokens = [(2, "<channel|>".to_owned())];
+        let tools = [
+            json!({"function":{"name":"lookup","parameters":{"properties":{"n":{"type":"integer"}}}}}),
+        ];
+        let close = (true, "<channel|>");
+        let text = |text| (false, text);
+        let call = "<|tool_call>call:lookup{n:1}<tool_call|>";
+        let cases: &[(OutputStart, &[(bool, &str)], Option<&str>, &str, usize)] = &[
+            (
+                OutputStart::Reasoning,
+                &[text("Quote <channel|> here.\n"), close, text("Answer.")],
+                Some("Quote <channel|> here."),
+                "Answer.",
+                0,
+            ),
+            (
+                OutputStart::Content,
+                &[
+                    text("<|channel>thought\nWrite <channel|> to close.\n"),
+                    close,
+                    text("Done."),
+                ],
+                Some("Write <channel|> to close."),
+                "Done.",
+                0,
+            ),
+            (
+                OutputStart::Content,
+                &[text("Answer with <channel|> spelled.")],
+                None,
+                "Answer with <channel|> spelled.",
+                0,
+            ),
+            (
+                OutputStart::Content,
+                &[text("Use <|chan to begin.")],
+                None,
+                "Use <|chan to begin.",
+                0,
+            ),
+            (
+                OutputStart::Content,
+                &[close, text("answer")],
+                None,
+                "answer",
+                0,
+            ),
+            (
+                OutputStart::Content,
+                &[text("<channel|>answer")],
+                None,
+                "<channel|>answer",
+                0,
+            ),
+            (
+                OutputStart::Reasoning,
+                &[text("Quote <channel|> first."), text(call)],
+                Some("Quote <channel|> first."),
+                "",
+                1,
+            ),
+            (
+                OutputStart::Content,
+                &[
+                    text("<|channel>thought\nplan\n"),
+                    close,
+                    text("Calling. "),
+                    text(call),
+                ],
+                Some("plan"),
+                "Calling. ",
+                1,
+            ),
+        ];
+        for (start, pieces, reasoning, content, calls) in cases {
+            for feed in 0..3 {
+                let message = delimited_by(&syntax, &control_tokens, *start, &tools, pieces, feed);
+                assert_eq!(
+                    message.get("reasoning_content").and_then(|r| r.as_str()),
+                    *reasoning,
+                    "{pieces:?} feed {feed}"
+                );
+                assert_eq!(
+                    message["content"].as_str().unwrap_or_default(),
+                    *content,
+                    "{pieces:?} feed {feed}"
+                );
+                assert_eq!(
+                    message
+                        .get("tool_calls")
+                        .map_or(0, |c| c.as_array().unwrap().len()),
+                    *calls,
+                    "{pieces:?} feed {feed}"
+                );
+            }
+        }
     }
 }

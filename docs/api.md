@@ -146,6 +146,8 @@ Responses accepts `include: ["message.output_text.logprobs"]` with optional
 Only tokens whose first text byte belongs to output text receive entries there;
 reasoning, tool calls, and delimiters do not. A token spanning a delimiter and
 answer belongs to the delimiter, even if its suffix contributes answer text.
+A reasoning delimiter spelled out in ordinary answer text is output text and
+receives entries.
 Other `include` values retain their existing behavior.
 
 On these three endpoints, `return_tokens_as_token_ids: true` changes chosen and
@@ -349,6 +351,19 @@ The official parser owns markup recognition, including its tolerance of omitted
 or partial tags. Structured answers become verbatim when ordinary answer content
 begins, preserving scalar JSON, Lark output, and markup inside string values.
 Shared runtime handling owns token accounting, stop filtering, and termination.
+
+A reasoning delimiter that the tokenizer encodes as one token, such as
+`<think>`, `</think>`, `</mm:think>`, or Gemma 4's `<channel|>`, opens or
+closes reasoning only when the model generates that token. When a model writes
+the same text in ordinary pieces, for example while explaining a chat template,
+the text remains reasoning or answer text. Delimiters that span several tokens,
+such as Gemma 4's `<|channel>thought`, are matched as text, as are DeepSeek's
+delimiters, which the official parser recognizes. Structured-output grammars
+follow the same rule: they end reasoning only at the delimiter token. A
+structured answer may contain the delimiter token, which it returns as text. If
+a model ever writes its real closing delimiter in ordinary pieces, the rest of
+its output remains reasoning. Under a structured-output grammar, reasoning then
+cannot end, so the request runs to its token limit without an answer.
 
 Qwen treats `<tool_call>` as an implicit end to reasoning. Function-tag calls
 complete at `</function>` and accept omitted outer tool tags in answer content.

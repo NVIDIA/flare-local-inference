@@ -993,6 +993,7 @@ mod native_prompt_tests {
             frontend.tokenizer(),
             config.contract.vocabulary,
             &config.eos_token_ids,
+            &[],
         )
         .unwrap();
         (frontend, compiler, config)

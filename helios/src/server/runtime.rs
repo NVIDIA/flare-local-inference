@@ -2697,7 +2697,7 @@ mod tests {
         tokenizer
             .add_special_tokens([tokenizers::AddedToken::from("<eos>", true)])
             .unwrap();
-        let compiler = crate::grammar::GrammarCompiler::new(&tokenizer, 6, &[5]).unwrap();
+        let compiler = crate::grammar::GrammarCompiler::new(&tokenizer, 6, &[5], &[]).unwrap();
         let mut grammar = compiler.compile_lark("start: \"abcd\"").unwrap();
         grammar.advance(0).unwrap();
 

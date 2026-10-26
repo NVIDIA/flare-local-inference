@@ -133,6 +133,8 @@ impl Fixture {
             frontend.tokenizer(),
             config.contract.vocabulary,
             &config.eos_token_ids,
+            &flare_helios::model::reasoning_delimiter_tokens(&frontend, &config.contract.frontend)
+                .unwrap(),
         )
         .unwrap();
         Self {

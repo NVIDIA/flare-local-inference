@@ -1142,6 +1142,7 @@ fn observations_precede_grammar_failures_and_token_stop_completion() {
             fixture.frontend.tokenizer(),
             fixture.config.contract.vocabulary,
             &[5],
+            &[],
         )
         .unwrap();
         let (sender, receiver) = mpsc::channel();
@@ -1978,6 +1979,7 @@ fn http_state(
         fixture.frontend.tokenizer(),
         6,
         &fixture.config.eos_token_ids,
+        &[],
     )
     .unwrap();
     let model = Arc::new(ModelRuntime {

@@ -57,10 +57,19 @@ pub struct GrammarCompiler {
     model_vocab: usize,
     tokenizer_vocab: usize,
     eos_ids: Arc<[u32]>,
+    delimiters: Arc<[(u32, String)]>,
 }
 
 impl GrammarCompiler {
-    pub fn new(tokenizer: &Tokenizer, model_vocab: usize, eos_ids: &[u32]) -> Result<Self> {
+    /// `delimiters` are single-token output delimiters that grammars reference by
+    /// token ID, so their text spelled in ordinary pieces never matches them. Their
+    /// bytes remain ordinary text, which answers may contain.
+    pub fn new(
+        tokenizer: &Tokenizer,
+        model_vocab: usize,
+        eos_ids: &[u32],
+        delimiters: &[(u32, String)],
+    ) -> Result<Self> {
         if model_vocab == 0 || model_vocab > u32::MAX as usize {
             return Err(Error::admission(
                 AdmissionError::Grammar,
@@ -100,6 +109,12 @@ impl GrammarCompiler {
             return Err(Error::admission(
                 AdmissionError::Grammar,
                 "grammar tokenizer has missing IDs or exceeds the model vocabulary",
+            ));
+        }
+        if delimiters.iter().any(|&(id, _)| id as usize >= bytes.len()) {
+            return Err(Error::admission(
+                AdmissionError::Grammar,
+                "grammar delimiter token exceeds the tokenizer vocabulary",
             ));
         }
         if eos_ids.is_empty()
@@ -144,7 +159,13 @@ impl GrammarCompiler {
             model_vocab,
             tokenizer_vocab,
             eos_ids: eos_ids.into(),
+            delimiters: delimiters.into(),
         })
+    }
+
+    /// The delimiters these grammars reference as tokens, which output parsers gate on.
+    pub fn delimiters(&self) -> &[(u32, String)] {
+        &self.delimiters
     }
 
     /// Compile supported JSON-schema assertions strictly; external references and
@@ -266,15 +287,25 @@ impl GrammarCompiler {
         if text.is_empty() {
             return String::new();
         }
-        match self.factory.tok_env().tok_trie().get_special_token(text) {
+        match self.token_id(text) {
             Some(id) => format!("<[{id}]>"),
             None => serde_json::to_string(text).unwrap(),
         }
     }
 
+    /// The ID of a declared delimiter or special token, which grammars match only as
+    /// that token.
+    fn token_id(&self, text: &str) -> Option<u32> {
+        self.delimiters
+            .iter()
+            .find(|(_, marker)| marker == text)
+            .map(|&(id, _)| id)
+            .or_else(|| self.factory.tok_env().tok_trie().get_special_token(text))
+    }
+
     fn region(&self, name: &str, close: &str) -> String {
         let trie = self.factory.tok_env().tok_trie();
-        if let Some(end) = trie.get_special_token(close) {
+        if let Some(end) = self.token_id(close) {
             let specials: Vec<_> = trie
                 .get_special_tokens()
                 .into_iter()
@@ -300,7 +331,7 @@ impl GrammarCompiler {
         let trie = self.factory.tok_env().tok_trie();
         let literals: Vec<_> = ends
             .iter()
-            .filter(|end| trie.get_special_token(end).is_none())
+            .filter(|end| self.token_id(end).is_none())
             .map(|end| serde_json::to_string(end).unwrap())
             .collect();
         let text = if literals.is_empty() {
@@ -311,10 +342,7 @@ impl GrammarCompiler {
                 literals.join(" | ")
             )
         };
-        let excluded: Vec<_> = ends
-            .iter()
-            .filter_map(|end| trie.get_special_token(end))
-            .collect();
+        let excluded: Vec<_> = ends.iter().filter_map(|end| self.token_id(end)).collect();
         let specials: Vec<_> = trie
             .get_special_tokens()
             .into_iter()
@@ -322,7 +350,7 @@ impl GrammarCompiler {
             .map(|id| id.to_string())
             .collect();
         let terminal = format!("{}_TEXT", name.to_uppercase());
-        let ending = if let Some(id) = trie.get_special_token(close) {
+        let ending = if let Some(id) = self.token_id(close) {
             format!("{name}_end: {terminal} <[{id}]>\n")
         } else {
             format!(
@@ -712,6 +740,11 @@ mod tests {
     use serde_json::json;
 
     fn byte_tokenizer() -> Tokenizer {
+        byte_tokenizer_with(&[])
+    }
+
+    /// Adds non-special tokens from 258, as checkpoints declare reasoning delimiters.
+    fn byte_tokenizer_with(added: &[&str]) -> Tokenizer {
         let mut vocab = serde_json::Map::new();
         let mut extra = 256;
         for byte in 0..=255_u32 {
@@ -723,12 +756,16 @@ mod tests {
             };
             vocab.insert(char::from_u32(mapped).unwrap().to_string(), json!(byte));
         }
+        let mut added_tokens = vec![
+            json!({"id":256,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}),
+            json!({"id":257,"content":"<end>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}),
+        ];
+        for (id, content) in (258..).zip(added) {
+            added_tokens.push(json!({"id":id,"content":content,"single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":false}));
+        }
         let tokenizer = json!({
             "version": "1.0", "truncation": null, "padding": null,
-            "added_tokens": [
-                {"id":256,"content":"<eos>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true},
-                {"id":257,"content":"<end>","single_word":false,"lstrip":false,"rstrip":false,"normalized":false,"special":true}
-            ],
+            "added_tokens": added_tokens,
             "normalizer": null,
             "pre_tokenizer": {"type":"ByteLevel","add_prefix_space":false,"trim_offsets":false,"use_regex":false},
             "post_processor": null,
@@ -781,7 +818,7 @@ mod tests {
             {"type":"ByteFallback"},
             {"type":"Fuse"}
         ]));
-        let compiler = GrammarCompiler::new(&tokenizer, 320, &[257, 258]).unwrap();
+        let compiler = GrammarCompiler::new(&tokenizer, 320, &[257, 258], &[]).unwrap();
         let schema = json!({"type":"object","properties":{"ok":{"type":"boolean"}},"required":["ok"],"additionalProperties":false});
         let advance_text = |text: &str| {
             let mut request = compiler.compile_json_schema(&schema).unwrap();
@@ -799,12 +836,12 @@ mod tests {
     #[test]
     fn decoder_without_byte_tokens_is_rejected() {
         let tokenizer = byte_fallback_tokenizer(json!([{"type":"Fuse"}]));
-        assert!(GrammarCompiler::new(&tokenizer, 320, &[257, 258]).is_err());
+        assert!(GrammarCompiler::new(&tokenizer, 320, &[257, 258], &[]).is_err());
     }
 
     #[test]
     fn exact_mask_words_eos_and_padded_ids() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let mut request = compiler.compile_lark(r"start: /[\x1f]/").unwrap();
         assert_eq!(request.mask().len(), 10);
         assert_eq!(request.mask()[0], i32::MIN);
@@ -822,7 +859,7 @@ mod tests {
 
     #[test]
     fn output_envelope_constrains_only_the_answer() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let schema = json!({"const":{"ok":true}});
         for reasoning in [false, true] {
             let envelope = OutputEnvelope {
@@ -868,7 +905,7 @@ mod tests {
 
     #[test]
     fn xtml_response_envelope_constrains_answers_and_allows_tool_calls() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         for reasoning in [false, true] {
             let envelope = OutputEnvelope {
                 reasoning_end: reasoning.then_some("<|close|>think<|sep|><|open|>response<|sep|>"),
@@ -908,7 +945,7 @@ mod tests {
 
     #[test]
     fn qwen_envelope_preserves_implicit_reasoning_and_function_boundaries() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let envelope = OutputEnvelope {
             reasoning_end: Some("</think>"),
             tool: Some(("<tool_call>", "</tool_call>")),
@@ -952,8 +989,64 @@ mod tests {
     }
 
     #[test]
+    fn single_token_reasoning_delimiters_end_reasoning_only_as_tokens() {
+        let tokenizer = byte_tokenizer_with(&["<think>", "</think>"]);
+        let delimiters = [(258, "<think>".into()), (259, "</think>".into())];
+        let compiler = GrammarCompiler::new(&tokenizer, 320, &[256, 257], &delimiters).unwrap();
+        // \x01 and \x02 stand for the <think> and </think> tokens; other bytes are text.
+        let ids = |text: &str| -> Vec<u32> {
+            text.bytes()
+                .map(|byte| match byte {
+                    1 => 258,
+                    2 => 259,
+                    byte => u32::from(byte),
+                })
+                .collect()
+        };
+        for tool_ends_reasoning in [false, true] {
+            let envelope = OutputEnvelope {
+                reasoning_end: Some("</think>"),
+                tool: Some(("<tool_call>", "</tool_call>")),
+                function: Some(("<function=", "</function>")),
+                tool_ends_reasoning,
+                response: None,
+                tool_body_start: false,
+            };
+            for (text, accepted) in [
+                ("Spell </think> and <think> here.\x02{\"ok\":true}", true),
+                ("Spelled </think>{\"ok\":false}\x02{\"ok\":true}", true),
+                ("plan\x01more\x02{\"ok\":true}", true),
+                ("plan\x02{\"ok\":false}", false),
+                ("plan</think>{\"ok\":true}", false),
+            ] {
+                let mut grammar = compiler
+                    .compile_json_schema_in(&json!({"const":{"ok":true}}), Some(&envelope))
+                    .unwrap();
+                let result = ids(text)
+                    .into_iter()
+                    .chain([256])
+                    .all(|id| grammar.advance(id).is_ok());
+                assert_eq!(result, accepted, "{text:?} {tool_ends_reasoning}");
+            }
+            for (text, accepted) in [
+                ("plan\x02\"\x01a\x02 </think>\"", true),
+                ("plan\x02\"a\"\x02", false),
+            ] {
+                let mut grammar = compiler
+                    .compile_json_schema_in(&json!({"type":"string"}), Some(&envelope))
+                    .unwrap();
+                let result = ids(text)
+                    .into_iter()
+                    .chain([256])
+                    .all(|id| grammar.advance(id).is_ok());
+                assert_eq!(result, accepted, "{text:?} {tool_ends_reasoning}");
+            }
+        }
+    }
+
+    #[test]
     fn output_envelope_copy_masks_cross_reasoning_and_tool_boundaries() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let envelope = OutputEnvelope {
             reasoning_end: Some("</think>"),
             tool: Some(("<tool_call>", "</tool_call>")),
@@ -987,7 +1080,34 @@ mod tests {
         let path = std::path::PathBuf::from(std::env::var_os("FLARE_TEST_SNAPSHOT").unwrap());
         let tokenizer = Tokenizer::from_file(path.join("tokenizer.json")).unwrap();
         let eos = tokenizer.token_to_id("<|im_end|>").unwrap();
-        let compiler = GrammarCompiler::new(&tokenizer, 248320, &[eos]).unwrap();
+        let think = tokenizer.token_to_id("<think>").unwrap();
+        let end = tokenizer.token_to_id("</think>").unwrap();
+        let delimiters = [(think, "<think>".into()), (end, "</think>".into())];
+        let compiler = GrammarCompiler::new(&tokenizer, 248320, &[eos], &delimiters).unwrap();
+        let encode = |text: &str| tokenizer.encode(text, false).unwrap().get_ids().to_vec();
+        // Spells reasoning delimiters in ordinary pieces.
+        let spelled = |text: &str| -> Vec<u32> {
+            let mut ids = Vec::new();
+            let mut rest = text;
+            while let Some(at) = ["<think>", "</think>"]
+                .iter()
+                .filter_map(|delimiter| rest.find(delimiter))
+                .min()
+            {
+                ids.extend(encode(&rest[..at]));
+                ids.extend(encode("<"));
+                rest = &rest[at + 1..];
+            }
+            ids.extend(encode(rest));
+            ids
+        };
+        let per_char = |text: &str| -> Vec<u32> {
+            text.chars()
+                .flat_map(|ch| encode(&ch.to_string()))
+                .collect()
+        };
+        let schema = json!({"type":"object","properties":{"literal":{"type":"string"}},"required":["literal"],"additionalProperties":false});
+        let literal = r#"{"literal":"<think>東京</think><tool_call>literal</tool_call>"}"#;
         for reasoning in [false, true] {
             let envelope = OutputEnvelope {
                 reasoning_end: reasoning.then_some("</think>"),
@@ -997,32 +1117,33 @@ mod tests {
                 response: None,
                 tool_body_start: false,
             };
+            let prefix = |pieces: &dyn Fn(&str) -> Vec<u32>| -> Vec<u32> {
+                if reasoning {
+                    [
+                        pieces("Consider </think> first."),
+                        vec![end],
+                        pieces("\n\n"),
+                    ]
+                    .concat()
+                } else {
+                    Vec::new()
+                }
+            };
+            let mut grammar = compiler
+                .compile_json_schema_in(&schema, Some(&envelope))
+                .unwrap();
+            for token in [prefix(&spelled), encode(r#"{"literal":""#)].concat() {
+                grammar.advance(token).unwrap();
+            }
+            assert!(allowed(&grammar, think) && allowed(&grammar, end));
             for text in [
-                r#"{"literal":"<think>東京</think><tool_call>literal</tool_call>"}"#,
+                literal,
                 "<tool_call><function=lookup><parameter=query>東京</parameter></function></tool_call>",
             ] {
-                let text = if reasoning {
-                    format!("Consider the request.</think>\n\n{text}")
-                } else {
-                    text.into()
-                };
-                let schema = json!({"type":"object","properties":{"literal":{"type":"string"}},"required":["literal"],"additionalProperties":false});
-                let canonical = tokenizer
-                    .encode(text.as_str(), false)
-                    .unwrap()
-                    .get_ids()
-                    .to_vec();
-                let fragmented: Vec<_> = text
-                    .chars()
-                    .flat_map(|ch| {
-                        tokenizer
-                            .encode(ch.to_string(), false)
-                            .unwrap()
-                            .get_ids()
-                            .to_vec()
-                    })
-                    .collect();
-                for tokens in [canonical, fragmented] {
+                let canonical = [prefix(&spelled), spelled(text)].concat();
+                let fragmented = [prefix(&per_char), per_char(text)].concat();
+                let delimiter_tokens = [prefix(&spelled), encode(text)].concat();
+                for tokens in [canonical, fragmented, delimiter_tokens] {
                     let mut grammar = compiler
                         .compile_json_schema_in(&schema, Some(&envelope))
                         .unwrap();
@@ -1042,7 +1163,7 @@ mod tests {
 
     #[test]
     fn custom_tool_grammars_validate_complete_exact_text_repeatedly() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         for (syntax, source) in [
             ("regex", "café[0-9]+"),
             ("lark", "start: \"café\" /[0-9]+/"),
@@ -1070,7 +1191,7 @@ mod tests {
 
     #[test]
     fn required_fields_enums_ranges_and_additional_properties() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let schema = json!({"type":"object","properties":{
             "action":{"enum":["read","write"]},
             "count":{"type":"integer","minimum":1,"maximum":3}
@@ -1095,7 +1216,7 @@ mod tests {
 
     #[test]
     fn local_references_arrays_unicode_and_nullable_values() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let schema = json!({"$defs":{"item":{"anyOf":[{"type":"null"},{"enum":["é","猫","😀"]}]}},
             "type":"array","items":{"$ref":"#/$defs/item"},"minItems":1,"maxItems":2});
         for text in [r#"[null]"#, r#"["é","猫"]"#, r#"["😀"]"#] {
@@ -1110,7 +1231,7 @@ mod tests {
     fn parser_failure_preserves_typed_first_cause() {
         use std::error::Error as _;
 
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let mut request = compiler.compile_lark("start: \"a\"").unwrap();
         let original = request
             .fail::<()>(Error::Admission(AdmissionError::Grammar(
@@ -1150,7 +1271,7 @@ mod tests {
     fn compiler_failure_retains_library_cause() {
         use std::error::Error as _;
 
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let error = compiler.compile_lark("start: missing_rule").err().unwrap();
         assert!(matches!(
             error,
@@ -1167,7 +1288,7 @@ mod tests {
 
     #[test]
     fn masked_tokens_poison_parser_without_permissive_fallback() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let mut request = compiler
             .compile_json_schema(&json!({"const":true}))
             .unwrap();
@@ -1193,7 +1314,7 @@ mod tests {
 
     #[test]
     fn copy_masks_include_bonus_and_rejection_does_not_advance_committed_parser() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let mut committed = compiler.compile_lark("start: \"abc\" | \"axy\"").unwrap();
         committed.advance(b'a' as u32).unwrap();
         let before = committed.mask().to_vec();
@@ -1223,7 +1344,7 @@ mod tests {
 
     #[test]
     fn copy_masks_trim_forbidden_ids_without_poisoning_and_preserve_utf8_prefixes() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         let mut committed = compiler
             .compile_json_schema(&json!({"const":"猫"}))
             .unwrap();
@@ -1257,7 +1378,7 @@ mod tests {
 
     #[test]
     fn unsupported_invalid_and_external_schemas_fail_before_admission() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         for schema in [
             json!({"type":"array","uniqueItems":true}),
             json!({"type":"integer","minimim":1}),
@@ -1291,7 +1412,8 @@ mod tests {
         fn send<T: Send>() {}
         send_sync::<GrammarCompiler>();
         send::<RequestGrammar>();
-        let compiler = Arc::new(GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap());
+        let compiler =
+            Arc::new(GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap());
         let mut schema = json!(true);
         for _ in 0..=MAX_SCHEMA_DEPTH {
             schema = json!({"type":"array","items":schema});
@@ -1315,11 +1437,11 @@ mod tests {
     #[test]
     fn reject_tokenizer_or_eos_geometry_mismatch() {
         let tokenizer = byte_tokenizer();
-        assert!(GrammarCompiler::new(&tokenizer, 257, &[256]).is_err());
-        assert!(GrammarCompiler::new(&tokenizer, 320, &[]).is_err());
-        assert!(GrammarCompiler::new(&tokenizer, 320, &[256, 256]).is_err());
-        assert!(GrammarCompiler::new(&tokenizer, 320, &[256, 319]).is_err());
-        assert!(GrammarCompiler::new(&tokenizer, 320, &[b'a' as u32]).is_err());
+        assert!(GrammarCompiler::new(&tokenizer, 257, &[256], &[]).is_err());
+        assert!(GrammarCompiler::new(&tokenizer, 320, &[], &[]).is_err());
+        assert!(GrammarCompiler::new(&tokenizer, 320, &[256, 256], &[]).is_err());
+        assert!(GrammarCompiler::new(&tokenizer, 320, &[256, 319], &[]).is_err());
+        assert!(GrammarCompiler::new(&tokenizer, 320, &[b'a' as u32], &[]).is_err());
     }
 
     #[test]
@@ -1355,7 +1477,7 @@ mod tests {
             "0997f410c57a1f4e53b09e4be8f4a172d90edd9564368fb0847030937229b9f3"
         );
         let tokenizer = Tokenizer::from_bytes(&bytes).unwrap();
-        let compiler = GrammarCompiler::new(&tokenizer, 248_320, &[248_046, 248_044]).unwrap();
+        let compiler = GrammarCompiler::new(&tokenizer, 248_320, &[248_046, 248_044], &[]).unwrap();
         assert_eq!(compiler.tokenizer_vocab, 248_077);
         let cases = [
             (
@@ -1459,7 +1581,7 @@ mod tests {
 
     #[test]
     fn prefixed_dsml_tool_body_preserves_json_and_lark_answer_constraints() {
-        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257]).unwrap();
+        let compiler = GrammarCompiler::new(&byte_tokenizer(), 320, &[256, 257], &[]).unwrap();
         for (open, close, separator) in [
             ("<｜DSML｜tool_calls>", "</｜DSML｜tool_calls>", ""),
             ("<｜DSML｜ calls>", "</｜DSML｜ calls>", " "),

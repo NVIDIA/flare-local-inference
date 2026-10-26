@@ -3,6 +3,7 @@
 use super::{Event, Input, ModelOutput, Progress, ReasoningParser, Termination, ToolCallParser};
 use crate::Result;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::sync::Arc;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -44,6 +45,62 @@ pub struct ThinkReasoning<D: ToolDialect> {
     trim_wrap: bool,
     tool_ends_reasoning: bool,
     finishing: bool,
+    /// Delimiters with a token count only at `offsets`; other spellings are text.
+    open_token: bool,
+    close_token: bool,
+    /// Ascending byte offsets, in the composer's concatenated text, where a
+    /// delimiter token's text begins. Buffers hold plain text because tool dialects
+    /// and logprob spans index it directly, so token identity sits beside the text
+    /// instead of as an escaped sentinel in it. Every unparsed byte lies at or after
+    /// `received` minus the three buffer lengths; offsets below that are dropped.
+    offsets: Vec<usize>,
+    /// Composer byte offset of the end of `buffer`.
+    end: usize,
+}
+impl<D: ToolDialect> ThinkReasoning<D> {
+    fn find_delimiter(&self, text: &str, start: usize, close: bool) -> Option<usize> {
+        let (marker, token) = if close {
+            (&self.close, self.close_token)
+        } else {
+            (&self.open, self.open_token)
+        };
+        if !token {
+            return text.find(marker.as_str());
+        }
+        self.offsets
+            .iter()
+            .filter_map(|offset| offset.checked_sub(start))
+            .find(|&at| {
+                text.get(at..)
+                    .is_some_and(|rest| rest.starts_with(marker.as_str()))
+            })
+    }
+    fn without_open(&self, text: &str, start: usize) -> String {
+        if !self.tool_ends_reasoning {
+            return text.to_owned();
+        }
+        if !self.open_token {
+            return text.replace(&self.open, "");
+        }
+        let mut kept = String::with_capacity(text.len());
+        let mut from = 0;
+        for at in self
+            .offsets
+            .iter()
+            .filter_map(|offset| offset.checked_sub(start))
+        {
+            if at >= from
+                && text
+                    .get(at..)
+                    .is_some_and(|rest| rest.starts_with(&self.open))
+            {
+                kept.push_str(&text[from..at]);
+                from = at + self.open.len();
+            }
+        }
+        kept.push_str(&text[from..]);
+        kept
+    }
 }
 impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
     fn push(&mut self, input: Input<'_>) -> Result<Progress> {
@@ -59,10 +116,10 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
                 self.trim_newlines = 0;
             }
         }
+        let start = self.end - self.buffer.len();
         let mut progress = Progress::default();
         let mut boundary = self
-            .buffer
-            .find(&self.close)
+            .find_delimiter(&self.buffer, start, true)
             .map(|at| (at, self.close.len()));
         let mut undecided = None;
         if self.tools && self.tool_ends_reasoning {
@@ -87,23 +144,24 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
                 text.strip_suffix('\n').unwrap_or(text)
             } else {
                 text
-            }
-            .to_owned();
-            let text = if self.tool_ends_reasoning {
-                text.replace(&self.open, "")
-            } else {
-                text
             };
+            let text = self.without_open(text, start);
             if !text.is_empty() {
                 progress.events.push(Event::Reasoning(text));
             }
             self.buffer.drain(..end + consumed);
             progress.remainder = Some(std::mem::take(&mut self.buffer));
         } else {
-            let mut hold =
-                partial_marker(&self.buffer, &[&self.close, &format!("\n{}", self.close)]);
+            // Token delimiters arrive whole; only the newline they would trim is held.
+            let mut hold = if self.close_token {
+                usize::from(self.trim_wrap && self.buffer.ends_with('\n'))
+            } else {
+                partial_marker(&self.buffer, &[&self.close, &format!("\n{}", self.close)])
+            };
             if self.tool_ends_reasoning {
-                hold = hold.max(partial_marker(&self.buffer, &[&self.open]));
+                if !self.open_token {
+                    hold = hold.max(partial_marker(&self.buffer, &[&self.open]));
+                }
                 if self.tools {
                     hold = hold.max(partial_marker(&self.buffer, &[D::OPEN]));
                 }
@@ -113,12 +171,8 @@ impl<D: ToolDialect> ReasoningParser for ThinkReasoning<D> {
                 hold = hold.max(self.buffer.len() - line);
             }
             let visible = self.buffer.len() - hold;
-            let text: String = self.buffer.drain(..visible).collect();
-            let text = if self.tool_ends_reasoning {
-                text.replace(&self.open, "")
-            } else {
-                text
-            };
+            let text = self.without_open(&self.buffer[..visible], start);
+            self.buffer.drain(..visible);
             if !text.is_empty() {
                 progress.events.push(Event::Reasoning(text));
             }
@@ -231,11 +285,17 @@ pub struct TaggedOutput<D: ToolDialect> {
     tool: Option<TaggedTools<D>>,
     calls: usize,
     finishing: bool,
+    delimiter_tokens: Vec<(u32, String)>,
+    pending_delimiters: VecDeque<String>,
+    pending_text: String,
 }
 impl<D: ToolDialect> TaggedOutput<D> {
+    /// `control_tokens` lists delimiters that occupy one tokenizer token; those
+    /// count only where generated as that token.
     pub fn with_reasoning(
         mut self,
         syntax: Option<&crate::model::contract::ReasoningParser>,
+        control_tokens: &[(u32, String)],
     ) -> Self {
         self.reasoning_enabled = syntax.is_some();
         if let Some(syntax) = syntax {
@@ -243,6 +303,17 @@ impl<D: ToolDialect> TaggedOutput<D> {
             self.reasoning.close.clone_from(&syntax.close);
             self.initial_close = matches!(self.mode, Mode::Content)
                 && syntax.kind == crate::model::contract::ReasoningParserKind::MmThink;
+            self.delimiter_tokens = control_tokens
+                .iter()
+                .filter(|(_, marker)| *marker == syntax.open || *marker == syntax.close)
+                .cloned()
+                .collect();
+            self.reasoning.open_token =
+                self.delimiter_tokens.iter().any(|(_, m)| *m == syntax.open);
+            self.reasoning.close_token = self
+                .delimiter_tokens
+                .iter()
+                .any(|(_, m)| *m == syntax.close);
         }
         self.reasoning.trim_wrap = syntax.is_some_and(|s| s.wrapping_newlines > 0);
         self.reasoning.tool_ends_reasoning =
@@ -280,6 +351,10 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 tool_ends_reasoning: D::TOOL_ENDS_REASONING,
                 finishing: false,
                 dialect: std::marker::PhantomData,
+                open_token: false,
+                close_token: false,
+                offsets: vec![],
+                end: 0,
             },
             tool: (config.start == OutputStart::ToolBody).then(|| TaggedTools {
                 dialect: std::marker::PhantomData,
@@ -289,6 +364,9 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
             }),
             calls: 0,
             finishing: false,
+            delimiter_tokens: vec![],
+            pending_delimiters: VecDeque::new(),
+            pending_text: String::new(),
         }
     }
     #[cfg(feature = "server")]
@@ -311,16 +389,79 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
     }
     fn push(&mut self, input: Input<'_>) -> Result<Vec<Event>> {
         self.spans.clear();
-        if let Input::Token(_) = input {
+        let text = match input {
+            Input::Token(token) => {
+                if let Some((_, marker)) = self.delimiter_tokens.iter().find(|(id, _)| *id == token)
+                {
+                    self.pending_delimiters.push_back(marker.clone());
+                    return Ok(vec![]);
+                }
+                return match self.mode {
+                    Mode::Reasoning => self.reasoning.push(input).map(|p| p.events),
+                    Mode::Tool => self.tool.as_mut().unwrap().push(input).map(|p| p.events),
+                    _ => Ok(vec![]),
+                };
+            }
+            Input::Text(text) => text,
+        };
+        // A token precedes its text, possibly by several pushes.
+        self.pending_text.push_str(text);
+        let mut output = Vec::new();
+        while let Some(marker) = self.pending_delimiters.front() {
+            let Some(at) = self.pending_text.find(marker.as_str()) else {
+                let visible =
+                    self.pending_text.len() - partial_marker(&self.pending_text, &[marker]);
+                let text: String = self.pending_text.drain(..visible).collect();
+                output.extend(self.parse(&text)?);
+                return Ok(output);
+            };
+            let end = at + marker.len();
+            self.reasoning.offsets.push(self.received + at);
+            self.pending_delimiters.pop_front();
+            let text: String = self.pending_text.drain(..end).collect();
+            output.extend(self.parse(&text)?);
+        }
+        let text = std::mem::take(&mut self.pending_text);
+        output.extend(self.parse(&text)?);
+        let unparsed = self.buffer.len()
+            + self.reasoning.buffer.len()
+            + self.tool.as_ref().map_or(0, |tool| tool.buffer.len());
+        let floor = self.received.saturating_sub(unparsed);
+        self.reasoning.offsets.retain(|&offset| offset >= floor);
+        Ok(output)
+    }
+    fn finish(&mut self, cause: Termination) -> Result<Vec<Event>> {
+        self.pending_delimiters.clear();
+        if matches!(cause, Termination::Cancelled | Termination::ExecutionError) {
+            self.pending_text.clear();
+            self.buffer.clear();
             return match self.mode {
-                Mode::Reasoning => self.reasoning.push(input).map(|p| p.events),
-                Mode::Tool => self.tool.as_mut().unwrap().push(input).map(|p| p.events),
+                Mode::Reasoning => self.reasoning.finish(cause),
+                Mode::Tool => self.tool.as_mut().unwrap().finish(cause),
                 _ => Ok(vec![]),
             };
         }
-        let Input::Text(text) = input else {
-            unreachable!()
-        };
+        self.finishing = true;
+        self.reasoning.finishing = true;
+        let mut output = self.push(Input::Text(""))?;
+        match self.mode {
+            Mode::Reasoning => output.extend(self.reasoning.finish(cause)?),
+            Mode::Tool => output.extend(self.tool.as_mut().unwrap().finish(cause)?),
+            _ => {
+                let start = self.received - self.buffer.len();
+                let text = std::mem::take(&mut self.buffer);
+                if !text.is_empty() {
+                    self.spans.push(Some(start..start + text.len()));
+                    output.push(Event::Content(text));
+                }
+            }
+        }
+        Ok(output)
+    }
+}
+
+impl<D: ToolDialect> TaggedOutput<D> {
+    fn parse(&mut self, text: &str) -> Result<Vec<Event>> {
         self.received += text.len();
         self.buffer.push_str(text);
         let mut output = Vec::new();
@@ -350,6 +491,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                     let text = std::mem::take(&mut self.buffer);
                     let reasoning = matches!(self.mode, Mode::Reasoning);
                     let progress = if reasoning {
+                        self.reasoning.end = self.received;
                         self.reasoning.push(Input::Text(&text))?
                     } else {
                         self.tool.as_mut().unwrap().push(Input::Text(&text))?
@@ -374,13 +516,16 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 }
                 Mode::Content => {
                     if self.initial_close {
-                        if self.reasoning.close.starts_with(&self.buffer)
-                            && self.buffer.len() < self.reasoning.close.len()
+                        let start = self.received - self.buffer.len();
+                        if self.buffer.is_empty()
+                            || (!self.reasoning.close_token
+                                && self.reasoning.close.starts_with(&self.buffer)
+                                && self.buffer.len() < self.reasoning.close.len())
                         {
                             return Ok(output);
                         }
                         self.initial_close = false;
-                        if self.buffer.starts_with(self.reasoning.close.as_str()) {
+                        if self.reasoning.find_delimiter(&self.buffer, start, true) == Some(0) {
                             self.buffer.drain(..self.reasoning.close.len());
                             continue;
                         }
@@ -406,6 +551,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                             self.buffer.drain(..whitespace);
                         }
                     }
+                    let start = self.received - self.buffer.len();
                     if self.structured {
                         let text = self.buffer.trim_start();
                         if text.is_empty() {
@@ -415,28 +561,37 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                             D::OPEN,
                             D::CLOSE,
                             D::FUNCTION.map_or(D::OPEN, |(open, _)| open),
-                            self.reasoning.close.as_str(),
+                            if self.reasoning.close_token {
+                                ""
+                            } else {
+                                self.reasoning.close.as_str()
+                            },
                         ];
                         let control = markers
                             .iter()
                             .filter(|marker| !marker.is_empty())
-                            .any(|marker| text.starts_with(marker) || marker.starts_with(text));
+                            .any(|marker| text.starts_with(marker) || marker.starts_with(text))
+                            || (self.reasoning.close_token
+                                && self.reasoning.find_delimiter(&self.buffer, start, true)
+                                    == Some(self.buffer.len() - text.len()));
                         if !control {
                             self.mode = Mode::Verbatim;
                             continue;
                         }
                     }
                     if self.reasoning.tool_ends_reasoning {
-                        if let Some(at) = self.buffer.find(self.reasoning.close.as_str()) {
-                            let earlier = [
-                                self.reasoning.open.as_str(),
-                                D::OPEN,
-                                D::FUNCTION.map_or(D::OPEN, |(open, _)| open),
-                            ]
-                            .iter()
-                            .any(|marker| self.buffer.find(marker).is_some_and(|start| start < at));
+                        if let Some(at) = self.reasoning.find_delimiter(&self.buffer, start, true) {
+                            let earlier = self
+                                .reasoning
+                                .find_delimiter(&self.buffer, start, false)
+                                .into_iter()
+                                .chain(
+                                    [D::OPEN, D::FUNCTION.map_or(D::OPEN, |(open, _)| open)]
+                                        .iter()
+                                        .filter_map(|marker| self.buffer.find(marker)),
+                                )
+                                .any(|opener| opener < at);
                             if !earlier {
-                                let start = self.received - self.buffer.len();
                                 let prefix: String = self.buffer.drain(..at).collect();
                                 self.buffer.drain(..self.reasoning.close.len());
                                 if !prefix.is_empty() {
@@ -449,7 +604,7 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                     }
                     let mut marker = self
                         .reasoning_enabled
-                        .then(|| self.buffer.find(self.reasoning.open.as_str()))
+                        .then(|| self.reasoning.find_delimiter(&self.buffer, start, false))
                         .flatten()
                         .map(|at| (at, false));
                     let mut bare_function = false;
@@ -524,25 +679,24 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                                 tool_ends_reasoning: self.reasoning.tool_ends_reasoning,
                                 tools: !self.tools.is_empty(),
                                 finishing: self.finishing,
+                                open_token: self.reasoning.open_token,
+                                close_token: self.reasoning.close_token,
+                                offsets: std::mem::take(&mut self.reasoning.offsets),
+                                end: self.received,
                             };
                         }
                     } else {
                         let newline = format!("\n{}", D::OPEN);
                         let double_newline = format!("\n\n{}", D::OPEN);
-                        let markers: &[&str] = match (self.reasoning_enabled, self.tools.is_empty())
-                        {
-                            (true, true) => &[self.reasoning.open.as_str()],
-                            (true, false) => &[
-                                self.reasoning.open.as_str(),
-                                D::OPEN,
-                                &double_newline,
-                                &newline,
-                            ],
-                            (false, false) => &[D::OPEN, &double_newline, &newline],
-                            (false, true) => &[],
-                        };
-                        let mut hold = partial_marker(&self.buffer, markers);
-                        if self.reasoning.tool_ends_reasoning {
+                        let mut markers = vec![];
+                        if self.reasoning_enabled && !self.reasoning.open_token {
+                            markers.push(self.reasoning.open.as_str());
+                        }
+                        if !self.tools.is_empty() {
+                            markers.extend([D::OPEN, &double_newline, &newline]);
+                        }
+                        let mut hold = partial_marker(&self.buffer, &markers);
+                        if self.reasoning.tool_ends_reasoning && !self.reasoning.close_token {
                             hold = hold.max(partial_marker(
                                 &self.buffer,
                                 &[self.reasoning.close.as_str()],
@@ -569,32 +723,6 @@ impl<D: ToolDialect> ModelOutput for TaggedOutput<D> {
                 }
             }
         }
-    }
-    fn finish(&mut self, cause: Termination) -> Result<Vec<Event>> {
-        if matches!(cause, Termination::Cancelled | Termination::ExecutionError) {
-            self.buffer.clear();
-            return match self.mode {
-                Mode::Reasoning => self.reasoning.finish(cause),
-                Mode::Tool => self.tool.as_mut().unwrap().finish(cause),
-                _ => Ok(vec![]),
-            };
-        }
-        self.finishing = true;
-        self.reasoning.finishing = true;
-        let mut output = self.push(Input::Text(""))?;
-        match self.mode {
-            Mode::Reasoning => output.extend(self.reasoning.finish(cause)?),
-            Mode::Tool => output.extend(self.tool.as_mut().unwrap().finish(cause)?),
-            _ => {
-                let start = self.received - self.buffer.len();
-                let text = std::mem::take(&mut self.buffer);
-                if !text.is_empty() {
-                    self.spans.push(Some(start..start + text.len()));
-                    output.push(Event::Content(text));
-                }
-            }
-        }
-        Ok(output)
     }
 }
 

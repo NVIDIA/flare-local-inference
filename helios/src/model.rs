@@ -18,7 +18,7 @@ pub use contract::PreparedContract;
 pub use inputs::{InputStep, pack_inputs};
 pub use packing::Inputs;
 #[cfg(feature = "server")]
-pub use prompt::{prepare_image_inputs, prepare_input, prepare_output};
+pub use prompt::{prepare_image_inputs, prepare_input, prepare_output, reasoning_delimiter_tokens};
 #[cfg(feature = "server")]
 pub(crate) use prompt::validate_conditioned_inputs;
 

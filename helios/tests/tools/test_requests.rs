@@ -85,6 +85,7 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         frontend.tokenizer(),
         248320,
         &config.eos_token_ids,
+        &flare_helios::model::reasoning_delimiter_tokens(&frontend, &config.contract.frontend)?,
     )?;
     for case in text["cases"].as_array().unwrap() {
         if case["messages"].to_string().contains("\"image") {

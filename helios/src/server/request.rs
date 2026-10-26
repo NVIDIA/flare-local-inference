@@ -255,6 +255,7 @@ pub(super) fn prepare_inference_cached(
             &normalized,
             &options,
             structured,
+            compiler.delimiters(),
         )?)
     };
     let envelope = output

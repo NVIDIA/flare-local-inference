@@ -273,6 +273,73 @@ mod tests {
     }
 
     #[test]
+    fn spelled_reasoning_delimiter_in_the_answer_receives_output_text_logprobs() {
+        let frontend = Arc::new(crate::server::output::tests::frontend(&[
+            "plan", "</think>", "Use ", "</", "think>", ".",
+        ]));
+        for (worker, streaming) in [(false, false), (false, true), (true, false), (true, true)] {
+            let mut config = config(true);
+            config.control_tokens = vec![(1, "</think>".into())];
+            let mut decoder = Decoder::<OutputPipeline>::new(&frontend, &[], Some(config));
+            decoder.track_logprobs(&frontend, true);
+            let mut encoder = encoder(Protocol::Responses, frontend.clone(), streaming);
+            let mut streamed = Vec::new();
+            let mut stops =
+                crate::server::stops::TextStops::new(&frontend, vec!["UNMATCHED".into()]).unwrap();
+            stops.track(&frontend);
+            for token in 0..6 {
+                let events = if worker {
+                    let (pieces, matched) = stops.push_logprob(token, value(token), false).unwrap();
+                    assert!(!matched);
+                    decoder.push_protocol(pieces).unwrap()
+                } else {
+                    decoder.push_logprob(value(token)).unwrap()
+                };
+                for frame in encoder.apply(0, events).unwrap() {
+                    if frame.data["type"] == "response.output_text.delta" {
+                        streamed.extend(frame.data["logprobs"].as_array().unwrap().iter().cloned());
+                    }
+                }
+            }
+            if worker {
+                let (pieces, _) = stops.finish(None).unwrap();
+                encoder
+                    .apply(0, decoder.push_protocol(pieces).unwrap())
+                    .unwrap();
+            }
+            for frame in encoder
+                .apply(0, decoder.finish(Termination::Eos).unwrap())
+                .unwrap()
+            {
+                if frame.data["type"] == "response.output_text.delta" {
+                    streamed.extend(frame.data["logprobs"].as_array().unwrap().iter().cloned());
+                }
+            }
+            encoder.finish(0, Termination::Eos, 6, 0, None).unwrap();
+            let response = encoder.response();
+            let part = &response["output"][1]["content"][0];
+            assert_eq!(
+                part["text"], "Use </think>.",
+                "worker {worker} streaming {streaming}"
+            );
+            let tokens: Vec<_> = part["logprobs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|e| e["token"].clone())
+                .collect();
+            assert_eq!(
+                tokens,
+                ["token_id:2", "token_id:3", "token_id:4", "token_id:5"],
+                "worker {worker} streaming {streaming}"
+            );
+            if streaming {
+                assert_eq!(json!(streamed), part["logprobs"]);
+            }
+        }
+    }
+
+    #[test]
     fn streamed_token_suffix_at_finish_reuses_its_previously_delivered_entry() {
         for (reasoning, token_text) in [(true, "tail\n"), (false, "tail<")] {
             for worker in [false, true] {

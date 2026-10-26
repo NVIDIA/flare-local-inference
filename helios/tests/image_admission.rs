@@ -75,6 +75,8 @@ fn jpeg_and_oriented_png_use_actual_checkpoint_request_preparation() {
         frontend.tokenizer(),
         248320,
         &config.eos_token_ids,
+        &flare_helios::model::reasoning_delimiter_tokens(&frontend, &config.contract.frontend)
+            .unwrap(),
     )
     .unwrap();
     let mut counts = 0;

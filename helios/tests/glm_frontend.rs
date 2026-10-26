@@ -72,8 +72,22 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
         history_drafts: false,
         speculative_proposal_source: Default::default(),
     };
-    let compiler =
-        GrammarCompiler::new(frontend.tokenizer(), 154880, &config.eos_token_ids).unwrap();
+    let delimiters =
+        model::reasoning_delimiter_tokens(&frontend, &config.contract.frontend).unwrap();
+    assert_eq!(
+        delimiters,
+        [
+            (154841, "<think>".to_owned()),
+            (154842, "</think>".to_owned())
+        ]
+    );
+    let compiler = GrammarCompiler::new(
+        frontend.tokenizer(),
+        154880,
+        &config.eos_token_ids,
+        &delimiters,
+    )
+    .unwrap();
     let reference: Value = serde_json::from_slice(
         &fs::read(std::env::var_os("FLARE_GLM_FRONTEND_REFERENCE").unwrap()).unwrap(),
     )
@@ -141,12 +155,13 @@ fn checkpoint_template_tokenization_requests_and_message_boundaries_match_transf
         let reasoning =
             prepared.output.content.start == flare_helios::output::tagged::OutputStart::Reasoning;
         let mut output = flare_helios::output::OutputPipeline::new(prepared.output);
-        let text = if reasoning {
-            "analysis</think>result"
-        } else {
-            "result"
-        };
-        let mut events = output.push(Input::Text(text)).unwrap();
+        let mut events = Vec::new();
+        if reasoning {
+            events.extend(output.push(Input::Text("analysis")).unwrap());
+            events.extend(output.push(Input::Token(154842)).unwrap());
+            events.extend(output.push(Input::Text("</think>")).unwrap());
+        }
+        events.extend(output.push(Input::Text("result")).unwrap());
         events.extend(output.finish(Termination::Eos).unwrap());
         assert_eq!(
             events.last(),

@@ -94,6 +94,10 @@ fn official_encoder_renders_and_initializes_native_output_state() {
     );
     assert!(prompt.text.contains("Reasoning Effort: 75"));
     assert!(!prompt.token_ids.is_empty());
+    let delimiters =
+        model::reasoning_delimiter_tokens(&frontend, &support::contract("deepseek41").frontend)
+            .unwrap();
+    assert!(delimiters.is_empty());
     let output = flare_helios::model::prepare_output(
         &support::model_config(support::contract("deepseek41")),
         &frontend,
@@ -101,6 +105,7 @@ fn official_encoder_renders_and_initializes_native_output_state() {
         &messages,
         &options,
         false,
+        &delimiters,
     )
     .unwrap();
     assert!((output.content.start == flare_helios::output::tagged::OutputStart::Reasoning));
@@ -121,6 +126,7 @@ fn official_encoder_renders_and_initializes_native_output_state() {
         &messages,
         &options,
         false,
+        &delimiters,
     )
     .unwrap();
     assert!(!(output.content.start == flare_helios::output::tagged::OutputStart::Reasoning));

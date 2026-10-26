@@ -83,8 +83,16 @@ impl Fixture {
             history_drafts: false,
             speculative_proposal_source: Default::default(),
         };
-        let compiler =
-            GrammarCompiler::new(frontend.tokenizer(), 248320, &config.eos_token_ids).unwrap();
+        let delimiters =
+            flare_helios::model::reasoning_delimiter_tokens(&frontend, &config.contract.frontend)
+                .unwrap();
+        let compiler = GrammarCompiler::new(
+            frontend.tokenizer(),
+            248320,
+            &config.eos_token_ids,
+            &delimiters,
+        )
+        .unwrap();
         Self {
             frontend,
             processor,

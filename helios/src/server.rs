@@ -176,10 +176,13 @@ impl Server {
         {
             return Err("invalid HTTP admission limits".into());
         }
+        let delimiters =
+            crate::model::reasoning_delimiter_tokens(&frontend, &model.contract.frontend)?;
         let grammar = Arc::new(crate::grammar::GrammarCompiler::new(
             frontend.tokenizer(),
             model.contract.vocabulary,
             &model.eos_token_ids,
+            &delimiters,
         )?);
         let ingress_capacity = config
             .queue_capacity

@@ -214,7 +214,8 @@ algorithms, not model identities. Qwen Coder function tags, GLM argument tags,
 and DSML tool syntax may be paired independently with think-tag reasoning.
 Wrapping newlines, tag separators, assistant boundaries, and reasoning terminal
 markers are explicit syntax data. A reasoning terminal marker must be the
-declared tool syntax's opener.
+declared tool syntax's opener. Reasoning delimiters that the frontend tokenizer
+encodes as one token delimit output only when generated as that token.
 
 The shared prompt path determines initial reasoning state from an open assistant
 envelope, excluding completed user, tool, and assistant messages. When a template
