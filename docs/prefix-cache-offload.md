@@ -13,6 +13,11 @@ publishes an ordinary GPU checkpoint, so branching, continuation, and retirement
 use the existing cache semantics. Scheduler-owned transfer tickets retain
 buffers independently of the requests waiting for them.
 
+Common host file I/O, memory mapping, scheduling-priority and filesystem
+capacity helpers live in `eos/` (`flare-eos`). Both Helios and Selene use Eos;
+Helios does not depend on Selene for non-cache OS operations. CUDA library
+loading and terminal sizing remain in `helios::os`.
+
 Host offload requires explicit configuration. Derived defaults remain disabled
 until correctness and the inference-latency thresholds in section 4 pass.
 Preparation, captured graphs, and the runtime
@@ -770,7 +775,7 @@ on the file format fixed in step 5.
 ### 3.1 Stores with the staged transport
 
 1. **Cache geometry and layout fingerprint.** Add `CacheGeometry` and the
-   fingerprint in `helios/src/offload/geometry.rs`. Collect it in
+   fingerprint in `selene/selene/src/geometry.rs`. Collect it in
    `allocate_caches` before `sizing.take()`, store it on the rank's
    `NativeResources`, and attach it in `execution_manifest`. Add
    `cache: Option<CacheGeometry>` to `ExecutionManifest` and keep
@@ -789,13 +794,13 @@ on the file format fixed in step 5.
    Acceptance: byte-exact round trips; the direct read succeeds into
    registered memory.
 
-3. **Slab pool.** `helios/src/offload/slab.rs`: anonymous mapping, two
+3. **Slab pool.** `selene/selene/src/slab.rs`: anonymous mapping, two
    fixed-size sub-pools, free lists, the retention flag, and separate
    `register` and `unregister` steps so CPU tests run without a driver.
    Acceptance: tests for exhaustion, reuse, alignment of every slab, release
    on completion without retention, and the minimum-size rule.
 
-4. **Index.** `helios/src/offload/index.rs`: nodes, buckets, insert, lookup,
+4. **Index.** `selene/selene/src/index.rs`: nodes, buckets, insert, lookup,
    pins, locations, leaf-first eviction with an evictability predicate,
    compaction, dedupe. Acceptance: CPU tests with 64, 128, and 256 token pages
    covering unaligned endpoints, feasibility through the resident ancestor, a
@@ -803,14 +808,14 @@ on the file format fixed in step 5.
    non-evictable nodes surviving eviction, compaction removing lookup matches
    but not chain pages, and LRU order.
 
-5. **Record files.** `helios/src/offload/record.rs`: header encoding with
+5. **Record files.** `selene/selene/src/record.rs`: header encoding with
    per-plane sizes, file naming, per-plane 4 KiB padding, temporary write and
    rename, truncation, scan. Acceptance: CPU tests in a temporary directory
    for round trip, aligned plane offsets for every geometry, row presence by
    size, rejection of wrong identity or fingerprint, temporary file cleanup,
    orphan removal, and a rebuilt index equal to the one that wrote the files.
 
-6. **Disk thread.** `helios/src/offload/disk.rs`: a thread owning an
+6. **Disk thread.** `selene/selene/src/disk.rs`: a thread owning an
    `io_uring` ring, with write, read, truncate, and unlink jobs over
    `O_DIRECT` files into caller-owned registered buffers, chunked at 8 MiB,
    with checksum computation and verification, running at reduced priority.
@@ -825,15 +830,16 @@ on the file format fixed in step 5.
    slabs, poisons the device storage, copies them back into different ids,
    and compares byte-exact.
 
-8. **Memory store and disk store.** `helios/src/offload/memory.rs` and
-   `helios/src/offload/disk_store.rs`, each implementing `PrefixStore` from
-   `helios/src/offload/mod.rs` over the components above; the disk store
+8. **Memory store and disk store.** `selene/selene/src/memory.rs` and
+   `selene/selene/src/disk_store.rs`, each implementing `HostStore` from
+   `selene/selene/src/store.rs` over the components above, which the
+   adapter in `helios/src/offload/adapter.rs` exposes as `PrefixStore`; the disk store
    behind the `DiskTransport` trait with the `Staged` implementation, its
    staging pool, `write_from`, and `read_into`. Acceptance: the step 7 GPU
    test repeated through each store's `store` and `fetch`, and CPU tests of
    each store's event sequencing with a transfer stub.
 
-9. **Composite store.** `helios/src/offload/composite.rs`: write-through,
+9. **Composite store.** `selene/selene/src/composite.rs`: write-through,
    read-through into the memory store, durability marking, subset
    maintenance, and failure handling. Acceptance: CPU tests with transfer and
    disk stubs covering a memory hit, a disk hit that becomes resident, a

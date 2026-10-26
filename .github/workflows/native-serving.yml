@@ -32,6 +32,10 @@ jobs:
       - name: Build native serving
         id: build
         run: cargo build --locked --release --manifest-path flare/Cargo.toml
+      - name: Test host OS helpers
+        run: cargo test --locked --release --manifest-path eos/Cargo.toml --target-dir flare/target
+      - name: Test host cache tiers
+        run: cargo test --locked --release --manifest-path selene/selene/Cargo.toml --target-dir flare/target
       - name: Test native runtime on Linux
         if: runner.os == 'Linux'
         run: |
