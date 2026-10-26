@@ -29,21 +29,17 @@ use std::{
 
 use blake2::{Blake2b, Digest, digest::consts::U16};
 
-use crate::{
-    Error, Result,
-    cache::{PageId, PrefixKey},
-    execution::RankStream,
-    scheduler::StateSlotId,
-};
-
-use super::{
-    InboundTicket, JobId, Prepared, PublishedCheckpoint, Shared, Transport,
+use flare_selene::{
+    CLOSE_TIMEOUT, Error, InboundTicket, JobId, PageId, PrefixKey, PublishedCheckpoint, Result,
+    SharedCopier, StateSlotId, Transport,
     disk::DiskThread,
     disk_store::{DiskTransport, FetchSegment, Staged, TransportEvent},
     geometry::invalid,
     record::{self, HEADER_BYTES, Header, Scanned},
-    transfer::{self, Transfers},
 };
+
+use super::{Prepared, Shared};
+use crate::execution::RankStream;
 
 /// Peers connect to rank zero's record listener within this time.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -916,7 +912,7 @@ impl DiskTransport for Sharded {
         }
         let local = self.local.close();
         self.absorb_local();
-        let deadline = Instant::now() + transfer::CLOSE_TIMEOUT + REPLY_TIMEOUT;
+        let deadline = Instant::now() + CLOSE_TIMEOUT + REPLY_TIMEOUT;
         let mut failure = local.err();
         for index in 0..self.peers.len() {
             let rank = index + 1;
@@ -972,7 +968,7 @@ fn decode_closed(payload: &[u8]) -> Result<()> {
 /// Rank zero's disk transport over its prepared staging resources and its peer connections.
 pub(super) fn transport(
     staging: Option<super::slab::SlabPool>,
-    transfers: Arc<Mutex<Transfers>>,
+    transfers: SharedCopier,
     peers: Vec<Link>,
 ) -> Result<Box<dyn DiskTransport>> {
     let local = Staged::new(staging, transfers, DiskThread::start("flare-offload-disk")?);
@@ -1614,7 +1610,7 @@ pub fn join_peer(
         .staging_pool
         .as_ref()
         .ok_or_else(|| invalid("a peer's prefix record service needs a staging pool"))?;
-    let transfers = Arc::new(Mutex::new(Transfers::start(
+    let transfers: SharedCopier = Arc::new(Mutex::new(super::transfer::Transfers::start(
         &prepared.contexts,
         prepared.geometry.clone(),
         pool,
@@ -1667,7 +1663,7 @@ pub fn join_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::offload::geometry::tests::geometry;
+    use flare_selene::testing::{StoppedCopier, geometry};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn directory(test: &str) -> PathBuf {
@@ -1680,10 +1676,10 @@ mod tests {
 
     /// A staged transport without a staging pool: its disk thread runs truncates and unlinks.
     fn staged() -> Staged {
-        let transfers = Transfers::stopped(&[geometry(64, &[("kv", 4096)], 4096)]).unwrap();
+        let transfers = StoppedCopier::shared(&[geometry(64, &[("kv", 4096)], 4096)]).unwrap();
         Staged::new(
             None,
-            Arc::new(Mutex::new(transfers)),
+            transfers,
             DiskThread::start("flare-shard-test").unwrap(),
         )
     }

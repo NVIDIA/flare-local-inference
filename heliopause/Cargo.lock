@@ -831,8 +831,10 @@ name = "flare-selene"
 version = "0.1.0"
 dependencies = [
  "blake2",
+ "flare-eos",
  "io-uring",
  "libc",
+ "twox-hash",
  "windows-sys 0.61.2",
 ]
 

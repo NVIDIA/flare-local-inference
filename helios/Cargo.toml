@@ -56,6 +56,7 @@ crossterm = { version = "0.28", default-features = false, optional = true }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 
 [dev-dependencies]
+flare-selene = { path = "../selene/selene", features = ["test-support"] }
 minijinja = { version = "=2.24.0", features = ["loader", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
 

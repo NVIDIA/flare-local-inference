@@ -24,61 +24,21 @@ use std::{
     collections::HashMap,
     sync::mpsc::{self, Receiver, RecvTimeoutError, Sender, SyncSender, TrySendError},
     thread::JoinHandle,
-    time::{Duration, Instant},
+    time::Instant,
 };
 
-use crate::{
-    Error, ExecutionError, Failure, Result,
-    cache::PageId,
-    cuda::{Event, Stream},
-    scheduler::StateSlotId,
-};
-
-use super::{
-    CacheGeometry, JobId, Layout,
+use flare_selene::{
+    CLOSE_TIMEOUT, CacheGeometry, Direction, Error, Job, JobId, Layout, PageCopier, QUEUE_DEPTH,
+    Reply, Result,
     geometry::{RankLayout, invalid},
     slab::{RankPart, SlabPool, WINDOW_PAGES},
 };
 
+use crate::cuda::{Event, Stream};
+
 pub use crate::cuda::{BATCH_BYTES, BATCH_ENTRIES};
 
-/// Jobs a store may have outstanding per rank; `submit` fails when full.
-pub const QUEUE_DEPTH: usize = 16;
 pub const NICE: i32 = 10;
-/// Longest `close` waits for outstanding jobs before reporting them.
-pub const CLOSE_TIMEOUT: Duration = Duration::from_secs(30);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Direction {
-    /// GPU ids to host slabs.
-    Out,
-    /// Host slabs to GPU ids.
-    In,
-}
-
-/// One window of a record: up to [`super::slab::WINDOW_PAGES`] pages and
-/// optionally the row. `pages` pairs a GPU page id with the host address of
-/// the page slab holding that page's record across ranks.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Job {
-    pub id: JobId,
-    pub window: u32,
-    pub direction: Direction,
-    pub pages: Vec<(PageId, usize)>,
-    pub row: Option<(StateSlotId, usize)>,
-}
-
-#[derive(Debug)]
-pub struct Reply {
-    pub id: JobId,
-    pub window: u32,
-    pub direction: Direction,
-    pub result: Result<()>,
-    /// Bytes copied across every rank.
-    pub bytes: u64,
-    /// Wall time from submission to the last rank's completion.
-    pub elapsed: Duration,
-}
 
 pub struct Transfers {
     layout: Layout,
@@ -453,10 +413,10 @@ impl Transfers {
                     worker.serve(jobs, replies);
                 })
                 .map_err(|error| {
-                    Error::Execution(ExecutionError::State(Failure::caused_by(
+                    Error::caused_by(
                         format!("cannot spawn the offload thread for rank {rank}"),
                         error,
-                    )))
+                    )
                 })?;
             transfers.ranks.push(RankThread {
                 sender: Some(sender),
@@ -475,8 +435,10 @@ impl Transfers {
         }
         Ok(transfers)
     }
+}
 
-    pub fn layout(&self) -> &Layout {
+impl PageCopier for Transfers {
+    fn layout(&self) -> &Layout {
         &self.layout
     }
 
@@ -488,7 +450,7 @@ impl Transfers {
     /// one [`Reply`] follows from `poll`. A thread that stops between that
     /// check and its send counts as a failed rank reply: the ranks that did
     /// accept the job complete their copies and the reply carries the error.
-    pub fn submit(&mut self, job: Job) -> Result<()> {
+    fn submit(&mut self, job: Job) -> Result<()> {
         let key = (job.id, job.window);
         if self.pending.contains_key(&key) {
             return Err(invalid(format!(
@@ -533,41 +495,13 @@ impl Transfers {
     }
 
     /// Collect replies whose every rank has completed.
-    pub fn poll(&mut self, replies: &mut Vec<Reply>) {
+    fn poll(&mut self, replies: &mut Vec<Reply>) {
         while let Ok(reply) = self.receiver.try_recv() {
             self.absorb(reply, replies);
         }
     }
 
-    fn absorb(&mut self, reply: RankReply, replies: &mut Vec<Reply>) {
-        if let Some(thread) = self.ranks.get_mut(reply.rank) {
-            thread.outstanding = thread.outstanding.saturating_sub(1);
-        }
-        let key = (reply.id, reply.window);
-        let Some(pending) = self.pending.get_mut(&key) else {
-            return;
-        };
-        pending.bytes += reply.bytes;
-        if let Err(error) = reply.result {
-            pending.error.get_or_insert(error);
-        }
-        pending.remaining = pending.remaining.saturating_sub(1);
-        if pending.remaining > 0 {
-            return;
-        }
-        if let Some(pending) = self.pending.remove(&key) {
-            replies.push(Reply {
-                id: reply.id,
-                window: reply.window,
-                direction: pending.direction,
-                result: pending.error.map_or(Ok(()), Err),
-                bytes: pending.bytes,
-                elapsed: pending.started.elapsed(),
-            });
-        }
-    }
-
-    pub fn in_flight(&self) -> usize {
+    fn in_flight(&self) -> usize {
         self.pending.len()
     }
 
@@ -575,7 +509,7 @@ impl Transfers {
     /// replies, then stop and join every thread. Jobs still outstanding at
     /// the timeout leave the threads running and are reported as an error;
     /// dropping `Transfers` joins the threads once those jobs finish.
-    pub fn close(&mut self) -> Result<()> {
+    fn close(&mut self) -> Result<()> {
         let deadline = Instant::now() + CLOSE_TIMEOUT;
         let mut discarded = Vec::new();
         while !self.pending.is_empty() {
@@ -620,6 +554,36 @@ impl Transfers {
     }
 }
 
+impl Transfers {
+    fn absorb(&mut self, reply: RankReply, replies: &mut Vec<Reply>) {
+        if let Some(thread) = self.ranks.get_mut(reply.rank) {
+            thread.outstanding = thread.outstanding.saturating_sub(1);
+        }
+        let key = (reply.id, reply.window);
+        let Some(pending) = self.pending.get_mut(&key) else {
+            return;
+        };
+        pending.bytes += reply.bytes;
+        if let Err(error) = reply.result {
+            pending.error.get_or_insert(error);
+        }
+        pending.remaining = pending.remaining.saturating_sub(1);
+        if pending.remaining > 0 {
+            return;
+        }
+        if let Some(pending) = self.pending.remove(&key) {
+            replies.push(Reply {
+                id: reply.id,
+                window: reply.window,
+                direction: pending.direction,
+                result: pending.error.map_or(Ok(()), Err),
+                bytes: pending.bytes,
+                elapsed: pending.started.elapsed(),
+            });
+        }
+    }
+}
+
 impl RankThread {
     /// Send without blocking; a refusal is recorded on `pending` as this rank's reply.
     fn offer(&mut self, rank: usize, job: Job, pending: &mut Pending) -> bool {
@@ -655,24 +619,14 @@ impl Drop for Transfers {
 }
 
 #[cfg(test)]
-impl Transfers {
-    /// A handle with no rank threads: every `submit` fails and `poll` returns
-    /// nothing, for tests of transports that never submit a transfer or
-    /// expect every submission to fail.
-    pub(crate) fn stopped(geometry: &[CacheGeometry]) -> Result<Self> {
-        let (_, receiver) = mpsc::channel();
-        Ok(Self {
-            layout: Layout::new(geometry)?,
-            ranks: Vec::new(),
-            receiver,
-            pending: HashMap::new(),
-        })
-    }
-}
-
-#[cfg(test)]
 mod tests {
-    use super::{super::geometry::tests::geometry, *};
+    use std::time::Duration;
+
+    use super::*;
+    use flare_selene::{
+        PageId, StateSlotId,
+        testing::{geometry, pattern as fill, rank_part},
+    };
 
     fn job(direction: Direction) -> Job {
         Job {
@@ -681,6 +635,71 @@ mod tests {
             direction,
             pages: vec![(PageId(5), 0x10000), (PageId(7), 0x20000)],
             row: Some((StateSlotId(3), 0x30000)),
+        }
+    }
+
+    #[test]
+    fn registered_parts_use_device_aliases_with_cross_rank_record_strides() {
+        let ranks = [
+            geometry(64, &[("kv", 8192), ("selector", 100)], 10_000),
+            geometry(64, &[("kv", 4096), ("selector", 200)], 5000),
+        ];
+        let layout = Layout::new(&ranks).unwrap();
+        let mut pool = SlabPool::new(
+            layout.page_record_bytes,
+            3,
+            layout.row_record_bytes,
+            2,
+            false,
+        )
+        .unwrap();
+        assert!(pool.device_parts(&layout).is_err());
+        let device = 0x2_0420_0000;
+        let parts = pool.registered_parts(&layout, device);
+        let pages: Vec<_> = (0..3).map(|_| pool.allocate_page().unwrap()).collect();
+        let rows: Vec<_> = (0..2).map(|_| pool.allocate_row().unwrap()).collect();
+        for (rank, part) in parts.iter().enumerate() {
+            let mut job = Job {
+                id: JobId(1),
+                window: 0,
+                direction: Direction::Out,
+                pages: vec![(PageId(5), pool.page_address(pages[2]))],
+                row: Some((StateSlotId(3), pool.row_address(rows[1]))),
+            };
+            let mut outbound = Vec::new();
+            expand(
+                &ranks[rank],
+                &layout.ranks[rank],
+                Some(part),
+                &job,
+                &mut outbound,
+            )
+            .unwrap();
+            let page = device + 2 * layout.page_record_bytes + layout.ranks[rank].page_offset;
+            let row = device
+                + 3 * layout.page_record_bytes
+                + layout.row_record_bytes
+                + layout.ranks[rank].row_offset;
+            assert_eq!(
+                outbound.iter().map(|d| d.destination).collect::<Vec<_>>(),
+                vec![page, page + ranks[rank].planes[0].padded_bytes(), row]
+            );
+            job.direction = Direction::In;
+            let mut inbound = Vec::new();
+            expand(
+                &ranks[rank],
+                &layout.ranks[rank],
+                Some(part),
+                &job,
+                &mut inbound,
+            )
+            .unwrap();
+            for (out, incoming) in outbound.iter().zip(&inbound) {
+                assert_eq!(
+                    (incoming.source, incoming.destination, incoming.bytes),
+                    (out.destination, out.source, out.bytes)
+                );
+            }
         }
     }
 
@@ -755,7 +774,7 @@ mod tests {
         );
         let start = 0x7e00_0000_0000usize;
         let (page_base, row_base) = (0x7e00_0100_0000usize, 0x7e00_0200_0000usize);
-        let part = super::super::slab::tests::rank_part(
+        let part = rank_part(
             start..start + (8 << 20),
             (page_record, 8, page_base, page_part),
             (row_record, 2, row_base, row_part),
@@ -1173,12 +1192,6 @@ mod tests {
         let targets = [2, 9, capacity / 2 + 1, capacity - 2];
         let (source_slot, target_slot) = (1u32, 2u32);
 
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
         let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
         let row_plane = rank.planes.len();
 
@@ -1233,7 +1246,8 @@ mod tests {
             false,
         )
         .unwrap();
-        pool.register(context).unwrap();
+        pool.register(&crate::offload::registrar::CudaRegistrar, context)
+            .unwrap();
         let page_slabs: Vec<usize> = (0..pages)
             .map(|_| {
                 let slab = pool.allocate_page().unwrap();
@@ -1479,11 +1493,19 @@ mod tests {
         let layout = Layout::new(&geometry).unwrap();
         let before = free();
         let mut registered = SlabPool::sized(&layout, POOL_BYTES).unwrap();
-        registered.register(contexts[0].0).unwrap();
+        registered
+            .register(&crate::offload::registrar::CudaRegistrar, contexts[0].0)
+            .unwrap();
         let with_registered = free();
         drop(registered);
         let between = free();
-        let pool = SlabPool::sized_by_rank(&layout, POOL_BYTES, &contexts).unwrap();
+        let pool = SlabPool::sized_by_rank(
+            &layout,
+            POOL_BYTES,
+            &contexts,
+            &crate::offload::registrar::CudaRegistrar,
+        )
+        .unwrap();
         let with_split = free();
         let mib = |bytes: i64| bytes as f64 / (1 << 20) as f64;
         for rank in 0..2 {

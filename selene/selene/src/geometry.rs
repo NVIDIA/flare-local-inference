@@ -10,7 +10,7 @@
 
 use blake2::{Blake2b, Digest, digest::consts::U16};
 
-use crate::{Error, ExecutionError, Result};
+use crate::{Error, Result};
 
 /// Alignment of every plane inside a record and of every direct-I/O transfer.
 pub const BLOCK_BYTES: u64 = 4096;
@@ -192,45 +192,15 @@ pub fn shard_fingerprint(geometry: &CacheGeometry, rank: usize, world: usize) ->
     hash.finalize().into()
 }
 
-pub(crate) fn invalid(message: impl Into<String>) -> Error {
-    Error::execution(ExecutionError::State, message)
+/// A host-tier failure with the given message.
+pub fn invalid(message: impl Into<String>) -> Error {
+    Error::new(message)
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-
-    pub(crate) fn geometry(
-        page_tokens: u64,
-        planes: &[(&str, u64)],
-        row_bytes: u64,
-    ) -> CacheGeometry {
-        let mut address = 0x7000_0000_0000u64;
-        let planes = planes
-            .iter()
-            .map(|(name, unit_bytes)| {
-                let plane = Plane {
-                    name: (*name).to_owned(),
-                    address,
-                    unit_bytes: *unit_bytes,
-                };
-                address += unit_bytes * 4096;
-                plane
-            })
-            .collect();
-        CacheGeometry {
-            snapshot_pages: Vec::new(),
-            page_tokens,
-            page_capacity: 4096,
-            row_capacity: 64,
-            row: Plane {
-                name: "state".into(),
-                address,
-                unit_bytes: row_bytes,
-            },
-            planes,
-        }
-    }
+    use crate::testing::geometry;
 
     #[test]
     fn layout_pads_every_plane_and_concatenates_ranks() {
@@ -298,46 +268,5 @@ pub(crate) mod tests {
         let mut zero = a;
         zero.row.unit_bytes = 0;
         assert!(Layout::new(&[zero]).is_err());
-    }
-}
-
-#[cfg(all(test, feature = "runtime-package"))]
-mod package_tests {
-    #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn package_geometry_lists_every_plane() {
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            return;
-        };
-        let model = unsafe {
-            crate::runtime_package::NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
-                &[0],
-                &crate::runtime_package::LoadOptions::default(),
-                &crate::startup::StartupProgress::silent(),
-            )
-        }
-        .unwrap();
-        let manifest = model.manifests().unwrap().remove(0);
-        let geometry = manifest.cache.unwrap();
-        eprintln!(
-            "page_tokens {} pages {} rows {} row {} {} bytes",
-            geometry.page_tokens,
-            geometry.page_capacity,
-            geometry.row_capacity,
-            geometry.row.name,
-            geometry.row.unit_bytes
-        );
-        for plane in &geometry.planes {
-            eprintln!(
-                "plane {} {} bytes at {:#x}",
-                plane.name, plane.unit_bytes, plane.address
-            );
-        }
-        eprintln!(
-            "page bytes {} record {}",
-            geometry.page_bytes(),
-            geometry.page_record_bytes()
-        );
     }
 }

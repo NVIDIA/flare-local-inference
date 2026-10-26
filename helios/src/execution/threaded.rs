@@ -543,7 +543,7 @@ mod tests {
         peer = root.clone();
         peer.graphs[0].prefill_capacity = 64;
         assert!(!same_layout(&root, &peer));
-        let geometry = crate::offload::geometry::tests::geometry(64, &[("k", 8192)], 4096);
+        let geometry = flare_selene::testing::geometry(64, &[("k", 8192)], 4096);
         peer = root.clone();
         peer.cache = Some(geometry.clone());
         assert!(!same_layout(&root, &peer));

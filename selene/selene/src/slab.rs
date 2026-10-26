@@ -19,10 +19,7 @@
 
 use std::collections::VecDeque;
 
-use crate::{
-    Result,
-    cuda::{DeviceHostParts, HostRegistration},
-};
+use crate::{HostRegistrar, Registration, Result, SplitMapping};
 
 use super::geometry::{BLOCK_BYTES, Layout, invalid};
 
@@ -180,7 +177,7 @@ impl RankPart {
 /// Each rank's parts of a pool split by rank and the memory holding them.
 struct Split {
     parts: Vec<RankPart>,
-    _memory: DeviceHostParts,
+    _memory: Box<dyn SplitMapping>,
 }
 
 /// Fixed pools of page and row slabs inside one registered mapping, or split by rank.
@@ -190,7 +187,7 @@ pub struct SlabPool {
     pages: SubPool,
     rows: SubPool,
     retain: bool,
-    registration: Option<HostRegistration>,
+    registration: Option<Box<dyn Registration>>,
     split: Option<Split>,
 }
 
@@ -219,7 +216,7 @@ impl SlabPool {
                 "a slab pool requires at least one page or row slab",
             ));
         }
-        let base = crate::os::map_host(mapping_bytes)
+        let base = flare_eos::map_host(mapping_bytes)
             .map_err(|error| invalid(format!("allocate host slabs: {error}")))?;
         Ok(Self {
             mapping: base,
@@ -254,7 +251,12 @@ impl SlabPool {
     /// split pool costs each device that for its own part only. The CPU cannot
     /// address a slab's record, so the pool suits stores that move records only
     /// between devices and slabs; [`SlabPool::rank_parts`] locates the parts.
-    pub fn sized_by_rank(layout: &Layout, bytes: u64, contexts: &[(usize, i32)]) -> Result<Self> {
+    pub fn sized_by_rank(
+        layout: &Layout,
+        bytes: u64,
+        contexts: &[(usize, i32)],
+        registrar: &dyn HostRegistrar,
+    ) -> Result<Self> {
         if contexts.len() != layout.ranks.len() {
             return Err(invalid(format!(
                 "a pool split by rank needs one context per rank: {} contexts for {} ranks",
@@ -284,7 +286,7 @@ impl SlabPool {
                 (context, device, page * page_count + row * row_count)
             })
             .collect();
-        let memory = crate::cuda::map_device_host_parts(&requests)?;
+        let memory = registrar.map_split(&requests)?;
         let base = memory.address();
         if memory.nbytes() < page_region + row_region {
             return Err(invalid(
@@ -383,7 +385,7 @@ impl SlabPool {
         Ok(self.registered_parts(layout, registration.device_address()))
     }
 
-    fn registered_parts(&self, layout: &Layout, device: u64) -> Vec<RankPart> {
+    pub fn registered_parts(&self, layout: &Layout, device: u64) -> Vec<RankPart> {
         layout
             .ranks
             .iter()
@@ -425,19 +427,18 @@ impl SlabPool {
             + MINIMUM_ROW_SLABS as u64 * layout.row_record_bytes
     }
 
-    /// Register the mapping with the driver as portable so every rank's context
+    /// Register the mapping through `registrar` as portable so every rank's context
     /// can address it, with `context` made current on the calling thread.
     /// A pool that is already registered is not registered again.
-    pub fn register(&mut self, context: usize) -> Result<()> {
+    pub fn register(&mut self, registrar: &dyn HostRegistrar, context: usize) -> Result<()> {
         if self.registered() {
             return Err(invalid(
                 "slab pool is already registered with the CUDA driver",
             ));
         }
-        // SAFETY: The mapping is page aligned and stays mapped at this size for
-        // the pool's lifetime; `Drop` releases the registration before unmapping.
-        let registration =
-            unsafe { crate::cuda::register_host(context, self.mapping, self.mapping_bytes) }?;
+        // The mapping is page aligned and stays mapped at this size for the
+        // pool's lifetime; `Drop` releases the registration before unmapping.
+        let registration = registrar.register(context, self.mapping, self.mapping_bytes)?;
         self.registration = Some(registration);
         Ok(())
     }
@@ -550,47 +551,49 @@ impl Drop for SlabPool {
         if self.split.take().is_none() && self.mapping != 0 {
             // SAFETY: The mapping was created by this pool and is no longer registered.
             unsafe {
-                crate::os::unmap_host(self.mapping, self.mapping_bytes);
+                flare_eos::unmap_host(self.mapping, self.mapping_bytes);
             }
         }
     }
 }
 
+/// Fixture for tests of code that consumes a pool's parts.
+#[cfg(any(test, feature = "test-support"))]
+/// A rank's part of a pool split by rank reserved at `range`, whose page and
+/// row identities begin at `range.start` and right after the page records.
+/// `pages` and `rows` give this rank's part of slab 0 and its share of a record.
+pub fn rank_part(
+    range: std::ops::Range<usize>,
+    (page_record, page_count, page_base, page_part): (usize, usize, usize, usize),
+    (row_record, row_count, row_base, row_part): (usize, usize, usize, usize),
+) -> RankPart {
+    let rows = range.start + page_record * page_count;
+    RankPart {
+        range: range.clone(),
+        pages: PartRegion {
+            identity: range.start,
+            record_bytes: page_record,
+            count: page_count,
+            base: page_base,
+            part_bytes: page_part,
+        },
+        rows: PartRegion {
+            identity: rows,
+            record_bytes: row_record,
+            count: row_count,
+            base: row_base,
+            part_bytes: row_part,
+        },
+    }
+}
+
 #[cfg(test)]
-pub(crate) mod tests {
+mod tests {
     use super::*;
-    use crate::offload::geometry::tests::geometry;
+    use crate::testing::geometry;
 
     const PAGE: u64 = 8192;
     const ROW: u64 = 4096;
-
-    /// A rank's part of a pool split by rank reserved at `range`, whose page and
-    /// row identities begin at `range.start` and right after the page records.
-    /// `pages` and `rows` give this rank's part of slab 0 and its share of a record.
-    pub(crate) fn rank_part(
-        range: std::ops::Range<usize>,
-        (page_record, page_count, page_base, page_part): (usize, usize, usize, usize),
-        (row_record, row_count, row_base, row_part): (usize, usize, usize, usize),
-    ) -> RankPart {
-        let rows = range.start + page_record * page_count;
-        RankPart {
-            range: range.clone(),
-            pages: PartRegion {
-                identity: range.start,
-                record_bytes: page_record,
-                count: page_count,
-                base: page_base,
-                part_bytes: page_part,
-            },
-            rows: PartRegion {
-                identity: rows,
-                record_bytes: row_record,
-                count: row_count,
-                base: row_base,
-                part_bytes: row_part,
-            },
-        }
-    }
 
     #[test]
     fn rank_parts_locate_slabs_and_reject_other_addresses_inside_the_pool() {
@@ -639,77 +642,6 @@ pub(crate) mod tests {
     /// One rank with two 4 KiB planes and a 4 KiB row: 8 KiB page records, 4 KiB row records.
     fn layout() -> Layout {
         Layout::new(&[geometry(64, &[("k", 4096), ("v", 4096)], 4096)]).unwrap()
-    }
-
-    #[test]
-    fn registered_parts_use_device_aliases_with_cross_rank_record_strides() {
-        use super::super::{
-            JobId,
-            transfer::{Direction, Job, expand},
-        };
-        use crate::{cache::PageId, scheduler::StateSlotId};
-
-        let ranks = [
-            geometry(64, &[("kv", 8192), ("selector", 100)], 10_000),
-            geometry(64, &[("kv", 4096), ("selector", 200)], 5000),
-        ];
-        let layout = Layout::new(&ranks).unwrap();
-        let mut pool = SlabPool::new(
-            layout.page_record_bytes,
-            3,
-            layout.row_record_bytes,
-            2,
-            false,
-        )
-        .unwrap();
-        assert!(pool.device_parts(&layout).is_err());
-        let device = 0x2_0420_0000;
-        let parts = pool.registered_parts(&layout, device);
-        let pages: Vec<_> = (0..3).map(|_| pool.allocate_page().unwrap()).collect();
-        let rows: Vec<_> = (0..2).map(|_| pool.allocate_row().unwrap()).collect();
-        for (rank, part) in parts.iter().enumerate() {
-            let mut job = Job {
-                id: JobId(1),
-                window: 0,
-                direction: Direction::Out,
-                pages: vec![(PageId(5), pool.page_address(pages[2]))],
-                row: Some((StateSlotId(3), pool.row_address(rows[1]))),
-            };
-            let mut outbound = Vec::new();
-            expand(
-                &ranks[rank],
-                &layout.ranks[rank],
-                Some(part),
-                &job,
-                &mut outbound,
-            )
-            .unwrap();
-            let page = device + 2 * layout.page_record_bytes + layout.ranks[rank].page_offset;
-            let row = device
-                + 3 * layout.page_record_bytes
-                + layout.row_record_bytes
-                + layout.ranks[rank].row_offset;
-            assert_eq!(
-                outbound.iter().map(|d| d.destination).collect::<Vec<_>>(),
-                vec![page, page + ranks[rank].planes[0].padded_bytes(), row]
-            );
-            job.direction = Direction::In;
-            let mut inbound = Vec::new();
-            expand(
-                &ranks[rank],
-                &layout.ranks[rank],
-                Some(part),
-                &job,
-                &mut inbound,
-            )
-            .unwrap();
-            for (out, incoming) in outbound.iter().zip(&inbound) {
-                assert_eq!(
-                    (incoming.source, incoming.destination, incoming.bytes),
-                    (out.destination, out.source, out.bytes)
-                );
-            }
-        }
     }
 
     #[test]

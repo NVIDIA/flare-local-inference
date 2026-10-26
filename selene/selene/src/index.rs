@@ -9,10 +9,7 @@
 
 use std::collections::HashMap;
 
-use crate::{
-    Result,
-    cache::{HASH_BLOCK_TOKENS, PrefixHistory, PrefixKey},
-};
+use crate::{HASH_BLOCK_TOKENS, History, PrefixKey, Result};
 
 use super::geometry::invalid;
 
@@ -215,7 +212,7 @@ impl<L> Index<L> {
     /// between the resident checkpoint and the endpoint.
     pub fn lookup_below(
         &mut self,
-        history: &PrefixHistory,
+        history: &dyn History,
         resident: u64,
         before: u64,
         usable: impl Fn(&Node<L>) -> bool,
@@ -365,7 +362,7 @@ impl<L> Index<L> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::PrefixHistory;
+    use crate::testing::TestHistory as PrefixHistory;
 
     const IDENTITY: [u8; 32] = [7; 32];
 

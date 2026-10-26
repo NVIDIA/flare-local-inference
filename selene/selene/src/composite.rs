@@ -32,20 +32,17 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
-    Error, Result,
-    cache::{CheckpointId, PrefixHistory, PrefixKey},
-};
+use crate::{CheckpointId, Error, History, PrefixKey, Result};
 
 use super::{
-    HostHit, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PrefixStore, PublishedCheckpoint,
+    HostHit, HostStore, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PublishedCheckpoint,
     StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
+    copier::CLOSE_TIMEOUT,
     disk_store::{DiskStore, Staged, TransportEvent},
     geometry::invalid,
     index::Match,
     memory::MemoryStore,
     record::Header,
-    transfer::CLOSE_TIMEOUT,
 };
 
 /// Weight of the newest observation in the disk rate estimates.
@@ -210,6 +207,26 @@ impl CompositeStore {
         &self.disk
     }
 
+    /// Records whose copy-out to disk or memory has not completed.
+    pub fn outbound_records(&self) -> usize {
+        self.outbound.len()
+    }
+
+    /// Whether the record's copy-out to disk or memory is still pending.
+    pub fn copying_out(&self, key: &PrefixKey) -> bool {
+        self.outbound.contains_key(key)
+    }
+
+    /// Records whose restore has not completed.
+    pub fn inbound_records(&self) -> usize {
+        self.inbound.len()
+    }
+
+    /// Disk jobs the composite has issued and not seen complete.
+    pub fn disk_jobs(&self) -> usize {
+        self.jobs.len()
+    }
+
     fn resident(&self, key: &PrefixKey, tail_pages: usize, row: bool) -> bool {
         resident_copy(&self.memory, &self.stale, key, tail_pages, row)
     }
@@ -238,7 +255,7 @@ impl CompositeStore {
         ))
     }
 
-    fn retains_chain(&self, chain: &Match) -> bool {
+    pub fn retains_chain(&self, chain: &Match) -> bool {
         let mut pages = 0;
         let mut rows = 1;
         for (position, key) in chain.nodes.iter().enumerate() {
@@ -763,8 +780,8 @@ impl CompositeStore {
     }
 }
 
-impl PrefixStore for CompositeStore {
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit> {
+impl HostStore for CompositeStore {
+    fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.stats.lookups += 1;
         let (memory, stale) = (&self.memory, &self.stale);
         let chain = self
@@ -1079,24 +1096,18 @@ impl PrefixStore for CompositeStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testing::{
+        Ids, StoppedCopier, TestHistory as PrefixHistory, checkpoint, pattern, test_directory,
+    };
     use crate::{
-        cache::{Fence, PageId, PrefixCheckpointCache, Publication, SnapshotId, StateSnapshot},
-        offload::{
-            CacheGeometry, INITIAL_MEMORY_RATE, Layout,
-            disk::DiskThread,
-            geometry::tests::geometry as rank,
-            memory::MemoryRecord,
-            record,
-            slab::{PageSlab, RowSlab, SlabPool},
-            transfer::Transfers,
-        },
-        scheduler::StateSlotId,
+        CacheGeometry, INITIAL_MEMORY_RATE, Layout, PageId, StateSlotId,
+        disk::DiskThread,
+        memory::MemoryRecord,
+        record,
+        slab::{PageSlab, RowSlab, SlabPool},
+        testing::geometry as rank,
     };
-    use std::{
-        fs,
-        path::Path,
-        sync::{Arc, Mutex},
-    };
+    use std::{fs, path::Path};
 
     const IDENTITY: [u8; 32] = [0x3c; 32];
     const FINGERPRINT: [u8; 16] = [0xc3; 16];
@@ -1119,123 +1130,8 @@ mod tests {
         history
     }
 
-    /// Mints checkpoint ids from a GPU prefix cache, whose constructor is the
-    /// only source of them.
-    struct Ids {
-        cache: PrefixCheckpointCache,
-        history: PrefixHistory,
-        previous: Option<CheckpointId>,
-        count: u32,
-    }
-
-    impl Ids {
-        fn new() -> Self {
-            Self {
-                cache: PrefixCheckpointCache::new(IDENTITY, 4096, 64, 64).unwrap(),
-                history: history(64 * 32),
-                previous: None,
-                count: 0,
-            }
-        }
-
-        fn next(&mut self) -> CheckpointId {
-            self.count += 1;
-            let consumed = 64 * u64::from(self.count);
-            let id = self
-                .cache
-                .publish(
-                    &self.history,
-                    &Publication {
-                        parent: self.previous,
-                        consumed_tokens: consumed,
-                        tail_pages: vec![PageId(self.count)],
-                        snapshot: StateSnapshot {
-                            id: SnapshotId(self.count),
-                            consumed_tokens: consumed,
-                        },
-                        ready_after: Fence(0),
-                    },
-                )
-                .unwrap()
-                .id();
-            self.previous = Some(id);
-            id
-        }
-    }
-
-    fn checkpoint(
-        ids: &mut Ids,
-        history: &PrefixHistory,
-        consumed: u64,
-        parent: Option<u64>,
-        chain_pages: Vec<PageId>,
-        tail_pages: usize,
-        slot: StateSlotId,
-    ) -> PublishedCheckpoint {
-        PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(consumed).unwrap(),
-            parent: parent.map(|parent| history.key_at(parent).unwrap()),
-            bucket: history.bucket_at(consumed).unwrap(),
-            chain_pages,
-            tail_pages,
-            slot,
-        }
-    }
-
     fn pages(range: std::ops::Range<u32>) -> Vec<PageId> {
         range.map(PageId).collect()
-    }
-
-    /// A fresh directory for one test under `FLARE_OFFLOAD_TEST_DIR` or the
-    /// system temporary directory, or `None` when it refuses direct I/O.
-    fn test_directory(test: &str) -> Option<PathBuf> {
-        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
-            .map(PathBuf::from)
-            .unwrap_or_else(std::env::temp_dir);
-        let directory = base.join(format!(
-            "flare-offload-composite-{test}-{}",
-            std::process::id()
-        ));
-        let _ = fs::remove_dir_all(&directory);
-        fs::create_dir_all(&directory).unwrap();
-        let probe = directory.join(".probe");
-        match crate::os::direct_file(&probe, true) {
-            Ok(_) => {
-                fs::remove_file(&probe).unwrap();
-                Some(directory)
-            }
-            Err(error) if cfg!(unix) && error.raw_os_error() == Some(libc::EINVAL) => {
-                eprintln!(
-                    "skipping {test}: {} refuses direct I/O",
-                    directory.display()
-                );
-                fs::remove_dir_all(&directory).unwrap();
-                None
-            }
-            Err(error) => panic!("probe {}: {error}", probe.display()),
-        }
-    }
-
-    #[cfg(feature = "runtime-package")]
-    fn gpu_transport(context: usize, device: i32, geometry: &[CacheGeometry]) -> Staged {
-        let mut pool = SlabPool::staging(&Layout::new(geometry).unwrap()).unwrap();
-        pool.register(context).unwrap();
-        let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.to_vec(), &pool).unwrap(),
-        ));
-        Staged::new(
-            Some(pool),
-            transfers,
-            DiskThread::start("flare-offload-disk").unwrap(),
-        )
-    }
-
-    fn pattern(bytes: &mut [u8], seed: u64) {
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            let index = index as u64;
-            *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-        }
     }
 
     /// A composite over `pages` page slabs and `rows` row slabs of
@@ -1243,13 +1139,13 @@ mod tests {
     /// store under `directory` with `limit` bytes.
     fn composite(directory: &Path, pages: usize, rows: usize, limit: u64) -> CompositeStore {
         let geometry = geometry();
-        let transfers = Arc::new(Mutex::new(Transfers::stopped(&geometry).unwrap()));
+        let transfers = StoppedCopier::shared(&geometry).unwrap();
         let pool = SlabPool::new(PAGE_RECORD, pages, ROW_RECORD, rows, true).unwrap();
         let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
         let directory_lock = record::DirectoryLock::acquire(directory).unwrap();
         let scanned = record::scan(&directory_lock, &IDENTITY, &FINGERPRINT, &geometry).unwrap();
         let layout = Layout::new(&geometry).unwrap();
-        let disk_transfers = Arc::new(Mutex::new(Transfers::stopped(&geometry).unwrap()));
+        let disk_transfers = StoppedCopier::shared(&geometry).unwrap();
         let disk = DiskStore::new(
             directory_lock,
             IDENTITY,
@@ -1409,7 +1305,7 @@ mod tests {
 
     #[test]
     fn oversized_chains_stream_without_evicting_retained_records() {
-        let Some(directory) = test_directory("oversized-chain") else {
+        let Some(directory) = test_directory("composite", "oversized-chain") else {
             return;
         };
         let full = history(2000);
@@ -1480,7 +1376,7 @@ mod tests {
 
     #[test]
     fn streamed_store_failure_preserves_ram_and_releases_parent_pins() {
-        let Some(directory) = test_directory("streamed-failure") else {
+        let Some(directory) = test_directory("composite", "streamed-failure") else {
             return;
         };
         let mut store = composite(&directory, 4, 2, 1 << 30);
@@ -1542,7 +1438,7 @@ mod tests {
 
     #[test]
     fn retention_planning_accounts_for_pinned_and_incomplete_copies() {
-        let Some(directory) = test_directory("retention-pressure") else {
+        let Some(directory) = test_directory("composite", "retention-pressure") else {
             return;
         };
         let mut store = composite(&directory, 20, 3, 1 << 30);
@@ -1579,19 +1475,19 @@ mod tests {
 
     #[test]
     fn new_requires_matching_flat_tiers_and_independent_staged_transfers() {
-        let Some(directory) = test_directory("new") else {
+        let Some(directory) = test_directory("composite", "new") else {
             return;
         };
         let geometry = geometry();
         let layout = Layout::new(&geometry).unwrap();
-        let transfers = Arc::new(Mutex::new(Transfers::stopped(&geometry).unwrap()));
+        let transfers = StoppedCopier::shared(&geometry).unwrap();
         let pool = || SlabPool::new(PAGE_RECORD, 4, ROW_RECORD, 2, true).unwrap();
         let staging = || Some(SlabPool::staging(&layout).unwrap());
         let disk = |identity: [u8; 32], staging: Option<SlabPool>, shared: bool| {
             let disk_transfers = if shared {
                 transfers.clone()
             } else {
-                Arc::new(Mutex::new(Transfers::stopped(&geometry).unwrap()))
+                StoppedCopier::shared(&geometry).unwrap()
             };
             DiskStore::new(
                 record::DirectoryLock::acquire(&directory).unwrap(),
@@ -1630,7 +1526,7 @@ mod tests {
 
     #[test]
     fn rejected_disk_endpoint_does_not_hide_a_warm_ancestor() {
-        let Some(directory) = test_directory("cost-fallback") else {
+        let Some(directory) = test_directory("composite", "cost-fallback") else {
             return;
         };
         let full = history(2000);
@@ -1662,7 +1558,7 @@ mod tests {
 
     #[test]
     fn store_dedupes_pins_the_parent_and_reports_a_failed_memory_copy() {
-        let Some(directory) = test_directory("store") else {
+        let Some(directory) = test_directory("composite", "store") else {
             return;
         };
         let mut store = composite(&directory, 48, 4, 1 << 30);
@@ -1736,7 +1632,7 @@ mod tests {
 
     #[test]
     fn write_through_reserves_the_file_and_marks_the_memory_copy_durable() {
-        let Some(directory) = test_directory("write-through") else {
+        let Some(directory) = test_directory("composite", "write-through") else {
             return;
         };
         let mut store = composite(&directory, 48, 4, 1 << 30);
@@ -1904,7 +1800,7 @@ mod tests {
 
     #[test]
     fn a_failed_disk_write_removes_the_memory_copy_and_fails_waiting_children() {
-        let Some(directory) = test_directory("write-failure") else {
+        let Some(directory) = test_directory("composite", "write-failure") else {
             return;
         };
         let mut store = composite(&directory, 16, 4, 1 << 30);
@@ -1978,7 +1874,7 @@ mod tests {
 
     #[test]
     fn read_through_restores_a_file_into_memory_before_the_upload() {
-        let Some(directory) = test_directory("read-through") else {
+        let Some(directory) = test_directory("composite", "read-through") else {
             return;
         };
         let mut store = composite(&directory, 48, 4, 1 << 30);
@@ -2134,7 +2030,7 @@ mod tests {
 
     #[test]
     fn a_fetch_attaches_to_a_record_another_fetch_is_reading() {
-        let Some(directory) = test_directory("attach") else {
+        let Some(directory) = test_directory("composite", "attach") else {
             return;
         };
         let mut store = composite(&directory, 16, 4, 1 << 30);
@@ -2209,7 +2105,7 @@ mod tests {
 
     #[test]
     fn disk_eviction_removes_memory_copies_once_their_pins_are_released() {
-        let Some(directory) = test_directory("eviction") else {
+        let Some(directory) = test_directory("composite", "eviction") else {
             return;
         };
         let full = history(4000);
@@ -2303,7 +2199,7 @@ mod tests {
 
     #[test]
     fn close_finishes_a_pending_disk_write() {
-        let Some(directory) = test_directory("close") else {
+        let Some(directory) = test_directory("composite", "close") else {
             return;
         };
         let mut store = composite(&directory, 16, 4, 1 << 30);
@@ -2330,853 +2226,6 @@ mod tests {
         assert_ne!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().store_skipped, 1);
         drop(store);
-        fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[cfg(feature = "runtime-package")]
-    #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn composite_writes_a_child_published_while_its_parent_is_in_flight() {
-        use crate::{
-            cuda::Stream,
-            offload::geometry::fingerprint,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
-            return;
-        };
-        let Some(directory) = test_directory("gpu-child") else {
-            return;
-        };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
-        let manifest = model.manifests().unwrap().remove(0);
-        let geometry = vec![manifest.cache.clone().unwrap()];
-        let rank = geometry[0].clone();
-        let (context, device) = (manifest.context, manifest.device);
-        let layout = Layout::new(&geometry).unwrap();
-        let fingerprint = fingerprint(&geometry);
-        let page_tokens = rank.page_tokens;
-        let stream = Stream::open(context, device).unwrap();
-        let mut staging = stream.host_buffer(rank.row.unit_bytes as usize).unwrap();
-        let mut write_unit = |address: u64, bytes: usize, seed: u64| {
-            for (index, byte) in staging.bytes_mut()[..bytes].iter_mut().enumerate() {
-                *byte = (index as u64).wrapping_mul(31).wrapping_add(seed) as u8;
-            }
-            unsafe { stream.upload(address as usize, &staging, 0, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-        };
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for id in 1..=8u64 {
-                write_unit(
-                    geometry.unit_address(id),
-                    geometry.unit_bytes as usize,
-                    plane as u64 * 100 + id,
-                );
-            }
-        }
-        for slot in 1..=4u64 {
-            write_unit(
-                rank.row.unit_address(slot),
-                rank.row.unit_bytes as usize,
-                900 + slot,
-            );
-        }
-        let mut pool = SlabPool::new(
-            layout.page_record_bytes,
-            16,
-            layout.row_record_bytes,
-            4,
-            true,
-        )
-        .unwrap();
-        pool.register(context).unwrap();
-        let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
-        ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
-        let disk = DiskStore::new(
-            record::DirectoryLock::acquire(&directory).unwrap(),
-            IDENTITY,
-            fingerprint,
-            1 << 40,
-            geometry.clone(),
-            Vec::new(),
-            Box::new(gpu_transport(context, device, &geometry)),
-        )
-        .unwrap();
-        let mut store = CompositeStore::new(memory, disk).unwrap();
-        let mut ids = Ids::new();
-        let drain = |store: &mut CompositeStore,
-                     events: &mut Vec<StoreEvent>,
-                     until: &dyn Fn(&CompositeStore) -> bool| {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            while !until(store) {
-                assert!(
-                    Instant::now() < deadline,
-                    "composite did not settle: outbound {:?} jobs {:?} stats {:?} events {events:?}",
-                    store.outbound.keys().collect::<Vec<_>>(),
-                    store.jobs.keys().collect::<Vec<_>>(),
-                    store.stats()
-                );
-                store.poll(events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        };
-        // Two root and child pairs: the child of the first pair is published
-        // before the root's memory copy lands, the child of the second after
-        // the root's memory copy landed but while its disk write may still run.
-        for (pair, wait_for_root_copy) in [(0u32, false), (1u32, true)] {
-            let root_consumed = 3 * page_tokens;
-            let child_consumed = 4 * page_tokens + 5;
-            let mut history = PrefixHistory::new(IDENTITY);
-            let tokens: Vec<u32> = (0..child_consumed as u32 + 8)
-                .map(|t| t.wrapping_mul(2654435761).wrapping_add(pair))
-                .collect();
-            history.append(&tokens, &[]).unwrap();
-            let base = 1 + pair * 4;
-            let root_pages: Vec<PageId> = (base..base + 3).map(PageId).collect();
-            let child_page = PageId(base + 3);
-            let root = PublishedCheckpoint {
-                id: ids.next(),
-                key: history.key_at(root_consumed).unwrap(),
-                parent: None,
-                bucket: history.bucket_at(root_consumed).unwrap(),
-                chain_pages: root_pages.clone(),
-                tail_pages: 3,
-                slot: StateSlotId(1 + pair * 2),
-            };
-            let child = PublishedCheckpoint {
-                id: ids.next(),
-                key: history.key_at(child_consumed).unwrap(),
-                parent: Some(root.key),
-                bucket: history.bucket_at(child_consumed).unwrap(),
-                chain_pages: root_pages.iter().copied().chain([child_page]).collect(),
-                tail_pages: 1,
-                slot: StateSlotId(2 + pair * 2),
-            };
-            let mut events = Vec::new();
-            assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
-            if wait_for_root_copy {
-                drain(&mut store, &mut events, &|store| {
-                    store.stats().bytes_out > 0 && store.memory.record(&root.key).is_some()
-                });
-            }
-            assert_eq!(store.store(&child).unwrap(), StoreOutcome::Queued);
-            drain(&mut store, &mut events, &|store| store.outbound.is_empty());
-            let stored: Vec<_> = events
-                .iter()
-                .filter_map(|event| match event {
-                    StoreEvent::Stored { key, result, .. } => Some((*key, result.is_ok())),
-                    _ => None,
-                })
-                .collect();
-            assert_eq!(stored.len(), 2, "pair {pair}: {events:?}");
-            assert!(stored.iter().all(|(_, ok)| *ok), "pair {pair}: {events:?}");
-            let stats = store.stats();
-            assert_eq!(
-                (stats.stored, stats.store_failed, stats.store_skipped),
-                (2 * (u64::from(pair) + 1), 0, 0),
-                "pair {pair}"
-            );
-            for key in [root.key, child.key] {
-                let node = store.disk.index().node(&key).unwrap();
-                assert!(
-                    node.ready && !node.pinned(),
-                    "pair {pair} disk node {key:?}"
-                );
-                assert_eq!(
-                    fs::metadata(&node.location.path).unwrap().len(),
-                    node.location.header.length_with_row()
-                );
-                assert!(
-                    store.memory.record(&key).unwrap().durable,
-                    "pair {pair} memory {key:?}"
-                );
-            }
-            assert!(
-                store.jobs.is_empty(),
-                "pair {pair}: {:?}",
-                store.jobs.keys().collect::<Vec<_>>()
-            );
-        }
-        // A grandchild under a page-less child: the child's endpoint shares its
-        // parent's last page, so its record holds only a row. After a restart the
-        // chain restores through disk with the child contributing no bytes.
-        let (pair, base) = (2u32, 9u32);
-        let root_consumed = 3 * page_tokens;
-        let child_consumed = 3 * page_tokens + 5;
-        let grandchild_consumed = 4 * page_tokens + 7;
-        let mut history = PrefixHistory::new(IDENTITY);
-        let tokens: Vec<u32> = (0..grandchild_consumed as u32 + 8)
-            .map(|t| t.wrapping_mul(2654435761).wrapping_add(pair))
-            .collect();
-        history.append(&tokens, &[]).unwrap();
-        let root_pages: Vec<PageId> = (base..base + 3).map(PageId).collect();
-        let grandchild_page = PageId(base + 3);
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for id in base..=base + 3 {
-                write_unit(
-                    geometry.unit_address(u64::from(id)),
-                    geometry.unit_bytes as usize,
-                    plane as u64 * 100 + u64::from(id),
-                );
-            }
-        }
-        for slot in 5..=6u64 {
-            write_unit(
-                rank.row.unit_address(slot),
-                rank.row.unit_bytes as usize,
-                900 + slot,
-            );
-        }
-        let root = PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(root_consumed).unwrap(),
-            parent: None,
-            bucket: history.bucket_at(root_consumed).unwrap(),
-            chain_pages: root_pages.clone(),
-            tail_pages: 3,
-            slot: StateSlotId(5),
-        };
-        let child = PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(child_consumed).unwrap(),
-            parent: Some(root.key),
-            bucket: history.bucket_at(child_consumed).unwrap(),
-            chain_pages: root_pages.clone(),
-            tail_pages: 0,
-            slot: StateSlotId(6),
-        };
-        let grandchild = PublishedCheckpoint {
-            id: ids.next(),
-            key: history.key_at(grandchild_consumed).unwrap(),
-            parent: Some(child.key),
-            bucket: history.bucket_at(grandchild_consumed).unwrap(),
-            chain_pages: root_pages
-                .iter()
-                .copied()
-                .chain([grandchild_page])
-                .collect(),
-            tail_pages: 1,
-            slot: StateSlotId(5),
-        };
-        let mut events = Vec::new();
-        for checkpoint in [&root, &child, &grandchild] {
-            assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
-            drain(&mut store, &mut events, &|store| store.outbound.is_empty());
-        }
-        assert_eq!(store.stats().stored, 7);
-        store.close().unwrap();
-        drop(store);
-
-        // Restart: a fresh composite over the scanned directory and an empty memory pool.
-        let directory_lock = record::DirectoryLock::acquire(&directory).unwrap();
-        let scanned =
-            crate::offload::record::scan(&directory_lock, &IDENTITY, &fingerprint, &geometry)
-                .unwrap();
-        assert_eq!(scanned.len(), 7);
-        let mut pool = SlabPool::new(
-            layout.page_record_bytes,
-            16,
-            layout.row_record_bytes,
-            4,
-            true,
-        )
-        .unwrap();
-        pool.register(context).unwrap();
-        let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
-        ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
-        let disk = DiskStore::new(
-            directory_lock,
-            IDENTITY,
-            fingerprint,
-            1 << 40,
-            geometry.clone(),
-            scanned,
-            Box::new(gpu_transport(context, device, &geometry)),
-        )
-        .unwrap();
-        let mut store = CompositeStore::new(memory, disk).unwrap();
-        let hit = store.lookup(&history, 0, u64::MAX).unwrap();
-        assert_eq!(
-            (hit.key, hit.pages, hit.tier),
-            (grandchild.key, 4, Tier::Disk)
-        );
-        let targets: Vec<PageId> = (base + 10..base + 14).map(PageId).collect();
-        let ticket = InboundTicket {
-            key: grandchild.key,
-            pages: targets.clone(),
-            slot: StateSlotId(7),
-        };
-        store.fetch(hit, ticket).unwrap();
-        let mut events = Vec::new();
-        drain(&mut store, &mut events, &|store| store.inbound.is_empty());
-        assert!(
-            matches!(
-                events.as_slice(),
-                [StoreEvent::Fetched { result: Ok(_), .. }]
-            ),
-            "{events:?}"
-        );
-        let read_unit = |address: u64, bytes: usize| -> Vec<u8> {
-            unsafe { stream.download(&staging, address as usize, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-            staging.bytes()[..bytes].to_vec()
-        };
-        let pattern = |seed: u64, bytes: usize| -> Vec<u8> {
-            (0..bytes)
-                .map(|index| (index as u64).wrapping_mul(31).wrapping_add(seed) as u8)
-                .collect()
-        };
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for (source, target) in (base..=base + 3).zip(&targets) {
-                let bytes = geometry.unit_bytes as usize;
-                assert!(
-                    read_unit(geometry.unit_address(u64::from(target.0)), bytes)
-                        == pattern(plane as u64 * 100 + u64::from(source), bytes),
-                    "plane {} page {} differs from page {source}",
-                    geometry.name,
-                    target.0
-                );
-            }
-        }
-        let bytes = rank.row.unit_bytes as usize;
-        assert!(read_unit(rank.row.unit_address(7), bytes) == pattern(905, bytes));
-        assert_eq!(store.stats().fetched, 1);
-        assert!(store.memory.record(&child.key).is_some());
-        store.close().unwrap();
-        drop(store);
-        fs::remove_dir_all(&directory).unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn composite_round_trips_through_memory_and_disk_on_a_loaded_package() {
-        use crate::{
-            cuda::Stream,
-            offload::geometry::fingerprint,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
-            return;
-        };
-        let Some(directory) = test_directory("gpu") else {
-            return;
-        };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
-        let manifest = model.manifests().unwrap().remove(0);
-        let geometry = vec![manifest.cache.clone().unwrap()];
-        let rank = geometry[0].clone();
-        let (context, device) = (manifest.context, manifest.device);
-        let layout = Layout::new(&geometry).unwrap();
-        let fingerprint = fingerprint(&geometry);
-        let page_tokens = rank.page_tokens;
-        assert!(rank.page_capacity >= 16 && rank.row_capacity >= 4);
-        let capacity = rank.page_capacity as u32;
-        let sources = pages_of([1, 7, capacity / 2]);
-        let targets = pages_of([2, 9, capacity / 2 + 1]);
-        let (source_slot, target_slot) = (StateSlotId(1), StateSlotId(2));
-        fn pages_of(ids: [u32; 3]) -> Vec<PageId> {
-            ids.into_iter().map(PageId).collect()
-        }
-
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
-        let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
-        let row_plane = rank.planes.len();
-        let stream = Stream::open(context, device).unwrap();
-        let largest = rank
-            .planes
-            .iter()
-            .chain([&rank.row])
-            .map(|plane| plane.unit_bytes as usize)
-            .max()
-            .unwrap();
-        let mut staging = stream.host_buffer(largest).unwrap();
-        let mut write_unit = |address: u64, bytes: usize, seed: u64| {
-            fill(&mut staging.bytes_mut()[..bytes], seed);
-            unsafe { stream.upload(address as usize, &staging, 0, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-        };
-        let write_pages = |write_unit: &mut dyn FnMut(u64, usize, u64),
-                           ids: &[PageId],
-                           pattern: &dyn Fn(usize, u32) -> u64| {
-            for (plane, geometry) in rank.planes.iter().enumerate() {
-                for id in ids {
-                    write_unit(
-                        geometry.unit_address(u64::from(id.0)),
-                        geometry.unit_bytes as usize,
-                        pattern(plane, id.0),
-                    );
-                }
-            }
-        };
-        let write_row =
-            |write_unit: &mut dyn FnMut(u64, usize, u64), slot: StateSlotId, seed: u64| {
-                write_unit(
-                    rank.row.unit_address(u64::from(slot.0)),
-                    rank.row.unit_bytes as usize,
-                    seed,
-                );
-            };
-        write_pages(&mut write_unit, &sources, &seed);
-        write_row(&mut write_unit, source_slot, seed(row_plane, source_slot.0));
-        write_pages(&mut write_unit, &targets, &|_, _| 0xDD);
-        write_row(&mut write_unit, target_slot, 0xDD);
-
-        // Seven page slabs and two row slabs hold two three-page records with
-        // one page to spare; a third record evicts the least recently used.
-        let mut pool = SlabPool::new(
-            layout.page_record_bytes,
-            7,
-            layout.row_record_bytes,
-            2,
-            true,
-        )
-        .unwrap();
-        pool.register(context).unwrap();
-        let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
-        ));
-        let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
-        let disk = DiskStore::new(
-            record::DirectoryLock::acquire(&directory).unwrap(),
-            IDENTITY,
-            fingerprint,
-            1 << 40,
-            geometry.clone(),
-            Vec::new(),
-            Box::new(gpu_transport(context, device, &geometry)),
-        )
-        .unwrap();
-        let mut store = CompositeStore::new(memory, disk).unwrap();
-
-        let consumed = 3 * page_tokens + 5;
-        let base: Vec<u32> = (0..consumed as u32 + 40)
-            .map(|t| t.wrapping_mul(2654435761))
-            .collect();
-        let histories: Vec<PrefixHistory> = (0..4u32)
-            .map(|salt| {
-                let mut history = PrefixHistory::new(IDENTITY);
-                let tokens: Vec<u32> = base.iter().map(|t| t.wrapping_add(salt)).collect();
-                history.append(&tokens, &[]).unwrap();
-                history
-            })
-            .collect();
-        let mut ids = Ids::new();
-        let checkpoints: Vec<PublishedCheckpoint> = histories
-            .iter()
-            .enumerate()
-            .map(|(index, history)| PublishedCheckpoint {
-                id: ids.next(),
-                key: history.key_at(consumed).unwrap(),
-                parent: None,
-                bucket: history.bucket_at(consumed).unwrap(),
-                chain_pages: if index == 0 {
-                    sources.clone()
-                } else {
-                    targets.clone()
-                },
-                tail_pages: 3,
-                slot: source_slot,
-            })
-            .collect();
-        let gpu_bytes = 3 * rank.page_bytes() + rank.row.unit_bytes;
-        let record_bytes = layout.record_bytes(3);
-
-        fn wait_event(store: &mut CompositeStore) -> StoreEvent {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            let mut events = Vec::new();
-            while events.is_empty() {
-                assert!(Instant::now() < deadline, "no store event within 120 s");
-                store.poll(&mut events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(events.len(), 1, "{events:?}");
-            events.pop().unwrap()
-        }
-        fn wait_until(store: &mut CompositeStore, mut done: impl FnMut(&CompositeStore) -> bool) {
-            let deadline = Instant::now() + Duration::from_secs(120);
-            let mut events = Vec::new();
-            while !done(store) {
-                assert!(
-                    Instant::now() < deadline,
-                    "condition not reached within 120 s"
-                );
-                store.poll(&mut events).unwrap();
-                assert!(events.is_empty(), "{events:?}");
-                std::thread::sleep(Duration::from_millis(1));
-            }
-        }
-        let store_and_land = |store: &mut CompositeStore, checkpoint: &PublishedCheckpoint| {
-            assert_eq!(store.store(checkpoint).unwrap(), StoreOutcome::Queued);
-            match wait_event(store) {
-                StoreEvent::Stored {
-                    checkpoint: id,
-                    key,
-                    result,
-                } => {
-                    assert_eq!((id, key), (checkpoint.id, checkpoint.key));
-                    assert_eq!(result.unwrap(), gpu_bytes);
-                }
-                other => panic!("unexpected event {other:?}"),
-            }
-            let key = checkpoint.key;
-            wait_until(store, |store| !store.outbound.contains_key(&key));
-            let node = store.disk.index().node(&key).unwrap();
-            assert!(node.ready && !node.pinned());
-            assert_eq!(
-                fs::metadata(&node.location.path).unwrap().len(),
-                node.location.header.length_with_row()
-            );
-            assert!(store.memory.record(&key).unwrap().durable);
-        };
-
-        // The first checkpoint lands in memory, is written through, and is
-        // served from memory.
-        let first = &checkpoints[0];
-        store_and_land(&mut store, first);
-        let stats = store.stats();
-        assert_eq!(
-            (
-                stats.stored,
-                stats.bytes_out,
-                stats.memory_records,
-                stats.disk_records
-            ),
-            (1, gpu_bytes, 1, 1)
-        );
-        assert_eq!(stats.memory_bytes, record_bytes);
-        write_pages(&mut write_unit, &sources, &|plane, _| 0xEE + plane as u64);
-        write_row(&mut write_unit, source_slot, 0xEE);
-        let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
-        assert_eq!(
-            (hit.key, hit.pages, hit.tier, hit.bytes),
-            (first.key, 3, Tier::Memory, record_bytes)
-        );
-        let ticket = || InboundTicket {
-            key: first.key,
-            pages: targets.clone(),
-            slot: target_slot,
-        };
-        store.fetch(hit, ticket()).unwrap();
-        assert_eq!(store.stats().inbound_in_flight, 1);
-        match wait_event(&mut store) {
-            StoreEvent::Fetched { key, result } => {
-                assert_eq!(key, first.key);
-                assert_eq!(result.unwrap(), gpu_bytes);
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        let readback = stream.host_buffer(largest).unwrap();
-        let read_unit = |address: u64, bytes: usize| -> Vec<u8> {
-            unsafe { stream.download(&readback, address as usize, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-            readback.bytes()[..bytes].to_vec()
-        };
-        let check = |read_unit: &dyn Fn(u64, usize) -> Vec<u8>| {
-            for (plane, geometry) in rank.planes.iter().enumerate() {
-                for (source, target) in sources.iter().zip(&targets) {
-                    let mut wanted = vec![0u8; geometry.unit_bytes as usize];
-                    fill(&mut wanted, seed(plane, source.0));
-                    let actual = read_unit(
-                        geometry.unit_address(u64::from(target.0)),
-                        geometry.unit_bytes as usize,
-                    );
-                    assert!(
-                        actual == wanted,
-                        "plane {} ({plane}) page {} differs from page {}",
-                        geometry.name,
-                        target.0,
-                        source.0
-                    );
-                }
-            }
-            let mut wanted = vec![0u8; rank.row.unit_bytes as usize];
-            fill(&mut wanted, seed(row_plane, source_slot.0));
-            let actual = read_unit(
-                rank.row.unit_address(u64::from(target_slot.0)),
-                rank.row.unit_bytes as usize,
-            );
-            assert!(
-                actual == wanted,
-                "row {} differs from row {}",
-                target_slot.0,
-                source_slot.0
-            );
-        };
-        check(&read_unit);
-        let stats = store.stats();
-        assert_eq!(
-            (
-                stats.fetched,
-                stats.hits,
-                stats.reused_tokens,
-                stats.bytes_in
-            ),
-            (1, 1, consumed, gpu_bytes)
-        );
-
-        // Two more records fill the memory pool; the third evicts the first,
-        // which stays on disk.
-        store_and_land(&mut store, &checkpoints[1]);
-        assert!(store.memory.index().contains(&first.key));
-        store_and_land(&mut store, &checkpoints[2]);
-        assert!(!store.memory.index().contains(&first.key));
-        assert!(store.disk.index().node(&first.key).unwrap().ready);
-        let stats = store.stats();
-        assert_eq!(
-            (stats.stored, stats.memory_records, stats.disk_records),
-            (3, 2, 3)
-        );
-
-        // The first record now comes from its file through memory slabs, and
-        // is resident again afterwards.
-        write_pages(&mut write_unit, &targets, &|_, _| 0xCC);
-        write_row(&mut write_unit, target_slot, 0xCC);
-        let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
-        assert_eq!((hit.key, hit.tier), (first.key, Tier::Disk));
-        assert!(hit.estimated_seconds > record_bytes as f64 / INITIAL_MEMORY_RATE);
-        store.fetch(hit, ticket()).unwrap();
-        match wait_event(&mut store) {
-            StoreEvent::Fetched { key, result } => {
-                assert_eq!(key, first.key);
-                assert_eq!(result.unwrap(), gpu_bytes);
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        check(&read_unit);
-        let node = store.memory.index().node(&first.key).unwrap();
-        assert!(node.ready && !node.pinned() && node.location.durable);
-        assert_eq!(node.location.pages.len(), 3);
-        assert!(!store.memory.index().contains(&checkpoints[1].key));
-        assert!(store.memory.index().nodes().all(|node| !node.pinned()));
-        assert!(store.disk.index().nodes().all(|node| !node.pinned()));
-        let stats = store.stats();
-        assert_eq!(
-            (stats.fetched, stats.fetch_failed, stats.bytes_in),
-            (2, 0, 2 * gpu_bytes)
-        );
-        assert_eq!((stats.memory_records, stats.disk_records), (2, 3));
-
-        // A record whose file cannot be created is dropped from memory and counted.
-        let fourth = &checkpoints[3];
-        let blocked = directory.join(record::temporary_name(&fourth.key));
-        fs::create_dir(&blocked).unwrap();
-        assert_eq!(store.store(fourth).unwrap(), StoreOutcome::Queued);
-        match wait_event(&mut store) {
-            StoreEvent::Stored { key, result, .. } => {
-                assert_eq!(key, fourth.key);
-                assert_eq!(result.unwrap(), gpu_bytes);
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        wait_until(&mut store, |store| store.outbound.is_empty());
-        fs::remove_dir(&blocked).unwrap();
-        assert!(!store.memory.index().contains(&fourth.key));
-        assert!(!store.disk.index().contains(&fourth.key));
-        assert!(store.memory.index().contains(&first.key));
-        let stats = store.stats();
-        assert_eq!(
-            (stats.stored, stats.store_failed, stats.store_skipped),
-            (3, 1, 0)
-        );
-        assert_eq!((stats.memory_records, stats.disk_records), (1, 3));
-        assert_eq!(
-            record::scan(
-                &store.disk.directory_lock,
-                &IDENTITY,
-                &fingerprint,
-                &geometry
-            )
-            .unwrap()
-            .len(),
-            3
-        );
-        store.close().unwrap();
-        drop(store);
-        // Retention is smaller than a record and staging holds one record's
-        // pages. Exercise simultaneous memory copy-out, streamed copy-out,
-        // and streamed restore, then reopen the files with an empty RAM tier.
-        let open_small = || {
-            let mut pool = SlabPool::new(
-                layout.page_record_bytes,
-                1,
-                layout.row_record_bytes,
-                1,
-                true,
-            )
-            .unwrap();
-            pool.register(context).unwrap();
-            let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
-            ));
-            let memory = MemoryStore::new_flat(IDENTITY, pool, transfers).unwrap();
-            let mut staging_pool = SlabPool::new(
-                layout.page_record_bytes,
-                3,
-                layout.row_record_bytes,
-                2,
-                true,
-            )
-            .unwrap();
-            staging_pool.register(context).unwrap();
-            let transfers = Arc::new(Mutex::new(
-                Transfers::start(&[(context, device)], geometry.clone(), &staging_pool).unwrap(),
-            ));
-            let lock = record::DirectoryLock::acquire(&directory).unwrap();
-            let scanned = record::scan(&lock, &IDENTITY, &fingerprint, &geometry).unwrap();
-            let disk = DiskStore::new(
-                lock,
-                IDENTITY,
-                fingerprint,
-                1 << 40,
-                geometry.clone(),
-                scanned,
-                Box::new(Staged::new(
-                    Some(staging_pool),
-                    transfers,
-                    DiskThread::start("flare-offload-disk").unwrap(),
-                )),
-            )
-            .unwrap();
-            CompositeStore::new(memory, disk).unwrap()
-        };
-        let mut store = open_small();
-        write_pages(&mut write_unit, &sources, &seed);
-        write_row(&mut write_unit, source_slot, seed(row_plane, source_slot.0));
-        let mut fresh = PrefixHistory::new(IDENTITY);
-        fresh
-            .append(
-                &base
-                    .iter()
-                    .map(|token| token.wrapping_add(77))
-                    .collect::<Vec<_>>(),
-                &[],
-            )
-            .unwrap();
-        let short = checkpoint(
-            &mut ids,
-            &fresh,
-            page_tokens + 5,
-            None,
-            sources[..1].to_vec(),
-            1,
-            source_slot,
-        );
-        let large = checkpoint(
-            &mut ids,
-            &fresh,
-            consumed,
-            None,
-            sources.clone(),
-            3,
-            source_slot,
-        );
-        assert_eq!(store.store(&short).unwrap(), StoreOutcome::Queued);
-        assert_eq!(store.store(&large).unwrap(), StoreOutcome::Queued);
-        assert_eq!(store.outbound.len(), 1);
-        assert_eq!(store.disk.stats().outbound_in_flight, 1);
-        assert_eq!(store.memory.pool().free_pages(), 0);
-        let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
-        assert!(!store.retains_chain(&hit.chain));
-        store.fetch(hit, ticket()).unwrap();
-        let mut events = Vec::new();
-        poll_until(&mut store, &mut events, |store| {
-            let stats = store.stats();
-            stats.outbound_in_flight == 0 && stats.inbound_in_flight == 0
-        });
-        assert_eq!(events.len(), 3, "{events:?}");
-        let mut stored_keys = Vec::new();
-        for event in events {
-            match event {
-                StoreEvent::Stored { key, result, .. } => {
-                    result.unwrap();
-                    stored_keys.push(key);
-                }
-                StoreEvent::Fetched { key, result } => {
-                    assert_eq!(key, first.key);
-                    assert_eq!(result.unwrap(), record_bytes);
-                }
-                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
-            }
-        }
-        assert!(stored_keys.contains(&short.key) && stored_keys.contains(&large.key));
-        check(&read_unit);
-        assert!(store.memory.record(&short.key).unwrap().durable);
-        assert!(store.memory.record(&large.key).is_none());
-        assert!(store.memory.index().nodes().all(|node| !node.pinned()));
-        assert!(store.disk.index().nodes().all(|node| !node.pinned()));
-        assert_eq!(
-            (
-                store.stats().stored,
-                store.stats().fetched,
-                store.stats().store_failed,
-                store.stats().fetch_failed
-            ),
-            (2, 1, 0, 0)
-        );
-        assert_eq!(store.stats().inbound_rate, store.disk.stats().inbound_rate);
-        store.close().unwrap();
-        drop(store);
-
-        let mut store = open_small();
-        write_pages(&mut write_unit, &targets, &|_, _| 0xA5);
-        write_row(&mut write_unit, target_slot, 0xA5);
-        let hit = store.lookup(&fresh, 0, u64::MAX).unwrap();
-        assert_eq!((hit.key, hit.pages, hit.tier), (large.key, 3, Tier::Disk));
-        store
-            .fetch(
-                hit,
-                InboundTicket {
-                    key: large.key,
-                    pages: targets.clone(),
-                    slot: target_slot,
-                },
-            )
-            .unwrap();
-        match wait_event(&mut store) {
-            StoreEvent::Fetched { key, result } => {
-                assert_eq!(key, large.key);
-                assert_eq!(result.unwrap(), record_bytes);
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        check(&read_unit);
-        assert_eq!(store.stats().memory_records, 0);
-        assert!(store.disk.index().nodes().all(|node| !node.pinned()));
-        store.close().unwrap();
-        drop(store);
-        drop(readback);
-        drop(staging);
-        drop(stream);
-        drop(model);
         fs::remove_dir_all(&directory).unwrap();
     }
 }

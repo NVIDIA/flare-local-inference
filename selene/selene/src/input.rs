@@ -137,7 +137,7 @@ impl DiskBudget {
     fn clear_checkpoint_pressure(&self) {
         self.usage.lock().unwrap().checkpoint_pressure = 0;
     }
-    pub(crate) fn progress(&self) -> u64 {
+    pub fn progress(&self) -> u64 {
         self.usage.lock().unwrap().progress
     }
     fn release_input(&self, bytes: u64) {
@@ -225,7 +225,7 @@ pub struct InputStore {
     owner: Arc<Owner>,
 }
 impl InputStore {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-support"))]
     pub fn start(
         memory: u64,
         directory: Option<PathBuf>,
@@ -262,7 +262,7 @@ impl InputStore {
         let thread = std::thread::Builder::new()
             .name("flare-input-records".into())
             .spawn(move || {
-                crate::os::lower_priority(super::disk::NICE);
+                flare_eos::lower_priority(super::disk::NICE);
                 match Worker::new(memory, directory, budget, shared, worker_staging) {
                     Ok(worker) => {
                         if ready.send(Ok(())).is_ok() {
@@ -532,7 +532,7 @@ impl Worker {
         s.queued = s.queued.saturating_sub(1);
     }
     fn run(mut self, receiver: mpsc::Receiver<Job>, waiters: Waiters) {
-        crate::os::lower_priority(super::disk::NICE);
+        flare_eos::lower_priority(super::disk::NICE);
         let mut pending: std::collections::VecDeque<(
             InputKey,
             Arc<PreparedInputRecord>,

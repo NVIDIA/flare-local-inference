@@ -16,11 +16,13 @@ default = []
 test-support = []
 
 [dependencies]
+flare-eos = { path = "../../eos" }
 blake2 = "0.10"
 libc = "0.2.189"
+twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_System_Console", "Win32_System_LibraryLoader", "Win32_System_Com", "Win32_UI_Shell", "Win32_Security", "Win32_Security_Authorization"] }
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage_FileSystem", "Win32_System_IO", "Win32_System_Memory", "Win32_System_SystemInformation", "Win32_System_Threading", "Win32_Security"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"

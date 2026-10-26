@@ -3,7 +3,7 @@
 //! A record is the page slabs and row slab of one checkpoint inside a retaining
 //! [`SlabPool`]. `store` allocates slabs, evicting under the tree policy of the
 //! [`Index`] when the pool is full, and copies the published GPU checkpoint out
-//! through the shared [`Transfers`] threads in windows of at most
+//! through the shared [`PageCopier`](super::PageCopier) in windows of at most
 //! [`WINDOW_PAGES`] pages; the record stays resident until evicted. `fetch`
 //! copies a looked-up chain of resident records back into the ids a ticket
 //! names. At most [`IN_FLIGHT_WINDOWS`] windows of one record are submitted at
@@ -29,23 +29,19 @@
 
 use std::{
     collections::{BTreeMap, VecDeque},
-    sync::{Arc, Mutex, PoisonError},
+    sync::PoisonError,
     time::{Duration, Instant},
 };
 
-use crate::{
-    Error, Result,
-    cache::{CheckpointId, PageId, PrefixHistory, PrefixKey},
-    scheduler::StateSlotId,
-};
+use crate::{CheckpointId, Error, History, PageId, PrefixKey, Result, StateSlotId};
 
 use super::{
-    HostHit, INITIAL_MEMORY_RATE, InboundTicket, JobId, Layout, PrefixStore, PublishedCheckpoint,
+    HostHit, HostStore, INITIAL_MEMORY_RATE, InboundTicket, JobId, Layout, PublishedCheckpoint,
     StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
+    copier::{CLOSE_TIMEOUT, Direction, Job, Reply, SharedCopier},
     geometry::invalid,
     index::{Eviction, Index, Match},
     slab::{PageSlab, RowSlab, SlabPool, WINDOW_PAGES},
-    transfer::{CLOSE_TIMEOUT, Direction, Job, Reply, Transfers},
 };
 
 /// Windows of one record submitted to the transfer threads at a time.
@@ -465,7 +461,7 @@ impl Core {
         Ok(())
     }
 
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit> {
+    fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         if self.flat {
             return None;
         }
@@ -809,7 +805,7 @@ fn windows(
 
 pub struct MemoryStore {
     core: Core,
-    transfers: Arc<Mutex<Transfers>>,
+    transfers: SharedCopier,
     /// Reply scratch reused across polls.
     replies: Vec<Reply>,
     /// Completions produced outside `poll`, delivered by the next `poll`.
@@ -818,28 +814,20 @@ pub struct MemoryStore {
 
 impl MemoryStore {
     /// A standalone store whose index mirrors the GPU checkpoint tree.
-    pub fn new(
-        identity: [u8; 32],
-        pool: SlabPool,
-        transfers: Arc<Mutex<Transfers>>,
-    ) -> Result<Self> {
+    pub fn new(identity: [u8; 32], pool: SlabPool, transfers: SharedCopier) -> Result<Self> {
         Self::open(identity, pool, transfers, false)
     }
 
     /// A store inside a composite: every node is a root and the composite's
     /// disk index owns parent links.
-    pub fn new_flat(
-        identity: [u8; 32],
-        pool: SlabPool,
-        transfers: Arc<Mutex<Transfers>>,
-    ) -> Result<Self> {
+    pub fn new_flat(identity: [u8; 32], pool: SlabPool, transfers: SharedCopier) -> Result<Self> {
         Self::open(identity, pool, transfers, true)
     }
 
     fn open(
         identity: [u8; 32],
         pool: SlabPool,
-        transfers: Arc<Mutex<Transfers>>,
+        transfers: SharedCopier,
         flat: bool,
     ) -> Result<Self> {
         let layout = transfers
@@ -885,11 +873,11 @@ impl MemoryStore {
         &self.core.index
     }
 
-    pub(crate) fn transfers(&self) -> &Arc<Mutex<Transfers>> {
+    pub fn transfers(&self) -> &SharedCopier {
         &self.transfers
     }
 
-    pub(crate) fn reclaimable_slabs(&self) -> (usize, usize) {
+    pub fn reclaimable_slabs(&self) -> (usize, usize) {
         self.core
             .index
             .nodes()
@@ -920,7 +908,7 @@ impl MemoryStore {
     /// Store the checkpoint's `tail` pages and row as a record with the given
     /// parent link; the composite decides the shape from its disk index. Under
     /// flat links the node is inserted as a root whatever `parent` says.
-    pub(crate) fn store_record(
+    pub fn store_record(
         &mut self,
         checkpoint: &PublishedCheckpoint,
         parent: Option<PrefixKey>,
@@ -937,7 +925,7 @@ impl MemoryStore {
     /// Allocate slabs for a record read in from elsewhere, evicting under the
     /// policy, and index it unready and pinned; `None` when no slabs can be
     /// freed. The record is durable: it exists outside this store already.
-    pub(crate) fn allocate_record(
+    pub fn allocate_record(
         &mut self,
         key: PrefixKey,
         bucket: [u8; 16],
@@ -949,37 +937,37 @@ impl MemoryStore {
 
     /// Finish a record from `allocate_record`: on success it becomes ready and
     /// unpinned; on failure it is unpinned, removed, and its slabs released.
-    pub(crate) fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
+    pub fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         self.core.complete_record(key, success)
     }
 
-    pub(crate) fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
+    pub fn mark_durable(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.mark_durable(key)
     }
 
     /// The slabs of a ready record.
-    pub(crate) fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
+    pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
     }
 
     /// Remove an unpinned childless record and release its slabs.
-    pub(crate) fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
+    pub fn remove_record(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.remove_record(key)
     }
 
     /// Hold a record in place while a job outside this store references its
     /// slabs: eviction and removal refuse pinned records.
-    pub(crate) fn pin_record(&mut self, key: &PrefixKey) -> Result<()> {
+    pub fn pin_record(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.index.pin(key)
     }
 
-    pub(crate) fn unpin_record(&mut self, key: &PrefixKey) -> Result<()> {
+    pub fn unpin_record(&mut self, key: &PrefixKey) -> Result<()> {
         self.core.index.unpin(key)
     }
 
     /// Copy a chain of resident records into the ticket's ids. An error means
     /// nothing was submitted and no event follows.
-    pub(crate) fn fetch_chain(&mut self, chain: &Match, ticket: InboundTicket) -> Result<()> {
+    pub fn fetch_chain(&mut self, chain: &Match, ticket: InboundTicket) -> Result<()> {
         self.core.fetch_chain(chain, ticket)?;
         self.pump();
         Ok(())
@@ -996,8 +984,8 @@ impl MemoryStore {
     }
 }
 
-impl PrefixStore for MemoryStore {
-    fn lookup(&mut self, history: &PrefixHistory, resident: u64, before: u64) -> Option<HostHit> {
+impl HostStore for MemoryStore {
+    fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.core.lookup(history, resident, before)
     }
 
@@ -1091,7 +1079,8 @@ impl PrefixStore for MemoryStore {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::offload::geometry::tests::geometry;
+    use crate::testing::TestHistory as PrefixHistory;
+    use crate::testing::geometry;
 
     const IDENTITY: [u8; 32] = [7; 32];
     const PAGE: u64 = 8192;
@@ -1117,32 +1106,9 @@ mod tests {
         history
     }
 
-    /// The `n`th checkpoint id a GPU cache mints, from a chain of one-token pages.
+    /// The `n`th checkpoint id a GPU cache mints.
     fn checkpoint_id(n: u32) -> CheckpointId {
-        use crate::cache::{Fence, PrefixCheckpointCache, Publication, SnapshotId, StateSnapshot};
-        let mut cache = PrefixCheckpointCache::new(IDENTITY, n + 1, n + 1, 1).unwrap();
-        let mut history = PrefixHistory::new(IDENTITY);
-        history.append(&vec![1; n as usize], &[]).unwrap();
-        let mut parent = None;
-        for consumed in 1..=n {
-            let published = cache
-                .publish(
-                    &history,
-                    &Publication {
-                        parent,
-                        consumed_tokens: u64::from(consumed),
-                        tail_pages: vec![PageId(consumed - 1)],
-                        snapshot: StateSnapshot {
-                            id: SnapshotId(consumed - 1),
-                            consumed_tokens: u64::from(consumed),
-                        },
-                        ready_after: Fence(0),
-                    },
-                )
-                .unwrap();
-            parent = Some(published.id());
-        }
-        parent.unwrap()
+        CheckpointId::new(u64::from(n))
     }
 
     /// A publication at `consumed` tokens whose chain pages are numbered from
@@ -1994,510 +1960,5 @@ mod tests {
         assert!((rate.0 - 1200.0).abs() < 1e-9);
         rate.observe(2000, Duration::from_secs(1));
         assert!((rate.0 - 1360.0).abs() < 1e-9);
-    }
-
-    #[cfg(feature = "runtime-package")]
-    #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn memory_store_round_trips_a_multi_window_checkpoint() {
-        use std::time::Instant;
-
-        use crate::{
-            cuda::Stream,
-            offload::CacheGeometry,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
-
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
-            return;
-        };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
-        let manifest = model.manifests().unwrap().remove(0);
-        let geometry = vec![manifest.cache.clone().unwrap()];
-        let rank: &CacheGeometry = &geometry[0];
-        let (context, device) = (manifest.context, manifest.device);
-        let layout = Layout::new(&geometry).unwrap();
-        let pt = layout.page_tokens;
-        let pages = 99u32;
-        assert!(rank.page_capacity >= 2 * u64::from(pages) + 400 && rank.row_capacity >= 4);
-        let sources: Vec<u32> = (1..=pages).collect();
-        let targets: Vec<u32> = (300..300 + pages).collect();
-        let (source_slot, target_slot) = (1u32, 2u32);
-
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
-        let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
-        let row_plane = rank.planes.len();
-        let stream = Stream::open(context, device).unwrap();
-        let largest = rank
-            .planes
-            .iter()
-            .chain([&rank.row])
-            .map(|plane| plane.unit_bytes as usize)
-            .max()
-            .unwrap();
-        let mut staging = stream.host_buffer(largest).unwrap();
-        let mut write_unit = |address: u64, bytes: usize, seed: u64| {
-            fill(&mut staging.bytes_mut()[..bytes], seed);
-            unsafe { stream.upload(address as usize, &staging, 0, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-        };
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for &id in &sources {
-                write_unit(
-                    geometry.unit_address(u64::from(id)),
-                    geometry.unit_bytes as usize,
-                    seed(plane, id),
-                );
-            }
-        }
-        write_unit(
-            rank.row.unit_address(u64::from(source_slot)),
-            rank.row.unit_bytes as usize,
-            seed(row_plane, source_slot),
-        );
-
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
-        pool.register(context).unwrap();
-        let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
-        ));
-        let mut store = MemoryStore::new(IDENTITY, pool, transfers.clone()).unwrap();
-        let consumed = u64::from(pages) * pt;
-        let mut history = PrefixHistory::new(IDENTITY);
-        let tokens: Vec<u32> = (0..consumed as u32 + 40)
-            .map(|t| t.wrapping_mul(2654435761))
-            .collect();
-        history.append(&tokens, &[]).unwrap();
-        let checkpoint = PublishedCheckpoint {
-            id: checkpoint_id(1),
-            key: history.key_at(consumed).unwrap(),
-            parent: None,
-            bucket: history.bucket_at(consumed).unwrap(),
-            chain_pages: sources.iter().map(|id| PageId(*id)).collect(),
-            tail_pages: pages as usize,
-            slot: StateSlotId(source_slot),
-        };
-        let wait = |store: &mut MemoryStore| -> StoreEvent {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let mut events = Vec::new();
-            while events.is_empty() {
-                assert!(Instant::now() < deadline, "no store event within 60 s");
-                store.poll(&mut events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(events.len(), 1, "{events:?}");
-            events.pop().unwrap()
-        };
-        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
-        match wait(&mut store) {
-            StoreEvent::Stored { result, .. } => {
-                assert_eq!(
-                    result.unwrap(),
-                    u64::from(pages) * rank.page_bytes() + rank.row.unit_bytes
-                );
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        let hit = store.lookup(&history, 0, u64::MAX).unwrap();
-        assert_eq!(hit.pages, pages as usize);
-        let ticket = InboundTicket {
-            key: checkpoint.key,
-            pages: targets.iter().map(|id| PageId(*id)).collect(),
-            slot: StateSlotId(target_slot),
-        };
-        store.fetch(hit, ticket).unwrap();
-        match wait(&mut store) {
-            StoreEvent::Fetched { result, .. } => {
-                assert_eq!(
-                    result.unwrap(),
-                    u64::from(pages) * rank.page_bytes() + rank.row.unit_bytes
-                );
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        let read_unit = |address: u64, bytes: usize| -> Vec<u8> {
-            unsafe { stream.download(&staging, address as usize, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-            staging.bytes()[..bytes].to_vec()
-        };
-        let mut mismatches = Vec::new();
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for (source, target) in sources.iter().zip(&targets) {
-                let mut wanted = vec![0u8; geometry.unit_bytes as usize];
-                fill(&mut wanted, seed(plane, *source));
-                let actual = read_unit(
-                    geometry.unit_address(u64::from(*target)),
-                    geometry.unit_bytes as usize,
-                );
-                if actual != wanted {
-                    mismatches.push((geometry.name.clone(), *source, *target));
-                }
-            }
-        }
-        let mut wanted = vec![0u8; rank.row.unit_bytes as usize];
-        fill(&mut wanted, seed(row_plane, source_slot));
-        let actual = read_unit(
-            rank.row.unit_address(u64::from(target_slot)),
-            rank.row.unit_bytes as usize,
-        );
-        assert!(
-            actual == wanted,
-            "row {target_slot} differs from row {source_slot}"
-        );
-        assert!(
-            mismatches.is_empty(),
-            "mismatched planes and pages: {mismatches:?}"
-        );
-        store.close().unwrap();
-    }
-
-    #[test]
-    #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
-    fn memory_store_round_trips_a_checkpoint_through_a_loaded_package() {
-        use std::time::Instant;
-
-        use crate::{
-            cuda::Stream,
-            offload::CacheGeometry,
-            runtime_package::{LoadOptions, NativeModel},
-            startup::StartupProgress,
-        };
-
-        let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
-            eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
-            return;
-        };
-        let model = unsafe {
-            NativeModel::load(
-                crate::runtime_package::test_support::authorize(std::path::Path::new(&package)),
-                &[0],
-                &LoadOptions::default(),
-                &StartupProgress::silent(),
-            )
-        }
-        .unwrap();
-        let manifest = model.manifests().unwrap().remove(0);
-        let geometry = vec![manifest.cache.clone().unwrap()];
-        let rank: &CacheGeometry = &geometry[0];
-        let (context, device) = (manifest.context, manifest.device);
-        let layout = Layout::new(&geometry).unwrap();
-        let pt = layout.page_tokens;
-        assert!(rank.page_capacity >= 16 && rank.row_capacity >= 4);
-        let capacity = rank.page_capacity as u32;
-        let sources = [1u32, 7, capacity / 2];
-        let targets = [2u32, 9, capacity / 2 + 1];
-        let (source_slot, target_slot) = (1u32, 2u32);
-
-        fn fill(bytes: &mut [u8], seed: u64) {
-            for (index, byte) in bytes.iter_mut().enumerate() {
-                let index = index as u64;
-                *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
-            }
-        }
-        let seed = |plane: usize, unit: u32| (plane as u64 + 1) * 1_000_003 + u64::from(unit);
-        let row_plane = rank.planes.len();
-
-        let stream = Stream::open(context, device).unwrap();
-        let largest = rank
-            .planes
-            .iter()
-            .chain([&rank.row])
-            .map(|plane| plane.unit_bytes as usize)
-            .max()
-            .unwrap();
-        let mut staging = stream.host_buffer(largest).unwrap();
-        let mut write_unit = |address: u64, bytes: usize, seed: u64| {
-            fill(&mut staging.bytes_mut()[..bytes], seed);
-            unsafe { stream.upload(address as usize, &staging, 0, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-        };
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for id in sources {
-                write_unit(
-                    geometry.unit_address(u64::from(id)),
-                    geometry.unit_bytes as usize,
-                    seed(plane, id),
-                );
-            }
-        }
-        write_unit(
-            rank.row.unit_address(u64::from(source_slot)),
-            rank.row.unit_bytes as usize,
-            seed(row_plane, source_slot),
-        );
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for id in targets {
-                write_unit(
-                    geometry.unit_address(u64::from(id)),
-                    geometry.unit_bytes as usize,
-                    0xDD + plane as u64,
-                );
-            }
-        }
-        write_unit(
-            rank.row.unit_address(u64::from(target_slot)),
-            rank.row.unit_bytes as usize,
-            0xDD,
-        );
-
-        let mut pool = SlabPool::sized(&layout, SlabPool::minimum_bytes(&layout)).unwrap();
-        pool.register(context).unwrap();
-        let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &pool).unwrap(),
-        ));
-        let mut store = MemoryStore::new(IDENTITY, pool, transfers.clone()).unwrap();
-
-        let consumed = 3 * pt + 5;
-        let mut history = PrefixHistory::new(IDENTITY);
-        let tokens: Vec<u32> = (0..consumed as u32 + 40)
-            .map(|t| t.wrapping_mul(2654435761))
-            .collect();
-        history.append(&tokens, &[]).unwrap();
-        let checkpoint = PublishedCheckpoint {
-            id: checkpoint_id(1),
-            key: history.key_at(consumed).unwrap(),
-            parent: None,
-            bucket: history.bucket_at(consumed).unwrap(),
-            chain_pages: sources.iter().map(|id| PageId(*id)).collect(),
-            tail_pages: 3,
-            slot: StateSlotId(source_slot),
-        };
-
-        let wait = |store: &mut MemoryStore| -> StoreEvent {
-            let deadline = Instant::now() + Duration::from_secs(60);
-            let mut events = Vec::new();
-            while events.is_empty() {
-                assert!(Instant::now() < deadline, "no store event within 60 s");
-                store.poll(&mut events).unwrap();
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert_eq!(events.len(), 1, "{events:?}");
-            events.pop().unwrap()
-        };
-
-        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
-        assert_eq!(store.stats().outbound_in_flight, 1);
-        match wait(&mut store) {
-            StoreEvent::Stored {
-                checkpoint: id,
-                key,
-                result,
-            } => {
-                assert_eq!(id, checkpoint.id);
-                assert_eq!(key, checkpoint.key);
-                assert_eq!(result.unwrap(), 3 * rank.page_bytes() + rank.row.unit_bytes);
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        let stats = store.stats();
-        assert_eq!(stats.stored, 1);
-        assert_eq!(stats.outbound_in_flight, 0);
-        assert_eq!(stats.memory_records, 1);
-        assert_eq!(stats.memory_bytes, layout.record_bytes(3));
-        assert!(stats.outbound_rate > 0.0);
-
-        // The record's slabs hold the source pages' and row's patterns under the layout.
-        let check_record = |store: &MemoryStore, key: &PrefixKey, label: &str| {
-            let record = store.record(key).unwrap().clone();
-            assert_eq!(record.pages.len(), 3, "{label}");
-            let pool = store.pool();
-            for (slab, id) in record.pages.iter().zip(sources) {
-                let bytes = pool.page(*slab);
-                for (plane, geometry) in rank.planes.iter().enumerate() {
-                    let start = layout.ranks[0].plane_offsets[plane] as usize;
-                    let mut expected = vec![0u8; geometry.unit_bytes as usize];
-                    fill(&mut expected, seed(plane, id));
-                    assert!(
-                        bytes[start..start + expected.len()] == expected[..],
-                        "{label}: slab bytes of plane {} ({plane}) page {id} differ from the device",
-                        geometry.name
-                    );
-                }
-            }
-            let row_start = layout.ranks[0].row_offset as usize;
-            let mut expected = vec![0u8; rank.row.unit_bytes as usize];
-            fill(&mut expected, seed(row_plane, source_slot));
-            assert!(
-                pool.row(record.row.unwrap())[row_start..row_start + expected.len()]
-                    == expected[..],
-                "{label}: row slab bytes differ from the device"
-            );
-        };
-        check_record(&store, &checkpoint.key, "first record");
-
-        // Poison the device copies, then restore the chain into other ids.
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for id in sources {
-                write_unit(
-                    geometry.unit_address(u64::from(id)),
-                    geometry.unit_bytes as usize,
-                    0xEE + plane as u64,
-                );
-            }
-        }
-        write_unit(
-            rank.row.unit_address(u64::from(source_slot)),
-            rank.row.unit_bytes as usize,
-            0xEE,
-        );
-        let hit = store.lookup(&history, 0, u64::MAX).unwrap();
-        assert_eq!(hit.key, checkpoint.key);
-        assert_eq!(hit.pages, 3);
-        assert_eq!(hit.bytes, layout.record_bytes(3));
-        assert_eq!(hit.tier, Tier::Memory);
-        assert!(hit.estimated_seconds > 0.0);
-        let ticket = InboundTicket {
-            key: checkpoint.key,
-            pages: targets.iter().map(|id| PageId(*id)).collect(),
-            slot: StateSlotId(target_slot),
-        };
-        store.fetch(hit, ticket).unwrap();
-        assert_eq!(store.stats().inbound_in_flight, 1);
-        match wait(&mut store) {
-            StoreEvent::Fetched { key, result } => {
-                assert_eq!(key, checkpoint.key);
-                assert_eq!(result.unwrap(), 3 * rank.page_bytes() + rank.row.unit_bytes);
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        let stats = store.stats();
-        assert_eq!(stats.fetched, 1);
-        assert_eq!(stats.hits, 1);
-        assert_eq!(stats.reused_tokens, consumed);
-        assert_eq!(stats.inbound_in_flight, 0);
-        assert!(!store.index().node(&checkpoint.key).unwrap().pinned());
-
-        let read_unit = |address: u64, bytes: usize| -> Vec<u8> {
-            unsafe { stream.download(&staging, address as usize, bytes) }.unwrap();
-            stream.synchronize().unwrap();
-            staging.bytes()[..bytes].to_vec()
-        };
-        for (plane, geometry) in rank.planes.iter().enumerate() {
-            for (source, target) in sources.iter().zip(targets) {
-                let mut wanted = vec![0u8; geometry.unit_bytes as usize];
-                fill(&mut wanted, seed(plane, *source));
-                let actual = read_unit(
-                    geometry.unit_address(u64::from(target)),
-                    geometry.unit_bytes as usize,
-                );
-                assert!(
-                    actual == wanted[..],
-                    "plane {} ({plane}) page {target} differs from page {source}",
-                    geometry.name
-                );
-            }
-        }
-        let mut wanted = vec![0u8; rank.row.unit_bytes as usize];
-        fill(&mut wanted, seed(row_plane, source_slot));
-        let actual = read_unit(
-            rank.row.unit_address(u64::from(target_slot)),
-            rank.row.unit_bytes as usize,
-        );
-        assert!(
-            actual == wanted[..],
-            "row {target_slot} differs from row {source_slot}"
-        );
-
-        // The same key is already resident: no second copy-out.
-        assert_ne!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
-        assert_eq!(store.stats().store_skipped, 1);
-        store.close().unwrap();
-        assert_eq!(store.stats().memory_records, 1);
-
-        // A pool holding one record evicts it when a second key is stored.
-        let mut small = SlabPool::new(
-            layout.page_record_bytes,
-            3,
-            layout.row_record_bytes,
-            1,
-            true,
-        )
-        .unwrap();
-        small.register(context).unwrap();
-        let transfers = Arc::new(Mutex::new(
-            Transfers::start(&[(context, device)], geometry.clone(), &small).unwrap(),
-        ));
-        let mut store = MemoryStore::new(IDENTITY, small, transfers).unwrap();
-        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
-        assert!(matches!(
-            wait(&mut store),
-            StoreEvent::Stored { result: Ok(_), .. }
-        ));
-        assert_eq!(store.pool().free_pages(), 0);
-        assert_eq!(store.pool().free_rows(), 0);
-        let mut other = PrefixHistory::new(IDENTITY);
-        other.append(&tokens[..consumed as usize], &[]).unwrap();
-        other.append(&[11, 12, 13, 14, 15], &[]).unwrap();
-        let second_consumed = consumed + 5;
-        let second = PublishedCheckpoint {
-            id: checkpoint_id(2),
-            key: other.key_at(second_consumed).unwrap(),
-            parent: None,
-            bucket: other.bucket_at(second_consumed).unwrap(),
-            chain_pages: targets.iter().map(|id| PageId(*id)).collect(),
-            tail_pages: 3,
-            slot: StateSlotId(target_slot),
-        };
-        assert_ne!(second.key, checkpoint.key);
-        assert_eq!(store.store(&second).unwrap(), StoreOutcome::Queued);
-        assert!(!store.index().contains(&checkpoint.key));
-        assert!(store.index().contains(&second.key));
-        assert_eq!(store.pool().free_pages(), 0);
-        match wait(&mut store) {
-            StoreEvent::Stored { key, result, .. } => {
-                assert_eq!(key, second.key);
-                result.unwrap();
-            }
-            other => panic!("unexpected event {other:?}"),
-        }
-        assert_eq!(store.stats().memory_records, 1);
-        assert!(store.lookup(&history, 0, u64::MAX).is_none());
-        assert_eq!(store.lookup(&other, 0, u64::MAX).unwrap().key, second.key);
-        check_record(&store, &second.key, "second record");
-
-        // Closing waits for a copy-out in progress: the record is resident afterwards.
-        let mut another = PrefixHistory::new(IDENTITY);
-        another.append(&tokens[..consumed as usize], &[]).unwrap();
-        another.append(&[21, 22, 23], &[]).unwrap();
-        let third_consumed = consumed + 3;
-        let third = PublishedCheckpoint {
-            id: checkpoint_id(3),
-            key: another.key_at(third_consumed).unwrap(),
-            parent: None,
-            bucket: another.bucket_at(third_consumed).unwrap(),
-            chain_pages: targets.iter().map(|id| PageId(*id)).collect(),
-            tail_pages: 3,
-            slot: StateSlotId(target_slot),
-        };
-        assert_eq!(store.store(&third).unwrap(), StoreOutcome::Queued);
-        assert!(!store.index().contains(&second.key));
-        assert_eq!(store.stats().outbound_in_flight, 1);
-        store.close().unwrap();
-        let stats = store.stats();
-        assert_eq!(stats.stored, 3);
-        assert_eq!(stats.store_failed, 0);
-        assert_eq!(stats.outbound_in_flight, 0);
-        assert_eq!(stats.memory_records, 1);
-        assert!(store.index().node(&third.key).unwrap().ready);
-        check_record(&store, &third.key, "record stored across close");
-        drop(store);
-        drop(staging);
-        drop(stream);
-        drop(model);
     }
 }

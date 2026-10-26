@@ -14,48 +14,26 @@
 //! read-through. Every store is driven from the model worker thread and never
 //! blocks it: `store` and `fetch` enqueue work, `poll` drains completions.
 
-pub mod composite;
-pub mod disk;
-pub mod disk_store;
-pub mod geometry;
-pub mod index;
-pub mod input;
-pub mod memory;
-pub mod record;
+mod adapter;
+#[cfg(all(test, feature = "runtime-package"))]
+mod gpu_tests;
+mod registrar;
 pub mod shard;
-pub mod slab;
 pub mod transfer;
+
+pub use flare_selene::{
+    CacheGeometry, HostHit, INITIAL_PREFILL_RATE, InboundTicket, Layout, Plane, PublishedCheckpoint,
+    StoreOutcome, StoreReason, StoreStats, Tier, Transport, disk, disk_store, geometry, index,
+    input, record, slab, worth_fetching,
+};
+use flare_selene::{HostStore, composite, memory};
 
 use std::path::PathBuf;
 
 use crate::{
     Result,
-    cache::{CheckpointId, PageId, PrefixHistory, PrefixKey},
-    scheduler::StateSlotId,
+    cache::{CheckpointId, PrefixHistory, PrefixKey},
 };
-
-pub use geometry::{CacheGeometry, Layout, Plane};
-
-/// Identifies one transfer or disk job issued by a store. Memory and disk
-/// stores own separate transfer queues, so their counters do not intersect.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct JobId(pub u64);
-
-/// Where a looked-up record is read from.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Tier {
-    Memory,
-    Disk,
-}
-
-/// How record files move between disk and the GPU.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Transport {
-    /// Through a registered staging pool and batched stream copies.
-    Staged,
-    /// Through GPUDirect Storage, with no host payload staging.
-    Direct,
-}
 
 /// Offload settings as the command line and configuration file supply them.
 /// `None` selects the default: no memory store and no disk store until the
@@ -433,10 +411,15 @@ pub fn prepare_with_inputs(
     let memory_pool = (checkpoint_memory != 0)
         .then(|| {
             if directory.is_none() {
-                return slab::SlabPool::sized_by_rank(&layout, checkpoint_memory, &contexts);
+                return Ok(slab::SlabPool::sized_by_rank(
+                    &layout,
+                    checkpoint_memory,
+                    &contexts,
+                    &registrar::CudaRegistrar,
+                )?);
             }
             let mut pool = slab::SlabPool::sized(&layout, checkpoint_memory)?;
-            pool.register(context)?;
+            pool.register(&registrar::CudaRegistrar, context)?;
             Ok::<_, crate::Error>(pool)
         })
         .transpose()?;
@@ -444,7 +427,7 @@ pub fn prepare_with_inputs(
         .is_some()
         .then(|| {
             let mut pool = slab::SlabPool::staging(&layout)?;
-            pool.register(context)?;
+            pool.register(&registrar::CudaRegistrar, context)?;
             Ok::<_, crate::Error>(pool)
         })
         .transpose()?;
@@ -551,17 +534,18 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
         directory_lock,
         shards,
     } = prepared;
-    let transfers = std::sync::Arc::new(std::sync::Mutex::new(transfer::Transfers::start(
-        &contexts,
-        geometry.clone(),
-        memory_pool
-            .as_ref()
-            .or(staging_pool.as_ref())
-            .ok_or("prefix transfers require a slab pool")?,
-    )?));
+    let transfers: flare_selene::SharedCopier =
+        std::sync::Arc::new(std::sync::Mutex::new(transfer::Transfers::start(
+            &contexts,
+            geometry.clone(),
+            memory_pool
+                .as_ref()
+                .or(staging_pool.as_ref())
+                .ok_or("prefix transfers require a slab pool")?,
+        )?));
     let disk = directory_lock
         .map(|directory| {
-            let disk_transfers = if memory_pool.is_some() {
+            let disk_transfers: flare_selene::SharedCopier = if memory_pool.is_some() {
                 std::sync::Arc::new(std::sync::Mutex::new(transfer::Transfers::start(
                     &contexts,
                     geometry.clone(),
@@ -613,59 +597,13 @@ pub fn open(prepared: Prepared) -> Result<Box<dyn PrefixStore>> {
             }
         })
         .transpose()?;
-    match (memory, disk) {
-        (Some(memory), Some(disk)) => Ok(Box::new(composite::CompositeStore::new(memory, disk)?)),
-        (Some(memory), None) => Ok(Box::new(memory)),
-        (None, Some(disk)) => Ok(Box::new(disk)),
-        (None, None) => Err("no prefix store tier is configured".into()),
-    }
-}
-
-/// A GPU checkpoint the scheduler published, as the worker reports it to the store.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct PublishedCheckpoint {
-    pub id: CheckpointId,
-    pub key: PrefixKey,
-    /// Key of the GPU parent checkpoint, or `None` at the root.
-    pub parent: Option<PrefixKey>,
-    /// Digest of the aligned hash-block boundary at or below the endpoint.
-    pub bucket: [u8; 16],
-    /// Every page of the checkpoint's chain from the root in ascending order.
-    /// The last `tail_pages` entries belong to the checkpoint itself.
-    pub chain_pages: Vec<PageId>,
-    pub tail_pages: usize,
-    /// State slot holding the checkpoint's row.
-    pub slot: StateSlotId,
-}
-
-impl PublishedCheckpoint {
-    pub fn tail(&self) -> &[PageId] {
-        &self.chain_pages[self.chain_pages.len() - self.tail_pages..]
-    }
-}
-
-/// A host record chain that extends a GPU checkpoint.
-#[derive(Clone, Debug, PartialEq)]
-pub struct HostHit {
-    pub key: PrefixKey,
-    pub consumed_tokens: u64,
-    /// Consumed count of the GPU checkpoint the chain extends.
-    pub resident_tokens: u64,
-    /// Pages the restore writes: complete pages at the endpoint minus complete
-    /// pages at the resident checkpoint.
-    pub pages: usize,
-    pub bytes: u64,
-    pub tier: Tier,
-    pub estimated_seconds: f64,
-    pub(crate) chain: index::Match,
-}
-
-/// Destination ids the scheduler reserved for one inbound transfer.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct InboundTicket {
-    pub key: PrefixKey,
-    pub pages: Vec<PageId>,
-    pub slot: StateSlotId,
+    let store: Box<dyn HostStore> = match (memory, disk) {
+        (Some(memory), Some(disk)) => Box::new(composite::CompositeStore::new(memory, disk)?),
+        (Some(memory), None) => Box::new(memory),
+        (None, Some(disk)) => Box::new(disk),
+        (None, None) => return Err("no prefix store tier is configured".into()),
+    };
+    Ok(Box::new(adapter::Host::new(store)))
 }
 
 /// Completion of work a store accepted earlier.
@@ -683,31 +621,6 @@ pub enum StoreEvent {
     Deferred { checkpoint: CheckpointId },
 }
 
-/// Counters every store maintains; rates are bytes per second of completed transfers.
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
-pub struct StoreStats {
-    pub lookups: u64,
-    pub hits: u64,
-    pub reused_tokens: u64,
-    pub stored: u64,
-    pub row_refills: u64,
-    pub progress: u64,
-    pub store_skipped: u64,
-    pub store_failed: u64,
-    pub fetched: u64,
-    pub fetch_failed: u64,
-    pub bytes_out: u64,
-    pub bytes_in: u64,
-    pub outbound_in_flight: usize,
-    pub inbound_in_flight: usize,
-    pub memory_records: usize,
-    pub memory_bytes: u64,
-    pub disk_records: usize,
-    pub disk_bytes: u64,
-    pub outbound_rate: f64,
-    pub inbound_rate: f64,
-}
-
 #[derive(Clone, Copy)]
 pub enum LookupOutcome {
     NoMatch,
@@ -715,23 +628,6 @@ pub enum LookupOutcome {
     CapacityRejected,
     EnqueueRejected,
     Admitted,
-}
-
-/// Immediate disposition of a publication; only Queued transfers keep a GPU pin.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoreOutcome {
-    Queued,
-    Present,
-    Retry(StoreReason),
-    Oversize,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum StoreReason {
-    Inflight,
-    Slabs,
-    Queue,
-    Budget,
 }
 
 /// A host tier the model worker drives without waiting on it.
@@ -759,19 +655,6 @@ pub trait PrefixStore {
     /// On failure the caller must retain the store: transfer jobs may still
     /// reference its registered host buffers and GPU destinations.
     fn close(&mut self) -> Result<()>;
-}
-
-/// Bytes per second assumed for a tier before its first transfers are measured.
-pub const INITIAL_MEMORY_RATE: f64 = 20e9;
-pub const INITIAL_STAGED_DISK_RATE: f64 = 3e9;
-pub const INITIAL_DIRECT_DISK_RATE: f64 = 10e9;
-/// Prefill tokens per second assumed before the worker supplies a measurement.
-pub const INITIAL_PREFILL_RATE: f64 = 8000.0;
-
-/// A fetch is worthwhile when the transfer takes less than half the prefill it replaces.
-pub fn worth_fetching(hit: &HostHit, prefill_tokens_per_second: f64) -> bool {
-    let gained = (hit.consumed_tokens - hit.resident_tokens) as f64;
-    hit.estimated_seconds < 0.5 * gained / prefill_tokens_per_second.max(1.0)
 }
 
 #[cfg(test)]
@@ -826,7 +709,7 @@ mod tests {
             },
             std::path::Path::new("/missing/model.safetensors"),
             [0; 32],
-            vec![geometry::tests::geometry(64, &[("kv", 4096)], 4096)],
+            vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)],
             Vec::new(),
         )
         .unwrap();
@@ -845,7 +728,7 @@ mod tests {
     #[test]
     fn zero_disk_limit_avoids_disk_setup_when_memory_is_enabled() {
         let directory = test_directory();
-        let geometry = vec![geometry::tests::geometry(64, &[("kv", 4096)], 4096)];
+        let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
         let memory_bytes = slab::SlabPool::minimum_bytes(&Layout::new(&geometry).unwrap());
         let error = prepare(
             &PrefixCacheOffload {
@@ -879,7 +762,7 @@ mod tests {
     #[test]
     fn zero_disk_limit_does_not_lock_or_scan_existing_records() {
         let base = test_directory();
-        let geometry = vec![geometry::tests::geometry(64, &[("kv", 4096)], 4096)];
+        let geometry = vec![flare_selene::testing::geometry(64, &[("kv", 4096)], 4096)];
         let fingerprint = geometry::fingerprint(&geometry);
         let directory = base.join(record::directory_name(&[0; 32], &fingerprint));
         std::fs::create_dir_all(&directory).unwrap();
@@ -970,38 +853,6 @@ mod tests {
             device,
             ((1u64 << 30) - ordinary).div_ceil(2).div_ceil(512) + STORE_DEVICE_MARGIN_BYTES
         );
-    }
-
-    #[test]
-    fn fetch_policy_compares_transfer_time_with_half_the_prefill_time() {
-        let hit = HostHit {
-            key: PrefixKey {
-                consumed_tokens: 8000,
-                digest: [0; 16],
-            },
-            consumed_tokens: 8000,
-            resident_tokens: 0,
-            pages: 125,
-            bytes: 1 << 30,
-            tier: Tier::Memory,
-            estimated_seconds: 0.4,
-            chain: index::Match {
-                key: PrefixKey {
-                    consumed_tokens: 8000,
-                    digest: [0; 16],
-                },
-                consumed_tokens: 8000,
-                resident_tokens: 0,
-                nodes: Vec::new(),
-                skip_pages: 0,
-                pages: 125,
-            },
-        };
-        assert!(worth_fetching(&hit, 8000.0));
-        assert!(!worth_fetching(&hit, 16000.0));
-        let mut slow = hit.clone();
-        slow.estimated_seconds = 0.6;
-        assert!(!worth_fetching(&slow, 8000.0));
     }
 }
 

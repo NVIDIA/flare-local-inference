@@ -207,7 +207,7 @@ impl DiskThread {
     /// reading are closed. A timeout retains the worker and its resources;
     /// callers must retain their buffers until a later successful drain.
     pub fn close(&mut self) -> Result<()> {
-        self.close_until(std::time::Instant::now() + super::transfer::CLOSE_TIMEOUT)
+        self.close_until(std::time::Instant::now() + super::copier::CLOSE_TIMEOUT)
     }
 
     fn close_until(&mut self, deadline: std::time::Instant) -> Result<()> {
@@ -267,7 +267,7 @@ fn run(ring: Ring, scratch: AlignedBuffer, jobs: Receiver<Job>, replies: mpsc::S
 
 /// Lower scheduling priority where the host permits it.
 fn lower_priority() {
-    crate::os::lower_priority(NICE);
+    flare_eos::lower_priority(NICE);
 }
 
 /// A record being written: its temporary file, header, and the checksums of
@@ -375,7 +375,7 @@ impl Worker {
             return Err(invalid(format!("disk job {} is already open", id.0)));
         }
         check_tail_pages(&header)?;
-        let file = crate::os::direct_file(&temporary, true)
+        let file = flare_eos::direct_file(&temporary, true)
             .map_err(|error| direct_open_failure("create record file", &temporary, error))?;
         #[cfg(windows)]
         self.ring
@@ -544,7 +544,7 @@ impl Worker {
         if self.records.contains_key(&id) {
             return Err(invalid(format!("disk job {} is already open", id.0)));
         }
-        let file = crate::os::direct_file(&path, false)
+        let file = flare_eos::direct_file(&path, false)
             .map_err(|error| direct_open_failure("open record file", &path, error))?;
         #[cfg(windows)]
         self.ring
@@ -955,7 +955,7 @@ impl Ring {
 
 #[cfg(windows)]
 struct Ring {
-    queue: crate::os::completion::Queue,
+    queue: flare_eos::completion::Queue,
     slots: Vec<Chunk>,
     free: Vec<usize>,
 }
@@ -964,7 +964,7 @@ struct Ring {
 impl Ring {
     fn new() -> Result<Self> {
         Ok(Self {
-            queue: crate::os::completion::Queue::new(RING_DEPTH)
+            queue: flare_eos::completion::Queue::new(RING_DEPTH)
                 .map_err(|e| io_failure("create disk completion port", e))?,
             slots: vec![Chunk::default(); RING_DEPTH],
             free: (0..RING_DEPTH).collect(),
@@ -1104,7 +1104,7 @@ unsafe impl Send for AlignedBuffer {}
 
 impl AlignedBuffer {
     fn new(length: usize) -> Result<Self> {
-        let pointer = crate::os::allocate_aligned(length)
+        let pointer = flare_eos::allocate_aligned(length)
             .map_err(|e| io_failure(format!("allocate {length} aligned bytes"), e))?
             as *mut u8;
         // SAFETY: The allocation holds `length` bytes.
@@ -1133,7 +1133,7 @@ impl AlignedBuffer {
 impl Drop for AlignedBuffer {
     fn drop(&mut self) {
         // SAFETY: The pointer came from `allocate_aligned` and is freed once.
-        unsafe { crate::os::free_aligned(self.address, self.length) };
+        unsafe { flare_eos::free_aligned(self.address, self.length) };
     }
 }
 
@@ -1141,11 +1141,9 @@ impl Drop for AlignedBuffer {
 mod tests {
     use super::*;
     use crate::{
-        cache::PrefixKey,
-        offload::{
-            geometry::tests::geometry,
-            record::{file_name, temporary_name},
-        },
+        PrefixKey,
+        record::{file_name, temporary_name},
+        testing::geometry,
     };
     use std::{
         io::{Seek, SeekFrom, Write as _},
@@ -1162,7 +1160,7 @@ mod tests {
         let _ = fs::remove_dir_all(&directory);
         fs::create_dir_all(&directory).unwrap();
         let probe = directory.join(".probe");
-        match crate::os::direct_file(&probe, true) {
+        match flare_eos::direct_file(&probe, true) {
             Ok(_) => {
                 fs::remove_file(&probe).unwrap();
                 Some(directory)

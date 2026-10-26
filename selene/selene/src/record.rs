@@ -60,7 +60,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use crate::{Error, ExecutionError, Failure, Result, cache::PrefixKey};
+use crate::{Error, PrefixKey, Result};
 
 use super::geometry::{BLOCK_BYTES, CacheGeometry, Layout, RankLayout, invalid};
 
@@ -855,9 +855,9 @@ fn remove(path: &Path) -> Result<()> {
 }
 
 /// A state error carrying the operating-system failure as its cause.
-pub(crate) fn io_failure(message: impl Into<String>, error: io::Error) -> Error {
+pub fn io_failure(message: impl Into<String>, error: io::Error) -> Error {
     let message = message.into();
-    ExecutionError::State(Failure::caused_by(format!("{message}: {error}"), error)).into()
+    Error::caused_by(format!("{message}: {error}"), error)
 }
 
 /// 64-bit xxh3 over `bytes`.
@@ -868,7 +868,7 @@ pub fn checksum(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::offload::{geometry::tests::geometry, index::Index};
+    use crate::{index::Index, testing::geometry};
     #[cfg(unix)]
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::{fs::File, io::Write as _};
