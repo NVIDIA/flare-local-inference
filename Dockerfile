@@ -13,6 +13,11 @@ RUN apt-get update \
 WORKDIR /src
 COPY flare/ flare/
 COPY helios/ helios/
+COPY eos/ eos/
+COPY selene/selene/ selene/selene/
+COPY ignition/recipes/qwen38/assets/ ignition/recipes/qwen38/assets/
+COPY ignition/recipes/step5/assets/ ignition/recipes/step5/assets/
+COPY ignition/recipes/kimi3/assets/ ignition/recipes/kimi3/assets/
 
 ARG TARGETARCH
 RUN --mount=type=cache,target=/usr/local/cargo/registry \

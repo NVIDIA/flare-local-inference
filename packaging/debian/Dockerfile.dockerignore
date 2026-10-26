@@ -7,6 +7,7 @@
 !selene/
 !selene/selene/
 !selene/selene/Cargo.toml
+!selene/selene/Cargo.lock
 !selene/selene/src/
 !selene/selene/src/**
 !eos/
@@ -27,6 +28,8 @@
 !ignition/recipes/qwen38/assets/**
 !ignition/recipes/step5/assets/
 !ignition/recipes/step5/assets/**
+!ignition/recipes/kimi3/assets/
+!ignition/recipes/kimi3/assets/**
 !LICENSE
 !NOTICE
 !packaging/

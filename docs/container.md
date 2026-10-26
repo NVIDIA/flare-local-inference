@@ -21,7 +21,8 @@ docker run --rm flare:local --version
 docker run --rm flare:local run --help
 ```
 
-The build context includes only the Rust serving sources and Protobuf schema.
+The build context includes the Rust serving sources, Protobuf schema, and embedded
+chat templates.
 Cargo uses `flare/Cargo.lock`. The build installs a C/C++ toolchain, CMake,
 NASM, and `protoc`; these remain in the build stage. BuildKit caches Cargo
 downloads and compilation output across builds.

@@ -17,6 +17,7 @@ COPY eos/ eos/
 COPY selene/selene/ selene/selene/
 COPY ignition/recipes/qwen38/assets/ ignition/recipes/qwen38/assets/
 COPY ignition/recipes/step5/assets/ ignition/recipes/step5/assets/
+COPY ignition/recipes/kimi3/assets/ ignition/recipes/kimi3/assets/
 COPY LICENSE NOTICE ./
 COPY packaging/debian/ packaging/debian/
 ARG PACKAGE_VERSION

@@ -13,4 +13,9 @@ license-files = ["LICENSE", "NOTICE"]
 [tool.maturin]
 features = ["server", "extension-module"]
 module-name = "flare_heliopause"
-include = [{ path = "licenses/*", format = ["sdist", "wheel"] }]
+include = [
+    { path = "licenses/*", format = ["sdist", "wheel"] },
+    { path = "ignition/recipes/qwen38/assets/chat_template.jinja", format = "sdist" },
+    { path = "ignition/recipes/step5/assets/chat_template.jinja", format = "sdist" },
+    { path = "ignition/recipes/kimi3/assets/chat_template.jinja", format = "sdist" },
+]

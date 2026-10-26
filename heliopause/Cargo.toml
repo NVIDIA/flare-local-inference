@@ -5,6 +5,8 @@ license = "Apache-2.0"
 edition = "2024"
 rust-version = "1.88"
 publish = false
+# Maturin includes only the embedded recipe assets from this link.
+exclude = ["ignition"]
 
 [lib]
 name = "flare_heliopause"
