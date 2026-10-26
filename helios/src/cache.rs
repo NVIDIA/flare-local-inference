@@ -5,22 +5,11 @@ mod hash;
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use crate::Result;
+pub use flare_selene::{CheckpointId, PageId};
 pub use hash::{ConditioningEvent, HASH_BLOCK_TOKENS, PrefixHistory, PrefixKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct PageId(pub u32);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SnapshotId(pub u32);
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
-pub struct CheckpointId(u64);
-
-impl CheckpointId {
-    pub fn value(self) -> u64 {
-        self.0
-    }
-}
 
 /// Completion on one ordered timeline covering every relevant GPU stream.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -213,7 +202,7 @@ impl PrefixCheckpointCache {
         self.nodes.get(&id).ok_or_else(|| {
             crate::Error::execution(
                 crate::ExecutionError::State,
-                format!("unknown or retired checkpoint {}", id.0),
+                format!("unknown or retired checkpoint {}", id.value()),
             )
         })
     }
@@ -321,7 +310,7 @@ impl PrefixCheckpointCache {
             .next_id
             .checked_add(1)
             .ok_or("checkpoint ID counter exhausted")?;
-        let id = CheckpointId(self.next_id);
+        let id = CheckpointId::new(self.next_id);
         let ready = proposal.ready_after <= self.completed;
         let node = Checkpoint {
             id,

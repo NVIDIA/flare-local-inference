@@ -941,6 +941,7 @@ dependencies = [
  "deepseek-recipe-core",
  "deepseek-recipe-encoding",
  "flare-eos",
+ "flare-selene",
  "flate2",
  "futures-util",
  "httpdate",
@@ -965,6 +966,16 @@ dependencies = [
  "twox-hash",
  "windows-sys 0.61.2",
  "zstd",
+]
+
+[[package]]
+name = "flare-selene"
+version = "0.1.0"
+dependencies = [
+ "blake2",
+ "io-uring",
+ "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

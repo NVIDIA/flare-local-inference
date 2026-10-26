@@ -40,6 +40,17 @@ impl Failure {
         }
     }
 
+    /// A failure whose cause is already shared, such as one from another crate.
+    pub fn shared(
+        message: impl Into<String>,
+        source: Option<Arc<dyn StdError + Send + Sync>>,
+    ) -> Self {
+        Self {
+            message: message.into(),
+            source,
+        }
+    }
+
     pub fn boxed(message: impl Into<String>, source: Box<dyn StdError + Send + Sync>) -> Self {
         Self {
             message: message.into(),
@@ -165,6 +176,28 @@ impl From<&str> for Error {
     }
 }
 
+/// Host-tier failures are state failures with the same message and cause, except
+/// that an error carried across a seam returns as it left.
+impl From<flare_selene::Error> for Error {
+    fn from(error: flare_selene::Error) -> Self {
+        if let Some(carried) = error.carried()
+            && let Some(original) = carried.downcast_ref::<Error>()
+        {
+            return original.clone();
+        }
+        Self::Execution(ExecutionError::State(Failure::shared(
+            error.to_string(),
+            error.cause().cloned(),
+        )))
+    }
+}
+
+impl From<Error> for flare_selene::Error {
+    fn from(error: Error) -> Self {
+        Self::carrying(error)
+    }
+}
+
 #[cfg(feature = "server")]
 impl serde::Serialize for Error {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
@@ -208,6 +241,58 @@ mod tests {
             error.source().unwrap().downcast_ref::<Error>().unwrap(),
             Error::Execution(ExecutionError::Driver(CudaError { code: 700, .. }))
         ));
+    }
+
+    #[test]
+    fn errors_cross_the_host_tier_seam_unchanged() {
+        let driver = Error::Execution(ExecutionError::Driver(CudaError {
+            operation: "cuMemHostRegister_v2".into(),
+            code: 700,
+            name: "CUDA_ERROR_ILLEGAL_ADDRESS".into(),
+            description: "illegal address".into(),
+        }));
+        let message = driver.to_string();
+        let crossed = flare_selene::Error::from(driver).clone();
+        assert_eq!(crossed.to_string(), message);
+        let returned = Error::from(crossed);
+        assert_eq!(returned.to_string(), message);
+        assert!(matches!(
+            returned,
+            Error::Execution(ExecutionError::Driver(CudaError { code: 700, .. }))
+        ));
+        let drained = Error::from(flare_selene::Error::from(Error::Execution(
+            ExecutionError::Drain(Failure::new("copy did not drain")),
+        )));
+        assert!(matches!(
+            drained,
+            Error::Execution(ExecutionError::Drain(_))
+        ));
+        assert_eq!(drained.to_string(), "copy did not drain");
+    }
+
+    #[test]
+    fn selene_failures_keep_message_and_cause() {
+        let cause = std::io::Error::from_raw_os_error(2);
+        let failure = flare_selene::Error::caused_by("open record", cause);
+        let converted = Error::from(failure.clone());
+        assert!(matches!(
+            &converted,
+            Error::Execution(ExecutionError::State(_))
+        ));
+        assert_eq!(converted.to_string(), "open record");
+        assert_eq!(
+            converted
+                .source()
+                .unwrap()
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(2)
+        );
+        assert_eq!(
+            Error::from(flare_selene::Error::new("plain")).to_string(),
+            "plain"
+        );
     }
 
     #[test]

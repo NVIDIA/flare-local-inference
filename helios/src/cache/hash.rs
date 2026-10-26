@@ -3,14 +3,7 @@ use blake2::{Blake2b, Digest};
 
 use crate::Result;
 
-/// Tokens per hash block; aligned boundaries and bucket digests use this unit.
-pub const HASH_BLOCK_TOKENS: usize = 64;
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct PrefixKey {
-    pub consumed_tokens: u64,
-    pub digest: [u8; 16],
-}
+pub use flare_selene::{HASH_BLOCK_TOKENS, PrefixKey};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ConditioningEvent {
@@ -154,5 +147,19 @@ impl PrefixHistory {
             }
         }
         Ok(())
+    }
+}
+
+impl flare_selene::History for PrefixHistory {
+    fn token_count(&self) -> u64 {
+        PrefixHistory::token_count(self)
+    }
+
+    fn key_at(&self, consumed_tokens: u64) -> Option<PrefixKey> {
+        PrefixHistory::key_at(self, consumed_tokens)
+    }
+
+    fn aligned_boundaries(&self) -> &[PrefixKey] {
+        PrefixHistory::aligned_boundaries(self)
     }
 }

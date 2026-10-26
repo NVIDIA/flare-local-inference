@@ -33,6 +33,7 @@ zstd = { version = "0.13", optional = true }
 brotli = { version = "8", optional = true }
 ring = { version = "0.17.14", optional = true }
 thiserror = "2.0"
+flare-selene = { path = "../selene/selene" }
 serde = { version = "1.0", features = ["derive"], optional = true }
 prost = { version = "0.14", optional = true }
 blake2 = "0.10"

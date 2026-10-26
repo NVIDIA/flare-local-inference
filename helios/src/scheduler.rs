@@ -34,8 +34,7 @@ pub struct RequestHandle {
     pub generation: u64,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StateSlotId(pub u32);
+pub use flare_selene::StateSlotId;
 
 #[derive(Clone, Copy, Debug)]
 pub struct SchedulerLimits {
