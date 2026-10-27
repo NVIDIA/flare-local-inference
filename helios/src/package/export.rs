@@ -373,6 +373,24 @@ fn publish_inner(
     let mut published: BTreeMap<PayloadId, PublishedPayload> = BTreeMap::new();
     let mut locations = Vec::new();
     let mut located: BTreeMap<PayloadId, ()> = BTreeMap::new();
+    // Hash every payload source concurrently before the ordered publication loops below; they
+    // then only compare identities. Sources reused from cached weights are not hashed at all.
+    let verified = if weights.is_some() {
+        VerifiedSources::default()
+    } else {
+        let sources: Vec<&PublishPayload> = request
+            .deployments
+            .iter()
+            .flat_map(|deployment| {
+                deployment.ranks.iter().flat_map(|rank| rank.payloads.iter()).chain(deployment.payloads.iter())
+            })
+            .collect();
+        let total = sources.iter().map(|payload| payload.nbytes()).sum();
+        let phase = progress.phase("Verify payload sources", Some(total));
+        let verified = VerifiedSources::hash(&sources, &phase)?;
+        phase.finish(format!("{total} source bytes verified by {} workers", verified.workers));
+        verified
+    };
     let mut primary: Vec<(String, Vec<u8>)> = Vec::new();
     let directory = match &destination {
         Destination::Directory(path) => path.to_path_buf(),
@@ -583,13 +601,14 @@ fn publish_inner(
                     reused_bytes += payload.nbytes();
                     located.insert(id, ());
                 } else if located.contains_key(&id) {
-                    verify_payload_source(payload)?;
+                    verified.check(payload)?;
                 } else {
-                    install_payload(
+                    install_payload_verified(
                         payload,
                         &mut destination,
                         &mut locations,
                         request.no_weights,
+                        &verified,
                     )?;
                     located.insert(id, ());
                 }
@@ -631,13 +650,14 @@ fn publish_inner(
                 reused_bytes += payload.nbytes();
                 located.insert(id, ());
             } else if located.contains_key(&id) {
-                verify_payload_source(payload)?;
+                verified.check(payload)?;
             } else {
-                install_payload(
+                install_payload_verified(
                     payload,
                     &mut destination,
                     &mut locations,
                     request.no_weights,
+                    &verified,
                 )?;
                 located.insert(id, ());
             }
@@ -1004,6 +1024,91 @@ fn verify_payload_source(payload: &PublishPayload) -> Result<PayloadId, crate::E
     Ok(actual)
 }
 
+/// Payload sources whose bytes already hashed to their assigned identity, keyed by address.
+#[derive(Default)]
+struct VerifiedSources {
+    sources: std::collections::HashSet<usize>,
+    workers: usize,
+}
+
+const MAX_SOURCE_VERIFY_WORKERS: usize = 8;
+
+impl VerifiedSources {
+    /// Hash `payloads` on parallel readers: one synchronous reader leaves NVMe queues idle.
+    fn hash(payloads: &[&PublishPayload], phase: &crate::startup::Phase) -> Result<Self, crate::Error> {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let workers = std::thread::available_parallelism()
+            .map_or(1, |workers| workers.get())
+            .min(MAX_SOURCE_VERIFY_WORKERS)
+            .min(payloads.len());
+        // Largest first, so the last worker does not start a long payload alone.
+        let mut order: Vec<usize> = (0..payloads.len()).collect();
+        order.sort_by_key(|&index| std::cmp::Reverse(payloads[index].nbytes()));
+        let cursor = AtomicUsize::new(0);
+        let failure: Mutex<Option<crate::Error>> = Mutex::new(None);
+        let mut spawn_error = None;
+        std::thread::scope(|scope| {
+            for _ in 0..workers {
+                let worker = std::thread::Builder::new().spawn_scoped(scope, || loop {
+                    if failure.lock().expect("source verification mutex").is_some() {
+                        break;
+                    }
+                    let Some(&index) = order.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
+                        break;
+                    };
+                    let payload = payloads[index];
+                    if let Err(error) = verify_payload_source(payload) {
+                        failure.lock().expect("source verification mutex").get_or_insert(error);
+                        break;
+                    }
+                    phase.advance_bytes(payload.nbytes());
+                });
+                if let Err(error) = worker {
+                    spawn_error = Some(error);
+                    break;
+                }
+            }
+        });
+        if let Some(error) = spawn_error {
+            return Err(invalid(format!("spawn payload source verifier: {error}")));
+        }
+        if let Some(error) = failure.into_inner().expect("source verification mutex") {
+            return Err(error);
+        }
+        Ok(Self {
+            sources: payloads.iter().map(|payload| *payload as *const PublishPayload as usize).collect(),
+            workers,
+        })
+    }
+
+    fn check(&self, payload: &PublishPayload) -> Result<PayloadId, crate::Error> {
+        if self.sources.contains(&(payload as *const PublishPayload as usize)) {
+            return Ok(payload.id);
+        }
+        verify_payload_source(payload)
+    }
+}
+
+/// Whether two slices name the same bytes of the same file, so one hash covers both.
+#[cfg(unix)]
+fn same_bytes(left: &Slice, right: &Slice) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if left.offset() != right.offset() || left.len() != right.len() {
+        return false;
+    }
+    match (left.file().metadata(), right.file().metadata()) {
+        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        _ => false,
+    }
+}
+
+#[cfg(not(unix))]
+fn same_bytes(_left: &Slice, _right: &Slice) -> bool {
+    false
+}
+
 /// Positional reader over a pinned safetensors payload slice.
 struct SliceReader<'a> {
     slice: &'a Slice,
@@ -1081,11 +1186,22 @@ fn reuse_weight(
     Ok(true)
 }
 
+#[cfg(test)]
 fn install_payload(
     payload: &PublishPayload,
     destination: &mut Destination<'_>,
     locations: &mut Vec<wire::PayloadLocation>,
     no_weights: bool,
+) -> Result<PayloadId, crate::Error> {
+    install_payload_verified(payload, destination, locations, no_weights, &VerifiedSources::default())
+}
+
+fn install_payload_verified(
+    payload: &PublishPayload,
+    destination: &mut Destination<'_>,
+    locations: &mut Vec<wire::PayloadLocation>,
+    no_weights: bool,
+    verified: &VerifiedSources,
 ) -> Result<PayloadId, crate::Error> {
     // Only stored weight bytes must already exist. Initial state, frontend
     // assets, and compressed executable resources (kernels/graphs) are installed
@@ -1094,7 +1210,7 @@ fn install_payload(
         payload.role,
         wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights
     ) {
-        verify_payload_source(payload)?;
+        verified.check(payload)?;
         match destination {
             Destination::Cache(root, staging) => {
                 let object = root.payload(payload.id)?.ok_or_else(|| {
@@ -1109,9 +1225,9 @@ fn install_payload(
                         payload.id
                     )));
                 }
-                // The object name is not evidence: hash the pinned cached bytes.
-                let cached = object.slice().digest()?;
-                if cached != payload.id {
+                // The object name is not evidence: hash the pinned cached bytes, unless they are
+                // the very source bytes already hashed against this identity.
+                if !same_bytes(object.slice(), &payload.source) && object.slice().digest()? != payload.id {
                     return Err(invalid(format!(
                         "cached payload {} bytes do not match their identity",
                         payload.id
@@ -1133,7 +1249,7 @@ fn install_payload(
             }
         }
     } else {
-        install_payload_bytes(payload, destination)?;
+        install_payload_bytes_verified(payload, destination, verified)?;
         locations.push(wire::PayloadLocation {
             payload_id: payload.id.as_bytes().to_vec(),
             file: payload.relative.clone(),
@@ -1165,7 +1281,15 @@ fn install_payload_bytes(
     payload: &PublishPayload,
     destination: &mut Destination<'_>,
 ) -> Result<(), crate::Error> {
-    verify_payload_source(payload)?;
+    install_payload_bytes_verified(payload, destination, &VerifiedSources::default())
+}
+
+fn install_payload_bytes_verified(
+    payload: &PublishPayload,
+    destination: &mut Destination<'_>,
+    verified: &VerifiedSources,
+) -> Result<(), crate::Error> {
+    verified.check(payload)?;
     match destination {
         Destination::Directory(root) => {
             write_verified_companion(root, &payload.relative, payload)?;
@@ -1183,8 +1307,9 @@ fn install_payload_bytes(
                         )));
                     }
                     // The object name is not evidence: a warm hit must also
-                    // validate the cached bytes before linking them.
-                    if object.slice().digest()? != payload.id {
+                    // validate the cached bytes before linking them, unless they are
+                    // the very source bytes already hashed against this identity.
+                    if !same_bytes(object.slice(), &payload.source) && object.slice().digest()? != payload.id {
                         return Err(invalid(format!(
                             "cached payload {} bytes do not match their identity",
                             payload.id
