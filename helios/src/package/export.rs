@@ -375,7 +375,7 @@ fn publish_inner(
     let mut located: BTreeMap<PayloadId, ()> = BTreeMap::new();
     // Hash every payload source concurrently before the ordered publication loops below; they
     // then only compare identities. Sources reused from cached weights are not hashed at all.
-    let verified = if weights.is_some() {
+    let mut verified = if weights.is_some() {
         VerifiedSources::default()
     } else {
         let sources: Vec<&PublishPayload> = request
@@ -642,6 +642,33 @@ fn publish_inner(
         }
         let payload_bytes = deployment.payloads.iter().map(|payload| payload.nbytes()).sum();
         let data_phase = progress.phase(if weights.is_some() { "Publish shared data" } else { "Verify and publish shared data" }, Some(payload_bytes));
+        // Copy the shared payloads the cache still lacks concurrently. The ordered loop below
+        // remains the only place that links, locates, and catalogs them, and finds these objects.
+        let mut installed = std::collections::HashSet::new();
+        if let Destination::Cache(root, _) = &destination {
+            let mut missing = Vec::new();
+            let mut seen = std::collections::BTreeSet::new();
+            for payload in &deployment.payloads {
+                let weight = matches!(
+                    payload.role,
+                    wire::PayloadRole::Weights | wire::PayloadRole::TunedWeights
+                );
+                let reused = weights.is_some_and(|objects| objects.iter().any(|object| object.id() == payload.id));
+                if located.contains_key(&payload.id)
+                    || (weight && (request.no_weights || reused))
+                    || !seen.insert(payload.id)
+                    || root.payload(payload.id)?.is_some()
+                {
+                    continue;
+                }
+                missing.push(payload);
+            }
+            if !missing.is_empty() {
+                data_phase.detail(format!("installing {} missing payloads", missing.len()));
+                verified.install(&missing, root, &data_phase)?;
+                installed.extend(missing.iter().map(|payload| source_address(payload)));
+            }
+        }
         let mut reused_bytes = 0;
         for payload in &deployment.payloads {
             data_phase.detail(format!("{} ({} bytes)", payload.relative, payload.nbytes()));
@@ -661,7 +688,9 @@ fn publish_inner(
                 )?;
                 located.insert(id, ());
             }
-            data_phase.advance_bytes(payload.nbytes());
+            if !installed.contains(&source_address(payload)) {
+                data_phase.advance_bytes(payload.nbytes());
+            }
             let descriptor = wire::PayloadDescriptor {
                 id: id.as_bytes().to_vec(),
                 nbytes: payload.nbytes(),
@@ -1024,70 +1053,131 @@ fn verify_payload_source(payload: &PublishPayload) -> Result<PayloadId, crate::E
     Ok(actual)
 }
 
-/// Payload sources whose bytes already hashed to their assigned identity, keyed by address.
+/// Payload sources whose bytes already hashed to their assigned identity, keyed by address, and
+/// cache objects this export installed and verified ahead of the ordered publication loop.
 #[derive(Default)]
 struct VerifiedSources {
     sources: std::collections::HashSet<usize>,
+    installed: BTreeMap<PayloadId, crate::package::cache::PayloadObject>,
     workers: usize,
 }
 
 const MAX_SOURCE_VERIFY_WORKERS: usize = 8;
 
-impl VerifiedSources {
-    /// Hash `payloads` on parallel readers: one synchronous reader leaves NVMe queues idle.
-    fn hash(payloads: &[&PublishPayload], phase: &crate::startup::Phase) -> Result<Self, crate::Error> {
-        use std::sync::Mutex;
-        use std::sync::atomic::{AtomicUsize, Ordering};
+fn source_address(payload: &PublishPayload) -> usize {
+    payload as *const PublishPayload as usize
+}
 
-        let workers = std::thread::available_parallelism()
-            .map_or(1, |workers| workers.get())
-            .min(MAX_SOURCE_VERIFY_WORKERS)
-            .min(payloads.len());
-        // Largest first, so the last worker does not start a long payload alone.
-        let mut order: Vec<usize> = (0..payloads.len()).collect();
-        order.sort_by_key(|&index| std::cmp::Reverse(payloads[index].nbytes()));
-        let cursor = AtomicUsize::new(0);
-        let failure: Mutex<Option<crate::Error>> = Mutex::new(None);
-        let mut spawn_error = None;
-        std::thread::scope(|scope| {
-            for _ in 0..workers {
-                let worker = std::thread::Builder::new().spawn_scoped(scope, || loop {
-                    if failure.lock().expect("source verification mutex").is_some() {
-                        break;
-                    }
-                    let Some(&index) = order.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
-                        break;
-                    };
-                    let payload = payloads[index];
-                    if let Err(error) = verify_payload_source(payload) {
-                        failure.lock().expect("source verification mutex").get_or_insert(error);
-                        break;
-                    }
-                    phase.advance_bytes(payload.nbytes());
-                });
-                if let Err(error) = worker {
-                    spawn_error = Some(error);
+/// Run `work` over `payloads` on parallel workers, largest first: one synchronous reader leaves
+/// NVMe queues idle, and the last worker should not start a long payload alone. The first error
+/// stops scheduling and is returned once running work drains. Returns the worker count and each
+/// result with its payload index.
+fn largest_first<T: Send>(
+    payloads: &[&PublishPayload],
+    work: impl Fn(&PublishPayload) -> Result<T, crate::Error> + Sync,
+) -> Result<(usize, Vec<(usize, T)>), crate::Error> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |workers| workers.get())
+        .min(MAX_SOURCE_VERIFY_WORKERS)
+        .min(payloads.len());
+    let mut order: Vec<usize> = (0..payloads.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(payloads[index].nbytes()));
+    let cursor = AtomicUsize::new(0);
+    let failure: Mutex<Option<crate::Error>> = Mutex::new(None);
+    let results: Mutex<Vec<(usize, T)>> = Mutex::new(Vec::with_capacity(payloads.len()));
+    let mut spawn_error = None;
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            let worker = std::thread::Builder::new().spawn_scoped(scope, || loop {
+                if failure.lock().expect("payload worker mutex").is_some() {
                     break;
                 }
+                let Some(&index) = order.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
+                    break;
+                };
+                match work(payloads[index]) {
+                    Ok(value) => results.lock().expect("payload worker mutex").push((index, value)),
+                    Err(error) => {
+                        failure.lock().expect("payload worker mutex").get_or_insert(error);
+                        break;
+                    }
+                }
+            });
+            if let Err(error) = worker {
+                spawn_error = Some(error);
+                break;
             }
-        });
-        if let Some(error) = spawn_error {
-            return Err(invalid(format!("spawn payload source verifier: {error}")));
         }
-        if let Some(error) = failure.into_inner().expect("source verification mutex") {
-            return Err(error);
-        }
+    });
+    if let Some(error) = spawn_error {
+        return Err(invalid(format!("spawn payload worker: {error}")));
+    }
+    if let Some(error) = failure.into_inner().expect("payload worker mutex") {
+        return Err(error);
+    }
+    Ok((workers, results.into_inner().expect("payload worker mutex")))
+}
+
+impl VerifiedSources {
+    /// Hash `payloads` against their assigned identities on parallel readers.
+    fn hash(payloads: &[&PublishPayload], phase: &crate::startup::Phase) -> Result<Self, crate::Error> {
+        let (workers, _) = largest_first(payloads, |payload| {
+            verify_payload_source(payload)?;
+            phase.advance_bytes(payload.nbytes());
+            Ok(())
+        })?;
         Ok(Self {
-            sources: payloads.iter().map(|payload| *payload as *const PublishPayload as usize).collect(),
+            sources: payloads.iter().map(|payload| source_address(payload)).collect(),
+            installed: BTreeMap::new(),
             workers,
         })
     }
 
     fn check(&self, payload: &PublishPayload) -> Result<PayloadId, crate::Error> {
-        if self.sources.contains(&(payload as *const PublishPayload as usize)) {
+        if self.sources.contains(&source_address(payload)) {
             return Ok(payload.id);
         }
         verify_payload_source(payload)
+    }
+
+    /// Insert cache objects for `payloads`, which have distinct identities absent from `root`,
+    /// on the parallel readers. Each runs the ordered loop's miss path: check the source, copy it
+    /// into the cache, and hash the written object against its identity. The ordered loop then
+    /// links these objects without hashing them again.
+    fn install(
+        &mut self,
+        payloads: &[&PublishPayload],
+        root: &crate::package::cache::Root,
+        phase: &crate::startup::Phase,
+    ) -> Result<(), crate::Error> {
+        let this = &*self;
+        let (_, objects) = largest_first(payloads, |payload| {
+            this.check(payload)?;
+            let object = root.insert_payload(payload.id, payload.nbytes(), payload.reader())?;
+            if object.id() != payload.id {
+                return Err(invalid(
+                    "cache payload identity differs from the signed identity",
+                ));
+            }
+            phase.advance_bytes(payload.nbytes());
+            Ok(object)
+        })?;
+        for (index, object) in objects {
+            // Each source was checked before it was copied.
+            self.sources.insert(source_address(payloads[index]));
+            self.installed.insert(object.id(), object);
+        }
+        Ok(())
+    }
+
+    /// Whether `object` is the file this export installed and hashed under its identity.
+    fn installed(&self, object: &crate::package::cache::PayloadObject) -> bool {
+        self.installed
+            .get(&object.id())
+            .is_some_and(|held| same_bytes(held.slice(), object.slice()))
     }
 }
 
@@ -1308,8 +1398,12 @@ fn install_payload_bytes_verified(
                     }
                     // The object name is not evidence: a warm hit must also
                     // validate the cached bytes before linking them, unless they are
-                    // the very source bytes already hashed against this identity.
-                    if !same_bytes(object.slice(), &payload.source) && object.slice().digest()? != payload.id {
+                    // the very source bytes already hashed against this identity or
+                    // the object this export installed and hashed.
+                    if !same_bytes(object.slice(), &payload.source)
+                        && !verified.installed(&object)
+                        && object.slice().digest()? != payload.id
+                    {
                         return Err(invalid(format!(
                             "cached payload {} bytes do not match their identity",
                             payload.id
@@ -2816,6 +2910,284 @@ mod tests {
         drop(entry);
         drop(root);
         drop(request);
+        let _ = std::fs::remove_dir_all(&work);
+    }
+
+    #[test]
+    fn shared_payloads_install_concurrently_with_serial_bookkeeping() {
+        use crate::package::cache::Root;
+        use crate::package::protection::{self, Selection};
+        use crate::runtime_package::Publisher;
+        use ring::signature::KeyPair;
+
+        let work = scratch("shared-concurrent");
+        let source_dir = work.join("sources");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let write = |name: &str, bytes: &[u8]| {
+            let path = source_dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            path
+        };
+        let pattern = |seed: u8, nbytes: usize| -> Vec<u8> {
+            (0..nbytes).map(|index| (index as u8).wrapping_mul(31).wrapping_add(seed)).collect()
+        };
+        let cubin = b"shared payload test cubin".to_vec();
+        let graph = b"shared payload test graph".to_vec();
+        let cubin_path = write("kernel.cubin", &cubin);
+        let graph_path = write("graph.bin", &graph);
+        // Two large weight tables, a second occurrence of the first from another file, and a
+        // state payload whose object is already cached before publication.
+        let table_a = pattern(1, 3 << 20);
+        let table_b = pattern(2, 2 << 20);
+        let state = pattern(3, 4096);
+        let (id_a, id_b, id_state) =
+            (PayloadId::of(&table_a), PayloadId::of(&table_b), PayloadId::of(&state));
+        let path_a = write("table-a.bin", &table_a);
+        let path_a_copy = write("table-a-copy.bin", &table_a);
+        let path_b = write("table-b.bin", &table_b);
+        let path_state = write("state.bin", &state);
+        let deployment_id = "sm120-tp1";
+        let shared = |role, name: &str, path: &Path, id| PublishPayload {
+            role,
+            relative: format!("deployments/{deployment_id}/shared/{name}.safetensors"),
+            source: pin_file(path, std::fs::metadata(path).unwrap().len()).unwrap(),
+            id,
+            tensor: None,
+        };
+        let rng = ring::rand::SystemRandom::new();
+        let pkcs8 = ring::signature::Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key = ring::signature::Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        let public_key: [u8; 32] = key.public_key().as_ref().try_into().unwrap();
+        let package_id = [23u8; 32];
+        let request = PublishRequest {
+            package: wire::PackageBody {
+                format_version: schema::FORMAT_VERSION,
+                package_id: package_id.to_vec(),
+                model_identity: "model".into(),
+                hardware_identity: "sm120".into(),
+                publisher: Some(wire::PublisherMetadata {
+                    namespace: "example".into(),
+                    official_source: "https://huggingface.co/example/model".into(),
+                    development: false,
+                    license_name: String::new(),
+                    license_link: String::new(),
+                    ranks: 1,
+                }),
+                frontend: Some(crate::runtime_package::wire::FrontendSettings::default()),
+                sampling_defaults: Some(
+                    crate::runtime_package::wire::DefaultSamplingParameters::default(),
+                ),
+                payloads: vec![],
+                assets: vec![],
+                deployments: vec![],
+            },
+            payloads: vec![],
+            deployments: vec![PublishDeployment {
+                body: wire::DeploymentBody {
+                    deployment_id: deployment_id.into(),
+                    architecture: vec![12, 0],
+                    tensor_parallel: 1,
+                    contract: Some(crate::runtime_package::wire::ServingContract::default()),
+                    cluster: None,
+                    rebuild: None,
+                    engram: None,
+                    payloads: vec![],
+                    ranks: vec![],
+                },
+                ranks: vec![PublishRank {
+                    body: wire::RankBody {
+                        rank: 0,
+                        deployment_id: deployment_id.into(),
+                        context: Some(crate::runtime_package::wire::Context::default()),
+                        allocations: vec![wire::Allocation {
+                            name: "storage".into(),
+                            nbytes: 1,
+                            alignment: 256,
+                            address: Some(0x1000),
+                            memory: 0,
+                            sizing: None,
+                            relocations: vec![],
+                        }],
+                        modules: vec![wire::Module {
+                            name: "kernel".into(),
+                            cubin: 0,
+                            globals: vec![],
+                        }],
+                        functions: vec![wire::Function {
+                            module: "kernel".into(),
+                            symbol: "decode".into(),
+                            parameter_sizes: vec![],
+                            attributes: vec![],
+                        }],
+                        graphs: vec![wire::Graph {
+                            name: "decode".into(),
+                            resource: 1,
+                            node_count: 1,
+                            edge_count: 0,
+                            functions: vec![0],
+                            ..Default::default()
+                        }],
+                        ..Default::default()
+                    },
+                    payloads: vec![],
+                    resources: vec![
+                        PublishResource {
+                            kind: wire::ExecutableKind::Cubin,
+                            path: cubin_path,
+                            nbytes: cubin.len() as u64,
+                        },
+                        PublishResource {
+                            kind: wire::ExecutableKind::Graph,
+                            path: graph_path,
+                            nbytes: graph.len() as u64,
+                        },
+                    ],
+                }],
+                payloads: vec![
+                    shared(wire::PayloadRole::InitialState, "state", &path_state, id_state),
+                    shared(wire::PayloadRole::Weights, "table-b", &path_b, id_b),
+                    shared(wire::PayloadRole::Weights, "table-a", &path_a, id_a),
+                    shared(wire::PayloadRole::Weights, "table-a-again", &path_a_copy, id_a),
+                ],
+            }],
+            package_id,
+            public_key,
+            accepted: "example".into(),
+            no_weights: false,
+        };
+        let publisher = Publisher {
+            name: "Example".into(),
+            namespace: "example".into(),
+            public_key,
+            development: false,
+        };
+        let shared_order = |directory: &Path| {
+            let metadata = crate::package::reader::Metadata::open(directory).unwrap();
+            let verified = protection::verify(
+                &metadata.envelope,
+                std::slice::from_ref(&publisher),
+                Selection::Deployment { deployment: 0, rank: None },
+            )
+            .unwrap();
+            let order: Vec<Vec<u8>> = verified
+                .deployment()
+                .unwrap()
+                .payloads
+                .iter()
+                .map(|descriptor| descriptor.id.clone())
+                .collect();
+            (metadata, order)
+        };
+        let blobs = |cache: &Path| {
+            std::fs::read_dir(cache.join("blobs"))
+                .unwrap()
+                .filter(|item| item.as_ref().unwrap().file_type().unwrap().is_file())
+                .count()
+        };
+
+        // The directory destination keeps the serial installation: the reference bookkeeping.
+        let directory = work.join("directory");
+        std::fs::create_dir_all(&directory).unwrap();
+        publish(&request, &key, Destination::Directory(&directory)).unwrap();
+        let (reference, reference_order) = shared_order(&directory);
+
+        let cache_dir = work.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let root = Root::open(&cache_dir).unwrap();
+        root.capture_payload(state.len() as u64, state.as_slice()).unwrap();
+        let mut staging = root.stage("model", "entry").unwrap();
+        publish(&request, &key, Destination::Cache(&root, &mut staging)).unwrap();
+        let entry = staging.commit().unwrap();
+        let (metadata, order) = shared_order(entry.directory());
+        // Signatures are deterministic, so equal envelopes mean equal bodies and catalogs.
+        assert_eq!(metadata.envelope, reference.envelope);
+        assert_eq!(metadata.locations, reference.locations);
+        let tail = order[order.len() - 4..].to_vec();
+        assert_eq!(order, reference_order);
+        let expected: Vec<Vec<u8>> =
+            [id_state, id_b, id_a, id_a].iter().map(|id| id.as_bytes().to_vec()).collect();
+        assert_eq!(tail, expected, "shared payloads must keep their declared catalog order");
+        // One object per identity: three shared payloads plus the kernel and graph companions.
+        assert_eq!(blobs(&cache_dir), 5);
+        for (id, bytes) in [(id_a, &table_a), (id_b, &table_b), (id_state, &state)] {
+            let object = root.payload(id).unwrap().unwrap();
+            assert_eq!(object.slice().digest().unwrap(), id);
+            let mut stored = Vec::new();
+            object.slice().copy_to(&mut stored).unwrap();
+            assert_eq!(&stored, bytes);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let object = root.payload(id_a).unwrap().unwrap();
+            let inode = std::fs::metadata(object.path()).unwrap().ino();
+            for name in ["table-a", "table-a-again"] {
+                let location = metadata
+                    .locations
+                    .locations
+                    .iter()
+                    .find(|location| location.file.ends_with(&format!("/{name}.safetensors")));
+                // Only the first occurrence is located; both names resolve to one object.
+                if let Some(location) = location {
+                    let linked = entry.directory().join(&location.file);
+                    assert_eq!(std::fs::metadata(linked).unwrap().ino(), inode);
+                }
+            }
+        }
+        drop(entry);
+
+        // A corrupted source still fails verification and installs nothing for it.
+        let fresh = pattern(4, 1 << 20);
+        let fresh_id = PayloadId::of(&fresh);
+        let fresh_path = write("fresh.bin", &fresh);
+        let mut corrupted = request;
+        corrupted.deployments[0]
+            .payloads
+            .push(shared(wire::PayloadRole::Weights, "fresh", &fresh_path, fresh_id));
+        std::fs::write(&fresh_path, vec![0x5a; fresh.len()]).unwrap();
+        let mut staging = root.stage("model", "corrupted").unwrap();
+        let error = publish(&corrupted, &key, Destination::Cache(&root, &mut staging)).unwrap_err();
+        assert!(error.to_string().contains("bytes do not match the assigned identity"), "{error}");
+        assert!(root.payload(fresh_id).unwrap().is_none());
+        drop(staging);
+
+        // Reusing cached weights skips the source pass, so the concurrent insertion itself must
+        // check the fresh shared source before copying it.
+        let object_a = root.payload(id_a).unwrap().unwrap();
+        let object_b = root.payload(id_b).unwrap().unwrap();
+        let mut reuse = corrupted;
+        let fresh_state = reuse.deployments[0].payloads.last_mut().unwrap();
+        fresh_state.role = wire::PayloadRole::InitialState;
+        for payload in &mut reuse.deployments[0].payloads {
+            if payload.id == id_a {
+                payload.source = object_a.slice().clone();
+            } else if payload.id == id_b {
+                payload.source = object_b.slice().clone();
+            }
+        }
+        let objects = [object_a.clone(), object_b.clone()];
+        let mut staging = root.stage("model", "reuse-corrupted").unwrap();
+        let error =
+            publish_reusing_cached_weights(&reuse, &key, Destination::Cache(&root, &mut staging), &objects)
+                .unwrap_err();
+        assert!(error.to_string().contains("bytes do not match the assigned identity"), "{error}");
+        assert!(root.payload(fresh_id).unwrap().is_none());
+        drop(staging);
+
+        std::fs::write(&fresh_path, &fresh).unwrap();
+        let mut staging = root.stage("model", "reuse").unwrap();
+        publish_reusing_cached_weights(&reuse, &key, Destination::Cache(&root, &mut staging), &objects)
+            .unwrap();
+        let entry = staging.commit().unwrap();
+        let (_, order) = shared_order(entry.directory());
+        assert_eq!(
+            order[order.len() - 5..].to_vec(),
+            [id_state, id_b, id_a, id_a, fresh_id].iter().map(|id| id.as_bytes().to_vec()).collect::<Vec<_>>()
+        );
+        let installed = root.payload(fresh_id).unwrap().unwrap();
+        assert_eq!(installed.slice().digest().unwrap(), fresh_id);
+        assert_eq!(blobs(&cache_dir), 6);
+        drop((entry, installed, objects, object_a, object_b, root));
         let _ = std::fs::remove_dir_all(&work);
     }
 
