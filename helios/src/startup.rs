@@ -144,18 +144,27 @@ impl StartupProgress {
                 Status::Running,
             );
         }
-        if self.terminal {
+        if self.enabled {
             let (stop, receiver) = mpsc::channel();
             let output = self.output.clone();
+            let terminal = self.terminal;
+            // A terminal redraws smoothly. Redirected output (an agent's retained log, or
+            // `flare orbit attach`) cannot redraw, so it reports a progress line periodically
+            // instead of staying on a bare PENDING row for minutes.
+            let interval = if terminal {
+                Duration::from_millis(125)
+            } else {
+                Duration::from_secs(10)
+            };
             let worker = thread::spawn(move || {
                 while matches!(
-                    receiver.recv_timeout(Duration::from_millis(125)),
+                    receiver.recv_timeout(interval),
                     Err(mpsc::RecvTimeoutError::Timeout)
                 ) {
                     output
                         .lock()
                         .unwrap()
-                        .write(&state.lock().unwrap(), true, Status::Running);
+                        .write(&state.lock().unwrap(), terminal, Status::Running);
                 }
             });
             phase.animation = Some((stop, worker));
