@@ -971,7 +971,7 @@ impl Controller {
                     format!("cannot access package {reference}: {e}; a node-held package is NODE:/ABSOLUTE/PATH with NODE a orbit node")
                 })?;
                 run_args.serving.verify_weights = verify_weights;
-                let (authorized, publisher) = verify(&primary, run_args, origin)?;
+                let (authorized, publisher) = verify(&primary, run_args, origin, false)?;
                 describe(
                     &authorized,
                     &primary,
@@ -992,7 +992,7 @@ impl Controller {
                     .mirror_package(&node, &path, &mirror.0)
                     .map_err(|e| at(&node.name, e))?;
                 run_args.serving.verify_weights = false;
-                let (authorized, publisher) = verify(&primary, run_args, origin)?;
+                let (authorized, publisher) = verify(&primary, run_args, origin, true)?;
                 describe(
                     &authorized,
                     &primary,
@@ -2080,10 +2080,15 @@ fn verify(
     primary: &Path,
     args: &crate::cli::Run,
     origin: Option<&str>,
+    metadata_only: bool,
 ) -> Result<(AuthorizedPackage, Publisher), Failure> {
     let mut progress = StartupProgress::silent();
-    crate::trust::load(primary, args, &mut progress, origin)
-        .map_err(|e| Failure::from(e.to_string()))
+    let loaded = if metadata_only {
+        crate::trust::load_metadata(primary, args, &mut progress, origin)
+    } else {
+        crate::trust::load(primary, args, &mut progress, origin)
+    };
+    loaded.map_err(|e| Failure::from(e.to_string()))
 }
 
 /// A verified package's files and every rank's byte ranges.

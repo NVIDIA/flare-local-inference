@@ -385,6 +385,27 @@ pub fn load(
     progress: &mut flare_helios::startup::StartupProgress,
     origin: Option<&str>,
 ) -> Result<(AuthorizedPackage, Publisher)> {
+    load_with(root, args, progress, origin, true)
+}
+
+/// Verify a package's signed metadata without reading payload bytes. A controller that mirrors a
+/// node-held package holds only the index and companion headers.
+pub fn load_metadata(
+    root: &Path,
+    args: &crate::cli::Run,
+    progress: &mut flare_helios::startup::StartupProgress,
+    origin: Option<&str>,
+) -> Result<(AuthorizedPackage, Publisher)> {
+    load_with(root, args, progress, origin, false)
+}
+
+fn load_with(
+    root: &Path,
+    args: &crate::cli::Run,
+    progress: &mut flare_helios::startup::StartupProgress,
+    origin: Option<&str>,
+    verify_payloads: bool,
+) -> Result<(AuthorizedPackage, Publisher)> {
     let phase = progress.phase("Verify package", None);
     let ResolvedIdentity {
         claim,
@@ -461,7 +482,16 @@ pub fn load(
         }
     }
     let publisher = package.publisher().clone();
-    let authorized = authorize(package, &claim, args, progress, &path, remembered, identity)?;
+    let authorized = authorize(
+        package,
+        &claim,
+        args,
+        progress,
+        &path,
+        remembered,
+        identity,
+        verify_payloads,
+    )?;
     Ok((authorized, publisher))
 }
 
@@ -473,6 +503,7 @@ fn authorize(
     path: &Path,
     remembered: Option<Entry>,
     identity: Identity,
+    verify_payloads: bool,
 ) -> Result<AuthorizedPackage> {
     let fingerprint = &claim.signer;
     let namespace = &claim.namespace;
@@ -513,7 +544,12 @@ fn authorize(
         }
     };
     let publisher = package.publisher().clone();
-    let authorized = package.authorize_with_progress(&accepted, args.verify_weights, Some(progress))?;
+    let authorized = package.authorize_with_progress(
+        &accepted,
+        args.verify_weights,
+        verify_payloads,
+        Some(progress),
+    )?;
     let entry = Entry {
         fingerprint: fingerprint.clone(),
         namespace: accepted,

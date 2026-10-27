@@ -694,7 +694,17 @@ impl VerifiedPackage {
         }
     }
     pub fn authorize(self, accepted: &str, verify_weights: bool) -> Result<AuthorizedPackage> {
-        self.authorize_with_progress(accepted, verify_weights, None)
+        self.authorize_with_progress(accepted, verify_weights, true, None)
+    }
+
+    /// Authorize signed metadata without reading payload bytes. A controller that mirrors only a
+    /// node-held package's index leaves payload verification to the serving ranks.
+    pub fn authorize_metadata(
+        self,
+        accepted: &str,
+        verify_weights: bool,
+    ) -> Result<AuthorizedPackage> {
+        self.authorize_with_progress(accepted, verify_weights, false, None)
     }
 
     /// Authorize the package while reporting mandatory and requested stored-data verification.
@@ -702,14 +712,16 @@ impl VerifiedPackage {
         self,
         accepted: &str,
         verify_weights: bool,
+        verify_payloads: bool,
         progress: Option<&crate::startup::StartupProgress>,
     ) -> Result<AuthorizedPackage> {
         match self {
             Self::Legacy(package) => {
+                let verify = verify_weights && verify_payloads;
                 let phase = progress
-                    .filter(|_| verify_weights)
+                    .filter(|_| verify)
                     .map(|progress| progress.phase("Verify stored data", None));
-                let authorized = package.authorize(accepted, verify_weights)?;
+                let authorized = package.authorize(accepted, verify)?;
                 if let Some(phase) = phase {
                     phase.finish("stored-data contents");
                 }
@@ -719,6 +731,7 @@ impl VerifiedPackage {
                 kind: AuthorizedKind::Payload(package.authorize_with_progress(
                     accepted,
                     verify_weights,
+                    verify_payloads,
                     progress,
                 )?),
             }),
@@ -2279,13 +2292,14 @@ impl PayloadVerifiedPackage {
         accepted: &str,
         verify_weights: bool,
     ) -> Result<PayloadAuthorizedPackage> {
-        self.authorize_with_progress(accepted, verify_weights, None)
+        self.authorize_with_progress(accepted, verify_weights, true, None)
     }
 
     fn authorize_with_progress(
         self,
         accepted: &str,
         verify_weights: bool,
+        verify_payloads: bool,
         progress: Option<&crate::startup::StartupProgress>,
     ) -> Result<PayloadAuthorizedPackage> {
         let Self {
@@ -2316,20 +2330,22 @@ impl PayloadVerifiedPackage {
             executables,
             authorized,
         };
-        let payloads = source.verification_payloads(verify_weights)?;
-        let total = payloads.iter().try_fold(0u64, |total, (_, slice)| {
-            total
-                .checked_add(slice.len())
-                .ok_or_else(|| invalid("verification byte count overflow"))
-        })?;
-        let phase = progress.map(|progress| progress.phase("Verify stored data", Some(total)));
-        payloads.verify_with_progress(&|bytes| {
-            if let Some(phase) = &phase {
-                phase.advance_bytes(bytes);
+        if verify_payloads {
+            let payloads = source.verification_payloads(verify_weights)?;
+            let total = payloads.iter().try_fold(0u64, |total, (_, slice)| {
+                total
+                    .checked_add(slice.len())
+                    .ok_or_else(|| invalid("verification byte count overflow"))
+            })?;
+            let phase = progress.map(|progress| progress.phase("Verify stored data", Some(total)));
+            payloads.verify_with_progress(&|bytes| {
+                if let Some(phase) = &phase {
+                    phase.advance_bytes(bytes);
+                }
+            })?;
+            if let Some(phase) = phase {
+                phase.finish(format!("{:.1} GiB", total as f64 / (1u64 << 30) as f64));
             }
-        })?;
-        if let Some(phase) = phase {
-            phase.finish(format!("{:.1} GiB", total as f64 / (1u64 << 30) as f64));
         }
         Ok(PayloadAuthorizedPackage { source, packages })
     }
@@ -3610,7 +3626,12 @@ mod payload_package_tests {
                     corrupt_payload_companion(&root.join(&location.file));
                 }
                 let package = VerifiedPackage::open_tensor_parallel(&root, &publishers, 2, Some(1)).unwrap();
-                let result = package.authorize_with_progress("example", verify_weights, Some(&crate::startup::StartupProgress::silent()));
+                let result = package.authorize_with_progress(
+                    "example",
+                    verify_weights,
+                    true,
+                    Some(&crate::startup::StartupProgress::silent()),
+                );
                 assert_eq!(result.is_err(), !optional || verify_weights, "{name}, verify_weights={verify_weights}");
                 drop(result);
                 drop(metadata);
