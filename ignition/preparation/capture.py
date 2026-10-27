@@ -15,13 +15,18 @@ from .compilation import _defer_full_collection
 def capture_forwards(functions, signatures, *, session, device, stream, pool,
                      collective=None, coordinator=None, compile_decoder=True, materialize=None,
                      progress=None, label="Prepare serving graphs", cache_root=None, retain_graphs=False,
-                     warmup_storage=None, capture_names=None,
+                     warmup_storage=None, capture_names=None, before_run=None, compile_group=None,
                      compile_kinds=("prefill", "scored_prefill", "decode", "resume", "speculative", "mixed", "vision")):
     """Retain compiled callables and capture with an optional b12x IPC runtime.
 
     Persistent state and graph outputs must live in caller-owned storage.
     Only graph-local intermediates may use the shared graph memory pool;
     serving replays variants serially and may choose them in any order.
+    ``before_run`` restores caller-owned trial inputs outside compiled warmup
+    and graph capture; it is unused for the ordinary serving catalog.
+    ``compile_group`` compiles one representative for same-signature trial
+    forwards, then checks every owner's guards and storage aliases before
+    capturing their distinct CUDA graphs.
     """
     if (progress is not None and not getattr(session, "_graph_catalog_reported", False)
             and (not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0)):
@@ -30,6 +35,9 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
     names = tuple(functions) if capture_names is None else tuple(capture_names)
     if len(set(names)) != len(names) or not set(names) <= functions.keys():
         raise ValueError("capture selection must name distinct prepared forwards")
+    if compile_group is not None and (not isinstance(compile_group, str) or not compile_group
+                                      or compile_group in functions or not compile_decoder or not names):
+        raise ValueError("grouped compilation requires a distinct name and selected compiled forwards")
     graphs, compiled = {}, {}
     warmup = nullcontext if warmup_storage is None else warmup_storage.transient
     if compile_decoder:
@@ -38,15 +46,36 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
                              compile_workers=getattr(session, "requested_compile_workers", None))
         forwards = {name: function for name, function in functions.items()
                     if name in names and signatures[name].kind in compile_kinds}
+        if compile_group is not None:
+            if len(forwards) != len(names):
+                raise ValueError("grouped compilation requires every selected forward to be compiled")
+            first = names[0]
+            if any(type(forward) is not type(forwards[first]) or signatures[name] != signatures[first]
+                   for name, forward in forwards.items()):
+                raise ValueError("grouped forwards require one type and graph signature")
         stream.wait_stream(torch.cuda.current_stream(device))
         with torch.cuda.stream(stream):
-            compiled = cache.prepare_many(forwards, signatures, progress=progress,
-                                          coordinator=coordinator, materialize=materialize, warmup=warmup)
+            if compile_group is None:
+                compiled = cache.prepare_many(forwards, signatures, progress=progress,
+                                              coordinator=coordinator, materialize=materialize, warmup=warmup,
+                                              before_run=before_run)
+            else:
+                representative = {compile_group: forwards[first]}
+                template = cache.prepare_many(representative, {compile_group: signatures[first]},
+                    progress=progress, coordinator=coordinator, materialize=materialize,
+                    warmup=warmup, before_run=None if before_run is None else lambda _: before_run(first))
         stream.synchronize()
+        if compile_group is not None:
+            compiled = cache.bind_group(template[compile_group], forwards,
+                                        signature=signatures[first], coordinator=coordinator)
         with phase(progress, "Release serialized compiler state", total=len(compiled)) as stage:
-            released = 0
+            released, counted = 0, set()
             for forward in compiled.values():
-                released += forward.prepare_capture()
+                artifact = id(getattr(forward, "artifact", forward))
+                size = forward.prepare_capture()
+                if artifact not in counted:
+                    released += size
+                    counted.add(artifact)
                 stage.update(advance=1)
             stage.update(f"{released >> 20} MiB; guards and kernel owners retained")
         from .host_memory import release_unused
@@ -62,8 +91,12 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             started = monotonic()
             stream.wait_stream(torch.cuda.current_stream(device))
             with warmup(), torch.cuda.stream(stream):
+                if before_run is not None:
+                    before_run(name)
                 if name in compiled:
                     function = compiled[name]
+                    if compile_group is not None:
+                        function()
                 else:
                     function()
             stream.synchronize()
@@ -81,6 +114,10 @@ def capture_forwards(functions, signatures, *, session, device, stream, pool,
             try:
                 if progress is not None:
                     progress(f"capturing {name}: {memory_detail()}")
+                if before_run is not None:
+                    with torch.cuda.stream(stream):
+                        before_run(name)
+                    stream.synchronize()
                 with communication, session.capture(), torch.cuda.graph(graph, pool=pool, stream=stream):
                     function()
                 if retain_graphs:
