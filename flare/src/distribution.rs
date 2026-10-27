@@ -13,7 +13,7 @@ use flare_helios::{
     runtime_package::{
         self, AuthorizedPackage, NativeResources, PackageFormat, Publisher, VerifiedPackage,
     },
-    startup::StartupProgress,
+    startup::{Phase, StartupProgress},
 };
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use std::{
@@ -459,7 +459,7 @@ fn verify_local_package(package: &AuthorizedPackage, plan: &Plan) -> Result<(), 
 
 /// Verify one received rank against the plan using signed metadata only, then hash its stored
 /// bytes. Returns the verified package for the caller to retain or discard.
-fn verify_plan(
+fn verify_plan_metadata(
     path: &Path,
     plan: &Plan,
     rank: usize,
@@ -485,7 +485,6 @@ fn verify_plan(
     if package.envelope_digest() != plan.expected_envelope {
         return Err("received rank signed envelope differs from rank zero's package".into());
     }
-    package.verify_stored_data().map_err(|e| e.to_string())?;
     let identity = package.identity().map_err(|e| e.to_string())?;
     // Distribution carries one rank of a multi-host package. The signed cluster identity must
     // match the planned world and export exactly; an absent cluster identity is rejected.
@@ -499,6 +498,215 @@ fn verify_plan(
         return Err("received rank differs from the planned verified identity".into());
     }
     Ok(package)
+}
+
+/// Re-validate a freshly received rank, including its stored payload bytes.
+fn verify_plan(
+    path: &Path,
+    plan: &Plan,
+    rank: usize,
+    phase: Option<&Phase>,
+) -> Result<runtime_package::VerifiedPackage, Failure> {
+    let package = verify_plan_metadata(path, plan, rank)?;
+    package
+        .verify_stored_data_with_progress(phase)
+        .map_err(|e| e.to_string())?;
+    Ok(package)
+}
+
+/// Bytes a full verification reads for this rank, for progress reporting.
+fn plan_bytes(plan: &Plan) -> u64 {
+    plan.files
+        .iter()
+        .map(|file| file.size)
+        .fold(0u64, u64::saturating_add)
+}
+
+const VERIFIED_MARKER: &str = ".flare-verified.json";
+
+/// What a completed full verification covered, so a warm launch can check that the immutable
+/// entry has not deviated instead of hashing every payload again.
+#[derive(Serialize, Deserialize)]
+struct VerifiedMarker {
+    version: u32,
+    envelope: String,
+    export: String,
+    rank: usize,
+    primary_sha256: String,
+    files: Vec<VerifiedFile>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct VerifiedFile {
+    name: String,
+    size: u64,
+    modified_ns: u128,
+    changed_ns: u128,
+    inode: u64,
+    device: u64,
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        let _ = write!(text, "{byte:02x}");
+    }
+    text
+}
+
+fn modified_ns(metadata: &fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0, |duration| duration.as_nanos())
+}
+
+/// Status-change time. Unlike mtime it cannot be reset by ordinary tools, so a rewritten file
+/// that copied its timestamps still fails the marker check.
+#[cfg(unix)]
+fn changed_ns(metadata: &fs::Metadata) -> u128 {
+    use std::os::unix::fs::MetadataExt;
+    let seconds = metadata.ctime();
+    let nanos = metadata.ctime_nsec();
+    if seconds < 0 {
+        return 0;
+    }
+    seconds as u128 * 1_000_000_000 + nanos.max(0) as u128
+}
+
+#[cfg(not(unix))]
+fn changed_ns(_: &fs::Metadata) -> u128 {
+    0
+}
+
+#[cfg(unix)]
+fn inode_device(metadata: &fs::Metadata) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (metadata.ino(), metadata.dev())
+}
+
+#[cfg(not(unix))]
+fn inode_device(_: &fs::Metadata) -> (u64, u64) {
+    (0, 0)
+}
+
+/// Hash one file in bounded chunks; the primary of a monolithic package can be tens of GiB.
+fn sha256_file(path: &Path) -> Result<[u8; 32], Failure> {
+    let mut file = File::open(path).map_err(|e| e.to_string())?;
+    let mut context = ring::digest::Context::new(&ring::digest::SHA256);
+    let mut buffer = vec![0u8; 4 << 20];
+    loop {
+        let read = file.read(&mut buffer).map_err(|e| e.to_string())?;
+        if read == 0 {
+            break;
+        }
+        context.update(&buffer[..read]);
+    }
+    Ok(context
+        .finish()
+        .as_ref()
+        .try_into()
+        .expect("SHA-256 digest is 32 bytes"))
+}
+
+/// The entry root names the primary `model.safetensors`; every other file keeps its signed name.
+fn entry_file_name(plan: &Plan, file: &FileSpec) -> String {
+    if file.name == plan.primary {
+        "model.safetensors".to_owned()
+    } else {
+        file.name.clone()
+    }
+}
+
+/// Record the state a successful full verification covered. The marker is written beside the
+/// immutable entry and binds the signed envelope, the primary digest, and every file's identity.
+fn write_verified_marker(root: &Path, plan: &Plan, rank: usize) -> Result<(), Failure> {
+    let primary_sha256 = hex_bytes(&sha256_file(&root.join("model.safetensors"))?);
+    let mut files = Vec::with_capacity(plan.files.len());
+    for file in &plan.files {
+        let name = entry_file_name(plan, file);
+        let metadata = fs::metadata(root.join(&name)).map_err(|e| e.to_string())?;
+        let (inode, device) = inode_device(&metadata);
+        files.push(VerifiedFile {
+            name,
+            size: metadata.len(),
+            modified_ns: modified_ns(&metadata),
+            changed_ns: changed_ns(&metadata),
+            inode,
+            device,
+        });
+    }
+    let marker = VerifiedMarker {
+        version: 2,
+        envelope: hex_bytes(&plan.expected_envelope),
+        export: plan.export.clone(),
+        rank,
+        primary_sha256,
+        files,
+    };
+    let temporary = root.join(format!("{VERIFIED_MARKER}.tmp"));
+    fs::write(
+        &temporary,
+        serde_json::to_vec(&marker).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    let marker_path = root.join(VERIFIED_MARKER);
+    fs::rename(&temporary, &marker_path).map_err(|e| e.to_string())?;
+    // Published entries are sealed read-only; the marker matches that immutability. Replacing
+    // it later only needs write permission on the directory, which stays writable.
+    #[cfg(unix)]
+    {
+        let mut permissions = fs::metadata(&marker_path)
+            .map_err(|e| e.to_string())?
+            .permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&marker_path, permissions).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// True when the entry still matches the state its last full verification covered.
+fn verified_marker_matches(root: &Path, plan: &Plan, rank: usize) -> bool {
+    let Ok(bytes) = fs::read(root.join(VERIFIED_MARKER)) else {
+        return false;
+    };
+    let Ok(marker) = serde_json::from_slice::<VerifiedMarker>(&bytes) else {
+        return false;
+    };
+    if marker.version != 2
+        || marker.envelope != hex_bytes(&plan.expected_envelope)
+        || marker.export != plan.export
+        || marker.rank != rank
+        || marker.files.len() != plan.files.len()
+    {
+        return false;
+    }
+    // Cheap identity checks first: a file that was replaced, truncated, or rewritten fails
+    // without reading its contents.
+    for (file, expected) in plan.files.iter().zip(&marker.files) {
+        if entry_file_name(plan, file) != expected.name {
+            return false;
+        }
+        let Ok(metadata) = fs::metadata(root.join(&expected.name)) else {
+            return false;
+        };
+        let (inode, device) = inode_device(&metadata);
+        if metadata.len() != expected.size
+            || modified_ns(&metadata) != expected.modified_ns
+            || changed_ns(&metadata) != expected.changed_ns
+            || inode != expected.inode
+            || device != expected.device
+        {
+            return false;
+        }
+    }
+    // The entry primary anchors the package: hash it even when metadata is unchanged.
+    match sha256_file(&root.join("model.safetensors")) {
+        Ok(primary) => marker.primary_sha256 == hex_bytes(&primary),
+        Err(_) => false,
+    }
 }
 
 fn receiver_candidate(platform: &str, tensor_parallel: u32) -> Result<String, Failure> {
@@ -536,7 +744,41 @@ pub(crate) fn receive_rank(
     {
         Some((_revision, entry)) => {
             let path = entry.directory().join("model.safetensors");
-            if path.is_file() && verify_plan(&path, plan, rank).is_ok() {
+            let phase = progress.phase("Verify cached rank package", Some(plan_bytes(plan)));
+            let root = entry.directory();
+            // The signed envelope is re-authenticated on every launch; it is cheap metadata.
+            // A verified marker records the exact state a full payload verification covered, so
+            // only an absent or stale marker hashes every payload again.
+            let cached = verified_marker_matches(root, plan, rank);
+            let valid = path.is_file()
+                && match verify_plan_metadata(&path, plan, rank) {
+                    Ok(package) => {
+                        if cached {
+                            true
+                        } else {
+                            let verified = package
+                                .verify_stored_data_with_progress(Some(&phase))
+                                .is_ok();
+                            // A read-only or full cache still serves a verified rank; the
+                            // marker only decides whether the next launch skips hashing.
+                            if verified {
+                                let _ = write_verified_marker(root, plan, rank);
+                            }
+                            verified
+                        }
+                    }
+                    Err(_) => false,
+                };
+            phase.finish(if valid {
+                if cached {
+                    format!("rank {rank} cached")
+                } else {
+                    format!("rank {rank}")
+                }
+            } else {
+                "mismatch".to_owned()
+            });
+            if valid {
                 (Some(entry), path)
             } else {
                 (None, PathBuf::new())
@@ -583,7 +825,9 @@ pub(crate) fn receive_rank(
                 }
                 let _ = fs::remove_dir_all(staging_dir.join("packages"));
                 let path = staging_dir.join("model.safetensors");
-                verify_plan(&path, plan, rank)?;
+                let verify = progress.phase("Verify rank package", Some(plan_bytes(plan)));
+                verify_plan(&path, plan, rank, Some(&verify))?;
+                verify.finish(format!("rank {rank} verified"));
                 Ok(())
             });
             if let Err(error) = received {
@@ -593,6 +837,10 @@ pub(crate) fn receive_rank(
             phase.finish(format!("rank {rank} verified"));
         }
         let entry = staging.commit().map_err(|e| e.to_string())?;
+        // Publication seals every file read-only, which changes its status time, so the marker
+        // is recorded against the committed entry. It only enables the next launch's fast path;
+        // never fail a verified rank because its cache cannot record one.
+        let _ = write_verified_marker(entry.directory(), plan, rank);
         if let Err(error) =
             root.publish_source_ref(&selector, &plan.export, &entry, plan.expected_envelope)
         {

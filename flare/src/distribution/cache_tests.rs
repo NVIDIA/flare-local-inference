@@ -1192,6 +1192,102 @@ fn corrupted_warm_rank_entry_is_rebuilt_and_republished() {
 }
 
 #[test]
+fn cold_receive_records_a_verified_marker_that_tracks_every_file() {
+    let temp = tempfile::tempdir().unwrap();
+    let model_root = temp.path().join("flare");
+    let (files, specs, plan) = fixture(temp.path(), "export-marker");
+    let entry = run(&files, &specs, plan_like(&plan, &plan.export), &model_root).unwrap();
+    let marker_path = entry.directory().join(VERIFIED_MARKER);
+    let marker: VerifiedMarker =
+        serde_json::from_slice(&fs::read(&marker_path).expect("cold receive writes a marker"))
+            .unwrap();
+    assert_eq!(marker.version, 2);
+    assert_eq!(marker.rank, plan.rank);
+    assert_eq!(marker.export, plan.export);
+    assert_eq!(marker.envelope, hex_bytes(&plan.expected_envelope));
+    assert_eq!(marker.files.len(), plan.files.len());
+    assert!(verified_marker_matches(entry.directory(), &plan, plan.rank));
+
+    // Rewriting any recorded file invalidates the marker, even at the same size.
+    let companion = entry.directory().join("weights/tp2/rank1.safetensors");
+    let bytes = fs::read(&companion).unwrap();
+    let mut permissions = fs::metadata(&companion).unwrap().permissions();
+    permissions.set_readonly(false);
+    fs::set_permissions(&companion, permissions).unwrap();
+    fs::write(&companion, &bytes).unwrap();
+    assert!(!verified_marker_matches(entry.directory(), &plan, plan.rank));
+
+    // A warm launch rehashes the entry once and records a fresh marker.
+    let warm = run(&files, &specs, plan_like(&plan, &plan.export), &model_root).unwrap();
+    assert_eq!(warm.id(), entry.id());
+    assert!(verified_marker_matches(warm.directory(), &plan, plan.rank));
+}
+
+#[test]
+fn warm_launch_reuses_a_verified_entry_without_rewriting_its_marker() {
+    let temp = tempfile::tempdir().unwrap();
+    let model_root = temp.path().join("flare");
+    let (files, specs, plan) = fixture(temp.path(), "export-warm-marker");
+    let entry = run(&files, &specs, plan_like(&plan, &plan.export), &model_root).unwrap();
+    let marker_path = entry.directory().join(VERIFIED_MARKER);
+    let recorded = fs::metadata(&marker_path).unwrap();
+    let recorded_ns = modified_ns(&recorded);
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let warm = run(&files, &specs, plan_like(&plan, &plan.export), &model_root).unwrap();
+    assert_eq!(warm.id(), entry.id());
+    assert_eq!(
+        modified_ns(&fs::metadata(&marker_path).unwrap()),
+        recorded_ns,
+        "a marker hit must not rehash or rewrite the marker"
+    );
+}
+
+#[test]
+fn unreadable_marker_directory_still_serves_the_verified_rank() {
+    let temp = tempfile::tempdir().unwrap();
+    let model_root = temp.path().join("flare");
+    let (files, specs, plan) = fixture(temp.path(), "export-readonly-marker");
+    let entry = run(&files, &specs, plan_like(&plan, &plan.export), &model_root).unwrap();
+    let directory = entry.directory().to_owned();
+    fs::remove_file(directory.join(VERIFIED_MARKER)).unwrap();
+    let mut permissions = fs::metadata(&directory).unwrap().permissions();
+    let original = permissions.clone();
+    permissions.set_readonly(true);
+    fs::set_permissions(&directory, permissions).unwrap();
+    let warm = run(&files, &specs, plan_like(&plan, &plan.export), &model_root);
+    fs::set_permissions(&directory, original).unwrap();
+    let warm = warm.expect("a cache that cannot record a marker must still serve");
+    assert_eq!(warm.id(), entry.id());
+    assert!(
+        !directory.join(VERIFIED_MARKER).exists(),
+        "read-only entry unexpectedly recorded a marker"
+    );
+}
+
+#[test]
+fn warm_entry_is_not_trusted_without_its_signed_envelope() {
+    let temp = tempfile::tempdir().unwrap();
+    let model_root = temp.path().join("flare");
+    let (files, specs, plan) = fixture(temp.path(), "export-warm-envelope");
+    let entry = run(&files, &specs, plan_like(&plan, &plan.export), &model_root).unwrap();
+    let mut wrong = plan_like(&plan, &plan.export);
+    wrong.expected_envelope = [0u8; 32];
+    let error = run(&files, &specs, wrong, &model_root)
+        .err()
+        .expect("a stale signed envelope must not reuse the warm entry");
+    assert!(
+        error.to_string().contains("signed envelope"),
+        "warm reuse did not re-authenticate the envelope: {error}"
+    );
+    let root = Root::open(&model_root).unwrap();
+    assert_eq!(
+        root.ref_entry(&model_key()).unwrap().as_deref(),
+        Some(entry.id()),
+        "rejected warm reuse must leave the previous default untouched"
+    );
+}
+
+#[test]
 fn interrupted_receive_removes_its_staging_tree() {
     let temp = tempfile::tempdir().unwrap();
     let model_root = temp.path().join("flare");
