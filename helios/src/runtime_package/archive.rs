@@ -294,6 +294,26 @@ impl PayloadFile {
 /// Inspect bounded metadata for sibling files before authentication, without opening any sibling.
 /// Callers may fetch these names from the primary's pinned source; signatures still require verification.
 pub fn package_companions(path: &Path) -> Result<Vec<String>> {
+    // A distributed directory package names its companions through signed location
+    // records; only a packed snapshot carries them in the archive layout.
+    let primary = if path.is_dir() {
+        path.join("model.safetensors")
+    } else {
+        path.to_owned()
+    };
+    if crate::package::reader::declared_format(&primary)?
+        == Some(crate::package::container::PAYLOAD_FORMAT.to_owned())
+    {
+        let metadata = crate::package::reader::Metadata::open(&primary)?;
+        let names: std::collections::BTreeSet<String> = metadata
+            .locations
+            .locations
+            .iter()
+            .filter(|location| !location.file.is_empty())
+            .map(|location| location.file.clone())
+            .collect();
+        return Ok(names.into_iter().collect());
+    }
     let (file, _, _, bytes) = Archive::envelope(path)?;
     if let Some(layout) = Layout::read(&file)? {
         return Ok(layout

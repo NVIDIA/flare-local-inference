@@ -668,4 +668,30 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn package_companions_lists_nested_payload_files() {
+        let directory = Directory::new();
+        let bytes = b"nested layer".to_vec();
+        let id = PayloadId::of(&bytes);
+        let nested = directory.0.join("weights/tp4/rank-0/layer.safetensors");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        write(
+            &nested,
+            vec![(container::COMPANION_TENSOR, bytes.clone())],
+        );
+        primary(
+            &directory.0.join("model.safetensors"),
+            vec![wire::PayloadLocation {
+                payload_id: id.as_bytes().to_vec(),
+                file: "weights/tp4/rank-0/layer.safetensors".into(),
+                tensor: container::COMPANION_TENSOR.into(),
+            }],
+            None,
+        );
+        assert_eq!(
+            crate::runtime_package::package_companions(&directory.0).unwrap(),
+            vec!["weights/tp4/rank-0/layer.safetensors"]
+        );
+    }
 }

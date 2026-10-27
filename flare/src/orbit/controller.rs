@@ -1036,18 +1036,17 @@ impl Controller {
             let size = companion["size"]
                 .as_u64()
                 .ok_or("STAT companion lacks size")?;
-            if name.is_empty() || name.starts_with('.') || name.contains('/') {
+            if !companion_path_is_valid(name) {
                 return Err(format!("invalid companion name {name:?}").into());
             }
-            let companion_path = remote.with_file_name(name);
+            let root = remote.parent().unwrap_or_else(|| Path::new("/"));
+            let companion_path = root.join(name);
             let companion_path = companion_path.to_str().ok_or("non-UTF-8 companion path")?;
-            mirror_file(
-                &mut session,
-                companion_path,
-                &directory.join(name),
-                size,
-                false,
-            )?;
+            let local = directory.join(name);
+            if let Some(parent) = local.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            mirror_file(&mut session, companion_path, &local, size, false)?;
         }
         Ok(primary)
     }
@@ -1234,7 +1233,8 @@ impl Controller {
                         let name = format!("{complete}/{}", file.name);
                         if !have(session, "package", &name, file.size)? {
                             needed += file.size;
-                            sends.push((primary.with_file_name(&file.name), name, file.size));
+                            let root = primary.parent().unwrap_or_else(|| Path::new("."));
+                            sends.push((root.join(&file.name), name, file.size));
                         }
                     }
                 }
@@ -1857,6 +1857,23 @@ fn get(
     Ok(())
 }
 
+/// A companion name is a relative package path: nested components are allowed, traversal and
+/// hidden entries are not.
+fn companion_path_is_valid(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && name.split('/').all(|part| {
+            !part.is_empty()
+                && !part.starts_with('.')
+                && part.len() <= 128
+                && part
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        })
+}
+
 /// Create `local` at `size` bytes holding the safetensors header of the node-local file `remote`
 /// and, for a primary, its signed index; every other byte is a hole.
 fn mirror_file(
@@ -1882,35 +1899,75 @@ fn mirror_file(
     if primary {
         let header: Value = serde_json::from_slice(&header)
             .map_err(|e| format!("{remote}: invalid safetensors header: {e}"))?;
-        let offsets = &header["flare.metadata"]["data_offsets"];
-        let (Some(begin), Some(mut end)) = (offsets[0].as_u64(), offsets[1].as_u64()) else {
-            return Err(format!("{remote} is not a Flare package").into());
-        };
-        if header["__metadata__"]["format"] == "flare-snapshot" {
-            let layout = &header["flare.layout"]["data_offsets"];
-            if layout[0].as_u64() != Some(end) {
-                return Err("snapshot layout must follow its signed metadata".into());
-            }
-            end = layout[1].as_u64().ok_or("snapshot lacks layout metadata")?;
-        }
-        let start = 8 + header_size;
-        if end <= begin
-            || end - begin > 256 << 20
-            || start.checked_add(end).is_none_or(|e| e > size)
-        {
-            return Err(format!("{remote} has an invalid model index range").into());
-        }
-        get(
-            session,
-            remote,
-            start + begin,
-            end - begin,
-            &mut |chunk: &[u8], position: u64| -> Result<(), Failure> {
+        let ranges = mirrored_ranges(&header, size, 8 + header_size)
+            .map_err(|e| format!("{remote}: {e}"))?;
+        for (offset, length) in ranges {
+            let mut write = |chunk: &[u8], position: u64| -> Result<(), Failure> {
                 Ok(file.write_all_at(chunk, position)?)
-            },
-        )?;
+            };
+            get(session, remote, offset, length, &mut write)?;
+        }
     }
     Ok(())
+}
+
+/// The primary byte ranges a controller mirrors for a node-held package: the signed index for
+/// either canonical form, never payload bytes. `start` is the first data byte after the
+/// safetensors header.
+fn mirrored_ranges(header: &Value, size: u64, start: u64) -> Result<Vec<(u64, u64)>, String> {
+    const MAX_INDEX: u64 = 256 << 20;
+    let offsets = |name: &str| -> Option<(u64, u64)> {
+        let offsets = header.get(name)?.get("data_offsets")?;
+        Some((offsets.get(0)?.as_u64()?, offsets.get(1)?.as_u64()?))
+    };
+    let bounded = |name: &str| -> Result<Option<(u64, u64)>, String> {
+        let Some((begin, end)) = offsets(name) else {
+            return Ok(None);
+        };
+        if end <= begin {
+            return Ok(None);
+        }
+        if end - begin > MAX_INDEX {
+            return Err(format!("{name} index exceeds {MAX_INDEX} bytes"));
+        }
+        if start.checked_add(end).is_none_or(|value| value > size) {
+            return Err(format!("{name} index exceeds the package file"));
+        }
+        Ok(Some((start + begin, end - begin)))
+    };
+    match header["__metadata__"]["format"].as_str() {
+        Some(format) if matches!(format, "flare" | "flare-staging" | "flare-snapshot") => {
+            let (begin, mut end) = offsets("flare.metadata").ok_or("not a Flare package")?;
+            if format == "flare-snapshot" {
+                let (layout_begin, layout_end) =
+                    offsets("flare.layout").ok_or("snapshot lacks layout metadata")?;
+                if layout_begin != end {
+                    return Err("snapshot layout must follow its signed metadata".into());
+                }
+                end = layout_end;
+            }
+            if end <= begin || end - begin > MAX_INDEX {
+                return Err("invalid model index range".into());
+            }
+            if start.checked_add(end).is_none_or(|value| value > size) {
+                return Err("invalid model index range".into());
+            }
+            Ok(vec![(start + begin, end - begin)])
+        }
+        Some(flare_helios::package::container::PAYLOAD_FORMAT) => {
+            let mut ranges = Vec::new();
+            for name in ["flare.manifest", "flare.locations", "flare.derivations"] {
+                if let Some(range) = bounded(name)? {
+                    ranges.push(range);
+                }
+            }
+            if ranges.is_empty() {
+                return Err("not a Flare package".into());
+            }
+            Ok(ranges)
+        }
+        _ => Err("not a Flare package".into()),
+    }
 }
 
 // ---- following output --------------------------------------------------------------------------
@@ -2079,8 +2136,9 @@ fn describe(
         name: primary_name.clone(),
         size: fs::metadata(primary)?.len(),
     }];
+    let root = primary.parent().unwrap_or_else(|| Path::new("."));
     for name in runtime_package::package_companions(primary).map_err(|e| e.to_string())? {
-        let size = fs::metadata(primary.with_file_name(&name))?.len();
+        let size = fs::metadata(root.join(&name))?.len();
         files.push(PackageEntry { name, size });
     }
     let mut ranks = Vec::with_capacity(world);
@@ -2961,6 +3019,147 @@ mod tests {
                 "maxwell:29900"
             ),
             "http://10.0.0.2:9000"
+        );
+    }
+
+    #[test]
+    fn mirrored_ranges_follow_each_package_carrier() {
+        let payload = json!({
+            "__metadata__": {"format": "flare-payload"},
+            "flare.manifest": {"dtype": "U8", "shape": [10], "data_offsets": [0, 10]},
+            "flare.locations": {"dtype": "U8", "shape": [20], "data_offsets": [10, 30]},
+            "flare.derivations": {"dtype": "U8", "shape": [5], "data_offsets": [30, 35]},
+        });
+        assert_eq!(
+            mirrored_ranges(&payload, 1000, 8).unwrap(),
+            vec![(8, 10), (18, 20), (38, 5)]
+        );
+
+        let packed = json!({
+            "__metadata__": {"format": "flare"},
+            "flare.metadata": {"dtype": "U8", "shape": [16], "data_offsets": [0, 16]},
+        });
+        assert_eq!(mirrored_ranges(&packed, 1000, 8).unwrap(), vec![(8, 16)]);
+
+        let snapshot = json!({
+            "__metadata__": {"format": "flare-snapshot"},
+            "flare.metadata": {"dtype": "U8", "shape": [16], "data_offsets": [0, 16]},
+            "flare.layout": {"dtype": "U8", "shape": [24], "data_offsets": [16, 40]},
+        });
+        assert_eq!(mirrored_ranges(&snapshot, 1000, 8).unwrap(), vec![(8, 40)]);
+
+        let unknown = json!({"__metadata__": {"format": "other"}});
+        assert!(mirrored_ranges(&unknown, 1000, 8).is_err());
+        let empty = json!({"__metadata__": {"format": "flare-payload"}});
+        assert!(mirrored_ranges(&empty, 1000, 8).is_err());
+    }
+
+    #[test]
+    fn companion_paths_allow_nesting_but_not_traversal() {
+        assert!(companion_path_is_valid(
+            "weights/tp4/rank-0/layer.safetensors"
+        ));
+        assert!(companion_path_is_valid(
+            "deployments/abc/rank-1/graphs.safetensors"
+        ));
+        assert!(!companion_path_is_valid(""));
+        assert!(!companion_path_is_valid("/absolute.safetensors"));
+        assert!(!companion_path_is_valid("../escape.safetensors"));
+        assert!(!companion_path_is_valid("weights/../../escape.safetensors"));
+        assert!(!companion_path_is_valid("weights//empty.safetensors"));
+        assert!(!companion_path_is_valid(".hidden"));
+    }
+
+    #[test]
+    fn mirror_package_reads_a_distributed_directory_package() {
+        use flare_helios::package::{
+            container::{Source, Writer, PAYLOAD_FORMAT},
+            schema::{self, wire},
+        };
+        use prost::Message;
+
+        let zero = harness(31);
+        let record = {
+            let mut session = pair_accept_first(&zero);
+            session.request(frame::STATUS, &json!({})).unwrap();
+            crate::orbit::agent::tests::record(&zero.controller)
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let node = Node {
+            name: "zero".into(),
+            fingerprint: zero.agent.key.public().fingerprint(),
+            public_key: zero.agent.key.public().to_hex(),
+            address: zero.address.clone(),
+        };
+        let nodes = vec![node.clone()];
+        let mut orbit = Orbit {
+            controllers: Some(record),
+            node: nodes.clone(),
+            cluster: Default::default(),
+            group: Vec::new(),
+        };
+        orbit.cluster.insert(
+            "pair".into(),
+            crate::orbit::store::Cluster {
+                nodes: vec!["zero".into()],
+            },
+        );
+        let controller = Controller::new(
+            Key::from_seed(&[31; 32]).unwrap(),
+            orbit,
+            temp.path().join("orbit.toml"),
+        );
+
+        let package = temp.path().join("package");
+        let nested = package.join("weights/tp4/rank-0/layer.safetensors");
+        fs::create_dir_all(nested.parent().unwrap()).unwrap();
+        let payload = b"layer payload".to_vec();
+        let mut companion = Writer::new(File::create(&nested).unwrap(), PAYLOAD_FORMAT).unwrap();
+        companion
+            .add("flare.payload", payload.len() as u64, Source::Bytes(payload))
+            .unwrap();
+        companion.finish().unwrap();
+
+        let locations = wire::LocationSet {
+            version: schema::FORMAT_VERSION,
+            locations: vec![wire::PayloadLocation {
+                payload_id: vec![7; 32],
+                file: "weights/tp4/rank-0/layer.safetensors".into(),
+                tensor: "flare.payload".into(),
+            }],
+            available_deployments: Vec::new(),
+        };
+        let primary = package.join("model.safetensors");
+        let mut writer = Writer::new(File::create(&primary).unwrap(), PAYLOAD_FORMAT).unwrap();
+        writer
+            .add("flare.manifest", 8, Source::Bytes(b"manifest".to_vec()))
+            .unwrap();
+        writer
+            .add(
+                "flare.locations",
+                locations.encoded_len() as u64,
+                Source::Bytes(locations.encode_to_vec()),
+            )
+            .unwrap();
+        writer.finish().unwrap();
+
+        let mirror = temp.path().join("mirror");
+        fs::create_dir_all(&mirror).unwrap();
+        let mirrored = controller
+            .mirror_package(&node, primary.to_str().unwrap(), &mirror)
+            .unwrap();
+        assert_eq!(
+            flare_helios::runtime_package::package_companions(&mirrored).unwrap(),
+            vec!["weights/tp4/rank-0/layer.safetensors"]
+        );
+        assert!(mirror
+            .join("weights/tp4/rank-0/layer.safetensors")
+            .is_file());
+        assert_eq!(
+            fs::metadata(mirror.join("weights/tp4/rank-0/layer.safetensors"))
+                .unwrap()
+                .len(),
+            fs::metadata(&nested).unwrap().len()
         );
     }
 }
