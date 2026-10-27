@@ -88,6 +88,14 @@ impl Lease {
         Ok(lease)
     }
 
+    /// Take the write lease directly. Upgrading a shared lease can deadlock against another
+    /// holder of the same directory, so writers open an exclusive lock instead.
+    pub fn write(directory: &Path) -> Result<Self, Failure> {
+        let lease = Self(Self::open(directory)?);
+        lease.lock(libc::LOCK_EX)?;
+        Ok(lease)
+    }
+
     fn open(directory: &Path) -> Result<File, Failure> {
         let locks = directory
             .parent()

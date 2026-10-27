@@ -1082,7 +1082,13 @@ impl Controller {
                 "--roce-ring and --roce-chain require a multi-host package with 2..16 ranks".into(),
             );
         }
-        let streams = if world > 1 {
+        // Parallel streams require the signed fabric plan. A transfer from a source outside the
+        // fabric membership, such as rank zero reading its own node-held package, uses one
+        // stream over the agent session.
+        let streams = if world > 1
+            && (options.stage_only
+                || matches!(&package.holder, Holder::Node { node, .. } if node.public_key != nodes[0].public_key))
+        {
             package_streams(options.transfer_streams)?
         } else {
             1

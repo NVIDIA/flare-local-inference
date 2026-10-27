@@ -846,8 +846,7 @@ fn put(
         return Err("PUT length does not match its ranges".into());
     }
     let entry = cache::entry(&agent.cache, cache::kind_directory(kind)?, name)?;
-    let lease = cache::Lease::shared(&cache::unit(&agent.cache, &entry))?;
-    lease.exclusive()?;
+    let lease = cache::Lease::write(&cache::unit(&agent.cache, &entry))?;
     let path = cache::store(&agent.cache, kind, name, size, &ranges, &mut body)?;
     let unit = cache::unit(&agent.cache, &path);
     if kind == "package" {
@@ -879,8 +878,7 @@ fn transfer(agent: &Agent, pinned: &mut Pinned, request: &Value) -> Result<Vec<u
         "packages",
         &format!("{directory}/{}", grant.primary()),
     )?;
-    let lease = cache::Lease::shared(primary.parent().unwrap())?;
-    lease.exclusive()?;
+    let lease = cache::Lease::write(primary.parent().unwrap())?;
     let marker = primary.with_file_name(VERIFIED);
     let fabric_source = if grant.transfer_fabric.is_some() {
         super::fabric::topology(&grant)?;
