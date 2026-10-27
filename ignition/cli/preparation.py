@@ -8,7 +8,7 @@ from ignition.errors import FetchError, UsageError
 from ignition.recipes import ResolvedModel, resolve
 from ignition.recipes.declaration import Speculation
 
-from .config import AUTOTUNE_EFFORTS, Configuration, Setting
+from .config import AUTOTUNE_EFFORTS, Configuration, Setting, parse_size
 
 
 @dataclass(frozen=True)
@@ -44,6 +44,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
            mixed_prefill: bool = False, prompt_logprobs: bool = False, expert_scale_compression: str | None = None,
            online_mxfp8: bool = False, language_model_only: bool = False,
            compile_workers: int | None = None, tuning_gpus: str | None = None, autotune_effort: str | None = None, collective_tuning: str | None = None, collective_ladder=None,
+           compile_headroom: str | None = None,
            image_concurrency: int | None = None, mla_compute_mode: str | None = None,
            lock_gpu_clocks: bool = False, native_dense_activations: bool = False,
            joint_tuning: bool = False, shard_hyperconnections: bool = False) -> planning.Plan:
@@ -61,6 +62,7 @@ def derive(configuration: Configuration, model: ResolvedModel, host: Host, *, gp
         image_concurrency=image_capacity_setting(configuration, model, image_concurrency),
         online_mxfp8=online_mxfp8, language_model_only=language_model_only, mla_compute_mode=mla_compute_mode)
     result = replace(result, compile_workers=workers, hub_cache=configuration.directory("hub_cache"),
+                     compile_headroom_bytes=compiler_headroom(configuration, compile_headroom),
                      autotune_effort=tuning_effort(configuration, autotune_effort),
                      collective_tuning=mode, collective_ladder=ladder,
                      joint_tuning=joint_tuning, shard_hyperconnections=shard_hyperconnections,
@@ -94,6 +96,13 @@ def compiler_workers(configuration, flag=None):
     if type(value) is not int or value < 0 or flag == 0:
         raise UsageError("--compile-workers must be a positive integer")
     return value or None
+
+
+def compiler_headroom(configuration, flag=None):
+    """Resolve the system memory compiler pools and tuning races leave free, in bytes."""
+    setting = configuration.get("preparation.compile_headroom", flag)
+    return parse_size(setting.value, "--compile-headroom" if setting.source == "flag"
+                      else "compile_headroom in [preparation]")
 
 
 def tuning_devices(plan, host, flag):

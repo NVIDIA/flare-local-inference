@@ -34,7 +34,7 @@ from ignition.preparation.contract import history_region
 from ignition.preparation.rebuild_manifest import declare_weights
 from ignition.preparation import runtime_package_pb2 as contract_proto
 from ignition.preparation.execution import GraphSignature
-from ignition.preparation.host_memory import device_memory_info
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES, device_memory_info
 from ignition.preparation.deferred import deferred_mode
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
@@ -71,6 +71,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
@@ -120,7 +121,8 @@ class PreparationConfig:
         if self.shard_hyperconnections and len(self.devices or (self.device,)) < 2:
             raise ValueError("--shard-hyperconnections requires tensor parallelism")
         request_capacity(self.max_active)
-        for name in ("device", "context", "prefill_chunk_size", "snapshot_budget_bytes", "headroom_bytes"):
+        for name in ("device", "context", "prefill_chunk_size", "snapshot_budget_bytes", "headroom_bytes",
+                     "compile_headroom_bytes"):
             if type(getattr(self, name)) is not int:
                 raise TypeError(f"{name} must be an integer")
         if self.device < 0 or not 64 <= self.context <= 262144 or self.context % 64:
@@ -135,7 +137,7 @@ class PreparationConfig:
             raise TypeError("mixed_prefill must be a boolean")
         minimum_snapshot = HybridStateLayout.build(speculative_tokens=7 if self.mtp else 0,
             world_size=1 if self.devices is None else len(self.devices)).row_bytes
-        if self.snapshot_budget_bytes < minimum_snapshot or self.headroom_bytes < 0:
+        if self.snapshot_budget_bytes < minimum_snapshot or self.headroom_bytes < 0 or self.compile_headroom_bytes < 0:
             raise ValueError("snapshot budget requires at least one state row; headroom must be nonnegative")
         widths = self.speculative_widths
         if (not isinstance(widths, tuple) or not widths or widths[0] != 1
@@ -296,6 +298,7 @@ def _prepare_model(snapshot: Path, config: PreparationConfig | None = None, *, t
     collectives = dict(runtime=collective, vocabulary_runtime=vocabulary_collective, coordinator=coordinator)
     session = preparation_session(
         compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+        compile_headroom_bytes=config.compile_headroom_bytes,
         native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
         device=device, checkpoint=REVISION, coordinator=coordinator,
         namespace={"config": manifest.metadata_sha256["config.json"], "headers": manifest.headers_sha256, "world_size": shard.world_size,

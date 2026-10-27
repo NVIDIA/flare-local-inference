@@ -320,6 +320,7 @@ explicit flags take precedence.
 | `--collective-tuning static\|runtime` | Static autotunes collectives during preparation; runtime uses the required ladder file for final compiled geometry and captures runtime submode/active-CTA selection for eligible BF16 PCIe reductions. Overrides `[preparation] collective_tuning`, then the recipe declaration. | Static |
 | `--lock-gpu-clocks` | Lock each tuning GPU at its maximum supported graphics frequency during b12x and Inductor autotuning, then reset driver clock defaults. Frozen warmup, capture, and serving remain unlocked. Requires root or noninteractive sudo access to `nvidia-smi`. Command line only; inactive with `--autotune-effort off`. | off |
 | `--compile-workers N` | CPU compiler process budget per host, divided among local preparation ranks and bounded by available RAM and device memory. Applies to b12x kernel compilation and complete-forward compilation. Overrides `[preparation] compile_workers`. | Automatic |
+| `--compile-headroom SIZE` | System memory that compiler processes and kernel-tuning races leave free on each host, such as `6G`; binary size suffixes as in `[memory] reserve`. On unified-memory GPUs, a larger preparation headroom from the plan and `[memory] reserve` still applies. Lowering it permits more compiler processes and Inductor threads on unified-memory GPUs such as DGX Spark, at the risk of exhausting host memory. Recorded in the plan and tuning report. Overrides `[preparation] compile_headroom`. | `8G` |
 | `--tuning-gpus LIST` | Local kernel-tuning GPUs. Start with the serving GPU list, then append complete replicas of that TP group on matching hardware. Serving TP size stays fixed. Command line only; cannot be combined with multi-host `--ranks`. | Serving GPUs |
 | `--no-compile` | Development only: capture graphs without compiling forwards. A recipe never sets it. | off |
 | `--native-dense-activations` | Replace dense projection `auto` precision with b12x `quantized`: A8 for FP8 weights and A4 for FP4 weights. Explicit recipe precision and routed MoE precision are retained. NVFP4 requires a checkpoint activation global scale; unsupported native paths fail preparation. | Recipe precision |
@@ -1061,6 +1062,7 @@ max_concurrency = 4
 
 [preparation]
 # compile_workers = 24           # Optional CPU process budget per host.
+# compile_headroom = "8G"        # System memory compiler and tuning pools leave free per host.
 # autotune_effort = "default"     # off, default, audit.
 # collective_tuning = "static"    # static, runtime; omitted uses the recipe default.
 
@@ -1149,6 +1151,7 @@ Configuration assigns each decision to one owner:
 | Queue, frontend workers, event capacity, body limit | Concurrency and recipe image limits |
 | Compiler workers | Automatic memory-bounded sizing; `[preparation] compile_workers` or `--compile-workers` overrides |
 | Collective selection | `--collective-tuning`, then `[preparation] collective_tuning`, otherwise the recipe default (`static`) |
+| Compiler memory headroom | 8 GiB of system memory per host; `[preparation] compile_headroom` or `--compile-headroom` overrides |
 | Kernel search effort | `--autotune-effort`, then `[preparation] autotune_effort`, otherwise `default` |
 | Local tuning replicas | `--tuning-gpus`; independent of serving TP size |
 | CUDA toolkit | `[paths] cuda`, otherwise native build libraries discover the system toolkit |

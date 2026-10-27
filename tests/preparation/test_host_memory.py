@@ -22,10 +22,10 @@ def test_loading_reclaims_promoted_cycles_when_host_headroom_is_low(monkeypatch)
         observer = weakref.ref(owner)
         gc.collect(0)
         del owner
-        monkeypatch.setattr(host_memory, "available_bytes", lambda: 2 * host_memory._HEADROOM_BYTES)
+        monkeypatch.setattr(host_memory, "available_bytes", lambda: 2 * host_memory.COMPILE_HEADROOM_BYTES)
         host_memory.release_unused(generation=0)
         assert observer() is not None
-        monkeypatch.setattr(host_memory, "available_bytes", lambda: host_memory._HEADROOM_BYTES - 1)
+        monkeypatch.setattr(host_memory, "available_bytes", lambda: host_memory.COMPILE_HEADROOM_BYTES - 1)
         host_memory.release_unused(generation=0)
         assert observer() is None
     finally:
@@ -73,6 +73,56 @@ def test_unified_memory_budgets_host_and_device_storage_together():
     assert worker_limit(8, pools=2, available=24 << 30, device_bytes=2 << 30) == 2
     with pytest.raises(MemoryError, match="available host memory"):
         worker_limit(8, available=11 << 30, device_bytes=2 << 30)
+
+
+@pytest.mark.parametrize("compile_headroom,expected", [(4 << 30, 5), (8 << 30, 4), (16 << 30, 2)])
+def test_compile_headroom_sets_the_memory_compiler_pools_leave_free(compile_headroom, expected):
+    assert worker_limit(8, available=24 << 30, device_bytes=2 << 30,
+                        compile_headroom_bytes=compile_headroom) == expected
+    # A larger preparation headroom still applies.
+    assert worker_limit(8, available=24 << 30, device_bytes=2 << 30, headroom_bytes=20 << 30,
+                        compile_headroom_bytes=compile_headroom) == 1
+    with pytest.raises(ValueError, match="nonnegative"):
+        worker_limit(8, available=24 << 30, compile_headroom_bytes=-1)
+
+
+def test_lower_compile_headroom_admits_a_compiler_on_a_loaded_unified_memory_host():
+    # After DeepSeek V4.1 TP3 loads its weights, a GB10 rank has about 11 GiB left.
+    with pytest.raises(MemoryError, match="found 11264 MiB [(]8192 MiB headroom, 4096 MiB per worker"):
+        worker_limit(8, available=11 << 30, device_bytes=2 << 30)
+    assert worker_limit(8, available=11 << 30, device_bytes=2 << 30, compile_headroom_bytes=6 << 30) == 1
+
+
+@pytest.mark.parametrize("compile_headroom,threads", [(None, 2), (6 << 30, 6), (12 << 30, 1)])
+def test_inductor_threads_follow_the_compile_headroom(compile_headroom, threads):
+    options = {} if compile_headroom is None else {"compile_headroom_bytes": compile_headroom}
+    assert host_memory.compile_threads(16, workers=1, available=13 << 30, device_bytes=2 << 30,
+                                       **options) == threads
+
+
+@pytest.mark.parametrize("compile_headroom,expected", [(None, (2, 7 << 28)), (4 << 30, (4, 11 << 28)),
+                                                       (14 << 30, (0, 1 << 28))])
+def test_integrated_tuning_follows_the_compile_headroom(monkeypatch, compile_headroom, expected):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (16 << 30, 121 << 30))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 16 << 30)
+    options = {} if compile_headroom is None else {"compile_headroom_bytes": compile_headroom}
+    assert host_memory.tuning_limits("cuda:0", 8, **options) == expected
+    with pytest.raises(MemoryError, match="kernel tuning"):
+        host_memory.tuning_limits("cuda:0", 8, compile_headroom_bytes=15 << 30)
+
+
+@pytest.mark.parametrize("compile_headroom,workers", [(None, 32), (40 << 30, 16)])
+def test_discrete_tuning_compilers_leave_the_compile_headroom_in_host_ram(monkeypatch, compile_headroom, workers):
+    import torch
+
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=False))
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (24 << 30, 96 << 30))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 72 << 30)
+    options = {} if compile_headroom is None else {"compile_headroom_bytes": compile_headroom}
+    assert host_memory.tuning_limits("cuda:0", 64, headroom_bytes=1 << 30, **options)[0] == workers
 
 
 @pytest.mark.parametrize("platform", ["posix", "nt"])

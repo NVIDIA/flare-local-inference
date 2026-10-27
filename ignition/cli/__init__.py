@@ -214,6 +214,9 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--compile-workers", type=int, metavar="N",
                           help="CPU compiler process budget per host, shared by local preparation ranks;"
                                " bounded by available RAM and device memory (default: automatic)")
+    advanced.add_argument("--compile-headroom", metavar="SIZE",
+                          help="system memory compiler and tuning pools leave free on each host, such as 6G;"
+                               " a larger preparation headroom still applies (default: 8G)")
     advanced.add_argument("--tuning-gpus", metavar="LIST",
                           help="local GPUs for kernel tuning, starting with --gpus and followed by complete"
                                " TP replicas; serving TP size is unchanged (default: serving GPUs)")

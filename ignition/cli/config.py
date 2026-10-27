@@ -19,7 +19,7 @@ _SECTIONS = {
     "defaults": {"model": str, "max_concurrency": int, "image_concurrency": int,
                  "speculative_token_capacity": int, "speculative_graph_budget": int},
     "memory": {"reserve": str},
-    "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str},
+    "preparation": {"compile_workers": int, "compile_headroom": str, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str},
     "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
@@ -31,6 +31,7 @@ _BUILT_IN = {
     "server.host": "127.0.0.1", "server.port": 8000, "server.api_key": "",
     "memory.reserve": "0",
     "preparation.compile_workers": 0,
+    "preparation.compile_headroom": "8G",
     "preparation.autotune_effort": "default",
     "preparation.collective_tuning": None,
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
@@ -86,6 +87,7 @@ class Configuration:
                 raise UsageError(f"{resolved}: unknown section [{section}]")
         configuration = cls(resolved, values, True)
         parse_size(configuration.get("memory.reserve").value)
+        parse_size(configuration.get("preparation.compile_headroom").value, "compile_headroom in [preparation]")
         for key in ("prefix_cache.memory", "prefix_cache.disk_limit"):
             if configuration.get(key).value:
                 parse_size(configuration.get(key).value, key.replace(".", " "))
@@ -172,6 +174,8 @@ class Configuration:
             '# speculative_graph_budget = 64  # packed round graphs; excludes width-one and ordinary graphs',
             "", "[preparation]",
             '# compile_workers = 24           # CPU processes per host; default: automatic, bounded by memory',
+            f'# compile_headroom = "{self.get("preparation.compile_headroom").value}"'
+            '        # system memory compiler and tuning pools leave free per host',
             '# autotune_effort = "default"    # off, default, audit',
             '# collective_tuning = "static"  # static, runtime; omitted uses recipe default',
             "", "[memory]",

@@ -33,7 +33,7 @@ from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.frontend import prepare_frontend
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
-from ignition.preparation.host_memory import release_unused
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES, release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena, scratch_views
 from ignition.preparation.tuning import RecordedPreparationSession, with_autotune_effort
@@ -61,6 +61,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
@@ -107,7 +108,7 @@ class PreparationConfig:
             raise ValueError(f"Kimi K3 context must be {self.page_tokens}-aligned in [{self.page_tokens},1048576]")
         if not 128 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 128:
             raise ValueError("Kimi K3 prefill chunk must be 128-aligned and fit the context")
-        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
+        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0 or self.compile_headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
 
     @property
@@ -238,6 +239,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "world_size": shard.world_size, "contract": "kimi3.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_headroom_bytes=config.compile_headroom_bytes,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="kimi3", numerical_policy="default", coordinator=coordinator,

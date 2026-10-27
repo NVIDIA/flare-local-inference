@@ -36,6 +36,7 @@ from ignition.preparation.collectives import (
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.scratch import ScratchArena
@@ -70,6 +71,7 @@ class PreparationConfig:
     collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
@@ -129,7 +131,8 @@ class PreparationConfig:
                 or self.hosts is not None and (not isinstance(self.hosts, tuple) or len(self.hosts) != len(self.devices))
                 or any(type(d) is not int or d < 0 for d in self.devices)):
             raise ValueError("GLM requires one, two or four distinct CUDA devices")
-        for name in ("context", "prefill_chunk_size", "max_active", "snapshot_budget_bytes", "headroom_bytes"):
+        for name in ("context", "prefill_chunk_size", "max_active", "snapshot_budget_bytes", "headroom_bytes",
+                     "compile_headroom_bytes"):
             if type(getattr(self, name)) is not int:
                 raise TypeError(f"{name} must be an integer")
         if not self.page_tokens <= self.context <= 1048576 or self.context % self.page_tokens:
@@ -148,7 +151,7 @@ class PreparationConfig:
         if self.minimum_pages is not None and (type(self.minimum_pages) is not int or self.minimum_pages <= 0
                                                or self.pages is not None and self.minimum_pages > self.pages):
             raise ValueError("minimum page capacity must be positive and at most the fixed page capacity")
-        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
+        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0 or self.compile_headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
 
     @property
@@ -359,6 +362,7 @@ def prepare_rank(snapshot: Path, config: PreparationConfig, *, rank, group, prog
             "contract": "glm5next.graph-inputs.v3", "vision": not config.language_model_only}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_headroom_bytes=config.compile_headroom_bytes,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="glm-text-stack-tp-v1",
             numerical_policy="default", coordinator=coordinator,

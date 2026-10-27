@@ -28,7 +28,7 @@ from torch.utils._pytree import tree_flatten, tree_unflatten, treespec_dumps, tr
 from .compilation import (DEFAULT_CACHE_ROOT, _INVOCATIONS, _OPTIONS, _Invocation, _artifact_kernel_table,
                           _byte_storage, _storage_region, _lower_storage, _compiler_recursion)
 from .device_binding import bind_device, relocate_inductor, restore_device, restore_prepared_device
-from .host_memory import release_unused
+from .host_memory import COMPILE_HEADROOM_BYTES, release_unused
 
 _GUARD_LOCK = RLock()
 _GUARD_TENSOR_MODE = ContextVar("flare_guard_tensor_mode", default=None)
@@ -541,7 +541,7 @@ class ForwardCache:
     """Load complete compiled forwards before tracing the serving catalog."""
 
     def __init__(self, *, namespace, device, root=None, headroom_bytes=0, options=None, compile_workers=None,
-                 lock_gpu_clocks=False):
+                 lock_gpu_clocks=False, compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
         import flashinfer
         from torch._inductor.codecache import torch_key
 
@@ -549,6 +549,7 @@ class ForwardCache:
         self.headroom_bytes = headroom_bytes
         self.compile_workers = compile_workers
         self.lock_gpu_clocks = lock_gpu_clocks
+        self.compile_headroom_bytes = compile_headroom_bytes
         self.options = MappingProxyType(dict(_OPTIONS if options is None else options))
         properties = torch.cuda.get_device_properties(device)
         options = {name: value for name, value in self.options.items() if name != 'compile_threads'}
@@ -683,7 +684,8 @@ class ForwardCache:
         selections = InductorSelections(self.device, lock_gpu_clocks=self.lock_gpu_clocks)
         compiled, paths, pending = {}, {}, []
         with phase(progress, "Compile model forwards", total=len(functions)) as stage, CompilePool(self.device,
-                headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers) as compiler:
+                headroom_bytes=self.headroom_bytes, options=self.options, compile_workers=self.compile_workers,
+                compile_headroom_bytes=self.compile_headroom_bytes) as compiler:
             def finish():
                 name, bound, path = _completed(pending)
                 try:
@@ -765,7 +767,8 @@ class ForwardCache:
             try:
                 compiler = scope.enter_context(CompilePool(
                     self.device, headroom_bytes=self.headroom_bytes, pools=coordinator.local_ranks,
-                    options=self.options, compile_workers=self.compile_workers))
+                    options=self.options, compile_workers=self.compile_workers,
+                    compile_headroom_bytes=self.compile_headroom_bytes))
             except MemoryError as failure:
                 # A rank whose GPU has no room for a compiler lends its forwards to the others on this host.
                 unavailable = f"{type(failure).__name__}: {failure}"

@@ -11,6 +11,7 @@ import os
 from pathlib import Path
 
 from ignition.errors import CapacityError, UsageError
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES
 from ignition.preparation.tuning_replicas import TuningReplica
 from ignition.preparation.selection import BenchmarkSelection
 from ignition.recipes.declaration import Checkpoint, Recipe, Speculation
@@ -181,6 +182,8 @@ class Plan:
     roce_ring: bool = False
     roce_chain: bool = False
     compile_workers: int | None = None
+    # System memory compiler pools and tuning races leave free on each host.
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     autotune_effort: str = "default"
     collective_ladder: dict | None = None
     collective_tuning: str | None = None
@@ -343,6 +346,7 @@ class Plan:
             "expert_scale_compression": self.expert_scale_compression,
             "mla_compute_mode": self.mla_compute_mode,
             "compile_workers": self.compile_workers,
+            "compile_headroom_bytes": self.compile_headroom_bytes,
             "autotune_effort": self.autotune_effort,
             "collective_tuning": self.collective_tuning,
             "collective_ladder": self.collective_ladder,

@@ -30,7 +30,7 @@ from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.frontend import annotated_template_asset, prepare_frontend
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
-from ignition.preparation.host_memory import release_unused
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES, release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
 from ignition.preparation.selection import BenchmarkSelection
@@ -52,6 +52,7 @@ class PreparationConfig:
     collective_ladder: dict | None = None
     prompt_logprobs: bool = False
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
@@ -90,7 +91,7 @@ class PreparationConfig:
             raise ValueError("Qwen dense context must be 128-aligned in [128,262144]")
         if not 128 <= self.prefill_chunk_size <= self.context or self.prefill_chunk_size % 128:
             raise ValueError("Qwen dense prefill chunk must be 128-aligned and fit the context")
-        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
+        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0 or self.compile_headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         if type(self.mtp) is not bool:
             raise TypeError("MTP selection must be a boolean")
@@ -193,6 +194,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             "contract": "qwen38-dense.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_headroom_bytes=config.compile_headroom_bytes,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity,
             workload_schema="qwen38-dense", numerical_policy="default", coordinator=coordinator,

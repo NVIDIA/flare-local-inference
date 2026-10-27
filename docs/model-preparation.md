@@ -237,6 +237,15 @@ device memory can reduce it; local preparation ranks share the budget. Set
 overrides that setting. Omitting both retains automatic sizing, including
 shared-memory limits on DGX Spark.
 
+Automatic sizing leaves 8 GiB of system memory free beside compiler processes
+and tuning races. On unified-memory GPUs, the plan's preparation headroom
+applies instead when it is larger. On DGX Spark, the memory left after loading
+weights bounds both the compiler count and each compiler's Inductor threads.
+`--compile-headroom SIZE`, or `[preparation] compile_headroom = "SIZE"`,
+selects another value, such as `6G`; the flag overrides the setting. A smaller
+headroom compiles faster when memory is tight but leaves less for the rest of
+the host. The plan and tuning report record the value.
+
 On integrated GPUs, kernel tuning is divided into memory-bounded jobs. The
 terminal dashboard shows the active job number and total job count, with a
 separate live display for each job. Redirecting output records plain kernel

@@ -17,6 +17,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
         speculative_graph_budget=speculation.graph_budget, packed_verification=speculation.packed_verification,
         draft_prefix_selection=speculation.draft_prefix_selection)
     config = PreparationConfig(collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
+        compile_headroom_bytes=plan.compile_headroom_bytes,
         native_dense_activations=plan.native_dense_activations,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         image_concurrency=plan.image_concurrency if not plan.language_model_only else None,

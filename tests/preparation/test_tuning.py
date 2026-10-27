@@ -529,6 +529,37 @@ def test_worker_budget_accounts_for_all_preparing_ranks(backend, monkeypatch):
     assert report["compile_workers"] == 2
 
 
+@pytest.mark.parametrize("compile_headroom,workers", [(None, 2), (0, 3), (16 << 30, 1)])
+def test_compile_headroom_bounds_tuning_compilers_and_is_reported(backend, monkeypatch, compile_headroom, workers):
+    from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES
+
+    monkeypatch.setattr("ignition.preparation.host_memory.available_bytes", lambda: 24 << 30)
+    limits = []
+
+    def configure(session, count):
+        limits.append(count)
+        session.compile_workers = 8 if count is None else count
+
+    monkeypatch.setattr(PreparationSession, "configure_compile_workers", configure)
+    coordinator = SimpleNamespace(ranks=(0, 1, 2, 3), barrier=lambda: None, local_ranks=4, spans_hosts=False,
+                                  same_on_every_rank=lambda value: False)
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(is_integrated=False, name="NVIDIA GB10"))
+    options = {} if compile_headroom is None else {"compile_headroom_bytes": compile_headroom}
+    session = make_session(device=0, checkpoint="revision", coordinator=coordinator, **options)
+    session.declare((declaration("op"),))
+    report = session.tune()
+    assert limits == [None, workers]
+    assert report["compile_headroom_bytes"] == (COMPILE_HEADROOM_BYTES if compile_headroom is None
+                                                else compile_headroom)
+
+
+@pytest.mark.parametrize("value", [-1, 1.5, None])
+def test_invalid_compile_headroom_is_rejected(backend, value):
+    with pytest.raises(ValueError, match="compile_headroom_bytes"):
+        make_session(device=0, checkpoint="revision", compile_headroom_bytes=value)
+
+
 def test_explicit_cpu_budget_reaches_b12x_without_environment_switch(backend):
     events, _ = backend
     session = make_session(device=0, checkpoint="revision", compile_workers=24)
