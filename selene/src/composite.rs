@@ -1,11 +1,11 @@
-//! Local copies write through; pooled copies spill under headroom pressure.
+//! Memory copies spill to disk under headroom pressure.
 //! A full disk keeps restorable DRAM copies and parent pins until reservation.
 //! The disk index also holds uncharged parked metadata; DRAM links are flat.
 //! Only committed files make DRAM copies evictable; disk LRU removes both.
 //!
 //! Restores pin slabs and files and use bounded staging for larger chains.
 //! Filesystem pressure retries with backoff. Other I/O errors may discard a
-//! record after the pooled retry. Storage outlives every transfer.
+//! record after one retry. Storage outlives every transfer.
 
 #[cfg(test)]
 use crate::store::TierStore;
@@ -108,10 +108,8 @@ pub struct CompositeStore {
     stale: Vec<PrefixKey>,
     disk_outbound_rate: Rate,
     disk_inbound_rate: Rate,
-    /// Joined a pool: records are written to disk when memory needs the room.
-    pooled: bool,
     pub drain_on_shutdown: Duration,
-    /// Records in a pool whose memory copy landed, by key.
+    /// Records whose memory copy landed, by key.
     parked: HashMap<PrefixKey, Parked>,
     /// Scratch reused across polls.
     memory_events: Vec<StoreEvent>,
@@ -183,7 +181,6 @@ impl CompositeStore {
             stale: Vec::new(),
             disk_outbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
             disk_inbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
-            pooled: false,
             drain_on_shutdown: Duration::ZERO,
             parked: HashMap::new(),
             memory_events: Vec::new(),
@@ -475,9 +472,6 @@ impl CompositeStore {
             key,
             result: Ok(bytes),
         });
-        if !self.pooled && self.parked.values().filter(|p| p.writing).count() < MAX_SPILLS {
-            self.spill(key);
-        }
     }
 
     /// Write the memory record's slabs through to its reserved file.
@@ -512,8 +506,7 @@ impl CompositeStore {
             self.retry_after = Some(Instant::now() + Duration::from_millis(50));
         }
         let retry = pressure
-            || self.pooled
-                && result.is_err()
+            || result.is_err()
                 && self.parked.get_mut(&key).is_some_and(|parked| {
                     crate::store::retry_once(&mut parked.failures) == crate::Retirement::Failed
                 });
@@ -1233,7 +1226,7 @@ impl HostStore for CompositeStore {
                 self.retry_after = None;
             }
             self.maintenance_progress = progress;
-            if self.pooled && !retry {
+            if !retry {
                 let (pages, rows) = self.memory.headroom();
                 self.spill_parked(
                     pages.saturating_sub(self.memory.pool().free_pages()),
@@ -1277,13 +1270,11 @@ impl HostStore for CompositeStore {
     /// [`CLOSE_TIMEOUT`], then drain the disk and memory tiers. An error leaves
     /// ownership intact until their transfers can be drained.
     fn close(&mut self) -> Result<()> {
-        self.disk.preserve_committed = self.pooled;
+        crate::store::TierStore::drain_on_shutdown(self);
+        self.disk.preserve_committed = true;
         let deadline = Instant::now() + CLOSE_TIMEOUT;
         let mut events = Vec::new();
         while Instant::now() < deadline {
-            if !self.pooled {
-                self.spill_parked(usize::MAX, usize::MAX);
-            }
             let stats = self.stats();
             if stats.outbound_in_flight == 0 && stats.inbound_in_flight == 0 {
                 break;
@@ -1305,8 +1296,9 @@ impl HostStore for CompositeStore {
 
 impl crate::store::TierStore for CompositeStore {
     fn drain_on_shutdown(&mut self) {
-        self.disk.preserve_committed = self.pooled;
-        if !self.pooled || self.drain_on_shutdown.is_zero() {
+        self.disk.preserve_committed = true;
+        let timeout = std::mem::take(&mut self.drain_on_shutdown);
+        if timeout.is_zero() {
             return;
         }
         let started = Instant::now();
@@ -1320,7 +1312,7 @@ impl crate::store::TierStore for CompositeStore {
         let before = self.stats;
         let (mut skipped, mut failed) = (0, 0);
         let mut events = Vec::new();
-        while started.elapsed() < self.drain_on_shutdown {
+        while started.elapsed() < timeout {
             if self.poll(&mut events).is_err() {
                 failed += remaining.len();
                 break;
@@ -1347,7 +1339,7 @@ impl crate::store::TierStore for CompositeStore {
             {
                 key = parent;
             }
-            if started.elapsed() >= self.drain_on_shutdown {
+            if started.elapsed() >= timeout {
                 break;
             }
             remaining.remove(&key);
@@ -1367,7 +1359,7 @@ impl crate::store::TierStore for CompositeStore {
         eprintln!(
             "prefix cache shutdown drain: drained={drained} skipped_for_space={skipped} failed={failed} elapsed={:?} limited={}",
             started.elapsed(),
-            started.elapsed() >= self.drain_on_shutdown
+            started.elapsed() >= timeout
         );
     }
 
@@ -1414,9 +1406,6 @@ impl crate::store::TierStore for CompositeStore {
         }
         chain.reverse();
         self.memory.pin_export_chain(&chain, begin_tokens, want_row)
-    }
-    fn cascade(&mut self) {
-        self.pooled = true;
     }
     fn set_spill(&mut self, enabled: bool) {
         self.disk.set_spill(enabled);
@@ -1617,6 +1606,7 @@ mod tests {
         let (record, bytes) = copy_landed(store, checkpoint, parent, seed);
         let mut events = Vec::new();
         store.memory_stored(checkpoint.id, checkpoint.key, Ok(bytes), &mut events);
+        store.spill(checkpoint.key);
         assert!(matches!(
             events.as_slice(),
             [StoreEvent::Stored { result: Ok(_), .. }]
@@ -1983,7 +1973,7 @@ mod tests {
     }
 
     #[test]
-    fn write_through_reserves_the_file_and_marks_the_memory_copy_durable() {
+    fn spilling_reserves_the_file_and_marks_the_memory_copy_durable() {
         let Some(directory) = test_directory("composite", "write-through") else {
             return;
         };
@@ -1994,6 +1984,7 @@ mod tests {
         let (record, bytes) = copy_landed(&mut store, &root, None, 1);
         let mut events = Vec::new();
         store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.spill(root.key);
         match &events[..] {
             [
                 StoreEvent::Stored {
@@ -2164,6 +2155,7 @@ mod tests {
         let (_, bytes) = copy_landed(&mut store, &root, None, 1);
         let mut events = Vec::new();
         store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.spill(root.key);
         assert_eq!(stored(&events), [(root.key, true)]);
         events.clear();
         // The child's copy-out is in flight under the root: it holds the root pinned.
@@ -2181,6 +2173,10 @@ mod tests {
         store.disk.index_mut().pin(&root.key).unwrap();
         assert_eq!(store.disk.index().node(&root.key).unwrap().pins(), 2);
 
+        poll_until(&mut store, &mut events, |store| {
+            store.parked[&root.key].failures == 1
+        });
+        store.spill(root.key);
         poll_until(&mut store, &mut events, |store| {
             !store.outbound.contains_key(&root.key)
         });
@@ -2501,6 +2497,7 @@ mod tests {
         assert_eq!(store.disk.used(), file_bytes(10) + file_bytes(20));
         let (_, bytes) = copy_landed(&mut store, &third, None, 3);
         store.memory_stored(third.id, third.key, Ok(bytes), &mut events);
+        store.spill(third.key);
         assert_eq!(stored(&events), [(third.key, true)]);
         events.clear();
         assert!(!store.disk.index().contains(&first.key));
@@ -2515,6 +2512,7 @@ mod tests {
         store.memory.pin_record(&second.key).unwrap();
         let (_, bytes) = copy_landed(&mut store, &fourth, None, 4);
         store.memory_stored(fourth.id, fourth.key, Ok(bytes), &mut events);
+        store.spill(fourth.key);
         assert_eq!(stored(&events), [(fourth.key, true)]);
         events.clear();
         assert!(!store.disk.index().contains(&second.key));
@@ -2696,6 +2694,7 @@ mod tests {
         let (_, bytes) = copy_landed(&mut store, &root, None, 1);
         let mut events = Vec::new();
         store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        store.spill(root.key);
         assert!(!store.outbound.is_empty());
         store.close().unwrap();
         assert!(store.outbound.is_empty() && store.jobs.is_empty());
@@ -2840,7 +2839,7 @@ mod tests {
 
     #[test]
     fn filesystem_full_keeps_the_record_until_space_returns() {
-        for (pooled, pages) in [(false, 12), (true, 12), (true, 64)] {
+        for pages in [12, 64] {
             let Some(directory) = test_directory("composite", "filesystem-full") else {
                 return;
             };
@@ -2850,9 +2849,6 @@ mod tests {
                 ..Default::default()
             };
             let mut store = composite_with_faults(&directory, pages, 4, 1 << 30, faults);
-            if pooled {
-                store.cascade();
-            }
             fs::write(&flag, []).unwrap();
             let root = parked_root(&mut store, &mut Ids::new(), 1, 640);
             store.spill_parked(10, 1);
@@ -2884,9 +2880,6 @@ mod tests {
                 return;
             };
             let mut store = composite(&directory, 32, 4, 1 << 30);
-            if !durable {
-                store.cascade();
-            }
             let mut ids = Ids::new();
             let full = history(1280);
             let root = checkpoint(&mut ids, &full, 640, None, pages(0..10), 10, StateSlotId(1));
@@ -2894,6 +2887,7 @@ mod tests {
             store.memory.mark_volatile(&root.key);
             store.memory_stored(root.id, root.key, Ok(bytes), &mut Vec::new());
             if durable {
+                store.spill(root.key);
                 poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
             }
             let required = store
@@ -2964,10 +2958,10 @@ mod tests {
         let mut old = Vec::new();
         for salt in 1..=3 {
             old.push(parked_root(&mut store, &mut ids, salt, 640));
+            store.spill(old.last().unwrap().key);
             poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
         }
         store.disk.set_limit(store.disk.used());
-        store.cascade();
         let announcer =
             crate::pool::Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
@@ -3032,7 +3026,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 32, 4, 1 << 30);
-        store.cascade();
         let announcer =
             crate::pool::Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
@@ -3064,7 +3057,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 11, 4, 1 << 30);
-        store.cascade();
         let mut ids = Ids::new();
         let root = parked_root(&mut store, &mut ids, 1, 640);
         assert!(store.jobs.is_empty());
@@ -3083,7 +3075,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 100, 16, 1 << 30);
-        store.cascade();
         let mut ids = Ids::new();
         for salt in 1..=4 {
             parked_root(&mut store, &mut ids, salt, 22 * PAGE_TOKENS);
@@ -3110,55 +3101,50 @@ mod tests {
     }
 
     #[test]
-    fn disk_pressure_parks_complete_dram_records_in_both_modes() {
-        for pooled in [false, true] {
-            let Some(directory) = test_directory("composite", "disk-pressure-parked") else {
-                return;
-            };
-            let mut store = composite(&directory, 80, 16, 1 << 30);
-            if pooled {
-                store.cascade();
-            }
-            let mut ids = Ids::new();
-            let root = parked_root(&mut store, &mut ids, 1, 640);
-            store.spill_parked(10, 0);
-            let mut events = Vec::new();
-            poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
-            store.disk.set_limit(store.disk.used());
-            store.disk.index_mut().pin(&root.key).unwrap();
-            let held = parked_root(&mut store, &mut ids, 2, 640);
-            assert!(!store.parked[&held.key].reserved);
-            assert!(store.memory.record(&held.key).is_some());
-            assert!(!store.memory.record(&held.key).unwrap().durable);
-            let mut history = PrefixHistory::new(IDENTITY);
-            history
-                .append(
-                    &(0..640u32)
-                        .map(|t| t.wrapping_mul(2654435761).wrapping_add(2))
-                        .collect::<Vec<_>>(),
-                    &[],
-                )
-                .unwrap();
-            assert_eq!(store.lookup(&history, 0, u64::MAX).unwrap().key, held.key);
-            assert_eq!(store.store(&held).unwrap(), StoreOutcome::Present);
-            store.disk.index_mut().unpin(&root.key).unwrap();
-            store.spill_parked(10, 0);
-            poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
-            assert!(store.disk.index().node(&held.key).unwrap().ready);
-            assert!(store.memory.record(&held.key).unwrap().durable);
-            let disk = store.disk.record(&held.key).unwrap();
-            let mut expected = disk.header.clone();
-            let memory = store.memory.record(&held.key).unwrap();
-            expected.row_checksum = record::checksum(store.memory.pool().row(memory.row.unwrap()));
-            assert_eq!(
-                Header::decode(&fs::read(&disk.path).unwrap()).unwrap(),
-                expected
-            );
-            assert_eq!(store.stats.store_failed, 0);
-            store.close().unwrap();
-            drop(store);
-            fs::remove_dir_all(directory).unwrap();
-        }
+    fn disk_pressure_parks_complete_dram_records() {
+        let Some(directory) = test_directory("composite", "disk-pressure-parked") else {
+            return;
+        };
+        let mut store = composite(&directory, 80, 16, 1 << 30);
+        let mut ids = Ids::new();
+        let root = parked_root(&mut store, &mut ids, 1, 640);
+        store.spill_parked(10, 0);
+        let mut events = Vec::new();
+        poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
+        store.disk.set_limit(store.disk.used());
+        store.disk.index_mut().pin(&root.key).unwrap();
+        let held = parked_root(&mut store, &mut ids, 2, 640);
+        assert!(!store.parked[&held.key].reserved);
+        assert!(store.memory.record(&held.key).is_some());
+        assert!(!store.memory.record(&held.key).unwrap().durable);
+        let mut history = PrefixHistory::new(IDENTITY);
+        history
+            .append(
+                &(0..640u32)
+                    .map(|t| t.wrapping_mul(2654435761).wrapping_add(2))
+                    .collect::<Vec<_>>(),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(store.lookup(&history, 0, u64::MAX).unwrap().key, held.key);
+        assert_eq!(store.store(&held).unwrap(), StoreOutcome::Present);
+        store.disk.index_mut().unpin(&root.key).unwrap();
+        store.spill_parked(10, 0);
+        poll_until(&mut store, &mut events, |s| s.outbound.is_empty());
+        assert!(store.disk.index().node(&held.key).unwrap().ready);
+        assert!(store.memory.record(&held.key).unwrap().durable);
+        let disk = store.disk.record(&held.key).unwrap();
+        let mut expected = disk.header.clone();
+        let memory = store.memory.record(&held.key).unwrap();
+        expected.row_checksum = record::checksum(store.memory.pool().row(memory.row.unwrap()));
+        assert_eq!(
+            Header::decode(&fs::read(&disk.path).unwrap()).unwrap(),
+            expected
+        );
+        assert_eq!(store.stats.store_failed, 0);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -3180,7 +3166,6 @@ mod tests {
             StateSlotId(2),
         );
         written(&mut store, &root, None, 1);
-        store.cascade();
         store.disk.set_limit(store.disk.used());
         store.disk.index_mut().pin(&root.key).unwrap();
         let (_, bytes) = copy_landed(&mut store, &child, Some(root.key), 2);
@@ -3208,7 +3193,6 @@ mod tests {
         if let Some(directory) = std::env::var_os(CHILD_DIR) {
             let directory = Path::new(&directory);
             let mut store = composite(directory, 24, 4, 1 << 30);
-            store.cascade();
             let mut ids = Ids::new();
             let committed = parked_root(&mut store, &mut ids, 1, 640);
             store.spill_parked(10, 0);
@@ -3263,7 +3247,6 @@ mod tests {
         assert_eq!(status.signal(), Some(libc::SIGKILL));
 
         let mut store = composite(&directory, 24, 4, 1 << 30);
-        store.cascade();
         assert_eq!(store.stats().disk_records, 1);
         for salt in 1..=2u32 {
             let mut history = PrefixHistory::new(IDENTITY);
@@ -3311,7 +3294,6 @@ mod tests {
                     ..Default::default()
                 },
             );
-            store.cascade();
             let mut ids = Ids::new();
             let committed = parked_root(&mut store, &mut ids, 1, 640);
             store.spill(committed.key);
@@ -3442,7 +3424,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 80, 8, 1 << 30);
-        store.cascade();
         let mut ids = Ids::new();
         let committed = parked_root(&mut store, &mut ids, 1, 640);
         store.spill(committed.key);
@@ -3469,7 +3450,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 80, 8, 1 << 30);
-        store.cascade();
         let full = history(1280);
         let mut ids = Ids::new();
         let root = checkpoint(&mut ids, &full, 640, None, pages(0..10), 10, StateSlotId(1));
@@ -3523,7 +3503,6 @@ mod tests {
                 ..Default::default()
             },
         );
-        store.cascade();
         parked_root(&mut store, &mut Ids::new(), 1, 640);
         store.drain_on_shutdown = Duration::MAX;
         let started = Instant::now();
@@ -3541,7 +3520,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 16, 4, 1 << 30);
-        store.cascade();
         let mut ids = Ids::new();
         let root = parked_root(&mut store, &mut ids, 1, 640);
 
@@ -3614,7 +3592,6 @@ mod tests {
         };
         for recovers in [true, false] {
             let mut store = composite(&directory, 12, 4, 1 << 30);
-            store.cascade();
             let mut ids = Ids::new();
             let root = parked_root(&mut store, &mut ids, 1, 640);
             let mut events = Vec::new();
@@ -3672,7 +3649,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 16, 16, 1 << 30);
-        store.cascade();
         let mut ids = Ids::new();
         let roots: Vec<_> = (1..=MAX_SPILLS as u32 + 2)
             .map(|salt| parked_root(&mut store, &mut ids, salt, 64))
@@ -3722,7 +3698,6 @@ mod tests {
             copier,
         )
         .unwrap();
-        store.cascade();
         let announcer =
             crate::pool::Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
@@ -3793,7 +3768,6 @@ mod tests {
             return;
         };
         let mut store = composite(&directory, 32, 4, 1 << 30);
-        store.cascade();
         let announcer = Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
         store.announce_to(announcer.clone());
@@ -3870,19 +3844,24 @@ mod tests {
     }
 
     #[test]
-    fn a_publication_writes_through_in_local_mode() {
+    fn a_local_publication_stays_in_memory_until_shutdown_drain() {
         let Some(directory) = test_directory("composite", "publish-local") else {
             return;
         };
-        let mut store = composite(&directory, 12, 4, 1 << 30);
-        let full = history(2000);
-        let mut ids = Ids::new();
-        let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
-        // Local mode keeps write-through: the copy lands in memory and a file
-        // is reserved and written at once.
-        assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
-        assert!(store.outbound.contains_key(&root.key));
-        assert!(store.parked.is_empty());
+        let mut store = composite(&directory, 80, 8, 1 << 30);
+        let root = parked_root(&mut store, &mut Ids::new(), 1, 640);
+        store.poll(&mut Vec::new()).unwrap();
+        let path = directory.join(record::file_name(&root.key));
+        assert!(!path.exists());
+        assert!(store.jobs.is_empty());
+        assert!(store.outbound[&root.key].write.is_none());
+        store.drain_on_shutdown = Duration::MAX;
         store.close().unwrap();
+        drop(store);
+        let mut recovered = composite(&directory, 80, 8, 1 << 30);
+        assert!(recovered.disk.index().node(&root.key).unwrap().ready);
+        recovered.close().unwrap();
+        drop(recovered);
+        fs::remove_dir_all(directory).unwrap();
     }
 }

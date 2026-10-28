@@ -300,10 +300,6 @@ pub trait TierStore: HostStore {
     ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
         Err(ExportRefusal::NotFound)
     }
-    /// Join a pool: from now on a tier gives up a record only after the next
-    /// tier holds a committed copy, instead of writing every publication
-    /// through to the disk tier. Called once, before the first store.
-    fn cascade(&mut self) {}
     /// Whether the last tier may hand its records on to the pool's manager
     /// instead of dropping them. Set whenever the manager's availability changes.
     fn set_spill(&mut self, _enabled: bool) {}

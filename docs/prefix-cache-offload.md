@@ -44,7 +44,7 @@ selects one of them or none:
 
 | Memory size | Disk limit | Store | Behavior |
 |---|---|---|---|
-| nonzero | nonzero | `CompositeStore` | Records are retained in registered memory and written through to disk; disk reads warm the memory store when capacity permits. |
+| nonzero | nonzero | `CompositeStore` | Records are retained in registered memory and spilled to disk under pressure; disk reads warm the memory store when capacity permits. |
 | nonzero | zero | `MemoryStore` | Records are retained in pinned host memory only, each rank's part mapped by that rank's device alone. |
 | zero | nonzero | `DiskStore` | Records live on disk and stream through a bounded registered staging pool. |
 | zero | zero | none | The worker holds no store. |
@@ -232,8 +232,8 @@ The deferred direct transport requirements are in section 2.6.
 trait by orchestrating them:
 
 - `store` with the staged transport runs `memory.store`; when the copy-out
-  lands, local mode runs `write_from` with that record's memory slabs;
-  pooled mode delays the write until headroom or allocation pressure needs it.
+  lands, both modes park the record until headroom or allocation pressure
+  needs its slabs. `write_from` writes those same memory slabs.
   Completion makes the memory copy durable. If disk reservation fails, the
   complete record stays parked in DRAM, restorable and announced there, with
   its parent pinned until reservation succeeds. Its chain metadata is indexed
@@ -258,7 +258,7 @@ trait by orchestrating them:
   its file commits. Filesystem-full or quota errors retain it and retry with a
   short backoff. Terminal disk I/O errors may discard it and are counted.
 - The staged transport retains its bounded staging pool inside the composite.
-  Memory slabs supply write-through and read-through buffers when retention
+  Memory slabs supply spill and read-through buffers when retention
   fits; disk staging handles records and chains that cannot be retained.
   The staging pool is additional to the configured retention-memory budget
   and appears separately in the startup summary.
@@ -367,17 +367,17 @@ arise only from interrupted operations or external changes.
 A process killed mid-restore releases its directory lock without changing
 committed record files; the next scan can reuse those files. Publication and a
 completed GPU-to-RAM copy
-do not imply disk durability: local write-through commits asynchronously after
-copy-out, and SIGKILL loses RAM copies and queued writes. Only records renamed
+do not imply disk durability: files commit under pressure or an enabled shutdown
+drain, and SIGKILL loses RAM copies and queued writes. Only records renamed
 into place survive a process restart; partial temporary files are discarded.
 Waiting after restart cannot recover a write the killed process never committed.
-In pool mode, a RAM record reserves a disk-index entry and disk budget, but its
+A RAM record reserves a disk-index entry and disk budget, but its
 file is written only under memory pressure or an enabled shutdown drain. The disk-record
 count includes these reservations; it does not count only committed files. An
 idle wait does not flush them. A default clean stop or crash loses these RAM-only records;
 records whose file commits completed remain recoverable.
 
-`--prefix-cache-drain-on-shutdown[=DURATION]` saves pooled DRAM-only records to
+`--prefix-cache-drain-on-shutdown[=DURATION]` saves DRAM-only records to
 local disk for a warm restart. It is off by default because larger DRAM tiers
 extend stop time. A bare flag drains until done; `=90s` limits new writes, and
 `=off` disables a configured drain. `[prefix_cache] drain_on_shutdown` accepts
@@ -553,7 +553,7 @@ the store and its transfer threads.
 Policy:
 
 - Outbound: copy each published checkpoint into the first host tier. In local
-  composite mode, write through to disk; in pool mode, move records down the
+  composite mode, spill to disk; in pool mode, move records down the
   eviction cascade only when the preceding tier needs room. Only queued copies
   pin GPU checkpoints. A capacity refusal waits for host progress before retry;
   admission uses ordinary cache eviction and existing pin and retirement fences.
@@ -941,8 +941,8 @@ same completion events the store produces.
   Manager loss releases waiting selections; started moves keep their pins until
   their drained terminal event. While a manager is unavailable or busy, local
   disk LRU makes room; with DRAM alone, durable DRAM LRU is the local end.
-  Local mode keeps write-through and LRU unlink on demand, with the same parking
-  and completed-maintenance budget accounting. Only end-of-chain eviction,
+  Local mode uses the same parked/spill path and LRU unlink at the end of its
+  chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
   infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
   GPU publication announces the GPU holding and starts its first host copy;
   GPU eviction sends the existing notice and never starts a late copy.
@@ -1087,7 +1087,7 @@ on the file format fixed in step 5.
    test repeated through each store's `store` and `fetch`, and CPU tests of
    each store's event sequencing with a transfer stub.
 
-9. **Composite store.** `selene/src/composite.rs`: write-through,
+9. **Composite store.** `selene/src/composite.rs`: pressure-driven spills,
    read-through into the memory store, durability marking, subset
    maintenance, and failure handling. Acceptance: CPU tests with transfer and
    disk stubs covering a memory hit, a disk hit that becomes resident, a

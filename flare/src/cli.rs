@@ -896,7 +896,7 @@ pub struct ServingOptions {
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_disk_limit: Option<u64>,
 
-    /// Drain pooled DRAM to local disk at shutdown, optionally for 90s or 2m; off disables [default: prefix_cache.drain_on_shutdown, else off].
+    /// Drain DRAM to local disk at shutdown, optionally for 90s or 2m; off disables [default: prefix_cache.drain_on_shutdown, else off].
     #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "on",
         value_name = "DURATION|on|off", value_parser = parse_drain_on_shutdown, help_heading = "Prefix cache options")]
     pub prefix_cache_drain_on_shutdown: Option<std::time::Duration>,
