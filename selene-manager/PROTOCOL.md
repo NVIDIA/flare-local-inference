@@ -648,9 +648,11 @@ and `SharedMemory.regions_generation` (Hello) is unchanged. Windows name a regio
 (`ARENA` or `STAGING`) and an offset, both stable across the restart. Otherwise
 (first start, `--memory` or `--staging` changed, a file truncated or replaced) it
 recreates both files, chooses a new random nonzero generation and logs that
-running instances must restart to use the pool. The lock decides ownership, so a
-live manager's files are never reclaimed and another instance's directory is never
-read. Startup refuses region files owned by another user or symbolic links, and
+running instances must restart to use the pool. Only these definite mismatches
+recreate the files; an unexpected I/O error during the check (an interrupted
+`fallocate` is retried) fails the start and deletes nothing. The lock decides
+ownership, so a live manager's files are never reclaimed and another instance's
+directory is never read. Startup refuses region files owned by another user or symbolic links, and
 removes only its unfinished `generation.tmp` and `holders.tmp` metadata writes.
 Other files are left alone. Shutdown retains the regions for reconnecting clients.
 

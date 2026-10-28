@@ -70,8 +70,11 @@ The files are fixed (`arena`, `staging`, and a `generation` and `holders` file b
 persist across restarts. A restarted manager with the same `--memory` and `--staging` reopens the
 same files at the same offsets, so instances that registered them with CUDA at startup keep
 working; a killed manager never blocks a restart, and debris from a crash is reclaimed. If a size
-changed or a file is unusable, the manager recreates them under a new generation and logs that
-running instances must restart to use the pool: until they do, they run on local tiers only. After
+changed or a file is missing, the wrong size or has no valid generation, the manager
+recreates them under a new generation and logs that running instances must restart to use the
+pool: until they do, they run on local tiers only. A file owned by another user stops the
+start, as does an unexpected I/O error while checking them
+(an interrupted call is retried) stops the manager's start with an error and deletes nothing. After
 a crash the manager keeps the regions out of service until each process that had a session has
 reconnected or exited (PROTOCOL.md 8.6). The files outlive a stopped manager and keep their
 memory: remove `/dev/shm/selene/<name>` to give it back.
