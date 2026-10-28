@@ -40,6 +40,7 @@ minute. It walks from the oldest entry, skipping interior nodes, pinned records
 and active I/O. It stops at the first fresh leaf or 64 expired leaves, removing
 page-only ancestors with their last child. LRU order uses a store-wide counter,
 independently of timestamps.
+`selene_expired_total{tier="dram"|"nvme"}` counts those removals.
 
 ## Sizing
 

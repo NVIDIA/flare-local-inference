@@ -110,7 +110,10 @@ pub enum StoreEvent {
         result: Result<u64>,
     },
     /// No copy still reads the GPU checkpoint; retry its publication after progress.
-    Deferred { checkpoint: CheckpointId },
+    Deferred {
+        checkpoint: CheckpointId,
+        reason: StoreReason,
+    },
     /// The copy-in for an inbound ticket finished; the worker reports it to the scheduler.
     Fetched { key: PrefixKey, result: Result<u64> },
     /// A manager asked this instance to export a GPU checkpoint. The worker
@@ -153,6 +156,8 @@ pub struct StoreStats {
     pub parked_records: usize,
     pub inbound_in_flight: usize,
     pub memory_records: usize,
+    pub rows_used: usize,
+    pub rows_total: usize,
     pub memory_bytes: u64,
     pub disk_records: usize,
     pub disk_bytes: u64,

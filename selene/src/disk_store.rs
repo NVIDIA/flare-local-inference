@@ -2396,6 +2396,7 @@ impl DiskStore {
         events.push(if pressure {
             StoreEvent::Deferred {
                 checkpoint: job.checkpoint,
+                reason: StoreReason::Budget,
             }
         } else {
             StoreEvent::Stored {
@@ -2978,7 +2979,7 @@ mod tests {
             &mut events,
         );
         assert!(
-            matches!(&events[..], [StoreEvent::Deferred { checkpoint }] if *checkpoint == record.id)
+            matches!(&events[..], [StoreEvent::Deferred { checkpoint, reason: StoreReason::Budget }] if *checkpoint == record.id)
         );
         assert!(store.outbound.is_empty());
         assert_eq!(store.stats().dropped, [0; 6]);

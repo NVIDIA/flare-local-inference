@@ -779,22 +779,23 @@ impl Store {
     }
 
     /// Remove leaves through the shared tree, accounting bytes and files.
-    fn evict_accounted(&mut self, id: NamespaceId, key: Key) -> bool {
+    fn evict_accounted(&mut self, id: NamespaceId, key: Key) -> u64 {
         let eligible = self
             .namespaces
             .get(&id)
             .and_then(|namespace| namespace.tree.node(&key))
             .is_some_and(|node| node.ready && node.children() == 0 && !node.pinned());
         if !eligible {
-            return false;
+            return 0;
         }
         let removed = self
             .namespaces
             .get_mut(&id)
             .and_then(|namespace| namespace.tree.remove(&key).ok());
         let Some(nodes) = removed else {
-            return false;
+            return 0;
         };
+        let count = nodes.len() as u64;
         for node in nodes {
             if node.location.memory.is_some() || node.location.disk.is_some() {
                 self.charged = self.charged.saturating_sub(node.location.bytes);
@@ -802,10 +803,9 @@ impl Store {
             if let Some(disk) = &node.location.disk {
                 disk.retire();
             }
-            self.metrics.evictions += 1;
             self.delta(id, CatalogKind::Removed, node.key);
         }
-        true
+        count
     }
 
     fn reused(&mut self, id: NamespaceId, key: Key) {
@@ -1518,7 +1518,9 @@ impl Store {
             self.delta(id, CatalogKind::Changed, key);
             return true;
         }
-        self.evict_accounted(id, key)
+        let removed = self.evict_accounted(id, key);
+        self.metrics.evictions += removed;
+        removed != 0
     }
 
     /// The physical requirement for this Put shape. A record whose
@@ -3465,10 +3467,8 @@ impl Store {
             for key in keys {
                 let node = &self.namespaces[&id].tree[&key];
                 let tier = usize::from(node.location.disk.is_some());
-                let before = self.metrics.evictions;
-                if self.evict_accounted(id, key) {
-                    self.metrics.expired[tier] += self.metrics.evictions - before;
-                }
+                let removed = self.evict_accounted(id, key);
+                self.metrics.expired[tier] += removed;
             }
         }
     }
@@ -3562,6 +3562,12 @@ impl Store {
 
     pub fn metrics_text(&self) -> String {
         let mut text = String::new();
+        for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            text.push_str(&format!(
+                "selene_expired_total{{tier=\"{tier}\"}} {}\n",
+                self.metrics.expired[i]
+            ));
+        }
         for (name, value) in [
             ("unknown_frames_total", self.metrics.dropped),
             ("cancels_total", self.metrics.cancels),
@@ -5784,14 +5790,20 @@ mod tests {
             }
         }
         let before = store.charged;
+        let evictions = store.metrics.evictions;
         store.tick();
         assert!(store.namespaces.values().all(|ns| ns.tree.len() == 6));
         assert_eq!(store.metrics.expired, [128, 0]);
+        assert_eq!(store.metrics.evictions, evictions);
+        assert!(
+            store
+                .metrics_text()
+                .contains("selene_expired_total{tier=\"dram\"} 128\n")
+        );
         assert!(store.charged < before);
         store.tick();
         assert!(store.namespaces.values().all(|ns| ns.tree.len() == 6));
         drop(store);
         fs::remove_dir_all(directory).unwrap();
     }
-
 }

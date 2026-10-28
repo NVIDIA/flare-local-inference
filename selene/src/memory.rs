@@ -792,6 +792,7 @@ impl Core {
                     Ok(false) => {
                         events.push(StoreEvent::Deferred {
                             checkpoint: checkpoint.id,
+                            reason: StoreReason::Slabs,
                         });
                         finished.push(checkpoint.key);
                         continue;
@@ -868,6 +869,8 @@ impl Core {
             outbound_in_flight: self.outbound.len() + self.deferred.len(),
             inbound_in_flight: self.inbound.len(),
             memory_records: self.index.len(),
+            rows_used: self.pool.row_count() - self.pool.free_rows(),
+            rows_total: self.pool.row_count(),
             memory_bytes: self.resident_bytes(),
             outbound_rate: self.outbound_rate.0,
             inbound_rate: self.inbound_rate.0,
@@ -2284,10 +2287,10 @@ mod tests {
             matches!(&events[0], StoreEvent::Stored { key, result: Ok(_), .. } if *key == root.key)
         );
         assert!(
-            matches!(&events[1], StoreEvent::Deferred { checkpoint } if *checkpoint == child.id)
+            matches!(&events[1], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs } if *checkpoint == child.id)
         );
         assert!(
-            matches!(&events[2], StoreEvent::Deferred { checkpoint } if *checkpoint == grandchild.id)
+            matches!(&events[2], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs } if *checkpoint == grandchild.id)
         );
         assert!(core.deferred.is_empty());
         assert!(core.outbound.is_empty());
@@ -2641,6 +2644,7 @@ mod tests {
         store.index_mut().max_age = std::time::Duration::from_secs(7200);
         let checkpoint = published(&history(64, 1), 64, None, 0, 1);
         store.store(&checkpoint).unwrap();
+        assert_eq!((store.stats().rows_used, store.stats().rows_total), (1, 2));
         store
             .index_mut()
             .node_mut(&checkpoint.key)
@@ -2648,6 +2652,7 @@ mod tests {
             .last_used = std::time::SystemTime::UNIX_EPOCH;
         store.poll(&mut Vec::new()).unwrap();
         assert_eq!(store.stats().expired, [1, 0]);
+        assert_eq!((store.stats().rows_used, store.stats().rows_total), (0, 2));
         assert_eq!(
             (store.pool().free_pages(), store.pool().free_rows()),
             (2, 2)

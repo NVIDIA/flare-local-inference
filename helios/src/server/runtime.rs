@@ -897,7 +897,7 @@ struct Worker<'a> {
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
     store: Option<Box<dyn flare_selene::HostStore>>,
-    deferred_stores: Vec<crate::cache::CheckpointId>,
+    deferred_stores: Vec<(crate::cache::CheckpointId, flare_selene::StoreReason)>,
     store_progress: u64,
     /// The checkpoint each served export pins, until its `ExportEnded`: the only
     /// place an export's pin is released.
@@ -2054,15 +2054,19 @@ impl<'a> Worker<'a> {
         let mut released = false;
         for event in events {
             match event {
-                StoreEvent::Stored { checkpoint, .. } => {
+                StoreEvent::Stored {
+                    checkpoint, result, ..
+                } => {
+                    self.metrics.host_retry_abandoned[5]
+                        .fetch_add(u64::from(result.is_err()), Ordering::Relaxed);
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
                 }
-                StoreEvent::Deferred { checkpoint } => {
+                StoreEvent::Deferred { checkpoint, reason } => {
                     self.scheduler.unpin_checkpoint(checkpoint)?;
                     released = true;
-                    if !self.deferred_stores.contains(&checkpoint) {
-                        self.deferred_stores.push(checkpoint);
+                    if !self.deferred_stores.iter().any(|(id, _)| *id == checkpoint) {
+                        self.deferred_stores.push((checkpoint, reason));
                     }
                 }
                 StoreEvent::Fetched { key, result } => {
@@ -2117,16 +2121,16 @@ impl<'a> Worker<'a> {
         let mut publications = self.scheduler.take_publications();
         let retry_ids = self.deferred_stores.clone();
         let mut waiting = Vec::new();
-        for id in self.deferred_stores.drain(..) {
+        for (id, reason) in self.deferred_stores.drain(..) {
             if let Some(publication) = self.scheduler.publication(id) {
                 if retry {
                     publications.push(publication);
                 } else {
-                    waiting.push(id);
+                    waiting.push((id, reason));
                 }
             } else {
                 self.metrics
-                    .host_retry_abandoned
+                    .host_retry_abandoned[reason as usize]
                     .fetch_add(1, Ordering::Relaxed);
             }
         }
@@ -2137,26 +2141,23 @@ impl<'a> Worker<'a> {
                 self.metrics.host_store_outcome(outcome);
                 match outcome {
                     StoreOutcome::Queued => self.scheduler.pin_checkpoint(publication.id)?,
-                    StoreOutcome::Retry(_) => {
-                        if !waiting.contains(&publication.id) {
-                            waiting.push(publication.id);
+                    StoreOutcome::Retry(reason) => {
+                        if !waiting.iter().any(|(id, _)| *id == publication.id) {
+                            waiting.push((publication.id, reason));
                         }
                         continue;
                     }
                     _ => {}
                 }
-                if retry_ids.contains(&publication.id) {
-                    let counter = if outcome == StoreOutcome::Oversize {
-                        &self.metrics.host_retry_abandoned
-                    } else {
-                        &self.metrics.host_retry_success
-                    };
-                    counter.fetch_add(1, Ordering::Relaxed);
+                if outcome == StoreOutcome::Oversize {
+                    self.metrics.host_retry_abandoned[4].fetch_add(1, Ordering::Relaxed);
+                } else if retry_ids.iter().any(|(id, _)| *id == publication.id) {
+                    self.metrics
+                        .host_retry_success
+                        .fetch_add(1, Ordering::Relaxed);
                 }
-            } else if retry_ids.contains(&publication.id) {
-                self.metrics
-                    .host_retry_abandoned
-                    .fetch_add(1, Ordering::Relaxed);
+            } else {
+                self.metrics.host_retry_abandoned[5].fetch_add(1, Ordering::Relaxed);
             }
         }
         self.deferred_stores = waiting;

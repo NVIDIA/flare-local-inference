@@ -1042,7 +1042,9 @@ fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint)
                             return;
                         }
                     }
-                    StoreEvent::Deferred { checkpoint: id } if id == checkpoint.id => retry = true,
+                    StoreEvent::Deferred { checkpoint: id, .. } if id == checkpoint.id => {
+                        retry = true
+                    }
                     _ => {}
                 }
             }
