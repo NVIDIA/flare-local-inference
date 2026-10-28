@@ -537,6 +537,15 @@ pub fn write_companion(output: &mut impl Write, payload: &Slice) -> Result<()> {
     writer.finish()
 }
 
+/// The exact bytes `write_companion` writes ahead of a `len`-byte payload.
+pub fn companion_prefix(len: u64) -> Result<Vec<u8>> {
+    let layout = [(COMPANION_TENSOR.to_owned(), 0, len, Source::Zero(len))];
+    let header = header_bytes(PAYLOAD_FORMAT, &layout)?;
+    let mut prefix = (header.len() as u64).to_le_bytes().to_vec();
+    prefix.extend_from_slice(&header);
+    Ok(prefix)
+}
+
 /// Maps a companion path to its packed tensor name.
 pub fn packed_tensor_name(relative: &str) -> Result<String> {
     validate_relative_path(relative)?;
@@ -1205,6 +1214,21 @@ mod tests {
             slice.digest().unwrap().as_bytes(),
             digest::digest(&digest::SHA256, &payload).as_ref()
         );
+    }
+
+    #[test]
+    fn companion_prefix_is_the_wrapper_ahead_of_its_payload() {
+        let scratch = Scratch::new("prefix");
+        for length in [1usize, 1234, 4096, 4097] {
+            let payload: Vec<u8> = (0..length as u32).map(|value| (value * 13) as u8).collect();
+            let (_, container) = container_with(&scratch, "payload.safetensors", &payload);
+            let slice = container.tensor(COMPANION_TENSOR).unwrap();
+            let mut wrapper = Vec::new();
+            write_companion(&mut wrapper, &slice).unwrap();
+            let prefix = companion_prefix(length as u64).unwrap();
+            assert_eq!(wrapper.len(), prefix.len() + length);
+            assert_eq!(&wrapper[..prefix.len()], prefix.as_slice());
+        }
     }
 
     #[test]
