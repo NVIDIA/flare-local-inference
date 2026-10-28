@@ -281,7 +281,11 @@ def _validate_config(config: dict) -> None:
                         f"quantized_layers.{name}: expected {recipe!r}, got {actual.get(name)!r}"
                     )
             else:
-                linear_format(actual, name)
+                storage = linear_format(actual, name)
+                if storage not in ("mxfp8", "mxfp4", "nvfp4"):
+                    raise CheckpointError(
+                        f"{name}: Qwen dense projections do not support {storage} storage"
+                    )
     except ValueError as exc:
         raise CheckpointError(str(exc)) from exc
     extra = actual.keys() - expected.keys()
