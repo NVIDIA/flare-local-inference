@@ -1510,12 +1510,12 @@ mod tests {
     #[test]
     fn directory_lock_lives_through_last_input_handle() {
         let dir = Directory::new();
-        let guard = super::super::record::DirectoryLock::acquire(&dir.0).unwrap();
+        let guard = crate::testing::directory_lock(&dir.0).unwrap();
         let store = InputStore::start(0, Some(dir.0.clone()), DiskBudget::new(4096, 0)).unwrap();
         store.retain_directory(guard.clone());
         drop(guard);
-        assert!(super::super::record::DirectoryLock::acquire(&dir.0).is_err());
+        assert!(crate::testing::directory_lock(&dir.0).is_err());
         drop(store);
-        assert!(super::super::record::DirectoryLock::acquire(&dir.0).is_ok());
+        assert!(crate::testing::directory_lock(&dir.0).is_ok());
     }
 }

@@ -1518,7 +1518,7 @@ mod tests {
         let transfers = StoppedCopier::shared(&geometry).unwrap();
         let pool = SlabPool::new(PAGE_RECORD, pages, ROW_RECORD, rows, true).unwrap();
         let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
-        let directory_lock = record::DirectoryLock::acquire(directory).unwrap();
+        let directory_lock = crate::testing::directory_lock(directory).unwrap();
         let scanned = record::scan(&directory_lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
         let layout = Layout::new(&geometry).unwrap();
         let disk_transfers = StoppedCopier::shared(&geometry).unwrap();
@@ -1868,7 +1868,7 @@ mod tests {
                 StoppedCopier::shared(&geometry).unwrap()
             };
             DiskStore::new(
-                record::DirectoryLock::acquire(&directory).unwrap(),
+                crate::testing::directory_lock(&directory).unwrap(),
                 identity,
                 FINGERPRINT,
                 1 << 30,

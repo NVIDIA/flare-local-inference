@@ -219,7 +219,7 @@ fn zero_disk_limit_does_not_lock_or_scan_existing_records() {
     let fingerprint = geometry::fingerprint(&geometry);
     let directory = base.join(record::directory_name(&[0; 32], &fingerprint));
     std::fs::create_dir_all(&directory).unwrap();
-    let lock = record::DirectoryLock::acquire(&directory).unwrap();
+    let lock = crate::testing::directory_lock(&directory).unwrap();
     let active_write = directory.join("active-record.tmp");
     std::fs::write(&active_write, b"active writer payload").unwrap();
     let prepared = prepare(

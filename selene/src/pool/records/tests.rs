@@ -50,7 +50,7 @@ fn rank_records_read_slices_rows_and_chain_spills_with_persisted_sums() {
     let geometry = vec![geometry(64, &[("kv", 4096)], 4096)];
     let root = write(&directory, &geometry, 128, None, &[11, 22]);
     let tail = write(&directory, &geometry, 256, Some(root.key), &[33, 44]);
-    let lock = record::DirectoryLock::acquire(&directory).unwrap();
+    let lock = crate::testing::directory_lock(&directory).unwrap();
     let mut records = DeferredRecords(Arc::new(Mutex::new(Some(Records {
         directory: directory.clone(),
         identity: [1; 32],
