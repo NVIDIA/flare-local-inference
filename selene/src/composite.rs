@@ -486,9 +486,10 @@ impl CompositeStore {
     ) -> Result<JobId> {
         let (pages, row) = self.slab_addresses(&key)?;
         let row = row.ok_or_else(|| invalid("the memory copy of the record has no row slab"))?;
+        let sums = self.memory.announced_sums(&key).map(|s| (*s).clone());
         let id = self.disk.next_job();
         self.staged()?
-            .write_from(id, header, temporary, path, pages, Some(row))?;
+            .write_from(id, header, temporary, path, pages, Some(row), sums)?;
         self.jobs.insert(id, DiskJob::Write(key));
         Ok(id)
     }
@@ -2882,6 +2883,54 @@ mod tests {
         store.poll(&mut events).unwrap();
         assert!(store.memory.index().nodes().all(|n| !n.pinned()));
         assert!(store.disk.index().nodes().all(|n| !n.pinned()));
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn spilling_an_announced_record_reuses_its_checksums() {
+        use crate::pool::{Announcer, HostWindow, Tier as PoolTier};
+        let Some(directory) = test_directory("composite", "spill-sums") else {
+            return;
+        };
+        let mut store = composite(&directory, 48, 4, 1 << 30);
+        let full = history(2000);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 700, None, pages(0..10), 10, StateSlotId(1));
+        let announcer = Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer.clone());
+        let (_, bytes) = copy_landed(&mut store, &root, None, 1);
+        let mut events = Vec::new();
+        store.memory_stored(root.id, root.key, Ok(bytes), &mut events);
+        poll_until(&mut store, &mut events, |store| {
+            let _ = announcer.take_batch(100);
+            store.memory.announced_sums(&root.key).is_some()
+        });
+        let sums = store.memory.announced_sums(&root.key).unwrap();
+        store.spill(root.key);
+        poll_until(&mut store, &mut events, |store| store.outbound.is_empty());
+        let node = store.disk.index().node(&root.key).unwrap();
+        assert!(node.ready);
+        // The file's persisted checksums equal the announced ones and match the bytes.
+        let mut pin = store.pin_export(PoolTier::Nvme, root.key, 0, true).unwrap();
+        let mut dst = vec![0u8; (10 * PAGE_RECORD + ROW_RECORD) as usize];
+        let window = HostWindow {
+            record: 0,
+            first_page: 0,
+            page_count: 10,
+            row: true,
+        };
+        let read = pin.read(&window, &mut dst).unwrap();
+        assert_eq!((read.pages.clone(), read.row), (sums.pages.clone(), sums.row));
+        // The served sums are the persisted ones, so hash the bytes themselves.
+        let page = PAGE_RECORD as usize;
+        for (i, sum) in read.pages.iter().enumerate() {
+            assert_eq!(*sum, crate::record::checksum(&dst[i * page..(i + 1) * page]));
+        }
+        assert_eq!(read.row, Some(crate::record::checksum(&dst[10 * page..])));
+        drop(pin);
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(&directory).unwrap();

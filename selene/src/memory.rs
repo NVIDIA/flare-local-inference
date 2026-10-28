@@ -1086,6 +1086,13 @@ impl MemoryStore {
         }
     }
 
+    /// The checksums committed with a ready, announced record. A removed
+    /// record's sums are dropped by the next flush, which every poll runs
+    /// before it can spill, so a spill never sees another record's sums.
+    pub fn announced_sums(&self, key: &PrefixKey) -> Option<Arc<RecordSums>> {
+        self.announce.as_ref()?.sums.get(key).cloned()
+    }
+
     /// The slabs of a ready record.
     pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
