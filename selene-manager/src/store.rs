@@ -819,13 +819,14 @@ impl Store {
 
     pub fn snapshot(&self, id: NamespaceId) -> Option<Vec<EntryData>> {
         let namespace = self.namespaces.get(&id)?;
-        let mut keys: Vec<Key> = namespace.tree.nodes().map(|node| node.key).collect();
-        keys.sort_unstable();
-        let entries = keys
-            .into_iter()
-            .map(|key| Self::entry(namespace, key))
-            .collect();
-        Some(entries)
+        // The only consumer upserts into a hash index, so the order is unspecified.
+        Some(
+            namespace
+                .tree
+                .nodes()
+                .map(|node| Self::entry(namespace, node.key))
+                .collect(),
+        )
     }
 
     fn entry(namespace: &Namespace, key: Key) -> EntryData {
