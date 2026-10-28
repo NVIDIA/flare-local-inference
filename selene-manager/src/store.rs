@@ -3359,8 +3359,9 @@ impl Store {
             }
             let namespace = &self.namespaces[&id];
             let mut keys: Vec<Key> = namespace
-                .tree
-                .nodes()
+                .undurable
+                .iter()
+                .filter_map(|key| namespace.tree.node(key))
                 .filter(|node| {
                     !node.location.durable
                         && !node.location.writing
@@ -4730,6 +4731,8 @@ mod tests {
                 },
             )
             .unwrap();
+        // A publish refreshes durability right after it inserts, which is how scheduling finds it.
+        store.refresh_durability(id, Some(key));
         store.pump();
         let job = store.namespaces[&id]
             .tree
