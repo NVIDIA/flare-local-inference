@@ -179,16 +179,21 @@ async fn serve(
         let row_hash = shape
             .row
             .then(|| pool::xxh3(&bytes[shape.page_count as usize * PAGE_BYTES as usize..]));
-        ToManager::Filled {
-            index: shape.index,
-            row_xxh3: row_hash,
-            page_xxh3: hashes,
+        let sent = async {
+            ToManager::Filled {
+                index: shape.index,
+                row_xxh3: row_hash,
+                page_xxh3: hashes,
+            }
+            .write(&mut conn)
+            .await?;
+            conn.write_all(&bytes).await?;
+            conn.flush().await
+        };
+        if sent.await.is_err() {
+            // The manager closed the source leg mid-window.
+            break;
         }
-        .write(&mut conn)
-        .await
-        .unwrap();
-        conn.write_all(&bytes).await.unwrap();
-        conn.flush().await.unwrap();
         pages += u64::from(shape.page_count);
         row |= shape.row;
         served += 1;
