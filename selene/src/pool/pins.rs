@@ -1,7 +1,11 @@
 //! Exports of host-tier holdings: pinned record chains that fill windows from
 //! slabs in memory or from record files.
 
-use std::{fs::File, path::PathBuf, sync::Arc};
+use std::{
+    fs::File,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use flare_eos::FileReadAt;
 
@@ -171,10 +175,10 @@ impl FileSpan {
 
 /// A span's file as the export reads it.
 struct OpenSpan {
-    /// Page-cache reads, for the checksums, the row and whatever cannot be read directly.
+    /// Page-cache reads, for the checksums and whatever cannot be read directly.
     file: File,
-    /// The pages read ahead from the file past the page cache, if the filesystem allows it
-    /// and the record's layout is aligned for it.
+    /// The pages' read-ahead, then the row's, from the file past the page cache, if the
+    /// filesystem allows it and the range is aligned for it.
     ahead: Option<ReadAhead>,
 }
 
@@ -186,7 +190,7 @@ struct OpenSpan {
 /// device's rate: readahead is a few requests deep, and each window waits for the device
 /// before the next is asked for. The pages of a record are therefore read ahead directly
 /// from the device, the same way the disk tier restores them, with several blocks in flight
-/// while earlier windows are copied out.
+/// while earlier windows are copied out. The row, last in the record, is read the same way.
 pub struct FilePin {
     pub(crate) chain: HostChain,
     pub(crate) spans: Vec<FileSpan>,
@@ -230,43 +234,29 @@ impl HostPin for FilePin {
             // record of several blocks; a window that does not follow the last, a record
             // too small to gain from it and a filesystem that refuses direct I/O are read
             // through the cache.
-            let ahead_ok = page_bytes.is_multiple_of(BLOCK_BYTES)
-                && pages_at.is_multiple_of(BLOCK_BYTES)
-                && end - pages_at >= MIN_AHEAD_BYTES;
-            if open.ahead.is_none() && ahead_ok {
-                open.ahead = flare_eos::direct_file(&span.path, false)
-                    .ok()
-                    .and_then(|direct| ReadAhead::start(direct, pages_at, end).ok());
-            }
-            match open.ahead.as_mut().filter(|ahead| ahead.at(pages_at)) {
-                Some(ahead) => ahead.read(&mut dst[..pages_bytes]).map_err(|e| {
-                    io("cannot read pages of", std::io::Error::other(e.to_string()))
-                })?,
-                None => {
-                    open.ahead = None;
-                    open.file
-                        .read_exact_at(&mut dst[..pages_bytes], pages_at)
-                        .map_err(|e| io("cannot read pages of", e))?;
-                }
-            }
+            read_range(&span.path, open, &mut dst[..pages_bytes], pages_at, end)
+                .map_err(|e| io("cannot read pages of", e))?;
         }
-        let file = &open.file;
         let mut stored = vec![0u8; count * 8];
-        file.read_exact_at(&mut stored, header.checksum_segment() + first * 8)
+        open.file
+            .read_exact_at(&mut stored, header.checksum_segment() + first * 8)
             .map_err(|e| io("cannot read checksums of", e))?;
         let pages = stored
             .chunks_exact(8)
             .map(|c| u64::from_le_bytes(c.try_into().expect("eight bytes")))
             .collect();
         let row = if window.row {
-            file.read_exact_at(
-                &mut dst[pages_bytes..pages_bytes + self.row_bytes as usize],
-                header.row_segment,
-            )
-            .map_err(|e| io("cannot read the row of", e))?;
+            // The row, often 100 MiB or more, is read ahead like the pages: drop the pages'
+            // read-ahead, which ends at their last page, so the row gets its own.
+            let at = header.row_segment;
+            open.ahead = None;
+            let dst = &mut dst[pages_bytes..pages_bytes + self.row_bytes as usize];
+            read_range(&span.path, open, dst, at, at + self.row_bytes)
+                .map_err(|e| io("cannot read the row of", e))?;
             // The persisted row checksum is in the file's own header.
             let mut block = vec![0u8; crate::record::HEADER_BYTES];
-            file.read_exact_at(&mut block, 0)
+            open.file
+                .read_exact_at(&mut block, 0)
                 .map_err(|e| io("cannot read the header of", e))?;
             Some(Header::decode(&block)?.row_checksum)
         } else {
@@ -279,6 +269,34 @@ impl HostPin for FilePin {
             self.spans[window.record as usize].open = None;
         }
         Ok(Checksums { pages, row })
+    }
+}
+
+/// Reads `dst` from `at` in the open file, ahead of the consumer past the page cache when the
+/// range `at..end` is block aligned and long enough, and through the cache otherwise.
+fn read_range(
+    path: &Path,
+    open: &mut OpenSpan,
+    dst: &mut [u8],
+    at: u64,
+    end: u64,
+) -> std::io::Result<()> {
+    let direct = at.is_multiple_of(BLOCK_BYTES)
+        && end.is_multiple_of(BLOCK_BYTES)
+        && end - at >= MIN_AHEAD_BYTES;
+    if open.ahead.is_none() && direct {
+        open.ahead = flare_eos::direct_file(path, false)
+            .ok()
+            .and_then(|direct| ReadAhead::start(direct, at, end).ok());
+    }
+    match open.ahead.as_mut().filter(|ahead| ahead.at(at)) {
+        Some(ahead) => ahead
+            .read(dst)
+            .map_err(|e| std::io::Error::other(e.to_string())),
+        None => {
+            open.ahead = None;
+            open.file.read_exact_at(dst, at)
+        }
     }
 }
 
@@ -402,6 +420,30 @@ mod tests {
         assert_eq!(releases.drain(), [key(48, 1)]);
     }
 
+    /// Writes a record file: the header, `pages` pages of `pattern` with their checksums, the row.
+    fn write_record(
+        directory: &Path,
+        header: &Header,
+        page: usize,
+        pages: u32,
+        pattern: &dyn Fn(u32) -> Vec<u8>,
+        row: &[u8],
+    ) -> PathBuf {
+        let mut file = vec![0u8; header.length_with_row() as usize];
+        file[..crate::record::HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+        for p in 0..pages {
+            let at = header.page_segment as usize + p as usize * page;
+            file[at..at + page].copy_from_slice(&pattern(p));
+            let sum = header.checksum_segment() as usize + p as usize * 8;
+            file[sum..sum + 8].copy_from_slice(&crate::record::checksum(&pattern(p)).to_le_bytes());
+        }
+        let at = header.row_segment as usize;
+        file[at..at + row.len()].copy_from_slice(row);
+        let path = directory.join("record");
+        std::fs::write(&path, &file).unwrap();
+        path
+    }
+
     #[test]
     fn a_file_pin_serves_windows_in_order_and_out_of_order_with_the_persisted_checksums() {
         use crate::testing::geometry;
@@ -429,18 +471,7 @@ mod tests {
             |p: u32| -> Vec<u8> { (0..page).map(|i| (i as u32 * 3 + p * 11) as u8).collect() };
         let stored_row = vec![5u8; 4096];
         header.row_checksum = crate::record::checksum(&stored_row);
-        let mut file = vec![0u8; header.length_with_row() as usize];
-        file[..crate::record::HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
-        for p in 0..pages {
-            let at = header.page_segment as usize + p as usize * page;
-            file[at..at + page].copy_from_slice(&pattern(p));
-            let sum = header.checksum_segment() as usize + p as usize * 8;
-            file[sum..sum + 8].copy_from_slice(&crate::record::checksum(&pattern(p)).to_le_bytes());
-        }
-        let at = header.row_segment as usize;
-        file[at..at + 4096].copy_from_slice(&stored_row);
-        let path = directory.join("record");
-        std::fs::write(&path, &file).unwrap();
+        let path = write_record(&directory, &header, page, pages, &pattern, &stored_row);
         // The export starts at page 4 and takes the row.
         let nodes = [(header.key, pages as usize)];
         let mut pin = FilePin {
@@ -484,6 +515,65 @@ mod tests {
         check(19, 5, false);
         check(14, 5, false);
         check(24, 16, true);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_row_of_several_blocks_read_ahead_directly_follows_pages_read_ahead_in_the_same_window() {
+        let base = std::env::var_os("FLARE_OFFLOAD_TEST_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(std::env::temp_dir);
+        let directory = base.join(format!("flare-file-pin-row-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&directory);
+        std::fs::create_dir_all(&directory).unwrap();
+        // 1024 pages of 8 KiB are MIN_AHEAD_BYTES: they are read ahead, then the row is.
+        let (page, pages) = (8192usize, 1024u32);
+        let row_bytes = 3 * MIN_AHEAD_BYTES as usize;
+        let geometry = [crate::testing::geometry(
+            16,
+            &[("k", 4096), ("v", 4096)],
+            row_bytes as u64,
+        )];
+        let mut header = Header::new(
+            &geometry,
+            [1; 32],
+            [2; 16],
+            key(16 * u64::from(pages), 9),
+            None,
+            [3; 16],
+            pages,
+            std::time::SystemTime::now(),
+        )
+        .unwrap();
+        let pattern =
+            |p: u32| -> Vec<u8> { (0..page).map(|i| (i as u32 * 3 + p * 11) as u8).collect() };
+        let stored_row: Vec<u8> = (0..row_bytes).map(|i| (i * 7 + i / 4093) as u8).collect();
+        header.row_checksum = crate::record::checksum(&stored_row);
+        let path = write_record(&directory, &header, page, pages, &pattern, &stored_row);
+        let nodes = [(header.key, pages as usize)];
+        let mut pin = FilePin {
+            chain: host_chain(16, 0, true, &nodes),
+            spans: vec![FileSpan::new(path, header.clone())],
+            page_bytes: page as u64,
+            row_bytes: row_bytes as u64,
+            keys: vec![header.key],
+            releases: Releases::default(),
+        };
+        let mut dst = vec![0u8; pages as usize * page + row_bytes];
+        let window = HostWindow {
+            record: 0,
+            first_page: 0,
+            page_count: pages,
+            row: true,
+        };
+        let sums = pin.read(&window, &mut dst).unwrap();
+        for p in 0..pages {
+            let at = p as usize * page;
+            assert!(dst[at..at + page] == pattern(p)[..], "page {p}");
+            assert_eq!(sums.pages[p as usize], crate::record::checksum(&pattern(p)));
+        }
+        assert!(dst[pages as usize * page..] == stored_row[..]);
+        assert_eq!(sums.row, Some(crate::record::checksum(&stored_row)));
         std::fs::remove_dir_all(&directory).unwrap();
     }
 
