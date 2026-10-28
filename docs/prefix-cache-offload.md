@@ -994,14 +994,20 @@ failed transfers and row-only restores do not update the rates.
 
 A pooled instance can span hosts. Rank zero owns the pool session and decisions;
 each peer runs an agent that moves only its own rank's bytes. The pool identity
-covers every rank's GPU UUID, and its layout matches single-process TP of the
-same width. Every rank approves and registers its pool memory before cache
-sizing; a refusal on any rank disables the pool for the whole instance.
+covers every rank's GPU UUID, and its layout is built the same way as
+single-process TP of the same width (not yet tested across the two). Every
+rank approves and registers its pool memory before cache sizing; a refusal on
+any rank disables the pool for the whole instance.
 Multi-host local retention remains disk-only: peer agents read their shards
 under rank zero's holds, while the existing record links mirror writes and
 restores. The pool link shares the record listener's launch token and address
 checks; deployments must secure the cluster fabric, since these links carry
 session secrets and transfer tokens in plaintext.
+Records reach the manager's store only when they cascade off the end of a
+local chain under pressure, and an instance's own records leave the manager's
+index when its session ends. Restarting with wiped local disks therefore
+restores nothing unless records had already cascaded to the manager. This holds
+on a single host too.
 
 ## 3. Implementation sequence
 

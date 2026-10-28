@@ -127,6 +127,34 @@ impl Membership {
     }
 }
 
+impl flare_helios::runtime_package::CacheAgreement for Membership {
+    fn caches(&mut self, local: (u64, u64)) -> flare_helios::Result<(u64, u64)> {
+        self.agree(local)
+    }
+
+    fn pool(
+        &mut self,
+        offer: flare_helios::offload::shard::PoolOffer,
+    ) -> flare_helios::Result<Option<flare_helios::offload::shard::PoolPeers>> {
+        use flare_helios::offload::shard;
+        match self {
+            Membership::Zero(peers) => Ok(shard::pool_rank_zero(offer, peers)?),
+            Membership::Peer(stream) => Ok(shard::pool_peer(offer, stream)?),
+        }
+    }
+
+    fn pool_approved(&mut self, approved: bool, world: usize) -> flare_helios::Result<bool> {
+        use flare_helios::execution::rendezvous;
+        let records = match self {
+            Membership::Zero(peers) => rendezvous::share_records(peers, vec![approved as u8])?,
+            Membership::Peer(stream) => {
+                rendezvous::exchange_record(stream, &[approved as u8], world)?
+            }
+        };
+        Ok(records.iter().all(|record| record.as_slice() == [1]))
+    }
+}
+
 /// Rank zero: exchange transport records with every admitted peer and wait until every rank's
 /// transport is connected.
 pub fn rank_zero(
@@ -219,5 +247,40 @@ pub fn peer(
     {
         let _ = (owner, cluster, stream, progress, shape);
         Err("this flare build has no RoCE transport for multi-host packages".into())
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+    use flare_helios::runtime_package::CacheAgreement;
+    use std::net::{TcpListener, TcpStream};
+
+    #[test]
+    fn pool_approval_is_unanimous_and_waits_for_every_rank() {
+        for peer_approved in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let peer = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let zero = listener.accept().unwrap().0;
+            let (ready, started) = std::sync::mpsc::channel();
+            let zero = std::thread::spawn(move || {
+                let approved = Membership::Zero(vec![RankStream::Tcp(zero)])
+                    .pool_approved(true, 2)
+                    .unwrap();
+                ready.send(approved).unwrap();
+                approved
+            });
+            assert!(
+                started
+                    .recv_timeout(std::time::Duration::from_millis(50))
+                    .is_err()
+            );
+            let approved = Membership::Peer(RankStream::Tcp(peer))
+                .pool_approved(peer_approved, 2)
+                .unwrap();
+            assert_eq!(approved, peer_approved);
+            assert_eq!(started.recv().unwrap(), peer_approved);
+            assert_eq!(zero.join().unwrap(), peer_approved);
+        }
     }
 }

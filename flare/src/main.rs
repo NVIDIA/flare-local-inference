@@ -231,16 +231,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rendezvous = args.rendezvous;
     // SAFETY: The trusted package owners remain live until every rank drains.
     let owner = unsafe {
-        NativeModel::load_agreeing(
-            authorized,
-            &local_devices,
-            &options,
-            &progress,
-            &mut |local| match membership.as_mut() {
-                Some(membership) => membership.agree(local),
-                None => Ok(local),
-            },
-        )?
+        let mut local = Ok;
+        let agreement: &mut dyn flare_helios::runtime_package::CacheAgreement =
+            match membership.as_mut() {
+                Some(membership) => membership,
+                None => &mut local,
+            };
+        NativeModel::load_agreeing(authorized, &local_devices, &options, &progress, agreement)?
     };
     let cluster = match (owner.cluster().cloned(), membership, rendezvous) {
         (Some(cluster), Some(membership), Some(address)) => Some((cluster, membership, address)),
