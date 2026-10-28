@@ -3703,6 +3703,9 @@ pub enum GetAnswer {
 }
 
 pub enum StoreCommand {
+    Metrics {
+        reply: std::sync::mpsc::Sender<String>,
+    },
     Hello {
         connection: u64,
         pid: u32,
@@ -3981,6 +3984,9 @@ impl Store {
                 self.cancel(connection, transfer);
             }
             StoreCommand::ConnectionClosed { connection } => self.connection_closed(connection),
+            StoreCommand::Metrics { reply } => {
+                let _ = reply.send(self.metrics_text());
+            }
             StoreCommand::Tick => {}
             StoreCommand::Shutdown => {}
         }

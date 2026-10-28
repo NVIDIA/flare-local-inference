@@ -228,7 +228,8 @@ the total; a nonzero value that does not fall means an instance is hung, not a l
 ## Metrics
 
 `GET /metrics` on `--metrics HOST:PORT` returns Prometheus text (`selene_` prefix, content type
-`text/plain; version=0.0.4`); only that path is served.
+`text/plain; version=0.0.4`); only that path is served. Store series are built when scraped, on the store thread; if it
+does not answer within 1 s the previous store text is served.
 
 | Series | Meaning | Alert on |
 |---|---|---|
