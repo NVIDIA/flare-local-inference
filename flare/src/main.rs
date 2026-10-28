@@ -46,6 +46,9 @@ extern "C" fn stop(_: libc::c_int) {
     STOP.store(true, Ordering::Relaxed);
 }
 
+#[cfg(all(feature = "roce", not(target_os = "linux")))]
+compile_error!("the roce feature requires Linux");
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = cli::Cli::command().get_matches();
     let mut parsed = cli::Cli::from_arg_matches(&matches).unwrap_or_else(|error| error.exit());
@@ -170,6 +173,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .map_err(|error| error.to_string())?;
         configure_package_devices(&mut args, &authorized, &mut progress)?;
         _lease = lease;
+        if flare_helios::runtime_package::package_cluster(&authorized).is_some() && !args.stage_only
+        {
+            cluster::require_transport()?;
+        }
         if !args.hosts.is_empty() {
             launched = Some(
                 launch::Peers::start(&mut args, &authorized, &publisher, &root)
@@ -224,6 +231,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             peers.finish().map_err(|e| e.to_string())?;
         }
         return Ok(());
+    }
+    if membership.is_some() {
+        cluster::require_transport()?;
     }
     let options = args.load_options();
     let local_devices: Vec<i32> = (0..args.gpus.len() as i32).collect();

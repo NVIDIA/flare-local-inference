@@ -84,3 +84,4 @@ jobs:
         run: |
           cargo check --locked --manifest-path selene/Cargo.toml --tests --features rdma
           cargo check --locked --manifest-path selene-manager/Cargo.toml --tests --features rdma
+          cargo check --locked --manifest-path flare/Cargo.toml --tests --features roce,rdma

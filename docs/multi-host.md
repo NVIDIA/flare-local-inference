@@ -44,6 +44,15 @@ needs only Flare, the driver, and the package.
 - Free GPU memory and disk space on each selected node. Spark shares host and
   GPU memory; see [DGX Spark preparation](model-preparation.md#dgx-spark).
 
+Linux aarch64 builds include RoCE transport by default. To enable it on Linux
+x86_64, install the libibverbs development package and build with
+`cargo build --release --locked --manifest-path flare/Cargo.toml --features roce`.
+The resulting executable requires libibverbs at runtime. Default x86_64 builds
+do not link it and reject multi-host serving before loading GPU resources.
+Staging (`--stage-only`) does not need RoCE. x86_64 RoCE serving has been
+tested functionally only (Soft-RoCE).
+The separate `rdma` feature enables the prefix pool's data channel.
+
 ### Prefix cache pool
 
 A multi-host instance can use a Selene prefix cache pool (see
