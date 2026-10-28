@@ -479,31 +479,46 @@ def _lower_storage(module):
             accesses[node] = set().union(*(accesses[arg] for arg in node.all_input_nodes))
     positions = {node: index for index, node in enumerate(originals)}
     last_write = {keys[arg]: positions[node] for node in originals for arg in mutations.get(node, ())}
+
+    # Complete writes to a disjoint region can fuse into their destination.
+    def complete_write(arg):
+        value = arg.meta['val']
+        if not value.is_contiguous():
+            return False
+        if key_for(arg) not in bases:
+            return True
+        begin, end = regions[key_for(arg)]
+        return (int(value.storage_offset()) * value.element_size() == begin
+                and value.numel() * value.element_size() == end - begin)
+
+    def tensor_operands(node):
+        leaves, _ = tree_flatten((node.args, node.kwargs))
+        return [arg for arg in leaves if isinstance(arg, torch.fx.Node)
+                and isinstance(arg.meta.get('val'), torch.Tensor)]
+
+    # Inductor can recompute the source when writing inputs back after the graph, but it then
+    # substitutes that source for the destination in every later opaque call, whose region-relative
+    # operands require the region's own base. Such copies execute in order instead.
+    deferred, opaque = set(), set()
+    for node in reversed(originals):
+        mutated = mutations.get(node)
+        if not mutated:
+            continue
+        if (node.target is torch.ops.aten.copy_.default
+                and not any(last_write.get(key, -1) > positions[node] for key in accesses[node.args[1]])
+                and all(complete_write(arg) and key_for(arg) not in opaque for arg in mutated)):
+            deferred.add(node)
+        else:
+            opaque.update(key_for(arg) for arg in tensor_operands(node) if key_for(arg) in bases)
     calls, mutation_calls = [], {}
     for node in originals:
         if node.op != 'call_function':
             continue
         target = node.target
         mutated = mutations[node]
-        if not mutated:
+        if not mutated or node in deferred:
             continue
-        # Complete writes to a disjoint region can fuse into their destination.
-        def complete_write(arg):
-            value = arg.meta['val']
-            if not value.is_contiguous():
-                return False
-            if key_for(arg) not in bases:
-                return True
-            begin, end = regions[key_for(arg)]
-            return (int(value.storage_offset()) * value.element_size() == begin
-                    and value.numel() * value.element_size() == end - begin)
-
         mutable_keys = {key_for(arg) for arg in mutated}
-        # Inductor can recompute the source when writing inputs back after the graph.
-        if (target is torch.ops.aten.copy_.default
-                and not any(last_write.get(key, -1) > positions[node] for key in accesses[node.args[1]])
-                and all(complete_write(arg) for arg in mutated)):
-            continue
         reads, writes, read_indices, write_indices = [], [], {}, {}
         leaves, tree = tree_flatten((node.args, node.kwargs))
         operands, integers, integer_positions = [], [], []

@@ -1779,7 +1779,7 @@ fn write_record(output: &mut impl Write, message: &impl Message) -> ExportResult
 /// initializers without re-reading tensor metadata.
 
 
-/// Platform identifier (gb10/gb202) for the current CUDA device.
+/// Platform identifier for the current CUDA device.
 ///
 /// CUDA exposes the device's PCI bus location, not its NVIDIA product id, so the
 /// NVML PCI information for the same bus address supplies the product id. The

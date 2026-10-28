@@ -311,7 +311,7 @@ pub(crate) struct RankOutput {
     /// Stable semantic weight groups resolved against retained byte sources.
     #[serde(default)]
     pub weight_payload: Option<WeightPayloadSources>,
-    /// Platform identifier detected from the capture device (gb10, gb202).
+    /// Platform identifier detected from the capture device.
     #[serde(default)]
     pub hardware: Option<String>,
     /// Live object leases; serialized rank sources carry none.

@@ -132,7 +132,7 @@ pub struct CacheGc {
 
 #[derive(Debug, Args, Default, Clone, serde::Serialize, serde::Deserialize)]
 pub struct HubOptions {
-    /// Hub revision; uses the model origin when cached, otherwise detects gb10 or gb202.
+    /// Hub revision; uses the model origin when cached, otherwise detects gb10, gb202, or gb300.
     #[arg(long, value_name = "REVISION", help_heading = "Download options")]
     pub revision: Option<String>,
 

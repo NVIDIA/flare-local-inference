@@ -76,6 +76,7 @@ class _ForwardPickler(pickle.Pickler):
         from triton.runtime import JITFunction
         from triton.compiler import CompiledKernel
         from cutlass.base_dsl.jit_executor import JitCompiledFunction
+        from cutlass.cute.runtime import _Tensor as CuTeRuntimeTensor
         from b12x._lib.compile_plan import CompiledCuTeProgram, DeferredCuTeKernel, DeferredTritonKernel
         from b12x.preparation import PreparationSession
         from b12x.preparation.device import DetectedDevice
@@ -121,11 +122,12 @@ class _ForwardPickler(pickle.Pickler):
         if isinstance(value, (torch.cuda.Stream, torch.cuda.Event, torch.cuda.CUDAGraph, torch.cuda.MemPool,
                               torch.distributed.ProcessGroup, socket.socket, ctypes.CDLL, ctypes._Pointer,
                               ctypes._CFuncPtr, ctypes.Structure, ctypes.Array, ctypes._SimpleCData,
-                              CompiledKernel, JitCompiledFunction, CompiledCuTeProgram, local,
+                              CompiledKernel, JitCompiledFunction, CompiledCuTeProgram, CuTeRuntimeTensor, local,
                               DeferredCuTeKernel, DeferredTritonKernel, PreparationSession, PackageStorage,
                               PeerStorage, *_LOCK_TYPES)):
             # Preparation sessions, allocators and peer storage retain process-local contexts, not forward
-            # metadata; collective runtimes keep peer storage for teardown.
+            # metadata; collective runtimes keep peer storage for teardown. CuTe runtime tensors describe
+            # device pointers, and their __class__ is not their type, so default pickling rejects them.
             return _Unavailable, (f'{type(value).__module__}.{type(value).__qualname__}',)
         if not isinstance(value, type) and (hasattr(type(value), '__del__')
                 or type(value).__module__.startswith('cutlass._mlir.')):

@@ -715,7 +715,7 @@ pub(crate) fn publish_payload(
             .iter()
             .find_map(|rank| rank.hardware.clone())
             .ok_or_else(|| {
-                invalid("export naming requires the capture device identity (gb10 or gb202)")
+                invalid("export naming requires the capture device identity")
             })?;
         let deployment_id = cluster
             .as_ref()
