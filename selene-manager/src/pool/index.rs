@@ -7,7 +7,7 @@
 
 use crate::Key;
 use flare_selene::shared::Tier;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap};
 
 pub type InstanceId = [u8; 16];
 pub type Bucket = [u8; 16];
@@ -37,7 +37,7 @@ pub type EntryRef = (SourceId, Key, Tier);
 #[derive(Default)]
 pub struct ScopeIndex {
     sources: HashMap<SourceId, HashMap<(Key, Tier), Entry>>,
-    buckets: HashMap<Bucket, HashSet<EntryRef>>,
+    buckets: HashMap<Bucket, BTreeSet<EntryRef>>,
     entries: usize,
 }
 
@@ -114,14 +114,8 @@ impl ScopeIndex {
     }
 
     /// The entries whose bucket is `bucket`, in a stable order.
-    pub fn in_bucket(&self, bucket: &Bucket) -> Vec<EntryRef> {
-        let mut refs: Vec<EntryRef> = self
-            .buckets
-            .get(bucket)
-            .map(|set| set.iter().copied().collect())
-            .unwrap_or_default();
-        refs.sort_unstable();
-        refs
+    pub fn in_bucket(&self, bucket: &Bucket) -> impl Iterator<Item = EntryRef> + '_ {
+        self.buckets.get(bucket).into_iter().flatten().copied()
     }
 
     fn drop_bucket(&mut self, source: SourceId, entry: &Entry) {
@@ -252,7 +246,7 @@ mod tests {
         assert_eq!(index.get(SOURCE, entry.key, Tier::Dram).unwrap().bytes, 77);
         assert!(index.remove(SOURCE, entry.key, Tier::Dram));
         assert!(!index.remove(SOURCE, entry.key, Tier::Dram));
-        assert!(index.in_bucket(&[9; 16]).is_empty());
+        assert!(index.in_bucket(&[9; 16]).next().is_none());
     }
 
     #[test]
@@ -274,7 +268,7 @@ mod tests {
         index.upsert(SOURCE, entry(256, 2, Some((128, 1)), 2, Tier::Dram));
         index.replace(SOURCE, [entry(64, 7, None, 1, Tier::Dram)]);
         assert_eq!(index.len(), 1);
-        assert_eq!(index.in_bucket(&[9; 16]).len(), 1);
+        assert_eq!(index.in_bucket(&[9; 16]).count(), 1);
         assert_eq!(index.clear(SOURCE), 1);
         assert_eq!(index.len(), 0);
         assert!(index.sources.is_empty());
