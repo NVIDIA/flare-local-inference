@@ -9,7 +9,8 @@ use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::Typ
 use flare_helios::{
     engram::Storage,
     offload::{
-        PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_pool_address, parse_size,
+        PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_max_age,
+        parse_pool_address, parse_size,
     },
     runtime_package::{KvCacheLimit, LoadOptions, MemoryLimit},
 };
@@ -901,6 +902,10 @@ pub struct ServingOptions {
         value_name = "DURATION|on|off", value_parser = parse_drain_on_shutdown, help_heading = "Prefix cache options")]
     pub prefix_cache_drain_on_shutdown: Option<std::time::Duration>,
 
+    /// Expire host records since last use; off disables [default: prefix_cache.max_age, else off].
+    #[arg(long, value_name = "DURATION|off", value_parser = parse_max_age, help_heading = "Prefix cache options")]
+    pub prefix_cache_max_age: Option<std::time::Duration>,
+
     /// Share prefix checkpoints at `unix:PATH`, plain TCP `HOST:PORT`, or TLS `tls:HOST:PORT` [default: not shared].
     #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
         help_heading = "Prefix cache options")]
@@ -1062,6 +1067,14 @@ impl ServingOptions {
             };
             options.push(format!("--prefix-cache-drain-on-shutdown={value}"));
         }
+        if let Some(age) = self.prefix_cache_max_age {
+            let value = if age.is_zero() {
+                "off".into()
+            } else {
+                age.as_secs_f64().to_string()
+            };
+            options.push(format!("--prefix-cache-max-age={value}"));
+        }
         if let Some(address) = &self.prefix_cache_pool {
             options.extend(["--prefix-cache-pool".into(), address.clone()]);
         }
@@ -1113,6 +1126,7 @@ impl ServingOptions {
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
                 drain_on_shutdown: self.prefix_cache_drain_on_shutdown.unwrap_or_default(),
+                max_age: self.prefix_cache_max_age.unwrap_or_default(),
                 pool: self.prefix_cache_pool.clone().map(|address| PoolOptions {
                     address,
                     ca: self.prefix_cache_pool_ca.clone(),
@@ -1487,6 +1501,7 @@ mod tests {
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
                 drain_on_shutdown: std::time::Duration::ZERO,
+                max_age: std::time::Duration::ZERO,
                 pool: None,
             }
         );

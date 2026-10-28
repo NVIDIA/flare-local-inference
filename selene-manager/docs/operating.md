@@ -28,6 +28,19 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
   identical paths, and (in containers) share a PID namespace so peer credentials are real.
   Instances that cannot meet this still work over `--listen`, without shared memory.
 
+Record expiry is off by default. `--max-age DURATION|off`
+accepts positive durations in ms, s, m, h, or bare seconds; `off` disables expiry.
+Puts, gets and child publication refresh the required chain in memory only.
+Recovery uses file mtime from its last write. After a restart, a record reused
+from disk but never rewritten may expire up to one max age early. The cost is a
+recompute, never wrong output. With expiry off, hits do not refresh last use;
+enabling it later may expire old files at once.
+The existing tick sweeps every namespace, with each index limited to once a
+minute. It walks from the oldest entry, skipping interior nodes, pinned records
+and active I/O. It stops at the first fresh leaf or 64 expired leaves, removing
+page-only ancestors with their last child. LRU order uses a store-wide counter,
+independently of timestamps.
+
 ## Sizing
 
 The service is CPU-only and never touches GPU memory. Three budgets are configured

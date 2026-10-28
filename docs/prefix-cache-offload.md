@@ -387,6 +387,29 @@ are preserved. Limits and write failures do not fail shutdown; accepted transfer
 still drain before memory is released. Size a container's stop grace as Flare's
 usual stop time plus DRAM bytes ÷ measured disk write rate.
 
+Host record expiry is off by default. Enable it with
+`--prefix-cache-max-age DURATION|off` or `[prefix_cache] max_age = "2h"`;
+positive durations accept ms, s, m, h, or bare seconds. `off` disables expiry.
+Publication, reuse, restore and child publication refresh the record and its
+required ancestors in memory only. Recovery uses file mtime, from the last write
+when a record was spilled cold or drained. After a restart, a record reused from
+disk but never rewritten may expire up to one max age early. The cost is a
+recompute, never wrong output. With expiry off, hits do not refresh last use;
+enabling it later may expire old files on the first sweep.
+In pool mode, instance hits do not refresh manager copies, whose max age counts
+from their last put or restore; this is acceptable for a cold-tier copy because
+an instance that keeps the prefix hot re-cascades it on eviction.
+
+At most once a minute, the model-thread poll walks from the oldest entry,
+skipping interior nodes and records that cannot be dropped, and stopping at
+the first fresh leaf or 64 expired leaves. Expired leaves are dropped outright;
+they are never sent down the cascade. Page-only ancestors are removed with their
+last child; in-flight copies and exports retain their storage. LRU positions change only for the accessed key.
+A fresh former interior node left as a leaf by pressure eviction can delay a
+sweep by up to one max age. The manager sweeps every namespace on its existing
+tick, using each index's own once-a-minute limit. The GPU tier keeps its existing
+eviction policy.
+
 The disk thread owns an `io_uring` ring over files opened with `O_DIRECT`,
 chunks transfers at 8 MiB, and computes and verifies checksums. Before accepting
 payload reads,
@@ -943,7 +966,7 @@ same completion events the store produces.
   disk LRU makes room; with DRAM alone, durable DRAM LRU is the local end.
   Local mode uses the same parked/spill path and LRU unlink at the end of its
   chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
-  infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
+  expiry, infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
   GPU publication announces the GPU holding and starts its first host copy;
   GPU eviction sends the existing notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record

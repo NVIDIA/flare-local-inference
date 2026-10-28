@@ -430,6 +430,7 @@ pub struct Metrics {
     pub gets_ok: u64,
     pub gets_error: u64,
     pub evictions: u64,
+    pub expired: [u64; 2],
     pub compactions: u64,
     pub nvme_bytes: u64,
     pub nvme_seconds: f64,
@@ -656,15 +657,12 @@ impl Store {
             store.refresh_durability(id);
         }
         recovered_age.sort_unstable();
-        for (_, id, key) in recovered_age {
+        for (modified, id, key) in recovered_age {
             store.clock += 1;
-            let clock = store.clock;
-            store
-                .namespaces
-                .get_mut(&id)
-                .unwrap()
-                .tree
-                .access_at(&key, clock);
+            let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
+            tree.access_at(&key, store.clock);
+            let node = tree.node_mut(&key).unwrap();
+            node.last_used = modified;
         }
         Ok(store)
     }
@@ -721,9 +719,11 @@ impl Store {
         } else {
             (None, None)
         };
+        let mut tree = Tree::new(descriptor.page_tokens);
+        tree.max_age = self.config.max_age;
         Ok(Namespace {
             directory,
-            tree: Tree::new(descriptor.page_tokens),
+            tree,
             descriptor,
             disk,
             reads,
@@ -778,24 +778,21 @@ impl Store {
         crate::regions::LocalRegions::new(self.memory.clone(), self.staging.clone())
     }
 
-    /// Removes the evictable node `key` and the rowless ancestors the tree cascades with it,
-    /// releasing the charge of every node that owned local bytes and retiring its disk file.
-    /// This is the only caller of the tree's cascading removal; `remove_node` is the
-    /// non-cascading one.
+    /// Remove leaves through the shared tree, accounting bytes and files.
     fn evict_accounted(&mut self, id: NamespaceId, key: Key) -> bool {
         let eligible = self
             .namespaces
             .get(&id)
             .and_then(|namespace| namespace.tree.node(&key))
-            .is_some_and(|node| node.children() == 0 && !node.pinned());
+            .is_some_and(|node| node.ready && node.children() == 0 && !node.pinned());
         if !eligible {
             return false;
         }
         let removed = self
             .namespaces
             .get_mut(&id)
-            .and_then(|namespace| namespace.tree.evict(true, |node| node.key == key));
-        let Some(Eviction::Leaves(nodes)) = removed else {
+            .and_then(|namespace| namespace.tree.remove(&key).ok());
+        let Some(nodes) = removed else {
             return false;
         };
         for node in nodes {
@@ -809,6 +806,13 @@ impl Store {
             self.delta(id, CatalogKind::Removed, node.key);
         }
         true
+    }
+
+    fn reused(&mut self, id: NamespaceId, key: Key) {
+        self.clock += 1;
+        let namespace = self.namespaces.get_mut(&id).unwrap();
+        namespace.tree.access_at(&key, self.clock);
+        namespace.tree.touch_ancestors(&key);
     }
 
     pub fn snapshot(&self, id: NamespaceId) -> Option<Vec<EntryData>> {
@@ -1126,6 +1130,11 @@ impl Store {
         if initial_old.as_ref().is_some_and(|node| {
             node.row && (node.location.memory.is_some() || node.location.disk.is_some())
         }) {
+            self.namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .touch_ancestors(&request.key);
             self.metrics.present += 1;
             self.reject_put(&events, proto::Reason::Present as u8);
             return;
@@ -1418,11 +1427,11 @@ impl Store {
     ) -> Option<(NamespaceId, Key)> {
         self.namespaces
             .iter()
-            .flat_map(|(id, namespace)| {
+            .filter_map(|(id, namespace)| {
                 namespace
                     .tree
-                    .nodes()
-                    .filter(|node| {
+                    .ordered()
+                    .find(|node| {
                         !node.pinned()
                             && !node.location.writing
                             && !node.location.reading()
@@ -2407,13 +2416,7 @@ impl Store {
                 }));
             }
         }
-        self.clock += 1;
-        let clock = self.clock;
-        self.namespaces
-            .get_mut(&id)
-            .unwrap()
-            .tree
-            .access_at(&key, clock);
+        self.reused(id, key);
         self.charged = self.charged.saturating_sub(reservation) + bytes;
         if durable {
             if let Some(node) = self.namespaces.get_mut(&id).unwrap().tree.node_mut(&key) {
@@ -2466,9 +2469,18 @@ impl Store {
                     })));
                     return;
                 }
-                self.clock += 1;
-                namespace.tree.access_at(key, self.clock);
             }
+        }
+        for key in pages.iter().rev().skip(1).rev() {
+            self.clock += 1;
+            self.namespaces
+                .get_mut(&id)
+                .unwrap()
+                .tree
+                .access_at(key, self.clock);
+        }
+        if let Some(key) = pages.last() {
+            self.reused(id, *key);
         }
         let get = Get {
             namespace: id,
@@ -3442,6 +3454,23 @@ impl Store {
             self.disk_progress = now;
         }
         self.timeouts();
+        if self.config.max_age.is_zero() {
+            return;
+        }
+        let ids: Vec<_> = self.namespaces.keys().copied().collect();
+        for id in ids {
+            let keys = self.namespaces.get_mut(&id).unwrap().tree.expired(|node| {
+                !node.pinned() && !node.location.writing && !node.location.reading()
+            });
+            for key in keys {
+                let node = &self.namespaces[&id].tree[&key];
+                let tier = usize::from(node.location.disk.is_some());
+                let before = self.metrics.evictions;
+                if self.evict_accounted(id, key) {
+                    self.metrics.expired[tier] += self.metrics.evictions - before;
+                }
+            }
+        }
     }
 
     fn timeouts(&mut self) {
@@ -4254,7 +4283,7 @@ mod tests {
             fs::write(records.join(record::file_name(&key)), bytes).unwrap();
             parent = Some(key);
         }
-        let store = Store::open(config).unwrap();
+        let mut store = Store::open(config.clone()).unwrap();
         assert_eq!(store.charge_total(), expected);
         let id = store.namespace_id().unwrap();
         assert_eq!(store.namespaces[&id].tree.nodes().count(), 2);
@@ -4262,6 +4291,38 @@ mod tests {
         assert!(store.metrics_text().contains(&format!(
             "selene_bytes{{namespace=\"{name}\",tier=\"disk\"}} {expected}\n"
         )));
+        let old = SystemTime::now() - Duration::from_secs(10800);
+        let key = parent.unwrap();
+        let path = records.join(record::file_name(&key));
+        let bytes = fs::read(&path).unwrap();
+        let last_used = store.namespaces[&id].tree[&key].last_used;
+        store.reused(id, key);
+        assert!(store.jobs.is_empty());
+        assert!(!store.namespaces[&id].tree[&key].pinned());
+        assert_eq!(store.namespaces[&id].tree[&key].last_used, last_used);
+        store.config.max_age = Duration::from_secs(7200);
+        store.namespaces.get_mut(&id).unwrap().tree.max_age = store.config.max_age;
+        store.reused(id, key);
+        assert!(store.namespaces[&id].tree[&key].last_used > last_used);
+        store.reused(id, key);
+        assert!(store.jobs.is_empty());
+        assert!(!store.namespaces[&id].tree[&key].pinned());
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert_eq!(fs::metadata(&path).unwrap().modified().unwrap(), last_used);
+        fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
+            .unwrap();
+        drop(store);
+        let mut store = Store::open(config).unwrap();
+        assert_eq!(store.namespaces[&id].tree[&key].last_used, old);
+        store.config.max_age = Duration::from_secs(7200);
+        store.namespaces.get_mut(&id).unwrap().tree.max_age = store.config.max_age;
+        store.tick();
+        assert!(!store.namespaces[&id].tree.contains(&key));
+        assert_eq!(store.metrics.expired, [0, 2]);
         drop(store);
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
@@ -5644,4 +5705,93 @@ mod tests {
         let _ = fs::remove_dir_all(base);
         let _ = fs::remove_dir_all(directory);
     }
+    #[test]
+    fn oldest_uses_each_namespaces_first_eligible_record() {
+        let (mut store, directory) = store("oldest");
+        let mut value = descriptor();
+        let mut entries = Vec::new();
+        for n in 1..=2 {
+            value.identity = [n; 32];
+            let id = store.register_namespace(value.clone()).unwrap();
+            for pages in 1..=3 {
+                let key = Key {
+                    consumed_tokens: pages * 64,
+                    digest: [n; 16],
+                };
+                let header =
+                    crate::record::new_header(&value, key, None, [0; 16], pages as u32).unwrap();
+                let extent = store
+                    .memory
+                    .allocate(record_charge(&header, true) as usize)
+                    .unwrap();
+                insert_memory_node(&mut store, id, &value, key, None, pages as u32, extent);
+                store.reused(id, key);
+                entries.push((id, key));
+            }
+        }
+        let (id, key) = entries[0];
+        store
+            .namespaces
+            .get_mut(&id)
+            .unwrap()
+            .tree
+            .pin(&key)
+            .unwrap();
+        let (id, key) = entries[1];
+        store.namespaces.get_mut(&id).unwrap().tree[&key]
+            .location
+            .writing = true;
+        assert_eq!(store.oldest(|_| true), Some(entries[2]));
+        let (id, key) = entries[2];
+        store.reused(id, key);
+        assert_eq!(store.oldest(|_| true), Some(entries[3]));
+        assert_eq!(
+            store.oldest(|node| node.key.consumed_tokens == 128),
+            Some(entries[4])
+        );
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn expiry_is_bounded_and_releases_manager_memory() {
+        let (mut store, directory) = dram_store("expiry", 8 << 20);
+        let mut value = descriptor();
+        for identity in [1, 2] {
+            value.identity = [identity; 32];
+            let id = store.register_namespace(value.clone()).unwrap();
+            store.config.max_age = Duration::from_secs(7200);
+            store.namespaces.get_mut(&id).unwrap().tree.max_age = store.config.max_age;
+            for n in 1..=70u64 {
+                let key = Key {
+                    consumed_tokens: 64,
+                    digest: (n as u128).to_le_bytes(),
+                };
+                let header = crate::record::new_header(&value, key, None, [0; 16], 1).unwrap();
+                let extent = store
+                    .memory
+                    .allocate(record_charge(&header, true) as usize)
+                    .unwrap();
+                insert_memory_node(&mut store, id, &value, key, None, 1, extent);
+                store
+                    .namespaces
+                    .get_mut(&id)
+                    .unwrap()
+                    .tree
+                    .node_mut(&key)
+                    .unwrap()
+                    .last_used = SystemTime::UNIX_EPOCH;
+            }
+        }
+        let before = store.charged;
+        store.tick();
+        assert!(store.namespaces.values().all(|ns| ns.tree.len() == 6));
+        assert_eq!(store.metrics.expired, [128, 0]);
+        assert!(store.charged < before);
+        store.tick();
+        assert!(store.namespaces.values().all(|ns| ns.tree.len() == 6));
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
 }

@@ -37,6 +37,7 @@ pub struct PrefixCacheOffload {
     pub disk_limit: Option<u64>,
     /// Zero disables shutdown persistence; MAX drains without a time limit.
     pub drain_on_shutdown: Duration,
+    pub max_age: Duration,
     /// Pool manager through which this instance shares prefix checkpoints.
     pub pool: Option<PoolOptions>,
 }
@@ -160,6 +161,13 @@ pub fn parse_drain_on_shutdown(text: &str) -> std::result::Result<Duration, Stri
         .ok_or_else(|| "shutdown drain must be on, off, or a positive duration such as 90s".into())
 }
 
+pub fn parse_max_age(text: &str) -> std::result::Result<Duration, String> {
+    parse_drain_on_shutdown(text)
+        .ok()
+        .filter(|d| *d != Duration::MAX && (!d.is_zero() || text.trim() == "off"))
+        .ok_or_else(|| "max age must be off or a positive duration such as 2h".into())
+}
+
 fn invalid_size(text: &str) -> String {
     format!("size {text:?} must be a number with an optional K, M, G, or T suffix, such as \"16G\"")
 }
@@ -195,6 +203,7 @@ pub struct Prepared {
     pub shards: Vec<crate::shard::Link>,
     pub pool: Option<pool::PreparedPool>,
     pub drain_on_shutdown: Duration,
+    pub max_age: Duration,
 }
 
 /// The loader's result: either prepared resources or the reason no store exists.
@@ -491,6 +500,7 @@ pub fn prepare_with_inputs(
     Ok(Preparation::Store(Box::new(Prepared {
         inputs,
         drain_on_shutdown: options.drain_on_shutdown,
+        max_age: options.max_age,
         disk_budget,
         resolved: Resolved {
             memory_bytes,
@@ -531,6 +541,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     let Prepared {
         inputs: _,
         drain_on_shutdown,
+        max_age,
         disk_budget,
         resolved,
         identity,
@@ -594,6 +605,7 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
                 scanned,
                 transport,
             )?;
+            store.index_mut().max_age = max_age;
             store.share_budget(disk_budget.clone());
             Ok::<_, crate::Error>(store)
         })
@@ -601,11 +613,13 @@ pub fn open(prepared: Prepared, factory: &dyn CopierFactory) -> Result<Box<dyn H
     // Inside a composite the disk index owns the tree; memory nodes are flat.
     let memory = memory_pool
         .map(|pool| {
-            if disk.is_some() {
-                memory::MemoryStore::new_flat(identity, pool, tier_transfers()?)
+            let mut store = if disk.is_some() {
+                memory::MemoryStore::new_flat(identity, pool, tier_transfers()?)?
             } else {
-                memory::MemoryStore::new(identity, pool, tier_transfers()?)
-            }
+                memory::MemoryStore::new(identity, pool, tier_transfers()?)?
+            };
+            store.index_mut().max_age = max_age;
+            Ok::<_, crate::Error>(store)
         })
         .transpose()?;
     let local: Option<Box<dyn crate::store::TierStore>> = match (memory, disk) {
