@@ -32,7 +32,7 @@ pub const STAGING_PAGE_SLABS: usize = 256;
 /// Row slabs in a staging pool.
 pub const STAGING_ROW_SLABS: usize = 4;
 /// Pages per transfer window.
-pub const WINDOW_PAGES: usize = 64;
+pub use crate::shared::WINDOW_PAGES;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PageSlab(pub u32);

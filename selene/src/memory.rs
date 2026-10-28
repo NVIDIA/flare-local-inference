@@ -12,7 +12,7 @@
 //! A checkpoint whose parent's copy-out is still in flight is held back until
 //! that copy-out finishes, then stored as the parent's child, or as a root
 //! record holding its whole chain when the parent's copy-out failed. A
-//! held-back checkpoint that cannot start fails with an event and releases
+//! held-back checkpoint that cannot start reports Deferred and releases
 //! the checkpoints held back behind it the same way. Index edges therefore
 //! only ever point at ready records, so a failed copy-out can always remove
 //! its node, and a parent is pinned while its child's slabs are allocated so
@@ -28,16 +28,26 @@
 //! store answers no lookups of its own.
 
 use std::{
-    collections::{BTreeMap, VecDeque},
-    sync::PoisonError,
+    collections::{BTreeMap, HashMap, VecDeque},
+    sync::{Arc, PoisonError},
     time::{Duration, Instant},
 };
 
-use crate::{CheckpointId, Error, History, PageId, PrefixKey, Result, StateSlotId};
+use crate::levels::Rate;
+use crate::{
+    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
+    index::{NodeEvent, NodeNotice},
+    pool::{
+        Announcer, HostPin, IndexEntry, MemoryPin, Releases, Tier as PoolTier, TierView,
+        engine::hostfill::HostFiller,
+        pins::{MemorySpan, host_chain_kept},
+        tiers::{HashJob, RecordSums},
+    },
+};
 
 use super::{
     HostHit, HostStore, INITIAL_MEMORY_RATE, InboundTicket, JobId, Layout, PublishedCheckpoint,
-    StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
+    Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason, StoreStats, Tier,
     copier::{CLOSE_TIMEOUT, Direction, Job, Reply, SharedCopier},
     geometry::invalid,
     index::{Eviction, Index, Match},
@@ -45,10 +55,7 @@ use super::{
 };
 
 /// Windows of one record submitted to the transfer threads at a time.
-pub const IN_FLIGHT_WINDOWS: usize = 2;
-
-/// Weight of the newest observation in the transfer rate estimates.
-const RATE_WEIGHT: f64 = 0.2;
+pub const IN_FLIGHT_WINDOWS: usize = crate::shared::WINDOW_CREDITS as usize;
 
 /// Slabs holding one record. `durable` is set by the composite once the disk
 /// copy is complete; a standalone memory store treats every record as durable.
@@ -132,21 +139,6 @@ struct Inbound {
     pending: Pending,
 }
 
-/// Exponentially weighted bytes per second of completed windows.
-#[derive(Clone, Copy, Debug)]
-struct Rate(f64);
-
-impl Rate {
-    fn observe(&mut self, bytes: u64, elapsed: Duration) {
-        let seconds = elapsed.as_secs_f64();
-        if bytes == 0 || seconds <= 0.0 {
-            return;
-        }
-        let observed = bytes as f64 / seconds;
-        self.0 = (1.0 - RATE_WEIGHT) * self.0 + RATE_WEIGHT * observed;
-    }
-}
-
 /// The store's bookkeeping: the index, the pool, the per-record transfer
 /// state, and the counters. It submits windows through a caller-supplied
 /// function, so it is exercised without transfer threads.
@@ -165,9 +157,25 @@ struct Core {
     outbound_rate: Rate,
     inbound_rate: Rate,
     next_job: u64,
+    /// Eviction hands records to the pool's manager instead of dropping them.
+    spill: bool,
+    /// Records chosen for the manager and not yet taken by the pool store.
+    retiring: Vec<Retiring>,
+    /// Records held in place until their move ends: their pages and whether
+    /// they hold a row slab.
+    held: HashMap<PrefixKey, (usize, bool)>,
+    /// Records whose moves ended and that leave once nothing reads them.
+    finishing: Vec<PrefixKey>,
+    largest_pages: usize,
+    /// Checksum-backed holdings announced to the pool.
+    announced: std::collections::HashSet<PrefixKey>,
 }
 
 impl Core {
+    fn reused(&mut self, key: &PrefixKey) {
+        self.index.touch(key);
+    }
+
     fn new(identity: [u8; 32], pool: SlabPool, layout: Layout, flat: bool) -> Self {
         Self {
             index: Index::new(layout.page_tokens),
@@ -179,9 +187,15 @@ impl Core {
             inbound: BTreeMap::new(),
             deferred: Vec::new(),
             stats: StoreStats::default(),
-            outbound_rate: Rate(INITIAL_MEMORY_RATE),
-            inbound_rate: Rate(INITIAL_MEMORY_RATE),
+            outbound_rate: Rate::new(INITIAL_MEMORY_RATE),
+            inbound_rate: Rate::new(INITIAL_MEMORY_RATE),
             next_job: 1,
+            spill: false,
+            retiring: Vec::new(),
+            held: HashMap::new(),
+            finishing: Vec::new(),
+            largest_pages: 0,
+            announced: Default::default(),
         }
     }
 
@@ -342,16 +356,21 @@ impl Core {
         if tail_pages > self.pool.page_count() || (row && self.pool.row_count() == 0) {
             return Ok(None);
         }
+        if self.spill && self.retire_for(tail_pages, usize::from(row)) {
+            return Ok(None);
+        }
         while self.pool.free_pages() < tail_pages || (row && self.pool.free_rows() == 0) {
             let need_row =
                 row && self.pool.free_rows() == 0 && self.pool.free_pages() >= tail_pages;
             match self.index.evict(need_row, |node| node.location.durable) {
                 Some(Eviction::Leaves(nodes)) => {
+                    self.stats.dropped[0] += if self.flat { 0 } else { nodes.len() as u64 };
                     for node in &nodes {
                         self.release(&node.location);
                     }
                 }
                 Some(Eviction::Compacted(compacted)) => {
+                    self.stats.dropped[0] += u64::from(!self.flat);
                     let slab = self
                         .index
                         .node_mut(&compacted)
@@ -402,10 +421,95 @@ impl Core {
             return Err(error);
         }
         self.index.pin(&key)?;
+        self.largest_pages = self.largest_pages.max(tail_pages);
         Ok(Some(record))
     }
 
+    /// Hold bounded cold leaves until they cover the missing page and row slabs.
+    /// A full tier waits while any such records remain held.
+    fn retire_for(&mut self, tail_pages: usize, row_count: usize) -> bool {
+        let want_pages = tail_pages.saturating_sub(self.pool.free_pages());
+        let want_rows = row_count.saturating_sub(self.pool.free_rows());
+        if want_pages == 0 && want_rows == 0 {
+            return false;
+        }
+        let mut pages: usize = self.held.values().map(|(pages, _)| pages).sum();
+        let mut rows: usize = self.held.values().map(|(_, row)| usize::from(*row)).sum();
+        for _ in 0..crate::pool::cascade::MOVES_MAX {
+            if (pages >= want_pages && rows >= want_rows)
+                || self.held.len() >= crate::pool::cascade::MOVES_MAX
+            {
+                break;
+            }
+            let announced = &self.announced;
+            let Some(key) = self.index.candidate(false, |node| {
+                node.location.durable && announced.contains(&node.key)
+            }) else {
+                break;
+            };
+            let Some(node) = self.index.node(&key) else {
+                break;
+            };
+            let (held_pages, held_row) = (node.location.pages.len(), node.location.row.is_some());
+            let retiring = Retiring {
+                tier: PoolTier::Dram,
+                key,
+                parent: node.parent,
+                bucket: node.bucket,
+                tail_pages: node.tail_pages,
+                row: node.row,
+            };
+            if self.index.pin(&key).is_err() {
+                break;
+            }
+            pages += held_pages;
+            rows += usize::from(held_row);
+            self.held.insert(key, (held_pages, held_row));
+            self.retiring.push(retiring);
+        }
+        !self.held.is_empty()
+    }
+
+    fn headroom(&self) -> (usize, usize) {
+        (
+            crate::store::headroom(self.pool.page_count() as u64, self.largest_pages as u64)
+                as usize,
+            crate::store::headroom(self.pool.row_count() as u64, 1) as usize,
+        )
+    }
+
+    /// The move of a held record ended: drop it, or let it be offered again.
+    fn retired(&mut self, key: &PrefixKey, how: Retirement) {
+        if self.held.remove(key).is_none() {
+            return;
+        }
+        let _ = self.index.unpin(key);
+        self.stats.held[0] += u64::from(how == Retirement::Failed);
+        self.stats.progress += 1;
+        if how != Retirement::Failed {
+            self.finishing.push(*key);
+            self.finish_retired();
+        }
+    }
+
+    /// Remove the records whose moves ended, once no export pin still reads
+    /// them. A record that gained a child meanwhile stays.
+    fn finish_retired(&mut self) {
+        let mut finishing = std::mem::take(&mut self.finishing);
+        finishing.retain(|key| {
+            if self.index.node(key).is_some_and(|node| node.pinned()) {
+                return true;
+            }
+            if self.remove_record(key).is_ok() {
+                self.stats.progress += 1;
+            }
+            false
+        });
+        self.finishing = finishing;
+    }
+
     fn release(&mut self, record: &MemoryRecord) {
+        self.stats.progress += 1;
         for slab in &record.pages {
             self.pool.release_page(*slab);
         }
@@ -426,10 +530,9 @@ impl Core {
 
     fn complete_record(&mut self, key: &PrefixKey, success: bool) -> Result<()> {
         self.index.unpin(key)?;
+        self.stats.progress += 1;
         if success {
-            if let Some(node) = self.index.node_mut(key) {
-                node.ready = true;
-            }
+            let _ = self.index.set_ready(key, true);
             return Ok(());
         }
         for node in self.index.remove(key)? {
@@ -444,6 +547,7 @@ impl Core {
             .node_mut(key)
             .ok_or_else(|| invalid("cannot mark an unindexed host record durable"))?;
         node.location.durable = true;
+        self.stats.progress += 1;
         Ok(())
     }
 
@@ -477,7 +581,7 @@ impl Core {
             resident_tokens: chain.resident_tokens,
             pages: chain.pages,
             bytes,
-            tier: Tier::Memory,
+            tier: Tier::Dram,
             estimated_seconds: bytes as f64 / self.inbound_rate.0.max(1.0),
             chain,
         })
@@ -803,7 +907,26 @@ fn windows(
     queued
 }
 
+/// What a memory store keeps to announce its records and serve them as exports.
+struct Announce {
+    view: TierView,
+    hasher: HostFiller<PrefixKey>,
+    /// Ready records being hashed, pinned until the result is collected.
+    hashing: HashMap<PrefixKey, NodeNotice>,
+    /// The checksums committed with each announced record.
+    sums: HashMap<PrefixKey, Arc<RecordSums>>,
+    releases: Releases,
+}
+
+impl Drop for Announce {
+    fn drop(&mut self) {
+        self.hasher.join();
+    }
+}
+
 pub struct MemoryStore {
+    // Dropped first: the checksum thread reads slabs the core frees.
+    announce: Option<Announce>,
     core: Core,
     transfers: SharedCopier,
     /// Reply scratch reused across polls.
@@ -848,21 +971,11 @@ impl MemoryStore {
         }
         Ok(Self {
             core: Core::new(identity, pool, layout, flat),
+            announce: None,
             transfers,
             replies: Vec::new(),
             events: Vec::new(),
         })
-    }
-
-    /// Switch an empty store to flat parent links.
-    pub fn into_flat(mut self) -> Result<Self> {
-        if !self.core.index.is_empty() || !self.core.deferred.is_empty() {
-            return Err(invalid(
-                "a memory store with records cannot switch to flat parent links",
-            ));
-        }
-        self.core.flat = true;
-        Ok(self)
     }
 
     pub fn flat(&self) -> bool {
@@ -891,6 +1004,10 @@ impl MemoryStore {
                     )
                 },
             )
+    }
+
+    pub(crate) fn headroom(&self) -> (usize, usize) {
+        self.core.headroom()
     }
 
     pub fn pool(&self) -> &SlabPool {
@@ -945,6 +1062,15 @@ impl MemoryStore {
         self.core.mark_durable(key)
     }
 
+    /// A copy-out that landed in a composite is not durable until its file
+    /// commits; tests that allocate records directly say so with this.
+    #[cfg(test)]
+    pub(crate) fn mark_volatile(&mut self, key: &PrefixKey) {
+        if let Some(node) = self.core.index.node_mut(key) {
+            node.location.durable = false;
+        }
+    }
+
     /// The slabs of a ready record.
     pub fn record(&self, key: &PrefixKey) -> Option<&MemoryRecord> {
         self.core.record(key)
@@ -962,7 +1088,9 @@ impl MemoryStore {
     }
 
     pub fn unpin_record(&mut self, key: &PrefixKey) -> Result<()> {
-        self.core.index.unpin(key)
+        self.core.index.unpin(key)?;
+        self.core.stats.progress += 1;
+        Ok(())
     }
 
     /// Copy a chain of resident records into the ticket's ids. An error means
@@ -971,6 +1099,211 @@ impl MemoryStore {
         self.core.fetch_chain(chain, ticket)?;
         self.pump();
         Ok(())
+    }
+
+    /// Announce this store's records through `announcer` and serve them as
+    /// exports. Records get their checksums on a thread of their own before they
+    /// are announced. A pool split by rank is not readable by the CPU and
+    /// announces nothing.
+    pub fn announce_records(&mut self, announcer: Announcer) -> Result<()> {
+        if self.announce.is_some() || self.core.pool.rank_parts().is_some() {
+            return Ok(());
+        }
+        let wake = announcer.wake.clone();
+        let view = TierView::new(announcer, PoolTier::Dram, &self.core.layout);
+        self.core.index.observe(view.sink());
+        // What is resident already counts as newly ready.
+        view.sink()
+            .lock()
+            .unwrap()
+            .extend(self.core.index.ready_notices());
+        self.announce = Some(Announce {
+            view,
+            hasher: HostFiller::start(wake)
+                .map_err(|e| invalid(format!("cannot start the checksum worker: {e}")))?,
+            hashing: HashMap::new(),
+            sums: HashMap::new(),
+            releases: Releases::default(),
+        });
+        Ok(())
+    }
+
+    /// Release finished exports' pins, collect checksums and announce what
+    /// changed. `parent_of` gives the parent to announce a record under, from
+    /// the record's own and its key; a flat store's records have none of their
+    /// own.
+    pub fn flush_announcements(
+        &mut self,
+        parent_of: &dyn Fn(&PrefixKey, Option<PrefixKey>) -> Option<PrefixKey>,
+        spilled_to: &dyn Fn(&PrefixKey) -> Option<IndexEntry>,
+    ) {
+        let Some(a) = self.announce.as_mut() else {
+            return;
+        };
+        for key in a.releases.drain() {
+            let _ = self.core.index.unpin(&key);
+            self.core.stats.progress += 1;
+        }
+        let mut done = Vec::new();
+        a.hasher.collect(&mut done);
+        for done in done {
+            let Some(notice) = a.hashing.remove(&done.owner) else {
+                continue;
+            };
+            let _ = self.core.index.unpin(&done.owner);
+            self.core.stats.progress += 1;
+            if self.core.index.node(&done.owner).is_some_and(|n| n.ready) {
+                a.sums.insert(
+                    done.owner,
+                    Arc::new(done.result.expect("hashing pinned slabs cannot fail")),
+                );
+                a.view
+                    .announce(&notice, parent_of(&notice.key, notice.parent));
+                self.core.announced.insert(done.owner);
+            }
+        }
+        for notice in a.view.drain() {
+            let key = notice.key;
+            match notice.event {
+                NodeEvent::Ready => {
+                    if a.hashing.contains_key(&key) {
+                        continue;
+                    }
+                    let Some(node) = self.core.index.node(&key).filter(|n| n.ready) else {
+                        continue;
+                    };
+                    let pool = &self.core.pool;
+                    let job = HashJob {
+                        key,
+                        pages: node
+                            .location
+                            .pages
+                            .iter()
+                            .map(|slab| pool.page_address(*slab))
+                            .collect(),
+                        page_bytes: pool.page_bytes(),
+                        row: node.location.row.map(|slab| pool.row_address(slab)),
+                        row_bytes: pool.row_bytes(),
+                    };
+                    if self.core.index.pin(&key).is_ok() {
+                        if a.hasher.submit_hash(job) {
+                            a.hashing.insert(key, notice);
+                        } else {
+                            let _ = self.core.index.unpin(&key);
+                        }
+                    }
+                }
+                NodeEvent::Gone => {
+                    a.hashing.remove(&key);
+                    a.sums.remove(&key);
+                    self.core.announced.remove(&key);
+                    match spilled_to(&key) {
+                        Some(to) => a.view.spill(&key, to),
+                        None => a.view.retire(&key),
+                    }
+                }
+                NodeEvent::RowDropped => {
+                    if a.sums.contains_key(&key) {
+                        a.view.announce(&notice, parent_of(&key, notice.parent));
+                    }
+                }
+            }
+        }
+        self.core.finish_retired();
+    }
+
+    /// Pin the resident records `keys` (ascending, the last the endpoint) for an
+    /// export from `begin_tokens`, serving the checksums committed with them.
+    pub fn pin_export_chain(
+        &mut self,
+        keys: &[PrefixKey],
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        let (Some(a), Some(endpoint)) = (self.announce.as_ref(), keys.last()) else {
+            return Err(ExportRefusal::NotFound);
+        };
+        if !a.view.contains(endpoint) {
+            return Err(ExportRefusal::NotFound);
+        }
+        let pool = &self.core.pool;
+        let mut nodes = Vec::with_capacity(keys.len());
+        let mut spans = Vec::with_capacity(keys.len());
+        for (position, key) in keys.iter().enumerate() {
+            let node = self
+                .core
+                .index
+                .node(key)
+                .filter(|node| node.ready)
+                .ok_or(ExportRefusal::ChainGap)?;
+            let Some(sums) = a.sums.get(key).filter(|_| a.view.contains(key)) else {
+                return Err(ExportRefusal::ChainGap);
+            };
+            if want_row && position + 1 == keys.len() && node.location.row.is_none() {
+                return Err(ExportRefusal::ChainGap);
+            }
+            nodes.push((*key, node.location.pages.len()));
+            spans.push(MemorySpan {
+                pages: node
+                    .location
+                    .pages
+                    .iter()
+                    .map(|slab| pool.page_address(*slab))
+                    .collect(),
+                row: node.location.row.map(|slab| pool.row_address(slab)),
+                sums: sums.clone(),
+            });
+        }
+        let page_tokens = self.core.layout.page_tokens;
+        let (chain, kept) = host_chain_kept(page_tokens, begin_tokens, want_row, &nodes);
+        if chain.total_pages
+            != (endpoint.consumed_tokens / page_tokens).saturating_sub(begin_tokens / page_tokens)
+        {
+            return Err(ExportRefusal::ChainGap);
+        }
+        // Windows name records by their place in the chain, which leaves out nodes with no page.
+        let mut spans: Vec<Option<MemorySpan>> = spans.into_iter().map(Some).collect();
+        let spans: Vec<MemorySpan> = kept.iter().filter_map(|&i| spans[i].take()).collect();
+        for (position, key) in keys.iter().enumerate() {
+            if self.core.index.pin(key).is_err() {
+                for pinned in &keys[..position] {
+                    let _ = self.core.index.unpin(pinned);
+                }
+                return Err(ExportRefusal::NotFound);
+            }
+        }
+        Ok(Box::new(MemoryPin {
+            chain,
+            spans,
+            page_bytes: pool.page_bytes(),
+            row_bytes: pool.row_bytes(),
+            keys: keys.to_vec(),
+            releases: a.releases.clone(),
+        }))
+    }
+
+    /// The keys from the record holding the page that contains `begin_tokens` up
+    /// to `endpoint`, ascending, following this store's own parent links.
+    fn export_chain(
+        &self,
+        endpoint: &PrefixKey,
+        begin_tokens: u64,
+    ) -> std::result::Result<Vec<PrefixKey>, ExportRefusal> {
+        let page_tokens = self.core.layout.page_tokens;
+        let start_page = begin_tokens / page_tokens;
+        let mut chain = Vec::new();
+        let mut key = *endpoint;
+        loop {
+            let node = self.core.index.node(&key).ok_or(ExportRefusal::NotFound)?;
+            chain.push(key);
+            let start = (key.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
+            if start <= start_page {
+                break;
+            }
+            key = node.parent.ok_or(ExportRefusal::ChainGap)?;
+        }
+        chain.reverse();
+        Ok(chain)
     }
 
     fn pump(&mut self) {
@@ -985,6 +1318,10 @@ impl MemoryStore {
 }
 
 impl HostStore for MemoryStore {
+    fn reused(&mut self, key: PrefixKey) {
+        self.core.reused(&key);
+    }
+
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.core.lookup(history, resident, before)
     }
@@ -1014,6 +1351,7 @@ impl HostStore for MemoryStore {
         let (_, tail) = self.core.shape(checkpoint);
         if tail.len() > self.core.pool.page_count() || self.core.pool.row_count() == 0 {
             self.core.stats.store_skipped += 1;
+            self.core.stats.dropped[1] += 1;
             return Ok(StoreOutcome::Oversize);
         }
         let accepted = self.core.store(checkpoint)?;
@@ -1043,6 +1381,10 @@ impl HostStore for MemoryStore {
         self.core.settle(events);
         self.pump();
         events.append(&mut self.events);
+        // Inside a composite the disk index supplies parents, so it flushes.
+        if !self.core.flat {
+            self.flush_announcements(&|_, parent| parent, &|_| None);
+        }
         Ok(())
     }
 
@@ -1073,6 +1415,40 @@ impl HostStore for MemoryStore {
         self.core.abandon();
         self.events.clear();
         Ok(())
+    }
+}
+
+impl crate::store::TierStore for MemoryStore {
+    fn announce_to(&mut self, announcer: Announcer) {
+        if let Err(error) = self.announce_records(announcer) {
+            eprintln!("warning: host memory records will not be shared: {error}");
+        }
+    }
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier != PoolTier::Dram || self.core.flat {
+            return Err(ExportRefusal::NotFound);
+        }
+        let chain = self.export_chain(&key, begin_tokens)?;
+        self.pin_export_chain(&chain, begin_tokens, want_row)
+    }
+    fn set_spill(&mut self, enabled: bool) {
+        let enabled = enabled && !self.core.flat && self.announce.is_some();
+        self.core.stats.progress += u64::from(self.core.spill != enabled);
+        self.core.spill = enabled;
+    }
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        std::mem::take(&mut self.core.retiring)
+    }
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        if tier == PoolTier::Dram {
+            self.core.retired(&key, how);
+        }
     }
 }
 
@@ -1186,9 +1562,118 @@ mod tests {
             .map(|event| match event {
                 StoreEvent::Stored { key, result, .. } => (*key, result.as_ref().ok().copied()),
                 StoreEvent::Fetched { .. } => panic!("unexpected fetch event"),
-                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
+                _ => panic!("unexpected event"),
             })
             .collect()
+    }
+
+    #[test]
+    fn releasing_a_host_pin_notifies_capacity_waiters() {
+        let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 1, ROW, 1, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        let checkpoint = published(&history(64, 1), 64, None, 0, 1);
+        assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        store.pin_record(&checkpoint.key).unwrap();
+        let progress = store.stats().progress;
+        assert_eq!(store.reclaimable_slabs(), (0, 0));
+        store.unpin_record(&checkpoint.key).unwrap();
+        assert!(store.stats().progress > progress);
+        assert_eq!(store.reclaimable_slabs(), (1, 1));
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn published_prompt_copy_survives_reply_and_gpu_storage_reuse() {
+        let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
+        let (copier, gpu) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 2, ROW, 2, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        let full = history(128, 1);
+        let prompt = published(&full, 64, None, 0, 1);
+        let reply = published(&full, 128, Some(64), 0, 2);
+        gpu.pages.lock().unwrap().insert(0, vec![3; PAGE as usize]);
+        gpu.rows.lock().unwrap().insert(1, vec![17; ROW as usize]);
+        assert_eq!(store.store(&prompt).unwrap(), StoreOutcome::Queued);
+        let mut events = Vec::new();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Stored { result: Ok(_), .. }]
+        ));
+        gpu.pages.lock().unwrap().insert(1, vec![4; PAGE as usize]);
+        gpu.rows.lock().unwrap().insert(2, vec![18; ROW as usize]);
+        assert_eq!(store.store(&reply).unwrap(), StoreOutcome::Queued);
+        events.clear();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Stored { result: Ok(_), .. }]
+        ));
+        gpu.pages.lock().unwrap().insert(0, vec![99; PAGE as usize]);
+        gpu.rows.lock().unwrap().insert(1, vec![99; ROW as usize]);
+        let hit = store.lookup(&full, 0, 128).unwrap();
+        assert_eq!(hit.key, prompt.key);
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: prompt.key,
+                    pages: vec![PageId(10)],
+                    slot: StateSlotId(3),
+                },
+            )
+            .unwrap();
+        events.clear();
+        store.poll(&mut events).unwrap();
+        assert!(matches!(
+            events.as_slice(),
+            [StoreEvent::Fetched { result: Ok(_), .. }]
+        ));
+        assert_eq!(gpu.pages.lock().unwrap()[&10], vec![3; PAGE as usize]);
+        assert_eq!(gpu.rows.lock().unwrap()[&3], vec![17; ROW as usize]);
+        store.close().unwrap();
+    }
+
+    #[test]
+    fn gpu_reuse_refreshes_the_host_record_before_eviction() {
+        let mut core = store_core(2, 2, false);
+        let a = published(&history(64, 1), 64, None, 0, 1);
+        let b = published(&history(64, 2), 64, None, 1, 2);
+        let c = published(&history(64, 3), 64, None, 2, 3);
+        for record in [&a, &b] {
+            assert!(core.store(record).unwrap());
+            finish(&mut core);
+        }
+        core.reused(&a.key);
+        assert!(core.store(&c).unwrap());
+        assert!(core.index.contains(&a.key));
+        assert!(!core.index.contains(&b.key));
+        finish(&mut core);
+    }
+
+    #[test]
+    fn gpu_reuse_cannot_prevent_row_compaction_or_recreate_a_host_copy() {
+        let mut core = store_core(3, 2, false);
+        let full = history(128, 1);
+        let root = published(&full, 64, None, 0, 1);
+        let child = published(&full, 128, Some(64), 0, 2);
+        let stranger = published(&history(64, 2), 64, None, 2, 3);
+        assert!(core.store(&root).unwrap());
+        finish(&mut core);
+        assert!(core.store(&child).unwrap());
+        finish(&mut core);
+        core.index.pin(&child.key).unwrap();
+        core.reused(&root.key);
+        assert!(core.store(&stranger).unwrap());
+        finish(&mut core);
+        assert!(!core.index.node(&root.key).unwrap().row);
+        core.reused(&root.key);
+        assert!(core.lookup(&full, 0, 128).is_none());
+        core.index.unpin(&child.key).unwrap();
     }
 
     #[test]
@@ -1635,7 +2120,7 @@ mod tests {
         // A resident checkpoint inside the root's tail skips the page it holds.
         let hit = core.lookup(&full, 100, u64::MAX).unwrap();
         assert_eq!(hit.key, child.key);
-        assert_eq!(hit.tier, Tier::Memory);
+        assert_eq!(hit.tier, Tier::Dram);
         assert_eq!(hit.pages, 5);
         assert_eq!(hit.bytes, 5 * PAGE + ROW);
         assert_eq!(hit.chain.skip_pages, 1);
@@ -1950,15 +2435,141 @@ mod tests {
         );
     }
 
+    /// Marks every resident record as announced, as the hasher would have.
+    fn announce_all(core: &mut Core) {
+        let keys: Vec<_> = core.index.nodes().map(|node| node.key).collect();
+        for key in keys {
+            core.announced.insert(key);
+        }
+    }
+
     #[test]
-    fn rates_weight_recent_windows_and_ignore_empty_ones() {
-        let mut rate = Rate(1000.0);
-        rate.observe(0, Duration::from_secs(1));
-        rate.observe(500, Duration::ZERO);
-        assert_eq!(rate.0, 1000.0);
-        rate.observe(2000, Duration::from_secs(1));
-        assert!((rate.0 - 1200.0).abs() < 1e-9);
-        rate.observe(2000, Duration::from_secs(1));
-        assert!((rate.0 - 1360.0).abs() < 1e-9);
+    fn headroom_is_clamped_separately_for_pages_and_rows() {
+        let mut core = store_core(100, 4, false);
+        for salt in 1..=3 {
+            let h = history(600, salt);
+            assert!(core.store(&published(&h, 128, None, 0, salt)).unwrap());
+            finish(&mut core);
+        }
+        assert_eq!(core.headroom(), (5, 1));
+        announce_all(&mut core);
+        core.spill = true;
+        assert!(core.retire_for(5, 2));
+        assert_eq!(core.held.len(), 1);
+        let h = history(600, 4);
+        assert!(
+            core.store(&published(&h, 128, None, 0, 4)).unwrap(),
+            "free slabs remain usable during retirement"
+        );
+        core.largest_pages = 90;
+        assert_eq!(core.headroom(), (10, 1));
+    }
+
+    #[test]
+    fn a_spilling_store_holds_the_coldest_announced_leaf_until_its_move_ends() {
+        let mut core = store_core(4, 4, false);
+        let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
+        let cold = published(&one, 128, None, 0, 1);
+        let warm = published(&two, 128, None, 10, 2);
+        for checkpoint in [&cold, &warm] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        announce_all(&mut core);
+        core.spill = true;
+        let wanted = published(&three, 128, None, 20, 3);
+
+        // The pool is full: the coldest leaf is held, and nothing is evicted.
+        assert!(!core.store(&wanted).unwrap());
+        assert_eq!(core.held.len(), 1);
+        let retiring = std::mem::take(&mut core.retiring);
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(
+            (retiring[0].key, retiring[0].tier, retiring[0].tail_pages),
+            (cold.key, PoolTier::Dram, 2)
+        );
+        assert!(core.index.contains(&cold.key));
+
+        // A second attempt finds the held leaf covers it: nothing more is chosen.
+        assert!(!core.store(&wanted).unwrap());
+        assert!(core.retiring.is_empty());
+
+        // A failed move releases the leaf, which is offered again.
+        core.retired(&cold.key, Retirement::Failed);
+        assert!(core.index.contains(&cold.key) && core.held.is_empty());
+        assert!(!core.store(&wanted).unwrap());
+        assert_eq!(core.retiring.len(), 1);
+        core.retiring.clear();
+
+        // Once moved, its slabs are free for the new record.
+        core.retired(&cold.key, Retirement::Moved);
+        assert!(!core.index.contains(&cold.key));
+        assert!(core.index.contains(&warm.key));
+        assert!(core.store(&wanted).unwrap());
+    }
+
+    #[test]
+    fn unavailable_manager_uses_durable_dram_lru() {
+        let mut core = store_core(4, 4, false);
+        let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
+        let cold = published(&one, 128, None, 0, 1);
+        let warm = published(&two, 128, None, 10, 2);
+        for r in [&cold, &warm] {
+            assert!(core.store(r).unwrap());
+            finish(&mut core);
+        }
+        announce_all(&mut core);
+        core.spill = true;
+        assert!(core.retire_for(2, 1));
+        for r in std::mem::take(&mut core.retiring) {
+            core.retired(&r.key, Retirement::Failed);
+        }
+        core.spill = false;
+        assert!(core.index.contains(&cold.key));
+        assert!(core.store(&published(&three, 128, None, 20, 3)).unwrap());
+        assert!(!core.index.contains(&cold.key));
+        assert!(core.index.contains(&warm.key));
+        assert_eq!(core.stats().dropped[0], 1);
+        assert_eq!(core.stats().held[0], 1);
+    }
+
+    #[test]
+    fn records_not_yet_announced_are_evicted_in_place_as_before() {
+        let mut core = store_core(4, 4, false);
+        let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
+        let cold = published(&one, 128, None, 0, 1);
+        let warm = published(&two, 128, None, 10, 2);
+        for checkpoint in [&cold, &warm] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        core.spill = true;
+        // Nothing was announced, so nothing can be handed on.
+        assert!(core.store(&published(&three, 128, None, 20, 3)).unwrap());
+        assert!(core.retiring.is_empty() && core.held.is_empty());
+        assert!(!core.index.contains(&cold.key));
+    }
+
+    #[test]
+    fn a_moved_record_stays_until_its_export_pin_is_released() {
+        let mut core = store_core(4, 4, false);
+        let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
+        let cold = published(&one, 128, None, 0, 1);
+        let warm = published(&two, 128, None, 10, 2);
+        for checkpoint in [&cold, &warm] {
+            assert!(core.store(checkpoint).unwrap());
+            finish(&mut core);
+        }
+        announce_all(&mut core);
+        core.spill = true;
+        assert!(!core.store(&published(&three, 128, None, 20, 3)).unwrap());
+        assert!(core.held.contains_key(&cold.key));
+        // An export reads the slabs.
+        core.index.pin(&cold.key).unwrap();
+        core.retired(&cold.key, Retirement::Moved);
+        assert!(core.index.contains(&cold.key));
+        core.index.unpin(&cold.key).unwrap();
+        core.finish_retired();
+        assert!(!core.index.contains(&cold.key));
     }
 }

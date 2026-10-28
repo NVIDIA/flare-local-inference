@@ -1,0 +1,27 @@
+[Unit]
+Description=Selene manager for Flare KV cache sharing
+After=local-fs.target
+
+[Service]
+# Create flare as a system account; local instances must use the same uid/gid.
+# With a normal login uid, configure logind RemoveIPC=no to preserve /dev/shm.
+User=flare
+Group=flare
+RuntimeDirectory=selene
+RuntimeDirectoryMode=0770
+ExecStart=/usr/local/bin/selene \
+    --name pool \
+    --socket /run/selene/pool.sock \
+    --root /var/lib/selene \
+    --memory 8G \
+    --nvme 256G \
+    --staging 512M \
+    --metrics 127.0.0.1:9108
+Restart=on-failure
+RestartSec=2
+LimitNOFILE=65536
+NoNewPrivileges=true
+# The arena and staging files live in /dev/shm/selene and must hold --memory + --staging.
+
+[Install]
+WantedBy=multi-user.target

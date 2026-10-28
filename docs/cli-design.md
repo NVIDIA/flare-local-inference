@@ -951,6 +951,7 @@ reserve = "0"                     # GPU memory left for processes started later.
 
 [prefix_cache]
 memory = ""                      # Host retention budget; empty: disabled.
+drain_on_shutdown = "off"         # Pooled DRAM persistence: on, off, or a duration.
 disk_limit = ""                  # Empty: 10% of free disk space when disk retention is enabled.
 disk_transport = ""              # Empty: staged; also accepts direct.
 
@@ -1048,6 +1049,20 @@ in the [host retention design](prefix-cache-offload.md). Both tiers remain
 disabled unless configured. The memory setting includes registered checkpoint
 slabs and ordinary retained CPU inputs; bounded transfer, preprocessing, and
 decoded-source windows are accounted for separately at startup.
+
+`--prefix-cache-pool ADDRESS` accepts `unix:PATH` for a local socket,
+`HOST:PORT` for plain TCP, or `tls:HOST:PORT` for TLS. Network
+addresses require a nonempty host and a port from 1 through 65535; IPv6
+addresses use brackets, for example `[::1]:7000` or `tls:[::1]:7000`.
+The manager's `--name` supplies the pool salt for scope and instance identities.
+`--prefix-cache-pool-ca FILE` supplies the CA for a TLS manager;
+without it, TLS verifies the manager against the host's trust store. A CA
+cannot be used with a Unix socket or plaintext address. A manager declaring
+a different encryption setting disables the pool for TCP clients. Unix-socket
+clients trust filesystem permissions and can use the same TLS manager. The CA
+requires the pool flag. These command-line options are forwarded to
+every rank and have no configuration-file key. See
+[the pool section](prefix-cache-offload.md#215-sharing-through-a-pool).
 
 ## 4. Derived settings
 

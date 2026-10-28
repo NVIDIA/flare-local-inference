@@ -1,5 +1,6 @@
 //! Fixtures for tests of this crate and of the crates that implement its seams.
 
+pub use crate::pool::{engine::RESTORE_DEADLINE, net::{Roots, trusted}, options::pool_address};
 use std::{fs, path::PathBuf};
 
 use blake2::{Blake2b, Digest, digest::consts::U16};
@@ -167,6 +168,102 @@ impl PageCopier for StoppedCopier {
     }
 }
 
+/// The device pages and state rows a [`SimulatedGpu`] copies to and from, by id.
+#[derive(Clone, Default)]
+pub struct GpuMemory {
+    pub pages: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
+    pub rows: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
+}
+
+/// A copier that moves bytes between host slabs and an in-memory stand-in for
+/// the GPU as soon as a job is submitted, and reports the job on the next poll.
+pub struct SimulatedGpu {
+    layout: Layout,
+    memory: GpuMemory,
+    replies: Vec<Reply>,
+}
+
+impl SimulatedGpu {
+    pub fn new(geometry: &[CacheGeometry]) -> Result<(Self, GpuMemory)> {
+        let memory = GpuMemory::default();
+        Ok((
+            Self {
+                layout: Layout::new(geometry)?,
+                memory: memory.clone(),
+                replies: Vec::new(),
+            },
+            memory,
+        ))
+    }
+
+    pub fn shared(geometry: &[CacheGeometry]) -> Result<(crate::SharedCopier, GpuMemory)> {
+        let (copier, memory) = Self::new(geometry)?;
+        Ok((std::sync::Arc::new(std::sync::Mutex::new(copier)), memory))
+    }
+}
+
+impl PageCopier for SimulatedGpu {
+    fn layout(&self) -> &Layout {
+        &self.layout
+    }
+
+    fn submit(&mut self, job: Job) -> Result<()> {
+        let (page, row) = (
+            self.layout.page_record_bytes as usize,
+            self.layout.row_record_bytes as usize,
+        );
+        let (mut pages, mut rows) = (
+            self.memory.pages.lock().unwrap(),
+            self.memory.rows.lock().unwrap(),
+        );
+        for (id, address) in &job.pages {
+            // The host address names a slab the caller keeps mapped for the job.
+            let host = unsafe { std::slice::from_raw_parts_mut(*address as *mut u8, page) };
+            match job.direction {
+                crate::Direction::Out => {
+                    host.copy_from_slice(pages.get(&id.0).map_or(&vec![0; page], |p| p));
+                }
+                crate::Direction::In => {
+                    pages.insert(id.0, host.to_vec());
+                }
+            }
+        }
+        if let Some((slot, address)) = job.row {
+            let host = unsafe { std::slice::from_raw_parts_mut(address as *mut u8, row) };
+            match job.direction {
+                crate::Direction::Out => {
+                    host.copy_from_slice(rows.get(&slot.0).map_or(&vec![0; row], |p| p));
+                }
+                crate::Direction::In => {
+                    rows.insert(slot.0, host.to_vec());
+                }
+            }
+        }
+        self.replies.push(Reply {
+            id: job.id,
+            window: job.window,
+            direction: job.direction,
+            result: Ok(()),
+            bytes: job.pages.len() as u64 * self.layout.page_record_bytes
+                + u64::from(job.row.is_some()) * self.layout.row_record_bytes,
+            elapsed: std::time::Duration::from_micros(1),
+        });
+        Ok(())
+    }
+
+    fn poll(&mut self, replies: &mut Vec<Reply>) {
+        replies.append(&mut self.replies);
+    }
+
+    fn in_flight(&self) -> usize {
+        self.replies.len()
+    }
+
+    fn close(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
 #[derive(Default)]
 pub struct Ids {
     count: u32,
@@ -236,5 +333,110 @@ pub fn pattern(bytes: &mut [u8], seed: u64) {
     for (index, byte) in bytes.iter_mut().enumerate() {
         let index = index as u64;
         *byte = (index.wrapping_mul(31) ^ seed.wrapping_mul(7919) ^ (index >> 8)) as u8;
+    }
+}
+
+/// A host registration whose device address is the supplied host address.
+pub struct IdentityRegistrar;
+struct IdentityRegistration(usize);
+impl crate::Registration for IdentityRegistration {
+    fn device_address(&self) -> u64 {
+        self.0 as u64
+    }
+}
+impl crate::HostRegistrar for IdentityRegistrar {
+    fn register(&self, _: usize, address: usize, _: usize) -> Result<Box<dyn crate::Registration>> {
+        Ok(Box::new(IdentityRegistration(address)))
+    }
+    fn map_split(&self, _: &[(usize, i32, usize)]) -> Result<Box<dyn crate::SplitMapping>> {
+        Err("split mapping is not provided by this fixture".into())
+    }
+}
+
+#[derive(Default)]
+pub struct TrackingRegistrar {
+    pub calls: std::sync::Mutex<Vec<(usize, usize)>>,
+    pub drops: std::sync::Arc<std::sync::Mutex<usize>>,
+}
+struct Registration {
+    address: usize,
+    pub drops: std::sync::Arc<std::sync::Mutex<usize>>,
+}
+impl crate::Registration for Registration {
+    fn device_address(&self) -> u64 {
+        self.address as u64
+    }
+}
+impl Drop for Registration {
+    fn drop(&mut self) {
+        *self.drops.lock().unwrap() += 1;
+    }
+}
+impl crate::HostRegistrar for TrackingRegistrar {
+    fn register(
+        &self,
+        _: usize,
+        address: usize,
+        bytes: usize,
+    ) -> crate::Result<Box<dyn crate::Registration>> {
+        self.calls.lock().unwrap().push((address, bytes));
+        Ok(Box::new(Registration {
+            address,
+            drops: self.drops.clone(),
+        }))
+    }
+    fn map_split(&self, _: &[(usize, i32, usize)]) -> crate::Result<Box<dyn crate::SplitMapping>> {
+        Err("not used".into())
+    }
+}
+
+/// Whole-record bytes with the checksums supplied by a test.
+pub struct RecordBytes {
+    pub data: Vec<u8>,
+    pub sums: Vec<u64>,
+    pub row: u64,
+    pub page_bytes: usize,
+    pub row_bytes: usize,
+}
+impl crate::pool::PutBytes for RecordBytes {
+    fn fill(
+        &mut self,
+        first: u64,
+        pages: u32,
+        row: bool,
+        dst: &mut [u8],
+    ) -> Result<crate::pool::Checksums> {
+        let from = first as usize * self.page_bytes;
+        let n = pages as usize * self.page_bytes;
+        dst[..n].copy_from_slice(&self.data[from..from + n]);
+        if row {
+            dst[n..].copy_from_slice(&self.data[self.data.len() - self.row_bytes..]);
+        }
+        Ok(crate::pool::Checksums {
+            pages: self.sums[first as usize..][..pages as usize].to_vec(),
+            row: row.then_some(self.row),
+        })
+    }
+}
+pub struct BytesPin {
+    pub chain: crate::pool::HostChain,
+    pub bytes: RecordBytes,
+}
+impl crate::pool::HostPin for BytesPin {
+    fn chain(&self) -> &crate::pool::HostChain {
+        &self.chain
+    }
+    fn read(
+        &mut self,
+        window: &crate::pool::HostWindow,
+        dst: &mut [u8],
+    ) -> Result<crate::pool::Checksums> {
+        crate::pool::PutBytes::fill(
+            &mut self.bytes,
+            u64::from(window.first_page),
+            window.page_count,
+            window.row,
+            dst,
+        )
     }
 }

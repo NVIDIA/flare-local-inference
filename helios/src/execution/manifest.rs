@@ -225,7 +225,7 @@ pub struct ExecutionManifest {
     /// Present when this rank's graphs launch collectives over a transport between hosts.
     pub collectives: Option<CollectiveHealth>,
     /// This rank's prefix checkpoint storage, present after cache allocation.
-    pub cache: Option<crate::offload::CacheGeometry>,
+    pub cache: Option<flare_selene::CacheGeometry>,
     /// Host prefix store resources shared by every rank, present when configured.
     pub offload: Option<crate::offload::Binding>,
     pub abi_version: u32,

@@ -85,6 +85,7 @@ impl Checkpoint {
     pub fn ready(&self) -> bool {
         self.ready
     }
+
     pub fn pin_count(&self) -> u64 {
         self.pins
     }
@@ -105,9 +106,19 @@ pub struct Lookup {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RetiredResources {
     pub checkpoint: CheckpointId,
+    pub key: PrefixKey,
+    /// The single child that took this checkpoint's pages when it was compacted.
+    pub heir: Option<CheckpointId>,
     pub pages: Vec<PageId>,
     pub snapshot: SnapshotId,
     pub retire_after: Fence,
+}
+
+/// Storage that eviction could retire, as projected by `reclaimable_if_pinned`.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Reclaimable {
+    pub pages: Vec<PageId>,
+    pub snapshots: Vec<SnapshotId>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -207,7 +218,14 @@ impl PrefixCheckpointCache {
         })
     }
 
-    fn chain(&self, id: CheckpointId) -> Result<Vec<CheckpointId>> {
+    /// The GPU-ready checkpoint published under `prefix`, if any.
+    pub fn ready_by_prefix(&self, prefix: &PrefixKey) -> Option<CheckpointId> {
+        let id = *self.prefixes.get(prefix)?;
+        self.nodes[&id].ready.then_some(id)
+    }
+
+    /// Checkpoints from the root to `id`, each with its parent.
+    pub(crate) fn chain(&self, id: CheckpointId) -> Result<Vec<CheckpointId>> {
         let mut chain = Vec::new();
         let mut next = Some(id);
         while let Some(id) = next {
@@ -436,6 +454,8 @@ impl PrefixCheckpointCache {
         }
         let retired = RetiredResources {
             checkpoint: id,
+            key: node.prefix,
+            heir: None,
             pages: node.tail_pages,
             snapshot: node.snapshot,
             retire_after: node.last_use.max(node.ready_after),
@@ -454,6 +474,7 @@ impl PrefixCheckpointCache {
         debug_assert_eq!(node.direct_pins, 0);
         debug_assert_eq!(node.child_count, 1);
         debug_assert_eq!(node.pins, child.pins);
+        let heir = child.id;
         let mut pages = node.tail_pages;
         pages.append(&mut child.tail_pages);
         child.tail_pages = pages;
@@ -463,6 +484,8 @@ impl PrefixCheckpointCache {
         self.prefixes.remove(&node.prefix);
         let retired = RetiredResources {
             checkpoint: id,
+            key: node.prefix,
+            heir: Some(heir),
             pages: Vec::new(),
             snapshot: node.snapshot,
             retire_after: node.last_use.max(node.ready_after),
@@ -479,6 +502,14 @@ impl PrefixCheckpointCache {
             );
         }
         Ok(self.retire_leaf(id))
+    }
+
+    fn eviction_candidates(&self) -> impl Iterator<Item = &Checkpoint> {
+        self.nodes.values().filter(|node| {
+            node.ready
+                && ((node.pins == 0 && node.child_count == 0)
+                    || (node.direct_pins == 0 && node.child_count == 1))
+        })
     }
 
     /// Thin dense checkpoint chains before retiring endpoints under snapshot pressure.
@@ -511,13 +542,7 @@ impl PrefixCheckpointCache {
                 })
                 .flatten();
             let candidate = interior.or_else(|| {
-                self.nodes
-                    .values()
-                    .filter(|node| {
-                        node.ready
-                            && ((node.pins == 0 && node.child_count == 0)
-                                || (node.direct_pins == 0 && node.child_count == 1))
-                    })
+                self.eviction_candidates()
                     .min_by_key(|node| (node.accessed, node.id))
                     .map(|node| node.id)
             });
@@ -538,6 +563,74 @@ impl PrefixCheckpointCache {
             }
         }
         report
+    }
+
+    /// What `evict` could retire if `pin(id)` had happened: both of its rules
+    /// run to a fixpoint on the pin-adjusted counts, read-only. A node's
+    /// unready children count as live; compaction keeps a node's pages (they
+    /// move to its child and are reclaimed with it) and reclaims its snapshot.
+    pub fn reclaimable_if_pinned(&self, id: CheckpointId) -> Result<Reclaimable> {
+        Ok(self.reclaimable(&self.chain(id)?))
+    }
+
+    fn reclaimable(&self, chain: &[CheckpointId]) -> Reclaimable {
+        let pinned = |node: &Checkpoint| node.pins + u64::from(chain.contains(&node.id));
+        let direct =
+            |node: &Checkpoint| node.direct_pins + u64::from(chain.first() == Some(&node.id));
+        let mut live: HashMap<CheckpointId, usize> = HashMap::new();
+        let mut kids: HashMap<CheckpointId, Vec<CheckpointId>> = HashMap::new();
+        let mut parent: HashMap<CheckpointId, Option<CheckpointId>> = HashMap::new();
+        for node in self.nodes.values() {
+            live.insert(node.id, node.child_count);
+            parent.insert(node.id, node.parent);
+            if let Some(up) = node.parent {
+                kids.entry(up).or_default().push(node.id);
+            }
+        }
+        // Nodes whose pages a node now holds because they were compacted into it.
+        let mut absorbed: HashMap<CheckpointId, Vec<CheckpointId>> = HashMap::new();
+        let mut removed = HashSet::new();
+        let mut out = Reclaimable::default();
+        let mut work: Vec<_> = self.nodes.keys().copied().collect();
+        while let Some(next) = work.pop() {
+            if removed.contains(&next) {
+                continue;
+            }
+            let node = &self.nodes[&next];
+            if !node.ready {
+                continue;
+            }
+            let children = live[&next];
+            if pinned(node) == 0 && children == 0 {
+                removed.insert(next);
+                out.snapshots.push(node.snapshot);
+                out.pages.extend_from_slice(&node.tail_pages);
+                for from in absorbed.remove(&next).unwrap_or_default() {
+                    out.pages.extend_from_slice(&self.nodes[&from].tail_pages);
+                }
+                if let Some(up) = parent[&next] {
+                    *live.get_mut(&up).unwrap() -= 1;
+                    work.push(up);
+                }
+            } else if direct(node) == 0 && children == 1 {
+                let heir = kids[&next]
+                    .iter()
+                    .copied()
+                    .find(|child| !removed.contains(child) && parent[child] == Some(next))
+                    .unwrap();
+                removed.insert(next);
+                out.snapshots.push(node.snapshot);
+                let mut moved = absorbed.remove(&next).unwrap_or_default();
+                moved.push(next);
+                absorbed.entry(heir).or_default().extend(moved);
+                let up = parent[&next];
+                parent.insert(heir, up);
+                if let Some(up) = up {
+                    kids.entry(up).or_default().push(heir);
+                }
+            }
+        }
+        out
     }
 
     pub(crate) fn pending_retirement(&self) -> &[RetiredResources] {

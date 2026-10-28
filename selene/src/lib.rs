@@ -9,20 +9,28 @@
 //! in registered host memory, [`disk_store::DiskStore`] retains record files, and
 //! [`composite::CompositeStore`] composes the two with write-through and
 //! read-through. Every store is driven from the model worker thread and never
-//! blocks it: `store` and `fetch` enqueue work, `poll` drains completions.
+//! blocks it: `store` copies each publication into the first host tier, `fetch`
+//! queues restores, and `poll` drains completions. Pooled stores announce GPU
+//! holdings at publication and move retained records down the eviction cascade.
 
+pub mod levels;
 pub mod composite;
 pub mod copier;
 pub mod disk;
 pub mod disk_store;
 mod error;
 pub mod geometry;
-pub mod index;
+pub use shared::index;
 pub mod input;
 pub mod memory;
-pub mod record;
+pub mod offload;
+pub mod plan;
+pub mod pool;
+pub use shared::record;
 pub mod registrar;
 pub mod slab;
+pub mod shard;
+pub mod shared;
 pub mod store;
 #[cfg(any(test, feature = "test-support"))]
 pub mod testing;
@@ -33,8 +41,11 @@ pub use error::{Error, Result};
 pub use geometry::{CacheGeometry, Layout, Plane};
 pub use registrar::{HostRegistrar, Registration, SplitMapping};
 pub use store::{
-    HostHit, HostStore, INITIAL_DIRECT_DISK_RATE, INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE,
-    INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, PublishedCheckpoint, StoreEvent, StoreOutcome,
-    StoreReason, StoreStats, Tier, Transport, worth_fetching,
+    ExportChain, ExportId, ExportNode, ExportRefusal, HostHit, HostStore,
+    INITIAL_MEMORY_RATE, INITIAL_PREFILL_RATE, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId,
+    PublishedCheckpoint, Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason,
+    StoreStats, worth_fetching, worth_transfer,
 };
 pub use vocab::{CheckpointId, HASH_BLOCK_TOKENS, History, PageId, PrefixKey, StateSlotId};
+
+pub use shared::Tier;

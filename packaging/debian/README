@@ -16,3 +16,9 @@ identities and model caches are retained. Run `command -v flare` to check whethe
 another executable in ~/.local/bin or /usr/local/bin takes precedence.
 
 Ignition, model weights, the CUDA toolkit, and Python are not included.
+
+To share prefix checkpoints, use --prefix-cache-pool HOST:PORT for plain TCP
+on a trusted fabric, tls:HOST:PORT for TLS, or unix:PATH for a local socket.
+TLS verifies the manager against the host CA bundle, or the file given by
+--prefix-cache-pool-ca (accepted only with tls:). The manager enables TLS only
+with --tls-cert and --tls-key. Client and manager network modes must match.

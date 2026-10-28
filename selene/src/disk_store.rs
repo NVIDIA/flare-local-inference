@@ -1,4 +1,4 @@
-//! Records retained as files, moved by a staged or direct transport.
+//! Records retained as files, moved through registered host staging.
 //!
 //! [`DiskStore`] indexes the record files under one directory, accounts their
 //! bytes against a limit, and evicts under the tree policy of the index: the
@@ -14,6 +14,9 @@
 //! enqueue, and `poll` advances every pipeline as far as free slabs and queue
 //! space allow before reporting completions.
 
+#[cfg(test)]
+use crate::store::TierStore;
+
 use std::{
     collections::{HashMap, VecDeque},
     path::{Path, PathBuf},
@@ -21,12 +24,20 @@ use std::{
     time::{Duration, Instant, SystemTime},
 };
 
-use crate::{CheckpointId, Error, History, PageId, PrefixKey, Result, StateSlotId};
+use crate::levels::Rate;
+use crate::{
+    CheckpointId, Error, ExportRefusal, History, PageId, PrefixKey, Result, StateSlotId,
+    index::NodeEvent,
+    pool::{
+        Announcer, FilePin, HostPin, IndexEntry, Releases, Tier as PoolTier, TierView,
+        pins::{FileSpan, host_chain_kept},
+    },
+};
 
 use super::{
-    CacheGeometry, HostHit, HostStore, INITIAL_DIRECT_DISK_RATE, INITIAL_STAGED_DISK_RATE,
-    InboundTicket, JobId, Layout, PublishedCheckpoint, StoreEvent, StoreOutcome, StoreReason,
-    StoreStats, Tier, Transport,
+    CacheGeometry, HostHit, HostStore, INITIAL_STAGED_DISK_RATE, InboundTicket, JobId, Layout,
+    PublishedCheckpoint, Retirement, Retiring, StoreEvent, StoreOutcome, StoreReason, StoreStats,
+    Tier,
     copier::{self, Direction, PageCopier, SharedCopier},
     disk::{self, DiskThread, Operation},
     geometry::invalid,
@@ -36,7 +47,7 @@ use super::{
 };
 
 /// Windows of one record the staged transport keeps in staging at a time.
-pub const WINDOWS_IN_FLIGHT: usize = 2;
+pub const WINDOWS_IN_FLIGHT: usize = crate::shared::WINDOW_CREDITS as usize;
 /// Records per direction a disk store keeps in flight. Further `store` calls
 /// are skipped and further `fetch` calls refused until one completes, so GPU
 /// pins and ticket ids held for the store stay bounded.
@@ -77,7 +88,6 @@ pub enum TransportEvent {
 
 /// Moves whole records between GPU ids and record files.
 pub trait DiskTransport {
-    fn kind(&self) -> Transport;
     /// Stream a published GPU checkpoint into a new record file at `temporary`,
     /// renamed to `path` on completion. The record's pages are the last
     /// `header.tail_pages` entries of the checkpoint's chain.
@@ -1236,10 +1246,6 @@ impl Staged {
 }
 
 impl DiskTransport for Staged {
-    fn kind(&self) -> Transport {
-        Transport::Staged
-    }
-
     fn store(
         &mut self,
         id: super::JobId,
@@ -1389,20 +1395,6 @@ impl DiskTransport for Staged {
     }
 }
 
-/// Exponentially weighted bytes per second of completed records in one direction.
-#[derive(Clone, Copy)]
-struct Rate(f64);
-
-impl Rate {
-    fn observe(&mut self, bytes: u64, elapsed: Duration) {
-        let seconds = elapsed.as_secs_f64();
-        if bytes == 0 || seconds <= 0.0 {
-            return;
-        }
-        self.0 = 0.8 * self.0 + 0.2 * (bytes as f64 / seconds);
-    }
-}
-
 struct Outbound {
     checkpoint: CheckpointId,
     key: PrefixKey,
@@ -1417,8 +1409,7 @@ struct Inbound {
     started: Instant,
 }
 
-/// Bytes an unlink or truncate job returns to the budget when it is issued,
-/// charged again when the job fails and the file keeps them.
+/// Bytes charged until the unlink or truncate succeeds.
 struct Reclaim {
     /// The compacted record, for a truncate; `None` for an unlink.
     key: Option<PrefixKey>,
@@ -1446,7 +1437,26 @@ pub struct DiskStore {
     evicted: Vec<PrefixKey>,
     outbound_rate: Rate,
     inbound_rate: Rate,
+    announce: Option<Announce>,
+    /// Eviction hands records to the pool's manager instead of unlinking them.
+    spill: bool,
+    pub(crate) preserve_committed: bool,
+    /// Records chosen for the manager and not yet taken by the pool store.
+    retiring: Vec<Retiring>,
+    /// Records held in place until their move ends, with the bytes freed when
+    /// they go.
+    held: HashMap<PrefixKey, u64>,
+    /// Records whose moves ended and that leave once nothing reads them.
+    finishing: Vec<PrefixKey>,
+    largest: u64,
+    maintenance_progress: u64,
     pub directory_lock: record::DirectoryLock,
+}
+
+/// What a disk store keeps to announce its records and serve them as exports.
+struct Announce {
+    view: TierView,
+    releases: Releases,
 }
 
 impl DiskStore {
@@ -1486,10 +1496,6 @@ impl DiskStore {
         for record in by_age {
             index.touch(&record.header.key);
         }
-        let rate = match transport.kind() {
-            Transport::Staged => INITIAL_STAGED_DISK_RATE,
-            Transport::Direct => INITIAL_DIRECT_DISK_RATE,
-        };
         Ok(Self {
             index,
             identity,
@@ -1507,10 +1513,151 @@ impl DiskStore {
             maintenance: HashMap::new(),
             replacements: HashMap::new(),
             evicted: Vec::new(),
-            outbound_rate: Rate(rate),
-            inbound_rate: Rate(rate),
+            outbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
+            inbound_rate: Rate::new(INITIAL_STAGED_DISK_RATE),
+            announce: None,
+            spill: false,
+            preserve_committed: false,
+            retiring: Vec::new(),
+            held: HashMap::new(),
+            finishing: Vec::new(),
+            largest: scanned.iter().map(|r| r.bytes).max().unwrap_or(0),
+            maintenance_progress: 0,
             directory_lock,
         })
+    }
+
+    /// Announce this store's records through `announcer` and serve them as
+    /// exports. Recovered holdings are announced before this returns.
+    pub fn announce_records(&mut self, announcer: Announcer) {
+        if self.announce.is_some() {
+            return;
+        }
+        let view = TierView::new(announcer, PoolTier::Nvme, &self.layout);
+        self.index.observe(view.sink());
+        view.sink()
+            .lock()
+            .unwrap()
+            .extend(self.index.ready_notices());
+        self.announce = Some(Announce {
+            view,
+            releases: Releases::default(),
+        });
+        self.flush_announcements();
+    }
+
+    /// What this tier announced for a complete record, as the next tier below
+    /// memory: the entry a record spilled here is announced as.
+    pub fn announced_entry(&self, key: &PrefixKey) -> Option<IndexEntry> {
+        let node = self.index.node(key).filter(|node| node.ready)?;
+        if !self.announce.as_ref()?.view.contains(key) {
+            return None;
+        }
+        Some(IndexEntry {
+            key: *key,
+            parent: node.parent,
+            bucket: node.bucket,
+            tail_pages: node.tail_pages as u32,
+            row: node.row,
+            tier: PoolTier::Nvme,
+            bytes: node.tail_pages as u64 * self.layout.page_record_bytes
+                + if node.row {
+                    self.layout.row_record_bytes
+                } else {
+                    0
+                },
+        })
+    }
+
+    /// Release finished exports' pins and announce what changed.
+    pub fn flush_announcements(&mut self) {
+        let Some(a) = self.announce.as_mut() else {
+            return;
+        };
+        for key in a.releases.drain() {
+            let _ = self.index.unpin(&key);
+            self.stats.progress += 1;
+        }
+        for notice in a.view.drain() {
+            match notice.event {
+                NodeEvent::Ready | NodeEvent::RowDropped => a.view.announce(&notice, notice.parent),
+                NodeEvent::Gone => a.view.retire(&notice.key),
+            }
+        }
+        let _ = self.finish_retired();
+    }
+
+    /// Pin the chain of complete record files ending at `key` for an export
+    /// from `begin_tokens`. The files' own checksums are what is served.
+    pub fn pin_export_files(
+        &mut self,
+        key: PrefixKey,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        let Some(a) = self.announce.as_ref() else {
+            return Err(ExportRefusal::NotFound);
+        };
+        if !a.view.contains(&key) {
+            return Err(ExportRefusal::NotFound);
+        }
+        let page_tokens = self.layout.page_tokens;
+        let start_page = begin_tokens / page_tokens;
+        let mut keys = Vec::new();
+        let mut nodes = Vec::new();
+        let mut spans = Vec::new();
+        let mut cursor = key;
+        loop {
+            let node = self
+                .index
+                .node(&cursor)
+                .filter(|node| node.ready)
+                .ok_or(ExportRefusal::ChainGap)?;
+            if !a.view.contains(&cursor) {
+                return Err(ExportRefusal::ChainGap);
+            }
+            if want_row && cursor == key && !node.row {
+                return Err(ExportRefusal::ChainGap);
+            }
+            keys.push(cursor);
+            nodes.push((cursor, node.tail_pages));
+            spans.push(FileSpan::new(
+                node.location.path.clone(),
+                node.location.header.clone(),
+            ));
+            let start =
+                (cursor.consumed_tokens / page_tokens).saturating_sub(node.tail_pages as u64);
+            if start <= start_page {
+                break;
+            }
+            cursor = node.parent.ok_or(ExportRefusal::ChainGap)?;
+        }
+        keys.reverse();
+        nodes.reverse();
+        spans.reverse();
+        let (chain, kept) = host_chain_kept(page_tokens, begin_tokens, want_row, &nodes);
+        if chain.total_pages != (key.consumed_tokens / page_tokens).saturating_sub(start_page) {
+            return Err(ExportRefusal::ChainGap);
+        }
+        // Windows name records by their place in the chain, which leaves out nodes with no page.
+        let mut spans: Vec<Option<FileSpan>> = spans.into_iter().map(Some).collect();
+        let spans: Vec<FileSpan> = kept.iter().filter_map(|&i| spans[i].take()).collect();
+        for (position, key) in keys.iter().enumerate() {
+            if self.index.pin(key).is_err() {
+                for pinned in &keys[..position] {
+                    let _ = self.index.unpin(pinned);
+                }
+                return Err(ExportRefusal::NotFound);
+            }
+        }
+        Ok(Box::new(FilePin {
+            chain,
+            spans,
+            page_bytes: self.layout.page_record_bytes,
+            row_bytes: self.layout.row_record_bytes,
+            keys,
+            releases: a.releases.clone(),
+        }))
     }
 
     pub fn share_budget(&mut self, budget: Arc<super::input::DiskBudget>) {
@@ -1536,6 +1683,11 @@ impl DiskStore {
                 ),
             );
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_limit(&mut self, limit: u64) {
+        self.limit = limit;
     }
 
     pub fn index(&self) -> &Index<DiskRecord> {
@@ -1572,10 +1724,6 @@ impl DiskStore {
 
     pub fn layout(&self) -> &Layout {
         &self.layout
-    }
-
-    pub fn transport(&self) -> Transport {
-        self.transport.kind()
     }
 
     pub fn transport_mut(&mut self) -> &mut dyn DiskTransport {
@@ -1666,9 +1814,23 @@ impl DiskStore {
             tail.len() as u32,
             SystemTime::now(),
         )?;
-        Ok((header.length_with_row() > self.limit).then_some(StoreOutcome::Oversize))
+        let mut footprint = header.length_with_row();
+        let mut cursor = parent;
+        while let Some(key) = cursor {
+            let node = &self.index[&key];
+            footprint = footprint.saturating_add(if Some(key) != parent {
+                node.location.header.row_segment
+            } else if node.location.bytes == 0 {
+                node.location.header.length_with_row()
+            } else {
+                node.location.bytes
+            });
+            cursor = node.parent;
+        }
+        Ok((footprint > self.limit).then_some(StoreOutcome::Oversize))
     }
 
+    /// With `reserve=false`, index only uncharged metadata for a DRAM copy.
     /// Make room for a record of `tail_pages`, index it as writing, pin it,
     /// and return its header and file names; `None` when evicting every
     /// unpinned record would still not bring it under the limit. The key must
@@ -1682,8 +1844,10 @@ impl DiskStore {
         parent: Option<PrefixKey>,
         bucket: [u8; 16],
         tail_pages: usize,
+        reserve: bool,
     ) -> Result<Option<(Header, PathBuf, PathBuf)>> {
-        let replacement = if let Some(node) = self.index.node(&key) {
+        let parked = self.index.node(&key).is_some_and(|n| n.location.bytes == 0);
+        let replacement = if let Some(node) = self.index.node(&key).filter(|_| !parked) {
             if node.row {
                 return Err(invalid("host record key is already indexed"));
             }
@@ -1731,7 +1895,11 @@ impl DiskStore {
         if replacement.is_some() {
             self.index.pin(&key)?;
         }
-        let room = self.make_room(bytes);
+        let room = if reserve {
+            self.make_room(bytes)
+        } else {
+            Ok(true)
+        };
         if replacement.is_some() {
             self.index.unpin(&key)?;
         }
@@ -1741,11 +1909,13 @@ impl DiskStore {
         if !room? {
             return Ok(None);
         }
-        if let Some(budget) = &self.budget
+        if reserve
+            && let Some(budget) = &self.budget
             && !budget.reserve_checkpoint(bytes)
         {
             return Ok(None);
         }
+        let bytes = if reserve { bytes } else { 0 };
         let path = self.directory().join(record::file_name(&key));
         let temporary = self.directory().join(record::temporary_name(&key));
         let location = DiskRecord {
@@ -1753,17 +1923,22 @@ impl DiskStore {
             header: header.clone(),
             bytes,
         };
-        if let Some(old) = replacement {
+        if parked {
+            self.index.node_mut(&key).unwrap().location = location;
+        } else if let Some(old) = replacement {
             self.replacements.insert(key, old);
-            let node = self.index.node_mut(&key).unwrap();
-            node.location = location;
-            node.ready = false;
+            self.index.node_mut(&key).unwrap().location = location;
+            self.index.set_ready(&key, false)?;
         } else {
             self.index
                 .insert(key, parent, bucket, tail_pages, true, false, location)?;
         }
-        self.index.pin(&key)?;
+        if !parked {
+            self.index.pin(&key)?;
+        }
         self.used += bytes;
+        self.largest = self.largest.max(bytes);
+        self.stats.progress += 1;
         Ok(Some((header, temporary, path)))
     }
 
@@ -1779,29 +1954,31 @@ impl DiskStore {
         result: Result<u64>,
         prior_readable: bool,
     ) -> Result<()> {
+        self.stats.progress += 1;
         if let Some(old) = self.replacements.remove(&key) {
             let node = self.index.node_mut(&key).unwrap();
-            if result.is_ok() {
+            let ready = if result.is_ok() {
                 self.used -= old.bytes;
                 node.row = true;
-                node.ready = true;
                 self.stats.row_refills += 1;
                 self.stats.stored += 1;
                 self.stats.bytes_out += result.as_ref().copied().unwrap();
                 self.evicted.push(key);
+                true
             } else {
+                self.stats.store_failed += 1;
                 if prior_readable {
                     self.used -= node.location.bytes;
                     node.location = old;
-                    node.ready = true;
+                    true
                 } else {
                     // A failed cleanup can leave a complete replacement on one rank.
                     self.used -= old.bytes;
-                    node.ready = false;
                     node.row = false;
+                    false
                 }
-                self.stats.store_failed += 1;
-            }
+            };
+            self.index.set_ready(&key, ready)?;
             self.index.unpin(&key)?;
             if !prior_readable {
                 self.evicted.push(key);
@@ -1816,11 +1993,10 @@ impl DiskStore {
         }
         match result {
             Ok(bytes) => {
-                let node = self
-                    .index
-                    .node_mut(&key)
-                    .ok_or_else(|| invalid("cannot commit an unindexed host record"))?;
-                node.ready = true;
+                if !self.index.contains(&key) {
+                    return Err(invalid("cannot commit an unindexed host record"));
+                }
+                self.index.set_ready(&key, true)?;
                 self.index.unpin(&key)?;
                 self.stats.stored += 1;
                 self.stats.bytes_out += bytes;
@@ -1847,13 +2023,23 @@ impl DiskStore {
                 .map_or(self.limit, |b| b.checkpoint_limit())
                 .min(self.limit)
         {
+            if self.preserve_committed {
+                return Ok(false);
+            }
+            if self.spill && self.retire_for(bytes) {
+                return Ok(false);
+            }
             match self.index.evict(true, |_| true) {
                 Some(Eviction::Leaves(nodes)) => {
+                    self.stats.dropped[3] += nodes.len() as u64;
                     for node in nodes {
                         self.unlink(node)?;
                     }
                 }
-                Some(Eviction::Compacted(key)) => self.compact(&key)?,
+                Some(Eviction::Compacted(key)) => {
+                    self.stats.dropped[3] += 1;
+                    self.compact(&key)?;
+                }
                 None => {
                     if let Some(budget) = &self.budget {
                         budget.request_input_reclaim(bytes);
@@ -1862,7 +2048,113 @@ impl DiskStore {
                 }
             }
         }
-        Ok(true)
+        Ok(self.budget.is_none()
+            || self
+                .used
+                .saturating_add(self.pending_bytes())
+                .saturating_add(bytes)
+                <= self
+                    .budget
+                    .as_ref()
+                    .unwrap()
+                    .checkpoint_limit()
+                    .min(self.limit))
+    }
+
+    fn pending_bytes(&self) -> u64 {
+        self.maintenance.values().map(|r| r.bytes).sum()
+    }
+
+    pub(crate) fn maintain(&mut self) {
+        let progress = self.stats().progress;
+        if !self.preserve_committed && self.spill && self.maintenance_progress != progress {
+            self.maintenance_progress = progress;
+            self.retire_for(
+                crate::store::headroom(self.limit, self.largest)
+                    .saturating_add(self.pending_bytes()),
+            );
+        }
+    }
+
+    /// Hold bounded cold leaves for handover until they cover the demand.
+    /// A full tier waits while any such records remain held.
+    fn retire_for(&mut self, bytes: u64) -> bool {
+        let limit = self
+            .budget
+            .as_ref()
+            .map_or(self.limit, |b| b.checkpoint_limit())
+            .min(self.limit);
+        let mut freed: u64 = self.held.values().sum();
+        for _ in 0..crate::pool::cascade::MOVES_MAX {
+            if self.used.saturating_sub(freed).saturating_add(bytes) <= limit
+                || self.held.len() >= crate::pool::cascade::MOVES_MAX
+            {
+                break;
+            }
+            let announce = self.announce.as_ref();
+            let Some(key) = self.index.candidate(false, |node| {
+                announce.is_some_and(|a| a.view.contains(&node.key))
+            }) else {
+                break;
+            };
+            let Some(node) = self.index.node(&key) else {
+                break;
+            };
+            let retiring = Retiring {
+                tier: PoolTier::Nvme,
+                key,
+                parent: node.parent,
+                bucket: node.bucket,
+                tail_pages: node.tail_pages,
+                row: node.row,
+            };
+            let node_bytes = node.location.bytes;
+            if self.index.pin(&key).is_err() {
+                break;
+            }
+            freed += node_bytes;
+            self.held.insert(key, node_bytes);
+            self.retiring.push(retiring);
+        }
+        !self.held.is_empty()
+    }
+
+    /// The move of a held record ended: unlink it, or let it be offered again.
+    fn retired(&mut self, key: &PrefixKey, how: Retirement) -> Result<()> {
+        if self.held.remove(key).is_none() {
+            return Ok(());
+        }
+        self.index.unpin(key)?;
+        self.stats.held[1] += u64::from(how == Retirement::Failed);
+        self.stats.progress += 1;
+        if how != Retirement::Failed {
+            self.finishing.push(*key);
+            self.finish_retired()?;
+        }
+        Ok(())
+    }
+
+    /// Unlink the records whose moves ended, once no export pin still reads
+    /// them. A record that gained a child meanwhile stays.
+    fn finish_retired(&mut self) -> Result<()> {
+        let mut finishing = std::mem::take(&mut self.finishing);
+        let mut result = Ok(());
+        finishing.retain(|key| {
+            if self.index.node(key).is_some_and(|node| node.pinned()) {
+                return true;
+            }
+            if let Ok(removed) = self.index.remove(key) {
+                for node in removed {
+                    if let Err(error) = self.unlink(node) {
+                        result = Err(error);
+                    }
+                }
+                self.stats.progress += 1;
+            }
+            false
+        });
+        self.finishing = finishing;
+        result
     }
 
     /// Return a removed node's bytes to the budget and unlink its file.
@@ -1943,7 +2235,7 @@ impl DiskStore {
                 self.unlink(removed)?;
             }
         } else {
-            node.row = false;
+            self.index.drop_row(key);
         }
         self.sync_budget();
         Ok(())
@@ -1997,7 +2289,7 @@ impl DiskStore {
             resident_tokens: chain.resident_tokens,
             pages: chain.pages,
             bytes,
-            tier: Tier::Disk,
+            tier: Tier::Nvme,
             estimated_seconds: bytes as f64 / self.inbound_rate.0.max(1.0),
             chain,
         }
@@ -2036,10 +2328,8 @@ impl DiskStore {
                         // again. Its pages stay in the index for descendants
                         // that hold it as an ancestor; only its row, which
                         // makes it a lookup match, is dropped.
-                        if let Some(endpoint) = job.nodes.last()
-                            && let Some(node) = self.index.node_mut(endpoint)
-                        {
-                            node.row = false;
+                        if let Some(endpoint) = job.nodes.last() {
+                            self.index.drop_row(endpoint);
                         }
                     }
                 }
@@ -2084,19 +2374,32 @@ impl DiskStore {
         if let Ok(bytes) = &result {
             self.outbound_rate.observe(*bytes, job.started.elapsed());
         }
+        let pressure = result.as_ref().err().is_some_and(Error::no_space);
         let result = match self.finish_record(job.key, result.clone(), prior_readable) {
             Ok(()) => result,
             Err(error) => Err(error),
         };
-        events.push(StoreEvent::Stored {
-            checkpoint: job.checkpoint,
-            key: job.key,
-            result,
+        self.stats.dropped[5] += u64::from(result.is_err() && !pressure);
+        self.stats.held[1] += u64::from(pressure);
+        events.push(if pressure {
+            StoreEvent::Deferred {
+                checkpoint: job.checkpoint,
+            }
+        } else {
+            StoreEvent::Stored {
+                checkpoint: job.checkpoint,
+                key: job.key,
+                result,
+            }
         });
     }
 }
 
 impl HostStore for DiskStore {
+    fn reused(&mut self, key: PrefixKey) {
+        self.index.touch(&key);
+    }
+
     fn lookup(&mut self, history: &dyn History, resident: u64, before: u64) -> Option<HostHit> {
         self.stats.lookups += 1;
         let chain = self
@@ -2109,11 +2412,12 @@ impl HostStore for DiskStore {
     fn store(&mut self, checkpoint: &PublishedCheckpoint) -> Result<StoreOutcome> {
         if let Some(outcome) = self.store_status(checkpoint)? {
             self.stats.store_skipped += 1;
+            self.stats.dropped[4] += u64::from(outcome == StoreOutcome::Oversize);
             return Ok(outcome);
         }
         let (parent, tail) = self.plan_record(checkpoint);
         let Some((header, temporary, path)) =
-            self.reserve_record(checkpoint.key, parent, checkpoint.bucket, tail.len())?
+            self.reserve_record(checkpoint.key, parent, checkpoint.bucket, tail.len(), true)?
         else {
             self.stats.store_skipped += 1;
             return Ok(StoreOutcome::Retry(StoreReason::Budget));
@@ -2192,6 +2496,8 @@ impl HostStore for DiskStore {
         for event in completed {
             self.apply(event, events);
         }
+        self.flush_announcements();
+        self.maintain();
         polled
     }
 
@@ -2221,12 +2527,42 @@ impl HostStore for DiskStore {
     }
 }
 
+impl crate::store::TierStore for DiskStore {
+    fn announce_to(&mut self, announcer: Announcer) {
+        self.announce_records(announcer);
+    }
+    fn pin_export(
+        &mut self,
+        tier: PoolTier,
+        key: PrefixKey,
+        begin_tokens: u64,
+        want_row: bool,
+    ) -> std::result::Result<Box<dyn HostPin>, ExportRefusal> {
+        if tier != PoolTier::Nvme {
+            return Err(ExportRefusal::NotFound);
+        }
+        self.pin_export_files(key, begin_tokens, want_row)
+    }
+    fn set_spill(&mut self, enabled: bool) {
+        let enabled = enabled && self.announce.is_some();
+        self.stats.progress += u64::from(self.spill != enabled);
+        self.spill = enabled;
+    }
+    fn take_retiring(&mut self) -> Vec<Retiring> {
+        std::mem::take(&mut self.retiring)
+    }
+    fn retired(&mut self, key: PrefixKey, tier: PoolTier, how: Retirement) {
+        if tier == PoolTier::Nvme {
+            let _ = DiskStore::retired(self, &key, how);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{
-        Ids, StoppedCopier, TestHistory as PrefixHistory, checkpoint, pattern, test_directory,
-    };
+    use crate::testing::{Ids, checkpoint, pattern, test_directory};
+    use crate::testing::{StoppedCopier, TestHistory as PrefixHistory};
     use crate::{
         slab::{STAGING_PAGE_SLABS, STAGING_ROW_SLABS},
         testing::geometry as rank,
@@ -2345,10 +2681,6 @@ mod tests {
     }
 
     impl DiskTransport for Recorder {
-        fn kind(&self) -> Transport {
-            Transport::Staged
-        }
-
         fn store(
             &mut self,
             id: JobId,
@@ -2574,6 +2906,153 @@ mod tests {
     }
 
     #[test]
+    fn feasible_ancestor_row_compaction_is_not_oversize() {
+        let full = history(192);
+        let root = header(&geometry(), &full, 64, None);
+        let parent = header(&geometry(), &full, 128, Some(64));
+        let leaf = header(&geometry(), &full, 192, Some(128));
+        let limit = root.row_segment + parent.length_with_row() + leaf.length_with_row();
+        let (mut store, _) = store_with(
+            vec![
+                scanned(&directory(), root.clone(), 0, true),
+                scanned(&directory(), parent.clone(), 1, true),
+            ],
+            limit,
+        );
+        let record = checkpoint(
+            &mut Ids::new(),
+            &full,
+            192,
+            Some(128),
+            pages(0..3),
+            1,
+            StateSlotId(0),
+        );
+        assert_eq!(store.store(&record).unwrap(), StoreOutcome::Queued);
+        assert!(!store.index.node(&root.key).unwrap().row);
+        assert!(store.index.node(&parent.key).unwrap().row);
+    }
+
+    #[test]
+    fn filesystem_full_defers_a_disk_only_copy_after_drain() {
+        let full = history(64);
+        let record = checkpoint(
+            &mut Ids::new(),
+            &full,
+            64,
+            None,
+            vec![PageId(0)],
+            1,
+            StateSlotId(0),
+        );
+        let (mut store, _) = store_with(Vec::new(), 1 << 30);
+        assert_eq!(store.store(&record).unwrap(), StoreOutcome::Queued);
+        let id = *store.outbound.keys().next().unwrap();
+        let mut events = Vec::new();
+        store.apply(
+            TransportEvent::Stored {
+                id,
+                result: Err(Error::caused_by(
+                    "disk full",
+                    std::io::Error::from(std::io::ErrorKind::StorageFull),
+                )),
+            },
+            &mut events,
+        );
+        assert!(
+            matches!(&events[..], [StoreEvent::Deferred { checkpoint }] if *checkpoint == record.id)
+        );
+        assert!(store.outbound.is_empty());
+        assert_eq!(store.stats().dropped, [0; 6]);
+        assert_eq!(store.stats().held[1], 1);
+        assert!(!store.index.contains(&record.key));
+    }
+
+    #[test]
+    fn a_full_local_tier_keeps_every_record_until_one_is_needed() {
+        let full = history(1000);
+        let headers: Vec<_> = (1..=3)
+            .map(|n| header(&geometry(), &full, n * 64, None))
+            .collect();
+        let limit: u64 = headers.iter().map(Header::length_with_row).sum();
+        let records = headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| scanned(&directory(), h.clone(), i as u64, true))
+            .collect();
+        let (mut store, _log) = store_with(records, limit);
+        let _announcer = announced(&mut store);
+        // Local mode never sets spill: no proactive demotion, however full the tier.
+        store.maintain();
+        assert!(store.take_retiring().is_empty());
+        assert!(store.maintenance.is_empty());
+        assert_eq!(store.stats().disk_records, 3);
+        // With the pool ready the same tier does demote ahead of need.
+        store.set_spill(true);
+        store.maintain();
+        assert!(!store.take_retiring().is_empty());
+    }
+
+    #[test]
+    fn pending_unlinks_are_included_in_proactive_headroom() {
+        let full = history(1000);
+        let headers: Vec<_> = (1..=3)
+            .map(|n| header(&geometry(), &full, n * 64, None))
+            .collect();
+        let limit: u64 = headers.iter().map(Header::length_with_row).sum();
+        let records = headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| scanned(&directory(), h.clone(), i as u64, true))
+            .collect();
+        let (mut store, log) = store_with(records, limit);
+        let budget = super::super::input::DiskBudget::new(limit, limit);
+        store.share_budget(budget);
+        let _announcer = announced(&mut store);
+        store.set_spill(true);
+        store.maintain();
+        let first = store.take_retiring();
+        assert!(!first.is_empty());
+        for r in first {
+            store.retired(&r.key, Retirement::Moved).unwrap();
+        }
+        let pending = store.pending_bytes();
+        assert!(pending > 0);
+        store.maintain();
+        let next = store.take_retiring();
+        assert!(!next.is_empty(), "pending maintenance advances retirement");
+        for r in next {
+            store.retired(&r.key, Retirement::Moved).unwrap();
+        }
+        let id = *store.maintenance.keys().next().unwrap();
+        complete(
+            &log,
+            TransportEvent::Unlinked { id, result: Ok(()) },
+            &mut store,
+        );
+        let candidate = checkpoint(
+            &mut Ids::new(),
+            &full,
+            64,
+            None,
+            vec![PageId(0)],
+            1,
+            StateSlotId(0),
+        );
+        let key = PrefixKey {
+            digest: [93; 16],
+            ..candidate.key
+        };
+        assert!(store.pending_bytes() > 0);
+        assert!(
+            store
+                .reserve_record(key, None, candidate.bucket, 1, true)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
     fn shared_disk_budget_keeps_maintenance_bytes_until_success() {
         let history = history(700);
         let header = header(&geometry(), &history, 700, None);
@@ -2681,14 +3160,13 @@ mod tests {
         assert_eq!((stats.disk_records, stats.disk_bytes), (4, total));
         assert_eq!(stats.inbound_rate, INITIAL_STAGED_DISK_RATE);
         assert_eq!(stats.outbound_rate, INITIAL_STAGED_DISK_RATE);
-        assert_eq!(store.transport(), Transport::Staged);
         assert_eq!(store.limit(), total);
 
         // After the oldest sibling leaves, the older child compacts before
         // the page-only leaf is removed; that removal also reclaims the child.
         let key = full.key_at(300).unwrap();
         let (reserved, temporary, path) = store
-            .reserve_record(key, None, full.bucket_at(300).unwrap(), 4)
+            .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true)
             .unwrap()
             .unwrap();
         assert_eq!(reserved.tail_pages, 4);
@@ -2861,7 +3339,7 @@ mod tests {
             (700, 0, 10)
         );
         assert_eq!(hit.bytes, 10 * PAGE_RECORD + ROW_RECORD);
-        assert_eq!(hit.tier, Tier::Disk);
+        assert_eq!(hit.tier, Tier::Nvme);
         assert_eq!(
             hit.estimated_seconds,
             hit.bytes as f64 / INITIAL_STAGED_DISK_RATE
@@ -2996,7 +3474,7 @@ mod tests {
         );
         assert!(
             store
-                .reserve_record(grandchild.key, Some(root.key), grandchild.bucket, 21)
+                .reserve_record(grandchild.key, Some(root.key), grandchild.bucket, 21, true)
                 .is_err()
         );
         assert!(store.record(&grandchild.key).is_none());
@@ -3016,7 +3494,7 @@ mod tests {
         // Evicting the child takes the remnant with it; only the child's file is unlinked.
         let key = full.key_at(704).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, None, full.bucket_at(704).unwrap(), 11)
+            .reserve_record(key, None, full.bucket_at(704).unwrap(), 11, true)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -3152,7 +3630,7 @@ mod tests {
         let key = full.key_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, full.bucket_at(300).unwrap(), 4)
+                .reserve_record(key, None, full.bucket_at(300).unwrap(), 4, true)
                 .unwrap()
                 .is_some()
         );
@@ -3164,7 +3642,8 @@ mod tests {
                     full.key_at(400).unwrap(),
                     None,
                     full.bucket_at(400).unwrap(),
-                    6
+                    6,
+                    true
                 )
                 .unwrap()
                 .is_none()
@@ -3383,7 +3862,7 @@ mod tests {
         // evicting anything.
         assert!(
             store
-                .reserve_record(root.key, None, root.bucket, 10)
+                .reserve_record(root.key, None, root.bucket, 10, true)
                 .is_err()
         );
         let unknown = full.key_at(1000).unwrap();
@@ -3393,7 +3872,8 @@ mod tests {
                     full.key_at(1100).unwrap(),
                     Some(unknown),
                     full.bucket_at(1100).unwrap(),
-                    1
+                    1,
+                    true
                 )
                 .is_err()
         );
@@ -3423,7 +3903,13 @@ mod tests {
         branch.append(&[5; 700], &[]).unwrap();
         let key = branch.key_at(1340).unwrap();
         let (reserved, _, _) = store
-            .reserve_record(key, Some(root.key), branch.bucket_at(1340).unwrap(), 10)
+            .reserve_record(
+                key,
+                Some(root.key),
+                branch.bucket_at(1340).unwrap(),
+                10,
+                true,
+            )
             .unwrap()
             .unwrap();
         assert_eq!(reserved.length_with_row(), leaf.length_with_row());
@@ -3468,7 +3954,7 @@ mod tests {
         let bucket = full.bucket_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, bucket, 4)
+                .reserve_record(key, None, bucket, 4, true)
                 .unwrap()
                 .is_none()
         );
@@ -3513,7 +3999,10 @@ mod tests {
         // Releasing the leaf lets the whole chain go. The child's unlink fails,
         // so its bytes stay charged although the record left the index.
         store.index_mut().unpin(&leaf.key).unwrap();
-        let (reserved, _, _) = store.reserve_record(key, None, bucket, 4).unwrap().unwrap();
+        let (reserved, _, _) = store
+            .reserve_record(key, None, bucket, 4, true)
+            .unwrap()
+            .unwrap();
         assert_eq!(store.take_evicted(), [leaf.key, child.key, root.key]);
         assert_eq!(store.used(), reserved.length_with_row());
         match &log.borrow().calls[2..] {
@@ -3565,7 +4054,7 @@ mod tests {
         let bucket = full.bucket_at(300).unwrap();
         assert!(
             store
-                .reserve_record(key, None, bucket, 4)
+                .reserve_record(key, None, bucket, 4, true)
                 .unwrap()
                 .is_none()
         );
@@ -3605,7 +4094,10 @@ mod tests {
 
         // Releasing the pin lets the leaf go, and its page-only ancestors follow.
         store.index_mut().unpin(&leaf.key).unwrap();
-        let (reserved, _, _) = store.reserve_record(key, None, bucket, 4).unwrap().unwrap();
+        let (reserved, _, _) = store
+            .reserve_record(key, None, bucket, 4, true)
+            .unwrap()
+            .unwrap();
         assert_eq!(
             unlinked(&log),
             [&leaf, &child, &root].map(|header| directory.join(record::file_name(&header.key)))
@@ -3623,19 +4115,6 @@ mod tests {
         assert!(node.ready && !node.pinned());
         assert_eq!(store.stats().stored, 1);
         assert!(store.commit_record(root.key, Ok(0)).is_err());
-    }
-
-    #[test]
-    fn rates_weight_each_completed_record_and_ignore_empty_or_instant_ones() {
-        let mut rate = Rate(INITIAL_STAGED_DISK_RATE);
-        rate.observe(1_000_000_000, Duration::from_secs(1));
-        assert_eq!(rate.0, 0.8 * INITIAL_STAGED_DISK_RATE + 0.2 * 1e9);
-        let settled = rate.0;
-        rate.observe(0, Duration::from_secs(1));
-        rate.observe(4096, Duration::ZERO);
-        assert_eq!(rate.0, settled);
-        rate.observe(settled as u64 * 2, Duration::from_secs(1));
-        assert_eq!(rate.0, 0.8 * settled + 0.2 * (settled * 2.0).trunc());
     }
 
     #[test]
@@ -3711,7 +4190,7 @@ mod tests {
                 "{} of {count} transport events within 60 s",
                 events.len()
             );
-            staged.poll(&mut events);
+            staged.poll(&mut events).unwrap();
             std::thread::sleep(Duration::from_millis(1));
         }
         assert_eq!(events.len(), count);
@@ -3890,7 +4369,7 @@ mod tests {
             TransportEvent::Truncated { result: Ok(_), .. }
         ));
         let guard = record::DirectoryLock::acquire(&directory).unwrap();
-        let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, &geometry()).unwrap();
+        let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, geometry()[0].page_tokens, &record::rank_sizes(&geometry())).unwrap();
         let mut store = DiskStore::new(
             guard,
             IDENTITY,
@@ -3902,7 +4381,7 @@ mod tests {
         )
         .unwrap();
         let (replacement, temporary, path) = store
-            .reserve_record(root.key, None, root.bucket, 2)
+            .reserve_record(root.key, None, root.bucket, 2, true)
             .unwrap()
             .unwrap();
         assert!(!store.index.complete(&child.key));
@@ -3952,8 +4431,23 @@ mod tests {
         );
         store.close().unwrap();
         drop(store);
-        let guard = record::DirectoryLock::acquire(&directory).unwrap();
-        let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, &geometry()).unwrap();
+        // Parallel subprocess tests can inherit the flock until their exec completes.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let guard = loop {
+            match record::DirectoryLock::acquire(&directory) {
+                Ok(guard) => break guard,
+                Err(error) => {
+                    let busy = error.cause().is_some_and(|cause| {
+                        cause
+                            .downcast_ref::<std::io::Error>()
+                            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                    });
+                    assert!(busy && Instant::now() < deadline, "{error}");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+        };
+        let scanned = record::scan(&guard, &IDENTITY, &FINGERPRINT, geometry()[0].page_tokens, &record::rank_sizes(&geometry())).unwrap();
         assert_eq!(scanned.len(), 2);
         assert!(scanned.iter().all(|record| record.row));
         drop(guard);
@@ -4089,7 +4583,8 @@ mod tests {
             &record::DirectoryLock::acquire(&directory).unwrap(),
             &IDENTITY,
             &FINGERPRINT,
-            &geometry,
+            geometry[0].page_tokens,
+            &record::rank_sizes(&geometry),
         )
         .unwrap();
         assert_eq!(scanned.len(), 1);
@@ -4260,7 +4755,7 @@ mod tests {
         assert!(staged.truncate(JobId(10), path.clone(), 0).is_err());
         assert!(staged.unlink(JobId(10), path.clone()).is_err());
         let mut events = Vec::new();
-        staged.poll(&mut events);
+        staged.poll(&mut events).unwrap();
         assert!(events.is_empty());
         fs::remove_dir_all(&directory).unwrap();
     }
@@ -4477,7 +4972,8 @@ mod tests {
                 &record::DirectoryLock::acquire(&directory).unwrap(),
                 &IDENTITY,
                 &FINGERPRINT,
-                &geometry
+                geometry[0].page_tokens,
+                &record::rank_sizes(&geometry)
             )
             .unwrap()
             .len(),
@@ -4550,7 +5046,7 @@ mod tests {
                 "{} of {RECORDS} records within 120 s",
                 events.len()
             );
-            staged.poll(&mut events);
+            staged.poll(&mut events).unwrap();
             assert!(staged.resources.disk_outstanding <= disk::QUEUE_DEPTH);
             std::thread::sleep(Duration::from_millis(1));
         }
@@ -4580,7 +5076,8 @@ mod tests {
                 &record::DirectoryLock::acquire(&directory).unwrap(),
                 &IDENTITY,
                 &FINGERPRINT,
-                &geometry
+                geometry[0].page_tokens,
+                &record::rank_sizes(&geometry)
             )
             .unwrap()
             .len(),
@@ -4588,5 +5085,267 @@ mod tests {
         );
         staged.close().unwrap();
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    /// Write the record file of `header` with known pages, their checksums and a
+    /// row; returns the pages and the row.
+    fn write_record(directory: &Path, header: &mut Header, seed: u8) -> (Vec<Vec<u8>>, Vec<u8>) {
+        let tail = header.tail_pages as usize;
+        let pages: Vec<Vec<u8>> = (0..tail)
+            .map(|p| {
+                (0..PAGE_RECORD as usize)
+                    .map(|i| (i * 3 + p + seed as usize) as u8)
+                    .collect()
+            })
+            .collect();
+        let row: Vec<u8> = (0..ROW_RECORD as usize)
+            .map(|i| (i + seed as usize) as u8)
+            .collect();
+        header.row_checksum = record::checksum(&row);
+        let mut file = vec![0u8; header.length_with_row() as usize];
+        file[..record::HEADER_BYTES].copy_from_slice(&header.encode().unwrap());
+        for (index, page) in pages.iter().enumerate() {
+            let at = header.page_segment as usize + index * PAGE_RECORD as usize;
+            file[at..at + page.len()].copy_from_slice(page);
+            let sum = header.checksum_segment() as usize + index * 8;
+            file[sum..sum + 8].copy_from_slice(&record::checksum(page).to_le_bytes());
+        }
+        let at = header.row_segment as usize;
+        file[at..at + row.len()].copy_from_slice(&row);
+        fs::write(directory.join(record::file_name(&header.key)), file).unwrap();
+        (pages, row)
+    }
+
+    #[test]
+    fn records_on_disk_are_announced_and_exported_with_the_checksums_their_files_persist() {
+        use crate::pool::{Announcer, HostWindow, Notice, Tier as PoolTier};
+        let geometry = geometry();
+        let directory = directory();
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let full = history(2000);
+        let mut root = header(&geometry, &full, 700, None);
+        let mut leaf = header(&geometry, &full, 1300, Some(700));
+        let (root_pages, _) = write_record(&directory, &mut root, 1);
+        let (leaf_pages, leaf_row) = write_record(&directory, &mut leaf, 2);
+        let records = vec![
+            scanned(&directory, root.clone(), 0, true),
+            scanned(&directory, leaf.clone(), 1, true),
+        ];
+        let (mut store, _log) = store_with(records, 1 << 30);
+        let announcer = Announcer::new(Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer.clone());
+        store.flush_announcements();
+        let notices = announcer.take_batch(10).unwrap();
+        assert_eq!(notices.len(), 2, "both files are announced");
+        assert!(
+            notices
+                .iter()
+                .all(|n| matches!(n, Notice::Saved(e) if e.tier == PoolTier::Nvme))
+        );
+        assert_eq!(
+            store.pin_export(PoolTier::Dram, leaf.key, 0, true).err(),
+            Some(ExportRefusal::NotFound)
+        );
+        let mut pin = store.pin_export(PoolTier::Nvme, leaf.key, 0, true).unwrap();
+        let chain = pin.chain().clone();
+        assert_eq!(chain.records.len(), 2);
+        assert_eq!(chain.total_pages, 20);
+        assert_eq!(chain.records[0].key, root.key);
+        assert!(store.index.nodes().all(|node| node.pinned()));
+        // Pages and checksums come from the files.
+        let window = HostWindow {
+            record: 0,
+            first_page: 2,
+            page_count: 3,
+            row: false,
+        };
+        let mut dst = vec![0u8; 3 * PAGE_RECORD as usize];
+        let sums = pin.read(&window, &mut dst).unwrap();
+        assert_eq!(dst[..PAGE_RECORD as usize], root_pages[2][..]);
+        assert_eq!(sums.pages[0], record::checksum(&root_pages[2]));
+        let window = HostWindow {
+            record: 1,
+            first_page: 9,
+            page_count: 1,
+            row: true,
+        };
+        let mut dst = vec![0u8; (PAGE_RECORD + ROW_RECORD) as usize];
+        let sums = pin.read(&window, &mut dst).unwrap();
+        assert_eq!(dst[PAGE_RECORD as usize..], leaf_row[..]);
+        assert_eq!(sums.row, Some(record::checksum(&leaf_row)));
+        // A page that rotted on disk is served as it is, with the checksum it
+        // was written with, so the requester's check fails.
+        let path = directory.join(record::file_name(&leaf.key));
+        let mut file = fs::read(&path).unwrap();
+        file[leaf.page_segment as usize + 5] ^= 1;
+        fs::write(&path, file).unwrap();
+        let window = HostWindow {
+            record: 1,
+            first_page: 0,
+            page_count: 1,
+            row: false,
+        };
+        let mut dst = vec![0u8; PAGE_RECORD as usize];
+        let sums = pin.read(&window, &mut dst).unwrap();
+        assert_ne!(record::checksum(&dst), sums.pages[0]);
+        assert_eq!(sums.pages[0], record::checksum(&leaf_pages[0]));
+        // Starting inside the leaf needs only the leaf.
+        let suffix = store
+            .pin_export(PoolTier::Nvme, leaf.key, 700 + 640, false)
+            .unwrap();
+        assert_eq!(suffix.chain().records.len(), 1);
+        drop(suffix);
+        // Dropping the pins releases the records at the next flush.
+        drop(pin);
+        store.flush_announcements();
+        assert!(store.index.nodes().all(|node| !node.pinned()));
+        // Nothing further changed, so nothing further is announced.
+        store.flush_announcements();
+        assert!(announcer.take_batch(10).is_none());
+    }
+
+    fn announced(store: &mut DiskStore) -> crate::pool::Announcer {
+        let announcer = crate::pool::Announcer::new(Arc::new(tokio::sync::Notify::new()));
+        announcer.begin_session();
+        store.announce_to(announcer.clone());
+        store.flush_announcements();
+        announcer
+    }
+
+    #[test]
+    fn a_spilling_store_holds_the_coldest_leaf_until_its_move_ends() {
+        let full = history(1000);
+        let cold = header(&geometry(), &full, 128, None);
+        let warm = header(&geometry(), &full, 256, None);
+        let limit = cold.length_with_row() + warm.length_with_row();
+        let records = vec![
+            scanned(&directory(), cold.clone(), 0, true),
+            scanned(&directory(), warm.clone(), 1, true),
+        ];
+        let (mut store, log) = store_with(records, limit);
+        let _announcer = announced(&mut store);
+        store.set_spill(true);
+
+        // Room for one more page: the coldest file is held, nothing is unlinked.
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        let retiring = store.take_retiring();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(
+            (retiring[0].key, retiring[0].tier, retiring[0].row),
+            (cold.key, PoolTier::Nvme, true)
+        );
+        assert!(unlinked(&log).is_empty());
+        assert!(store.index.node(&cold.key).unwrap().pinned());
+
+        // The held file already covers the request: nothing more is chosen.
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        assert!(store.take_retiring().is_empty());
+
+        // A failed move keeps the file, which is offered again.
+        crate::store::TierStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Failed);
+        assert!(unlinked(&log).is_empty());
+        assert!(!store.index.node(&cold.key).unwrap().pinned());
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        assert_eq!(store.take_retiring()[0].key, cold.key);
+
+        // Once moved, the file is unlinked and its bytes are free.
+        crate::store::TierStore::retired(&mut store, cold.key, PoolTier::Nvme, Retirement::Moved);
+        assert_eq!(unlinked(&log).len(), 1);
+        assert!(!store.index.contains(&cold.key));
+        assert_eq!(store.take_evicted(), [cold.key]);
+        assert!(store.make_room(PAGE_RECORD).unwrap());
+    }
+
+    #[test]
+    fn a_busy_or_unavailable_manager_leaves_local_lru_as_the_end() {
+        let full = history(1000);
+        let cold = header(&geometry(), &full, 128, None);
+        let warm = header(&geometry(), &full, 256, None);
+        let limit = cold.length_with_row() + warm.length_with_row();
+        let (mut store, log) = store_with(
+            vec![
+                scanned(&directory(), cold.clone(), 0, true),
+                scanned(&directory(), warm.clone(), 1, true),
+            ],
+            limit,
+        );
+        let _announcer = announced(&mut store);
+        store.set_spill(true);
+        store.maintain();
+        let selected = store.take_retiring();
+        assert!(!selected.is_empty());
+        for r in selected {
+            store.retired(&r.key, Retirement::Failed).unwrap();
+        }
+        store.set_spill(false);
+        assert!(store.index.contains(&cold.key));
+        assert!(unlinked(&log).is_empty());
+        assert!(store.make_room(PAGE_RECORD).unwrap());
+        assert!(!store.index.contains(&cold.key));
+        assert!(store.index.contains(&warm.key));
+        assert_eq!(unlinked(&log).len(), 1);
+        assert_eq!(store.stats().dropped[3], 1);
+        assert!(store.stats().held[1] > 0);
+    }
+
+    #[test]
+    fn a_store_that_is_not_spilling_unlinks_the_coldest_leaf_as_before() {
+        let full = history(1000);
+        let cold = header(&geometry(), &full, 128, None);
+        let warm = header(&geometry(), &full, 256, None);
+        let limit = cold.length_with_row() + warm.length_with_row();
+        let records = vec![
+            scanned(&directory(), cold.clone(), 0, true),
+            scanned(&directory(), warm.clone(), 1, true),
+        ];
+        let (mut store, log) = store_with(records, limit);
+        let _announcer = announced(&mut store);
+        // Spilling was on and the manager went away.
+        store.set_spill(true);
+        store.set_spill(false);
+        assert!(store.make_room(PAGE_RECORD).unwrap());
+        assert!(store.take_retiring().is_empty());
+        assert_eq!(unlinked(&log).len(), 1);
+        assert!(!store.index.contains(&cold.key));
+    }
+
+    #[test]
+    fn a_moved_record_stays_until_the_pin_that_reads_it_is_released() {
+        use crate::pool::Tier as PoolTier;
+        let geometry = geometry();
+        let directory = directory();
+        let _ = fs::remove_dir_all(&directory);
+        fs::create_dir_all(&directory).unwrap();
+        let full = history(2000);
+        let mut leaf = header(&geometry, &full, 700, None);
+        write_record(&directory, &mut leaf, 1);
+        let (mut store, log) = store_with(
+            vec![scanned(&directory, leaf.clone(), 0, true)],
+            leaf.length_with_row(),
+        );
+        let _announcer = announced(&mut store);
+        store.set_spill(true);
+        assert!(!store.make_room(PAGE_RECORD).unwrap());
+        assert_eq!(store.take_retiring().remove(0).key, leaf.key);
+        let pin = store.pin_export(PoolTier::Nvme, leaf.key, 0, true).unwrap();
+
+        crate::store::TierStore::retired(&mut store, leaf.key, PoolTier::Nvme, Retirement::Moved);
+        assert!(unlinked(&log).is_empty(), "a pin still reads the file");
+        drop(pin);
+        store.flush_announcements();
+        assert_eq!(unlinked(&log).len(), 1);
+        assert!(!store.index.contains(&leaf.key));
+    }
+
+    #[test]
+    fn a_publication_starts_the_disk_copy() {
+        let (mut store, log) = store_with(Vec::new(), 1 << 30);
+        let full = history(1000);
+        let mut ids = Ids::new();
+        let publication = checkpoint(&mut ids, &full, 128, None, pages(0..2), 2, StateSlotId(1));
+        assert_eq!(store.store(&publication).unwrap(), StoreOutcome::Queued);
+        assert_eq!(log.borrow().calls.len(), 1);
     }
 }

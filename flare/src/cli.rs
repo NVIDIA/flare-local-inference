@@ -8,7 +8,9 @@ use std::{
 use clap::{Args, Parser, Subcommand, builder::PossibleValuesParser, builder::TypedValueParser};
 use flare_helios::{
     engram::Storage,
-    offload::{PrefixCacheOffload, Transport, parse_size},
+    offload::{
+        PoolOptions, PrefixCacheOffload, parse_drain_on_shutdown, parse_pool_address, parse_size,
+    },
     runtime_package::{KvCacheLimit, LoadOptions, MemoryLimit},
 };
 
@@ -894,11 +896,24 @@ pub struct ServingOptions {
     #[arg(long, value_name = "SIZE", value_parser = parse_size, help_heading = "Prefix cache options")]
     pub prefix_cache_disk_limit: Option<u64>,
 
-    /// Transfer disk checkpoints through host staging or GPUDirect Storage [default: prefix_cache.disk_transport, else staged].
-    #[arg(long, value_name = "MODE", help_heading = "Prefix cache options",
-        value_parser = PossibleValuesParser::new(["staged", "direct"])
-            .map(|value| if value == "staged" { Transport::Staged } else { Transport::Direct }))]
-    pub prefix_cache_disk_transport: Option<Transport>,
+    /// Drain pooled DRAM to local disk at shutdown, optionally for 90s or 2m; off disables [default: prefix_cache.drain_on_shutdown, else off].
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "on",
+        value_name = "DURATION|on|off", value_parser = parse_drain_on_shutdown, help_heading = "Prefix cache options")]
+    pub prefix_cache_drain_on_shutdown: Option<std::time::Duration>,
+
+    /// Share prefix checkpoints at `unix:PATH`, plain TCP `HOST:PORT`, or TLS `tls:HOST:PORT` [default: not shared].
+    #[arg(long, value_name = "ADDRESS", value_parser = parse_pool_address,
+        help_heading = "Prefix cache options")]
+    pub prefix_cache_pool: Option<String>,
+
+    /// CA certificate that the `tls:` pool manager's certificate must chain to [default: host trust store].
+    #[arg(
+        long,
+        value_name = "FILE",
+        requires = "prefix_cache_pool",
+        help_heading = "Prefix cache options"
+    )]
+    pub prefix_cache_pool_ca: Option<PathBuf>,
 }
 
 fn served_model_name(value: &str) -> Result<String, String> {
@@ -1040,15 +1055,18 @@ impl ServingOptions {
         if let Some(bytes) = self.prefix_cache_disk_limit {
             options.extend(["--prefix-cache-disk-limit".into(), bytes.to_string()]);
         }
-        if let Some(transport) = self.prefix_cache_disk_transport {
-            options.extend([
-                "--prefix-cache-disk-transport".into(),
-                match transport {
-                    Transport::Staged => "staged",
-                    Transport::Direct => "direct",
-                }
-                .into(),
-            ]);
+        if let Some(timeout) = self.prefix_cache_drain_on_shutdown {
+            let value = match timeout {
+                std::time::Duration::MAX => "on".into(),
+                _ => timeout.as_secs_f64().to_string(),
+            };
+            options.push(format!("--prefix-cache-drain-on-shutdown={value}"));
+        }
+        if let Some(address) = &self.prefix_cache_pool {
+            options.extend(["--prefix-cache-pool".into(), address.clone()]);
+        }
+        if let Some(ca) = &self.prefix_cache_pool_ca {
+            options.extend(["--prefix-cache-pool-ca".into(), ca.display().to_string()]);
         }
         options
     }
@@ -1094,7 +1112,11 @@ impl ServingOptions {
                 memory_bytes: self.prefix_cache_memory,
                 disk: self.prefix_cache_disk.clone(),
                 disk_limit: self.prefix_cache_disk_limit,
-                transport: self.prefix_cache_disk_transport,
+                drain_on_shutdown: self.prefix_cache_drain_on_shutdown.unwrap_or_default(),
+                pool: self.prefix_cache_pool.clone().map(|address| PoolOptions {
+                    address,
+                    ca: self.prefix_cache_pool_ca.clone(),
+                }),
             },
             cluster_rank,
         }
@@ -1449,8 +1471,6 @@ mod tests {
             "prefixes",
             "--prefix-cache-disk-limit",
             "0",
-            "--prefix-cache-disk-transport",
-            "direct",
         ]);
         assert_eq!(args.package, Some(PathBuf::from("model.safetensors")));
         assert_eq!(args.bind_address().to_string(), "[::1]:8001");
@@ -1466,7 +1486,8 @@ mod tests {
                 memory_bytes: Some(3 << 29),
                 disk: Some(PathBuf::from("prefixes")),
                 disk_limit: Some(0),
-                transport: Some(Transport::Direct),
+                drain_on_shutdown: std::time::Duration::ZERO,
+                pool: None,
             }
         );
     }
@@ -1786,6 +1807,134 @@ mod tests {
     }
 
     #[test]
+    fn pool_addresses_are_validated_and_forwarded_to_every_rank() {
+        let rejected = |arguments: &[&str]| {
+            let mut all = vec!["flare", "run", "model.safetensors"];
+            all.extend(arguments);
+            Cli::try_parse_from(all).is_err()
+        };
+        assert!(rejected(&["--prefix-cache-pool-tenant", "acme"]));
+        let single = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--prefix-cache-pool",
+            "unix:/run/selene.sock",
+        ]);
+        assert_eq!(
+            single.load_options().prefix_cache.pool,
+            Some(PoolOptions {
+                address: "unix:/run/selene.sock".into(),
+                ca: None
+            })
+        );
+        assert_eq!(
+            single.rank_options(),
+            ["--prefix-cache-pool", "unix:/run/selene.sock"]
+        );
+        for bad in [
+            "",
+            "unix:",
+            "host",
+            "host:0",
+            "host:70000",
+            ":9000",
+            "a b:9000",
+            "tls:",
+            "tls:host",
+            "tls::9000",
+            "tls:host:0",
+            "tls:host:70000",
+            "tls:host:+9000",
+            "tls:unix:/run/selene.sock",
+            "tls:tls:host:9000",
+            "plain:host:9000",
+            "http://host:9000",
+            "host:extra:9000",
+            "[invalid]:9000",
+            "tls:[::1:9000",
+            "host/path:9000",
+        ] {
+            assert!(
+                rejected(&["--prefix-cache-pool", bad]),
+                "{bad}"
+            );
+        }
+        for address in [
+            "unix:/run/selene.sock",
+            "10.0.0.5:7000",
+            "selene.local:7000",
+            "tls:selene.local:7000",
+            "[::1]:7000",
+            "tls:[::1]:7000",
+        ] {
+            let args = run(&[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--prefix-cache-pool",
+                address,
+            ]);
+            assert_eq!(
+                args.load_options().prefix_cache.pool,
+                Some(PoolOptions {
+                    address: address.into(),
+                    ca: None
+                })
+            );
+            // Every rank receives the same pool settings.
+            assert_eq!(
+                args.rank_options(),
+                ["--prefix-cache-pool", address]
+            );
+        }
+        let unset = run(&["flare", "run", "model.safetensors"]);
+        assert!(unset.load_options().prefix_cache.pool.is_none());
+        assert!(!unset.load_options().prefix_cache.enabled());
+    }
+
+    #[test]
+    fn the_pool_ca_needs_a_pool_and_reaches_every_rank() {
+        let rejected = |arguments: &[&str]| {
+            let mut all = vec!["flare", "run", "model.safetensors"];
+            all.extend(arguments);
+            Cli::try_parse_from(all).is_err()
+        };
+        assert!(rejected(&["--prefix-cache-pool-ca", "/etc/selene/ca.pem"]));
+        let args = run(&[
+            "flare",
+            "run",
+            "model.safetensors",
+            "--prefix-cache-pool",
+            "tls:selene.local:7000",
+            "--prefix-cache-pool-ca",
+            "/etc/selene/ca.pem",
+        ]);
+        assert_eq!(
+            args.load_options().prefix_cache.pool,
+            Some(PoolOptions {
+                address: "tls:selene.local:7000".into(),
+                ca: Some("/etc/selene/ca.pem".into())
+            })
+        );
+        assert_eq!(
+            args.rank_options(),
+            [
+                "--prefix-cache-pool",
+                "tls:selene.local:7000",
+                "--prefix-cache-pool-ca",
+                "/etc/selene/ca.pem"
+            ]
+        );
+        let mut forwarded = vec!["flare".to_owned(), "run".into(), "model.safetensors".into()];
+        forwarded.extend(args.rank_options());
+        let Command::Run(peer) = Cli::try_parse_from(forwarded).unwrap().command else {
+            panic!()
+        };
+        assert_eq!(peer.load_options().prefix_cache.pool, args.load_options().prefix_cache.pool);
+    }
+
+    #[test]
     fn prefix_cache_settings_reach_every_rank() {
         let args = run(&[
             "flare",
@@ -1797,9 +1946,12 @@ mod tests {
             "/var/cache/flare",
             "--prefix-cache-disk-limit",
             "100G",
-            "--prefix-cache-disk-transport",
-            "staged",
+            "--prefix-cache-drain-on-shutdown=1.5m",
         ]);
+        assert_eq!(
+            args.load_options().prefix_cache.drain_on_shutdown,
+            std::time::Duration::from_secs(90)
+        );
         let options = args.rank_options();
         assert_eq!(
             options,
@@ -1810,8 +1962,7 @@ mod tests {
                 "/var/cache/flare",
                 "--prefix-cache-disk-limit",
                 "107374182400",
-                "--prefix-cache-disk-transport",
-                "staged",
+                "--prefix-cache-drain-on-shutdown=90",
             ]
         );
         let mut forwarded = vec!["flare", "run", "model.safetensors"];

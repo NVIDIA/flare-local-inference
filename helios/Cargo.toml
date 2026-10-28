@@ -20,6 +20,9 @@ grammar = ["frontend", "dep:llguidance"]
 server = ["dep:serde", "images", "grammar", "dep:axum", "dep:tokio", "dep:async-stream", "dep:base64", "dep:ratatui", "dep:crossterm", "dep:futures-util", "dep:flate2", "dep:zstd", "dep:brotli", "dep:httpdate", "dep:deepseek-recipe"]
 # RoCEnante's RDMA proxy for ranks on separate hosts; links libibverbs.
 roce = ["dep:cc", "runtime-package"]
+# Lets the prefix cache pool's data channel use RDMA when its manager offers it (experimental);
+# links libibverbs.
+rdma = ["flare-selene/rdma"]
 
 [dependencies]
 flare-eos = { path = "../eos" }
@@ -56,6 +59,7 @@ crossterm = { version = "0.28", default-features = false, optional = true }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 
 [dev-dependencies]
+flare-selene-manager = { path = "../selene-manager", features = ["test-support"] }
 flare-selene = { path = "../selene", features = ["test-support"] }
 minijinja = { version = "=2.24.0", features = ["loader", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }

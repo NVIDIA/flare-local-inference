@@ -31,6 +31,17 @@ impl Error {
         }
     }
 
+    pub(crate) fn no_space(&self) -> bool {
+        self.source.as_ref().is_some_and(|source| {
+            source.downcast_ref::<std::io::Error>().is_some_and(|e| {
+                matches!(
+                    e.kind(),
+                    std::io::ErrorKind::StorageFull | std::io::ErrorKind::QuotaExceeded
+                )
+            }) || source.downcast_ref::<Self>().is_some_and(Self::no_space)
+        })
+    }
+
     /// Carry an error produced behind a seam, so the caller on the far side can
     /// recover it exactly. The message is the carried error's own.
     pub fn carrying(error: impl StdError + Send + Sync + 'static) -> Self {

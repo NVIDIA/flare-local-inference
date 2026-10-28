@@ -6,6 +6,10 @@ edition = "2024"
 rust-version = "1.88"
 publish = false
 
+[features]
+# The prefix cache pool's data channel may use RDMA when its manager offers it (experimental).
+rdma = ["flare-helios/rdma"]
+
 [profile.release]
 strip = "symbols"
 

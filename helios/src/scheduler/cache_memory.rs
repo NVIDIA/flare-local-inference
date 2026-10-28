@@ -58,7 +58,7 @@ impl RequestScheduler {
             if let Some(id) = self.reserve_snapshot(0) {
                 return Ok(Some(id));
             }
-            let evicted = self.cache.evict(EvictionTarget {
+            let evicted = self.evict(EvictionTarget {
                 pages: 0,
                 snapshots: 1,
             });
@@ -71,11 +71,13 @@ impl RequestScheduler {
         }
     }
 
-    fn pending_backing(&self) -> (Vec<bool>, Vec<SnapshotId>) {
+    /// Backing that is free or becomes free once every retired owner and `extra` reaches
+    /// its fence, with the snapshots those owners release.
+    pub(super) fn pending_backing(&self, extra: &Reclaimable) -> (Vec<bool>, Vec<SnapshotId>) {
         let mut available = vec![false; self.limits.pages as usize];
         let mut retiring_refs = vec![0; available.len()];
-        let mut snapshots = Vec::new();
-        for page in &self.free_pages {
+        let mut snapshots = extra.snapshots.clone();
+        for page in self.free_pages.iter().chain(&extra.pages) {
             available[page.0 as usize] = true;
         }
         for retirement in self.cache.pending_retirement() {
@@ -107,7 +109,7 @@ impl RequestScheduler {
 
     /// Project free backing after every already-retired owner reaches its fence.
     pub(super) fn pending_page_count(&self) -> usize {
-        let (available, _) = self.pending_backing();
+        let (available, _) = self.pending_backing(&Reclaimable::default());
         available.into_iter().filter(|free| *free).count()
     }
 
@@ -115,9 +117,21 @@ impl RequestScheduler {
         if self.cache.pending_retirement().is_empty() && self.retired.is_empty() {
             return false;
         }
-        let (backing, retiring) = self.pending_backing();
+        let (backing, retiring) = self.pending_backing(&Reclaimable::default());
+        self.projected_fits(&backing, &retiring, pages, snapshots)
+    }
+
+    /// Whether `pages` pages and `snapshots` snapshot ids are obtainable once `backing` is
+    /// free and the `retiring` snapshots are released, honouring snapshot aliases.
+    pub(super) fn projected_fits(
+        &self,
+        backing: &[bool],
+        retiring: &[SnapshotId],
+        pages: usize,
+        snapshots: usize,
+    ) -> bool {
         let mut available = 0;
-        for free in &backing {
+        for free in backing {
             available += usize::from(*free);
         }
         if available < pages {
@@ -127,7 +141,7 @@ impl RequestScheduler {
             return true;
         }
         let mut eligible = 0;
-        for snapshot in self.free_snapshots.iter().chain(&retiring) {
+        for snapshot in self.free_snapshots.iter().chain(retiring) {
             let mut cost = 0;
             let mut usable = true;
             if let Some(range) = self.snapshot_pages.get(snapshot.0 as usize) {

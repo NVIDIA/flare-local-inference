@@ -18,7 +18,7 @@ pub struct NativeModel {
     _package_files: Vec<std::sync::Arc<std::fs::File>>,
     pub(super) server_config: serde_json::Value,
     engram: Vec<(std::sync::Arc<crate::engram::Shared>, usize)>,
-    offload: Option<std::sync::Arc<crate::offload::Shared>>,
+    pub(super) offload: flare_selene::offload::Startup,
     cluster: Option<ClusterRank>,
     roce: Vec<Option<RoceSpec>>,
 }
@@ -188,9 +188,31 @@ pub fn rank_ranges(
     archive.rank_ranges(index, rank)
 }
 
-/// Turns the continuation rows and KV pages this process can back into those it allocates. Ranks on
-/// separate hosts agree on the smallest any of them can back; it must not exceed what it is given.
-pub type CacheAgreement<'a> = &'a mut dyn FnMut((u64, u64)) -> Result<(u64, u64)>;
+/// Startup agreement between ranks: register and approve pool memory before choosing the
+/// smallest cache capacity every host can back.
+pub trait CacheAgreement {
+    fn caches(&mut self, local: (u64, u64)) -> Result<(u64, u64)>;
+
+    fn pool(
+        &mut self,
+        offer: crate::offload::shard::PoolOffer,
+    ) -> Result<Option<crate::offload::shard::PoolPeers>> {
+        if offer.enabled {
+            return Err(invalid("a multi-host pool requires a rank rendezvous"));
+        }
+        Ok(None)
+    }
+
+    fn pool_approved(&mut self, approved: bool, _world: usize) -> Result<bool> {
+        Ok(approved)
+    }
+}
+
+impl<F: FnMut((u64, u64)) -> Result<(u64, u64)>> CacheAgreement for F {
+    fn caches(&mut self, local: (u64, u64)) -> Result<(u64, u64)> {
+        self(local)
+    }
+}
 
 impl NativeModel {
     /// # Safety
@@ -213,7 +235,7 @@ impl NativeModel {
         devices: &[i32],
         options: &LoadOptions,
         progress: &StartupProgress,
-        agree: CacheAgreement<'_>,
+        agree: &mut dyn CacheAgreement,
     ) -> Result<Self> {
         match package {
             super::ModelPackage::Legacy(authorized) => unsafe {
@@ -242,7 +264,7 @@ impl NativeModel {
         devices: &[i32],
         options: &LoadOptions,
         progress: &StartupProgress,
-        agree: CacheAgreement<'_>,
+        agree: &mut dyn CacheAgreement,
     ) -> Result<Self> {
         let device_labels = options.device_labels.as_deref().unwrap_or(devices);
         if device_labels.len() != devices.len() {
@@ -569,7 +591,7 @@ impl NativeModel {
             ranks: Vec::new(),
             server_config,
             engram: Vec::new(),
-            offload: None,
+            offload: Default::default(),
             cluster,
             roce,
         };
@@ -816,8 +838,7 @@ impl NativeModel {
             staging,
             shard,
         )?;
-        let summary = prepared.summary();
-        self.offload = prepared.into_shared();
+        let summary = self.offload.attach(prepared, &crate::offload::transfer::Copiers)?;
         phase.finish(summary);
         Ok(())
     }
@@ -900,9 +921,7 @@ impl NativeModel {
             .enumerate()
             .map(|(index, rank)| {
                 let mut manifest = rank.execution_manifest()?;
-                if let Some(shared) = &self.offload {
-                    manifest.offload = Some(crate::offload::Binding::new(shared.clone(), index));
-                }
+                manifest.offload = self.offload.binding(index);
                 if let Some((shared, delivery_rank)) = self.engram.get(index) {
                     let events = shared
                         .index
@@ -937,7 +956,7 @@ impl NativeModel {
 
     /// The host prefix store this process prepared, before the model worker opens it.
     pub fn offload(&self) -> Option<&crate::offload::Shared> {
-        self.offload.as_deref()
+        self.offload.shared()
     }
 
     /// The RoCE transport local rank `rank` launches, if any.
@@ -948,7 +967,7 @@ impl NativeModel {
 
 impl Drop for NativeModel {
     fn drop(&mut self) {
-        self.offload.take();
+        self.offload.reset();
         self.engram.clear();
         // Rank zero owns the shared reservations and releases them after every peer.
         while self.ranks.pop().is_some() {}
@@ -1046,7 +1065,7 @@ mod tests {
             ranks: Vec::new(),
             server_config: serde_json::Value::Null,
             engram: Vec::new(),
-            offload: None,
+            offload: Default::default(),
             cluster: None,
             roce: Vec::new(),
         };
@@ -1056,7 +1075,8 @@ mod tests {
                 memory_bytes: Some(0),
                 disk: Some("unopened-prefix-cache".into()),
                 disk_limit: Some(0),
-                transport: Some(crate::offload::Transport::Direct),
+                drain_on_shutdown: Default::default(),
+                pool: None,
             },
         ] {
             let options = LoadOptions {
@@ -1068,7 +1088,7 @@ mod tests {
                     .prepare_offload(Path::new("unopened-package"), &options, &progress)
                     .unwrap();
             }
-            assert!(model.offload.is_none());
+            assert!(model.offload.shared().is_none());
         }
         let options = LoadOptions {
             prefix_cache: crate::offload::PrefixCacheOffload {

@@ -7,7 +7,8 @@ use super::{
     driver::{Access, AllocationProperties, Location},
     format::{Memory, Package, invalid},
 };
-use crate::{Result, offload::CacheGeometry};
+use crate::Result;
+use flare_selene::CacheGeometry;
 
 #[derive(Debug)]
 struct Chunk {
@@ -171,7 +172,7 @@ mod tests {
             page_tokens: 64,
             page_capacity: pages,
             row_capacity: rows,
-            row: crate::offload::Plane {
+            row: flare_selene::Plane {
                 name: "rows".into(),
                 address: 0,
                 unit_bytes: row_bytes,
@@ -179,7 +180,7 @@ mod tests {
             planes: units
                 .iter()
                 .enumerate()
-                .map(|(i, &unit)| crate::offload::Plane {
+                .map(|(i, &unit)| flare_selene::Plane {
                     name: format!("plane-{i}"),
                     address: 0,
                     unit_bytes: unit,
@@ -358,7 +359,7 @@ mod tests {
             let planes: Vec<_> = units
                 .iter()
                 .enumerate()
-                .map(|(i, &unit)| crate::offload::Plane {
+                .map(|(i, &unit)| flare_selene::Plane {
                     name: format!("plane-{i}"),
                     address: 0,
                     unit_bytes: unit,
@@ -368,7 +369,7 @@ mod tests {
                 page_tokens: 64,
                 page_capacity: pages,
                 row_capacity: 41,
-                row: crate::offload::Plane {
+                row: flare_selene::Plane {
                     name: "rows".into(),
                     address: 0,
                     unit_bytes: row_bytes,

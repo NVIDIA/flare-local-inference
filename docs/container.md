@@ -99,6 +99,7 @@ filename selection, and offline behavior.
 Disk-backed embedding tables and disk prefix-cache offload use Linux `io_uring`.
 The container's seccomp policy must permit `io_uring_setup`, `io_uring_enter`,
 and `io_uring_register` for those modes. Docker's default policy can block them;
-use a policy allowing those calls. Prefix-cache disk directories also need a
+use a policy allowing those calls, such as
+`selene-manager/deploy/seccomp-io-uring.json` (Docker's default plus io_uring). Prefix-cache disk directories also need a
 writable bind mount owned by the serving user. `--ulimit memlock=-1:-1` permits
 the pinned host storage used for transfers.

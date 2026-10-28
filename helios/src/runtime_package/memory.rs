@@ -1,12 +1,12 @@
 //! Choose physical cache capacities within reserved virtual address ranges.
 
+use flare_selene::{CacheGeometry, Plane};
 use super::{
     KvCacheLimit, LoadOptions, MemoryLimit, NativeModel, NativeResources,
     format::{Memory, Package, invalid},
 };
 use crate::{
     Result,
-    offload::{CacheGeometry, Plane},
     startup::StartupProgress,
 };
 
@@ -16,22 +16,14 @@ const HEADROOM_BYTES: u64 = 64 << 20;
 // A GPU that allocates from system memory (GB10) shares it with the operating system and with
 // the server's host allocations made after sizing: frontend workers, tokenizers and request
 // buffers took about 1.4 GiB on a DGX Spark. Caches leave room for both beyond the reserve.
-const INTEGRATED_HOST_BYTES: u64 = 2 << 30;
-const INTEGRATED_SYSTEM_SHARE: u64 = 20;
+use flare_selene::offload::{
+    HOST_SERVICE_HEADROOM_BYTES as INTEGRATED_HOST_BYTES,
+    HOST_SYSTEM_SHARE as INTEGRATED_SYSTEM_SHARE,
+};
 
 #[cfg(any(unix, test))]
 pub(super) fn shared_available(meminfo: &str, total: usize) -> Result<usize> {
-    let available = meminfo.lines().find_map(|line| {
-        let mut fields = line.split_whitespace();
-        if fields.next()? != "MemAvailable:" {
-            return None;
-        }
-        let kib = fields.next()?.parse::<usize>().ok()?;
-        (fields.next()? == "kB").then_some(kib)?.checked_mul(1024)
-    });
-    available
-        .map(|n| n.min(total))
-        .ok_or_else(|| invalid("Linux MemAvailable is required to size integrated GPU memory"))
+    Ok(flare_selene::offload::available_memory(meminfo, total)?)
 }
 
 impl NativeResources {
@@ -466,12 +458,12 @@ impl NativeModel {
         packages: &mut [Package],
         progress: &StartupProgress,
         active: usize,
-        agree: super::model::CacheAgreement<'_>,
+        agree: &mut dyn super::model::CacheAgreement,
         options: &LoadOptions,
         initial: &[MemorySnapshot],
         embedding_host_bytes: u64,
     ) -> Result<()> {
-        // The host prefix store registers and streams after the caches are backed.
+        // Local host tiers register after cache backing; pool regions register before sizing.
         let reserve = headroom(&self.server_config)?;
         let page_tokens = self.server_config["page_tokens"]
             .as_u64()
@@ -535,13 +527,13 @@ impl NativeModel {
             let staging = input_window;
             let (device, host) = options.prefix_cache.headroom_with_inputs(
                 self.ranks.len(),
-                &crate::offload::Layout::new(&geometry)?,
+                &flare_selene::Layout::new(&geometry)?,
                 staging != 0,
             )?;
             let index = if staging == 0 {
                 0
             } else {
-                crate::offload::input::INDEX_HEADROOM_BYTES
+                flare_selene::input::INDEX_HEADROOM_BYTES
             };
             let host = host
                 .checked_add(staging)
@@ -623,6 +615,102 @@ impl NativeModel {
             .as_u64()
             .ok_or_else(|| invalid("model requires a prepared context ceiling"))?;
         let ceiling = page_ceiling(options.kv_cache_limit, context, active as u64, &contract)?;
+        let geometry = if options.prefix_cache.pool.is_some() {
+            packages
+                .iter()
+                .map(|package| cache_geometry(package, contract.cache.page_tokens as u64, 1, 1))
+                .collect::<Result<Vec<_>>>()?
+        } else {
+            Vec::new()
+        };
+        let peers = if let Some(cluster) = self.cluster() {
+            agree.pool(crate::offload::shard::PoolOffer {
+                enabled: options.prefix_cache.pool.is_some(),
+                identity: if options.prefix_cache.pool.is_some() {
+                    super::model::offload_identity(&self.server_config)?
+                } else {
+                    [0; 32]
+                },
+                layout: if geometry.is_empty() {
+                    [0; 16]
+                } else {
+                    flare_selene::geometry::fingerprint(&geometry)
+                },
+                rank: cluster.rank,
+                world: cluster.world,
+                gpu_uuid: if options.prefix_cache.pool.is_some() {
+                    crate::cuda::device_uuid(self.ranks[0].device)?
+                } else {
+                    [0; 16]
+                },
+            })?
+        } else {
+            None
+        };
+        if let Some(pool) = &options.prefix_cache.pool {
+            let minimum_pages = ceiling
+                .map_or(active as u64 * 8192u64.div_ceil(page_tokens), |limit| {
+                    limit.minimum
+                });
+            let minimum = packages
+                .iter()
+                .map(|package| {
+                    bytes(package, 0, 1 + active as u64 * width)?
+                        .checked_add(bytes(package, 1, minimum_pages)?)
+                        .ok_or_else(|| invalid("minimum cache footprint overflow"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            // Establish that local serving fits even if the pool is refused.
+            capacities(
+                packages,
+                &available,
+                active as u64,
+                width,
+                page_tokens,
+                ceiling,
+            )?;
+            let host = flare_selene::offload::host_pool_budget(host_future)
+                .map_err(|error| error.to_string());
+            let budget = crate::offload::pool::Budget {
+                host,
+                devices: available
+                    .iter()
+                    .zip(&minimum)
+                    .zip(&self.ranks)
+                    .map(|((&available, &minimum), rank)| {
+                        (available.saturating_sub(minimum), rank.integrated)
+                    })
+                    .collect(),
+            };
+            let uuids = self
+                .ranks
+                .iter()
+                .map(|rank| crate::cuda::device_uuid(rank.device))
+                .collect::<Result<Vec<_>>>()?;
+            let cluster = self.cluster().map(|cluster| cluster.world);
+            let charges = crate::offload::pool::start(
+                &mut self.offload,
+                flare_selene::pool::PoolBuilder {
+                    options: pool,
+                    identity: super::model::offload_identity(&self.server_config)?,
+                    geometry: &geometry,
+                    gpu_uuids: uuids,
+                    registration_context: self.ranks[0].context as usize,
+                    budget,
+                    peers,
+                    disk: options.prefix_cache.disk.is_some()
+                        && options.prefix_cache.disk_limit != Some(0),
+                },
+                progress,
+                |approved| match cluster {
+                    Some(world) => Ok(agree.pool_approved(approved, world)?),
+                    None => Ok(true),
+                },
+            )?;
+            for (available, charge) in available.iter_mut().zip(charges) {
+                *available = available.saturating_sub(charge);
+            }
+        }
         let (local_rows, local_pages, _) = capacities(
             packages,
             &available,
@@ -634,7 +722,7 @@ impl NativeModel {
         // Fewer pages only shrink KV, and fewer rows only the snapshot slots aliased into it, so
         // the smallest capacity any rank can back fits every rank. Snapshot rows need no
         // dedicated backing; the alias layout below rejects rows the agreed pages cannot back.
-        let (rows, pages) = agree((local_rows, local_pages))?;
+        let (rows, pages) = agree.caches((local_rows, local_pages))?;
         let virtual_pages = packages
             .iter()
             .flat_map(|p| &p.allocations)
@@ -1191,13 +1279,13 @@ mod tests {
         let mut reordered_ranks = original_ranks.clone();
         reordered_ranks[3] = reordered;
         assert_eq!(
-            crate::offload::geometry::fingerprint(&original_ranks),
-            crate::offload::geometry::fingerprint(&reordered_ranks),
+            flare_selene::geometry::fingerprint(&original_ranks),
+            flare_selene::geometry::fingerprint(&reordered_ranks),
         );
         let mut options = package(4096, 4096, 16);
         assert_eq!(
-            crate::offload::geometry::fingerprint(&[cache_geometry(&options, 64, 8, 16).unwrap()]),
-            crate::offload::geometry::fingerprint(
+            flare_selene::geometry::fingerprint(&[cache_geometry(&options, 64, 8, 16).unwrap()]),
+            flare_selene::geometry::fingerprint(
                 &[cache_geometry(&options, 64, 80, 160).unwrap()]
             )
         );
@@ -1218,6 +1306,34 @@ mod tests {
             }),
         });
         assert!(cache_geometry(&options, 64, 8, 16).is_err());
+    }
+
+    #[test]
+    fn pool_registration_reduces_kv_supply_within_occupied_and_reserve_limits() {
+        let gib = 1u64 << 30;
+        let packages = [package(4096, 1 << 20, 65536)];
+        let memory = MemorySnapshot {
+            free: 20 * gib,
+            total: 32 * gib,
+        };
+        for limit in [
+            None,
+            Some(MemoryLimit::Bytes(16 * gib)),
+            Some(MemoryLimit::Reserve(4 * gib)),
+            Some(MemoryLimit::Fraction(0.5)),
+        ] {
+            let available =
+                limited_budget(memory, 4 * gib, limit, HEADROOM_BYTES, false, 0).unwrap();
+            let before = capacities(&packages, &[available], 1, 1, 64, None).unwrap();
+            let budget = crate::offload::pool::Budget {
+                host: Ok(32 * gib),
+                devices: vec![(available, false)],
+            };
+            let charges = budget.charges(32 * gib, (32 * gib) / 512);
+            let after = capacities(&packages, &[available - charges[0]], 1, 1, 64, None).unwrap();
+            assert!(after.1 < before.1);
+            assert!(after.1 >= 8192 / 64);
+        }
     }
 
     #[test]

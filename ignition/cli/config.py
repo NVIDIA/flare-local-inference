@@ -20,7 +20,7 @@ _SECTIONS = {
                  "speculative_token_capacity": int, "speculative_graph_budget": int},
     "memory": {"reserve": str},
     "preparation": {"compile_workers": int, "autotune_effort": str, "collective_tuning": str, "checkpoint_token_file": str},
-    "prefix_cache": {"memory": str, "disk_limit": str, "disk_transport": str},
+    "prefix_cache": {"memory": str, "disk_limit": str, "drain_on_shutdown": str},
     "paths": {"hub_cache": str, "kernel_cache": str, "package_cache": str, "export_staging": str,
               "prefix_cache": str, "cuda": str},
 }
@@ -34,7 +34,7 @@ _BUILT_IN = {
     "preparation.autotune_effort": "default",
     "preparation.collective_tuning": None,
     "preparation.checkpoint_token_file": "~/.config/flare/agent.token",
-    "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.disk_transport": "",
+    "prefix_cache.memory": "", "prefix_cache.disk_limit": "", "prefix_cache.drain_on_shutdown": "",
     "paths.hub_cache": "~/.cache/huggingface/hub", "paths.kernel_cache": "~/.cache/flare/kernels",
     "paths.package_cache": "~/.cache/flare/packages",
     "paths.export_staging": "",
@@ -42,7 +42,6 @@ _BUILT_IN = {
     "paths.cuda": "",
 }
 AUTOTUNE_EFFORTS = ("off", "default", "audit")
-_TRANSPORTS = ("staged", "direct")
 _SIZE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:([KMGT])(?:iB|B)?)?", re.IGNORECASE)
 
 
@@ -90,9 +89,6 @@ class Configuration:
         for key in ("prefix_cache.memory", "prefix_cache.disk_limit"):
             if configuration.get(key).value:
                 parse_size(configuration.get(key).value, key.replace(".", " "))
-        transport = configuration.get("prefix_cache.disk_transport").value
-        if transport and transport not in _TRANSPORTS:
-            raise UsageError(f"{resolved}: disk_transport in [prefix_cache] must be one of {', '.join(_TRANSPORTS)}")
         return configuration
 
     @staticmethod
@@ -104,6 +100,17 @@ class Configuration:
                 raise UsageError(f"{path}: unknown key {key} in [{section}]")
             if type(value) is not schema[key]:
                 raise UsageError(f"{path}: {key} in [{section}] must be {schema[key].__name__}")
+            if key == "drain_on_shutdown":
+                text = value.strip()
+                if text in ("", "on", "off", "0"):
+                    continue
+                match = re.fullmatch(r"([0-9.eE+\-]+)(ms|s|m|h)?", text)
+                try:
+                    seconds = float(match[1]) * {None: 1, "ms": .001, "s": 1, "m": 60, "h": 3600}[match[2]] if match else 0
+                except ValueError:
+                    seconds = 0
+                if not 0.5e-9 < seconds < 2**63:
+                    raise UsageError(f'prefix_cache drain_on_shutdown {text!r} must be on, off, or a positive duration such as 90s or 2m')
             if key == "autotune_effort" and value not in AUTOTUNE_EFFORTS:
                 raise UsageError(f"{path}: autotune_effort must be one of {', '.join(AUTOTUNE_EFFORTS)}")
             if key == "collective_tuning" and value not in ("static", "runtime"):

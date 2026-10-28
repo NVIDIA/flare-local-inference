@@ -1,5 +1,5 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     sync::{
         Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -154,8 +154,56 @@ struct Incoming {
     prompt_scored: usize,
     /// Retry capacity admission only after the scheduler's resources change.
     blocked: Option<(crate::cache::Fence, usize, usize, usize)>,
+    /// Pool lookup started on arrival, retained until its answer or the first
+    /// prefill submission. Cancellation drops it with the `Incoming`.
+    pool_lookup: Option<flare_selene::pool::LookupTicket>,
+    pool_lookup_started: Option<std::time::Instant>,
+    /// Replaced on readmission and counted once when this request ends.
+    host_lookup_outcome: Option<crate::offload::LookupOutcome>,
+    pool_plan: Option<crate::scheduler::AdmissionPlan>,
 }
+impl Drop for Incoming {
+    fn drop(&mut self) {
+        if let Some(outcome) = self.host_lookup_outcome {
+            self.metrics.host_lookup_outcome(outcome);
+        }
+    }
+}
+
 impl Incoming {
+    fn spec(&self) -> RequestSpec {
+        RequestSpec {
+            message_boundaries: self.prompt.message_boundaries.clone(),
+            prompt: self.prompt.tokens.clone(),
+            conditioning: self.prompt.conditioning.clone(),
+            max_new_tokens: self.prompt.max_new_tokens,
+            grammar_constrained: self.prompt.grammar.is_some(),
+            host_stops: self.prompt.has_host_stops(),
+            prompt_logprobs: self.prompt_scored < self.prompt_score_end,
+            growable_output: true,
+        }
+    }
+
+    fn poll_pool_lookup(&mut self) {
+        if self.pool_lookup_started.is_some()
+            && self.pool_lookup.as_ref().is_some_and(|ticket| {
+                !matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+            })
+        {
+            self.pool_lookup_started = None;
+            self.blocked = None;
+        }
+    }
+
+    fn awaits_pool(&self, now: std::time::Instant) -> bool {
+        self.pool_lookup.as_ref().is_some_and(|ticket| {
+            matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+                && self
+                    .pool_lookup_started
+                    .is_some_and(|started| now.saturating_duration_since(started) < ticket.grace())
+        })
+    }
+
     fn prompt_score_range(&self, start: usize, tokens: usize) -> std::ops::Range<usize> {
         let first = (if start == 0 { 0 } else { start + 1 }).max(self.prompt_scored);
         first..(start + tokens + 1).min(self.prompt_score_end)
@@ -317,7 +365,7 @@ pub struct ModelRuntime {
     shutdown: Mutex<Option<Shutdown>>,
     finished: Arc<(Mutex<bool>, Condvar)>,
     metrics: Arc<super::metrics::Metrics>,
-    input_store: Option<crate::offload::input::InputStore>,
+    input_store: Option<flare_selene::input::InputStore>,
 }
 
 impl ModelRuntime {
@@ -491,7 +539,15 @@ impl ModelRuntime {
                     .offload
                     .as_ref()
                     .and_then(|binding| binding.take())
-                    .map(crate::offload::open)
+                    .map(|prepared| {
+                        if prepared.pool.is_some()
+                            && let Some(warning) =
+                                prepared.pool_row_warning(worker_config.limits.max_active)
+                        {
+                            eprintln!("warning: {warning}");
+                        }
+                        crate::offload::open(prepared)
+                    })
                     .transpose()
                 {
                     Ok(store) => store,
@@ -583,7 +639,7 @@ impl ModelRuntime {
         }
     }
 
-    pub(super) fn input_store(&self) -> Option<&crate::offload::input::InputStore> {
+    pub(super) fn input_store(&self) -> Option<&flare_selene::input::InputStore> {
         self.input_store.as_ref()
     }
 
@@ -697,6 +753,10 @@ impl ModelRuntime {
                 host_lookup: true,
                 readmitted: false,
                 blocked: None,
+                pool_lookup: None,
+                pool_lookup_started: None,
+                host_lookup_outcome: None,
+                pool_plan: None,
             };
             let enqueue_ns = observation
                 .filter(|timestamps| *timestamps)
@@ -782,7 +842,7 @@ struct ImagePreparation {
 }
 
 impl ImagePreparation {
-    fn new(store: Option<crate::offload::input::InputStore>) -> Self {
+    fn new(store: Option<flare_selene::input::InputStore>) -> Self {
         let (sender, jobs) = mpsc::sync_channel::<ImagePreparationJob>(1);
         let (results, receiver) = mpsc::sync_channel(1);
         let stop = Arc::new(AtomicBool::new(false));
@@ -836,9 +896,12 @@ struct Worker<'a> {
     admissions: Vec<Option<crate::model::Admission>>,
     inputs: Option<crate::model::Inputs>,
     queue_capacity: usize,
-    store: Option<Box<dyn crate::offload::PrefixStore>>,
+    store: Option<Box<dyn flare_selene::HostStore>>,
     deferred_stores: Vec<crate::cache::CheckpointId>,
     store_progress: u64,
+    /// The checkpoint each served export pins, until its `ExportEnded`: the only
+    /// place an export's pin is released.
+    exports: HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
     /// Prefill tokens per second measured from completed prefill frames, which
     /// the host-store fetch policy compares with transfer time.
     prefill_rate: f64,
@@ -869,12 +932,13 @@ impl<'a> Worker<'a> {
             store: None,
             deferred_stores: Vec::new(),
             store_progress: 0,
+            exports: HashMap::new(),
             pending: VecDeque::with_capacity(queue_capacity),
             parked: VecDeque::new(),
             active: (0..config.limits.max_active).map(|_| None).collect(),
             admissions: (0..config.limits.max_active).map(|_| None).collect(),
             inputs: None,
-            prefill_rate: crate::offload::INITIAL_PREFILL_RATE,
+            prefill_rate: flare_selene::INITIAL_PREFILL_RATE,
             prefill_started: VecDeque::new(),
             image_preparation: None,
             preparing_image: None,
@@ -935,11 +999,9 @@ impl<'a> Worker<'a> {
                     thread::yield_now();
                 } else {
                     self.scheduler.idle()?;
-                    match self
-                        .receiver
-                        .recv_timeout(std::time::Duration::from_millis(2))
-                    {
-                        Ok(request) => self.pending.extend(request),
+                    let wait = self.idle_wait();
+                    match self.receiver.recv_timeout(wait) {
+                        Ok(request) => self.enqueue(request),
                         Err(mpsc::RecvTimeoutError::Timeout) => {}
                         Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
                     }
@@ -949,11 +1011,49 @@ impl<'a> Worker<'a> {
         Ok(())
     }
 
-    fn attach_store(&mut self, store: Option<Box<dyn crate::offload::PrefixStore>>) {
+    fn idle_wait(&self) -> std::time::Duration {
+        let now = std::time::Instant::now();
+        if self
+            .pending
+            .iter()
+            .any(|incoming| incoming.awaits_pool(now))
+            || self
+                .parked
+                .iter()
+                .any(|(incoming, _)| incoming.awaits_pool(now))
+        {
+            std::time::Duration::from_micros(100)
+        } else {
+            std::time::Duration::from_millis(2)
+        }
+    }
+
+    fn attach_store(&mut self, store: Option<Box<dyn flare_selene::HostStore>>) {
         if store.is_some() {
             self.scheduler.enable_publications();
+            if store.as_ref().is_some_and(|store| store.pooled()) {
+                self.scheduler.enable_evictions();
+            }
         }
         self.store = store;
+    }
+
+    /// Queue arriving requests, starting each one's pool lookup so its answer is
+    /// ready by admission.
+    fn enqueue(&mut self, mut requests: Vec<Incoming>) {
+        self.begin_pool_lookups(&mut requests);
+        self.pending.extend(requests);
+    }
+
+    /// Starts a pool lookup for each request that will consult the store. Nothing
+    /// is built unless the store shares prefixes.
+    fn begin_pool_lookups(&mut self, requests: &mut [Incoming]) {
+        let Some(store) = self.store.as_mut().filter(|store| store.pooled()) else {
+            return;
+        };
+        for incoming in requests {
+            begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
+        }
     }
 
     fn close_store(&mut self, shutdown: &mut Shutdown) {
@@ -973,7 +1073,7 @@ impl<'a> Worker<'a> {
                 drop(std::mem::ManuallyDrop::into_inner(store));
             }
             Err(error) => {
-                shutdown.error.get_or_insert(error);
+                shutdown.error.get_or_insert(error.into());
             }
         }
     }
@@ -1036,7 +1136,7 @@ impl<'a> Worker<'a> {
         while self.pending.len() < self.queue_capacity {
             match self.receiver.try_recv() {
                 Ok(request) => {
-                    self.pending.extend(request);
+                    self.enqueue(request);
                     progress = true;
                 }
                 Err(mpsc::TryRecvError::Empty) => break,
@@ -1069,6 +1169,12 @@ impl<'a> Worker<'a> {
             }
         }
         while self.scheduler.has_available_slot() {
+            for incoming in self.pending.iter_mut().chain(self.parked.iter_mut().map(|(incoming, _)| incoming)) {
+                if let Some(store) = self.store.as_mut().filter(|store| store.pooled()) {
+                    begin_pool_lookup(&mut self.scheduler, store.as_mut(), incoming);
+                }
+                incoming.poll_pool_lookup();
+            }
             let stats = self.scheduler.stats();
             let resources = (
                 self.scheduler.completed(),
@@ -1076,7 +1182,10 @@ impl<'a> Worker<'a> {
                 stats.free_snapshots,
                 stats.free_slots,
             );
-            let eligible = |incoming: &Incoming| incoming.blocked != Some(resources);
+            let now = std::time::Instant::now();
+            let eligible = |incoming: &Incoming| {
+                incoming.blocked != Some(resources) && !incoming.awaits_pool(now)
+            };
             let parked = self
                 .parked
                 .iter()
@@ -1101,16 +1210,10 @@ impl<'a> Worker<'a> {
                 incoming.reject_admission("logprobs are not available in this model package".into());
                 continue;
             }
-            let spec = RequestSpec {
-                message_boundaries: incoming.prompt.message_boundaries.clone(),
-                prompt: incoming.prompt.tokens.clone(),
-                conditioning: incoming.prompt.conditioning.clone(),
-                max_new_tokens: incoming.prompt.max_new_tokens,
-                grammar_constrained: incoming.prompt.grammar.is_some(),
-                host_stops: incoming.prompt.has_host_stops(),
-                prompt_logprobs: incoming.prompt_scored < incoming.prompt_score_end,
-                growable_output: true,
-            };
+            let pending_pool_answer = incoming.pool_lookup.as_ref().is_some_and(|ticket| {
+                matches!(ticket.state(), flare_selene::pool::LookupState::Pending)
+            });
+            let spec = incoming.spec();
             self.scheduler
                 .advance_to(super::observation::monotonic_ns())?;
             let admission = if let Some(store) =
@@ -1119,10 +1222,18 @@ impl<'a> Worker<'a> {
                 admit_with_host_store(
                     &mut self.scheduler,
                     store.as_mut(),
+                    incoming.pool_lookup.as_ref(),
                     spec,
+                    incoming.pool_plan.as_ref(),
                     self.prefill_rate,
                     self.metrics,
                 )
+                .map(|(handle, outcome)| {
+                    if outcome.is_some() {
+                        incoming.host_lookup_outcome = outcome;
+                    }
+                    handle
+                })
             } else {
                 self.scheduler.admit(spec)
             };
@@ -1221,6 +1332,10 @@ impl<'a> Worker<'a> {
                 self.metrics.admitted.fetch_add(1, Ordering::Relaxed);
             }
             self.scheduler.resume_decoded_sequence(handle, parked.carried.decoded_sequence)?;
+            if !pending_pool_answer {
+                incoming.pool_lookup = None;
+                incoming.pool_plan = None;
+            }
             incoming.notify_admission(Ok(()));
             self.active[slot] = Some(Active {
                 request: handle,
@@ -1685,6 +1800,7 @@ impl<'a> Worker<'a> {
         incoming.prompt.tokens = tokens;
         incoming.prompt.max_new_tokens -= generated;
         incoming.readmitted = true;
+        self.begin_pool_lookups(std::slice::from_mut(&mut incoming));
         let seed = active.carried.seed.unwrap_or(incoming.prompt.sampling.seed);
         let generated_tokens = active.carried.generated_tokens + generated;
         incoming.prompt.sampling.seed = continuation_seed(seed, generated_tokens);
@@ -1715,6 +1831,9 @@ impl<'a> Worker<'a> {
     }
 
     fn plan(&mut self, outstanding: usize) -> Result<(Option<ScheduledPlan>, bool)> {
+        if self.retry_late_pool_answers()? {
+            return Ok((None, true));
+        }
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
         let mut progress = false;
@@ -1919,15 +2038,15 @@ impl<'a> Worker<'a> {
         Ok(true)
     }
 
-    /// Copy newly ready checkpoints out, apply finished host transfers, and
-    /// re-admit the waiters of a failed restore without the host store.
+    /// Copy newly ready checkpoints out and apply finished host transfers.
+    /// Re-admit the waiters of a failed restore without the host store.
     fn service_store(&mut self) -> Result<bool> {
         self.scheduler
             .advance_to(super::observation::monotonic_ns())?;
         let Some(store) = self.store.as_mut() else {
             return Ok(false);
         };
-        use crate::offload::{StoreEvent, StoreOutcome};
+        use flare_selene::{StoreEvent, StoreOutcome};
         let mut events = Vec::new();
         store.poll(&mut events)?;
         let mut progress = !events.is_empty();
@@ -1949,7 +2068,39 @@ impl<'a> Worker<'a> {
                 StoreEvent::Fetched { key, result } => {
                     requeued.extend(self.scheduler.finish_inbound(key, result.is_ok())?);
                 }
+                StoreEvent::ExportRequested {
+                    export,
+                    key,
+                    begin_tokens,
+                    want_row,
+                    ..
+                } => {
+                    let next = next_admission(&self.scheduler, &self.parked, &self.pending);
+                    serve_export(
+                        &mut self.scheduler,
+                        store.as_mut(),
+                        &mut self.exports,
+                        next,
+                        export,
+                        (key, begin_tokens, want_row),
+                    )?;
+                }
+                StoreEvent::ExportEnded { export } => {
+                    // A second end for the same export finds nothing: one unpin.
+                    if let Some(id) = self.exports.remove(&export) {
+                        self.scheduler.unpin_checkpoint(id)?;
+                        released = true;
+                    }
+                }
             }
+        }
+        // Eviction notices precede the next `store`, so a pool never learns of a
+        // replacement before the removal it replaces.
+        for evicted in self.scheduler.take_evictions() {
+            store.evicted(evicted.key, evicted.heir.as_ref());
+        }
+        if self.scheduler.take_evictions_lost() {
+            store.evictions_lost();
         }
         if released {
             for incoming in self
@@ -2012,14 +2163,63 @@ impl<'a> Worker<'a> {
         // Store gauges change without events, so they are refreshed every pass.
         self.metrics.store(store.stats());
         for handle in requeued {
-            self.requeue(handle);
+            self.requeue(handle, false);
         }
         Ok(progress)
     }
 
-    /// Return a request whose restore failed to the front of the queue; its next
-    /// admission skips the host store.
-    fn requeue(&mut self, handle: RequestHandle) {
+    /// Reuse the ordinary admission path when an answer beats the first prefill.
+    fn retry_late_pool_answers(&mut self) -> Result<bool> {
+        use flare_selene::pool::LookupState;
+        let mut progress = false;
+        for slot in 0..self.active.len() {
+            let Some(active) = self.active[slot].as_mut() else {
+                continue;
+            };
+            let Some(ticket) = active.incoming.pool_lookup.as_ref() else {
+                continue;
+            };
+            let live = self.scheduler.request(active.request)?;
+            let eligible = matches!(
+                live.phase,
+                RequestPhase::Initialize | RequestPhase::Restore | RequestPhase::Prefill
+            ) && live.consumed_tokens == live.reused_prompt_tokens()
+                && live.generated_tokens == 0
+                && !(live.phase == RequestPhase::Prefill
+                    && live.last_use() > self.scheduler.completed())
+                && active.incoming.prompt.conditioned_inputs.is_empty();
+            let state = ticket.state();
+            if !eligible || matches!(state, LookupState::None) {
+                active.incoming.pool_lookup = None;
+                active.incoming.pool_plan = None;
+                continue;
+            }
+            let LookupState::Ready(answer) = state else {
+                continue;
+            };
+            if !answer
+                .candidates
+                .iter()
+                .any(|candidate| candidate.plan.key.consumed_tokens > live.reused_prompt_tokens())
+            {
+                active.incoming.pool_lookup = None;
+                active.incoming.pool_plan = None;
+                continue;
+            }
+            // Initialization or restoration may still own the slot.
+            if live.last_use() > self.scheduler.completed() {
+                continue;
+            }
+            let handle = active.request;
+            self.scheduler.cancel(handle)?;
+            self.requeue(handle, true);
+            progress = true;
+        }
+        Ok(progress)
+    }
+
+    /// Return a retired request to the front of the queue for another admission.
+    fn requeue(&mut self, handle: RequestHandle, host_lookup: bool) {
         let slot = handle.slot as usize;
         let Some(active) = self.active[slot].take_if(|active| active.request == handle) else {
             return;
@@ -2029,7 +2229,11 @@ impl<'a> Worker<'a> {
             self.preparing_image = None;
         }
         let mut incoming = active.incoming;
-        incoming.host_lookup = false;
+        incoming.host_lookup = host_lookup;
+        if !host_lookup {
+            incoming.pool_lookup = None;
+            incoming.pool_plan = None;
+        }
         incoming.readmitted = true;
         self.parked.push_front((
             incoming,
@@ -2076,68 +2280,166 @@ impl<'a> Worker<'a> {
     }
 }
 
+/// The request admission would take next, as the export headroom check sees it:
+/// the first eligible one, parked before pending, as the admission loop picks.
+fn next_admission(
+    scheduler: &RequestScheduler,
+    parked: &VecDeque<(Incoming, Parked<'_>)>,
+    pending: &VecDeque<Incoming>,
+) -> Option<crate::scheduler::NextAdmission> {
+    let stats = scheduler.stats();
+    let resources = (
+        scheduler.completed(),
+        stats.free_pages,
+        stats.free_snapshots,
+        stats.free_slots,
+    );
+    parked
+        .iter()
+        .map(|(incoming, _)| incoming)
+        .chain(pending)
+        .find(|incoming| incoming.blocked != Some(resources))
+        .map(|incoming| crate::scheduler::NextAdmission {
+            prompt_tokens: incoming.prompt.tokens.len(),
+            max_new_tokens: incoming.prompt.max_new_tokens,
+            growable: true,
+        })
+}
+
+/// Answers one export request in the iteration it arrived: validate, check
+/// headroom, pin, then describe the chain to the store. Nothing is pinned after
+/// a refusal, and the pin is recorded before the store hears of the export.
+fn serve_export(
+    scheduler: &mut RequestScheduler,
+    store: &mut dyn flare_selene::HostStore,
+    exports: &mut HashMap<flare_selene::ExportId, crate::cache::CheckpointId>,
+    next: Option<crate::scheduler::NextAdmission>,
+    export: flare_selene::ExportId,
+    (key, begin_tokens, want_row): (crate::cache::PrefixKey, u64, bool),
+) -> Result<()> {
+    use flare_selene::ExportRefusal;
+    let refuse = |store: &mut dyn flare_selene::HostStore, reason| {
+        store.export_refused(export, reason);
+        Ok(())
+    };
+    if exports.contains_key(&export) {
+        return refuse(store, ExportRefusal::Busy);
+    }
+    let id = match scheduler.checkpoint_by_key(&key) {
+        Ok(id) => id,
+        Err(reason) => return refuse(store, reason),
+    };
+    let Some(chain) = scheduler.export_chain(id, begin_tokens, want_row) else {
+        return refuse(store, ExportRefusal::ChainGap);
+    };
+    if !scheduler.export_fits(id, next) {
+        return refuse(store, ExportRefusal::NoHeadroom);
+    }
+    scheduler.pin_checkpoint(id)?;
+    exports.insert(export, id);
+    if store.export_pinned(export, chain).is_err() {
+        // The store will not serve it and sends no end: release the pin here.
+        exports.remove(&export);
+        scheduler.unpin_checkpoint(id)?;
+    }
+    Ok(())
+}
+
+fn begin_pool_lookup(
+    scheduler: &mut RequestScheduler,
+    store: &mut dyn flare_selene::HostStore,
+    incoming: &mut Incoming,
+) {
+    if !incoming.host_lookup || incoming.prompt_scored < incoming.prompt_score_end || incoming.pool_plan.is_some() {
+        return;
+    }
+    let Ok(plan) = scheduler.plan_admission(&incoming.spec()) else {
+        return;
+    };
+    if plan.resident_tokens() < incoming.prompt.tokens.len() as u64 {
+        incoming.pool_lookup_started = Some(std::time::Instant::now());
+        incoming.pool_lookup = store.begin_lookup(plan.history());
+    }
+    incoming.pool_plan = Some(plan);
+}
+
 /// Plan the admission, look the history up in the host store above the GPU
 /// checkpoint, and start a restore when the transfer beats recomputation.
 fn admit_with_host_store(
     scheduler: &mut RequestScheduler,
-    store: &mut dyn crate::offload::PrefixStore,
+    store: &mut dyn flare_selene::HostStore,
+    pool_lookup: Option<&flare_selene::pool::LookupTicket>,
     spec: RequestSpec,
+    queued_plan: Option<&crate::scheduler::AdmissionPlan>,
     prefill_rate: f64,
     metrics: &super::metrics::Metrics,
-) -> Result<RequestHandle> {
-    let plan = scheduler.plan_admission(&spec)?;
-    use crate::offload::LookupOutcome;
-    let mut before = u64::MAX;
-    let hit = loop {
-        let Some(hit) = store.lookup(plan.history(), plan.resident_tokens(), before) else {
-            if before == u64::MAX {
-                metrics.host_lookup_outcome(LookupOutcome::NoMatch);
+) -> Result<(RequestHandle, Option<crate::offload::LookupOutcome>)> {
+    let plan = match queued_plan {
+        Some(plan) => scheduler.refresh_admission_plan(plan)?,
+        None => scheduler.plan_admission(&spec)?,
+    };
+    let reused = (plan.resident_tokens() != 0)
+        .then(|| plan.history().key_at(plan.resident_tokens()))
+        .flatten();
+    let result = (|| {
+        use crate::offload::LookupOutcome;
+        if plan.resident_tokens() == plan.history().token_count() {
+            return Ok((scheduler.admit_planned(spec, plan, None)?.handle, None));
+        }
+        let mut outcome = LookupOutcome::NoMatch;
+        let mut before = u64::MAX;
+        let hit = loop {
+            let Some(hit) =
+                store.lookup_for(pool_lookup, plan.history(), plan.resident_tokens(), before)
+            else {
+                break None;
+            };
+            metrics.host_lookup_cost(&hit, prefill_rate);
+            if flare_selene::worth_fetching(&hit, prefill_rate) {
+                break Some(hit);
             }
-            break None;
+            outcome = LookupOutcome::CostRejected;
+            before = hit.consumed_tokens;
         };
-        metrics.host_lookup_cost(&hit, prefill_rate);
-        if crate::offload::worth_fetching(&hit, prefill_rate) {
-            break Some(hit);
-        }
-        metrics.host_lookup_outcome(LookupOutcome::CostRejected);
-        before = hit.consumed_tokens;
-    };
-    let Some(hit) = hit else {
-        let handle = scheduler.admit_planned(spec, plan, None)?.handle;
-        // Lookups count once per admitted request, not per attempt of a waiting one.
-        scheduler.record_host_lookup();
-        return Ok(handle);
-    };
-    let inbound = crate::scheduler::InboundRequest {
-        key: hit.key,
-        consumed_tokens: hit.consumed_tokens,
-        pages: hit.pages,
-    };
-    let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
-        Ok(admitted) => admitted,
-        Err(Error::Admission(AdmissionError::Capacity(_))) => {
-            metrics.host_lookup_outcome(LookupOutcome::CapacityRejected);
-            let handle = scheduler.admit(spec)?;
+        let Some(hit) = hit else {
+            let handle = scheduler.admit_planned(spec, plan, None)?.handle;
+            // Lookups count once per admitted request, not per attempt of a waiting one.
             scheduler.record_host_lookup();
-            return Ok(handle);
+            return Ok((handle, Some(outcome)));
+        };
+        let inbound = crate::scheduler::InboundRequest {
+            key: hit.key,
+            consumed_tokens: hit.consumed_tokens,
+            pages: hit.pages,
+        };
+        let admitted = match scheduler.admit_planned(spec.clone(), plan, Some(inbound)) {
+            Ok(admitted) => admitted,
+            Err(Error::Admission(AdmissionError::Capacity(_))) => {
+                let handle = scheduler.admit(spec)?;
+                scheduler.record_host_lookup();
+                return Ok((handle, Some(LookupOutcome::CapacityRejected)));
+            }
+            Err(error) => return Err(error),
+        };
+        scheduler.record_host_lookup();
+        let Some(ticket) = admitted.ticket else {
+            return Ok((admitted.handle, Some(LookupOutcome::Admitted)));
+        };
+        let key = ticket.key;
+        if store.fetch(hit, ticket).is_err() {
+            // No event follows a rejected fetch; this request is the ticket's only
+            // waiter, so retire it and admit the request again without the store.
+            scheduler.finish_inbound(key, false)?;
+            return scheduler
+                .admit(spec)
+                .map(|handle| (handle, Some(LookupOutcome::EnqueueRejected)));
         }
-        Err(error) => return Err(error),
-    };
-    scheduler.record_host_lookup();
-    let Some(ticket) = admitted.ticket else {
-        metrics.host_lookup_outcome(LookupOutcome::Admitted);
-        return Ok(admitted.handle);
-    };
-    let key = ticket.key;
-    if store.fetch(hit, ticket).is_err() {
-        metrics.host_lookup_outcome(LookupOutcome::EnqueueRejected);
-        // No event follows a rejected fetch; this request is the ticket's only
-        // waiter, so retire it and admit the request again without the store.
-        scheduler.finish_inbound(key, false)?;
-        return scheduler.admit(spec);
+        Ok((admitted.handle, Some(LookupOutcome::Admitted)))
+    })();
+    if result.is_ok() && let Some(key) = reused {
+        store.reused(key);
     }
-    metrics.host_lookup_outcome(LookupOutcome::Admitted);
-    Ok(admitted.handle)
+    result
 }
 
 fn cancel_stopped(
@@ -2527,6 +2829,10 @@ mod tests {
             prompt_score_end: 0,
             prompt_scored: 0,
             blocked: None,
+            pool_lookup: None,
+            pool_lookup_started: None,
+            host_lookup_outcome: None,
+            pool_plan: None,
         };
         (
             incoming,

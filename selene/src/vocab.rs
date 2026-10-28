@@ -22,7 +22,7 @@ impl CheckpointId {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct StateSlotId(pub u32);
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct PrefixKey {
     pub consumed_tokens: u64,
     pub digest: [u8; 16],

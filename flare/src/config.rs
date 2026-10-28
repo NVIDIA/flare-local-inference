@@ -10,7 +10,7 @@ use std::{
 
 use clap::{ArgMatches, parser::ValueSource};
 use flare_helios::{
-    offload::{Transport, parse_size},
+    offload::{parse_drain_on_shutdown, parse_size},
     runtime_package::MemoryLimit,
 };
 use serde::Deserialize;
@@ -51,11 +51,11 @@ struct Memory {
 }
 
 #[derive(Default, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 struct PrefixCache {
     memory: Option<String>,
     disk_limit: Option<String>,
-    disk_transport: Option<String>,
+    drain_on_shutdown: Option<String>,
 }
 
 #[derive(Default, Deserialize)]
@@ -88,21 +88,15 @@ impl Configuration {
             nonempty(configuration.prefix_cache.disk_limit.as_deref()),
             "prefix_cache.disk_limit",
         )?;
-        configuration.transport()?;
+        if let Some(value) = nonempty(configuration.prefix_cache.drain_on_shutdown.as_deref()) {
+            parse_drain_on_shutdown(value)
+                .map_err(|error| format!("prefix_cache.drain_on_shutdown: {error}"))?;
+        }
         Ok(configuration)
     }
 
     pub(crate) fn package_cache(&self, home: &Path) -> Option<PathBuf> {
         nonempty(self.paths.package_cache.as_deref()).map(|path| expand(home, Path::new(path)))
-    }
-
-    fn transport(&self) -> Result<Option<Transport>, Failure> {
-        match nonempty(self.prefix_cache.disk_transport.as_deref()) {
-            None => Ok(None),
-            Some("staged") => Ok(Some(Transport::Staged)),
-            Some("direct") => Ok(Some(Transport::Direct)),
-            Some(_) => Err("prefix_cache.disk_transport must be staged or direct".into()),
-        }
     }
 
     pub(crate) fn apply(
@@ -144,8 +138,11 @@ impl Configuration {
                         "prefix_cache.disk_limit",
                     )?;
                 }
-                if serving.prefix_cache_disk_transport.is_none() {
-                    serving.prefix_cache_disk_transport = self.transport()?;
+                if serving.prefix_cache_drain_on_shutdown.is_none() {
+                    serving.prefix_cache_drain_on_shutdown =
+                        nonempty(self.prefix_cache.drain_on_shutdown.as_deref())
+                            .map(parse_drain_on_shutdown)
+                            .transpose()?;
                 }
                 if serving.prefix_cache_disk.is_none() {
                     serving.prefix_cache_disk = nonempty(self.paths.prefix_cache.as_deref())
@@ -261,6 +258,104 @@ mod tests {
         (config, *run)
     }
 
+    #[test]
+    fn prefix_cache_drain_on_shutdown_defaults_and_flag_precedence() {
+        let args = ["flare", "run", "model.safetensors"];
+        let (_, run) = configured("", &args, &[]);
+        assert_eq!(
+            run.load_options().prefix_cache.drain_on_shutdown,
+            std::time::Duration::ZERO
+        );
+        for value in ["on", "90s", "off", "0"] {
+            let text = format!("[prefix_cache]\ndrain_on_shutdown='{value}'");
+            let (_, run) = configured(&text, &args, &[]);
+            assert_eq!(
+                run.load_options().prefix_cache.drain_on_shutdown,
+                parse_drain_on_shutdown(value).unwrap()
+            );
+            let (_, run) = configured(
+                &text,
+                &[
+                    "flare",
+                    "run",
+                    "model.safetensors",
+                    "--prefix-cache-drain-on-shutdown=0.5s",
+                ],
+                &[],
+            );
+            assert_eq!(
+                run.load_options().prefix_cache.drain_on_shutdown,
+                std::time::Duration::from_millis(500)
+            );
+        }
+        let (_, run) = configured(
+            "[prefix_cache]\ndrain_on_shutdown='off'",
+            &[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--prefix-cache-drain-on-shutdown",
+            ],
+            &[],
+        );
+        assert_eq!(
+            run.load_options().prefix_cache.drain_on_shutdown,
+            std::time::Duration::MAX
+        );
+        let (_, run) = configured(
+            "[prefix_cache]\ndrain_on_shutdown='on'",
+            &[
+                "flare",
+                "run",
+                "model.safetensors",
+                "--prefix-cache-drain-on-shutdown=off",
+            ],
+            &[],
+        );
+        assert_eq!(
+            run.load_options().prefix_cache.drain_on_shutdown,
+            std::time::Duration::ZERO
+        );
+        for value in ["on", "off", "1ms", "2h", "0.0001s"] {
+            let run = cli::Cli::try_parse_from([
+                "flare",
+                "run",
+                "model.safetensors",
+                &format!("--prefix-cache-drain-on-shutdown={value}"),
+            ])
+            .unwrap();
+            let cli::Command::Run(run) = run.command else {
+                panic!()
+            };
+            let forwarded = run.rank_options();
+            let mut args = vec!["flare", "run", "model.safetensors"];
+            args.extend(forwarded.iter().map(String::as_str));
+            let peer = cli::Cli::try_parse_from(args).unwrap();
+            let cli::Command::Run(peer) = peer.command else {
+                panic!()
+            };
+            assert_eq!(
+                run.load_options().prefix_cache.drain_on_shutdown,
+                peer.load_options().prefix_cache.drain_on_shutdown
+            );
+        }
+        for invalid in ["-1", "NaN", "inf", "1e30h", "later", "0s"] {
+            assert!(
+                Configuration::parse(&format!("[prefix_cache]\ndrain_on_shutdown='{invalid}'"))
+                    .is_err()
+            );
+            assert!(
+                cli::Cli::try_parse_from([
+                    "flare",
+                    "run",
+                    "model.safetensors",
+                    &format!("--prefix-cache-drain-on-shutdown={invalid}")
+                ])
+                .is_err()
+            );
+        }
+    }
+
     const SETTINGS: &str = r#"
 [server]
 host = "::1"
@@ -279,7 +374,6 @@ max_concurrency = 4
 [prefix_cache]
 memory = "1.5G"
 disk_limit = "20GiB"
-disk_transport = "direct"
 [paths]
 package_cache = "~/packages"
 prefix_cache = "~/prefix"
@@ -307,7 +401,6 @@ namespace = "publisher"
         assert_eq!(run.max_concurrency.unwrap().get(), 4);
         assert_eq!(run.prefix_cache_memory, Some(3 << 29));
         assert_eq!(run.prefix_cache_disk_limit, Some(20 << 30));
-        assert_eq!(run.prefix_cache_disk_transport, Some(Transport::Direct));
         assert_eq!(
             run.prefix_cache_disk.as_deref(),
             Some(Path::new("/home/test/prefix"))
@@ -345,8 +438,6 @@ namespace = "publisher"
                 "0",
                 "--prefix-cache-disk",
                 "/explicit-prefix",
-                "--prefix-cache-disk-transport",
-                "staged",
                 "--model-cache",
                 "/explicit-cache",
             ],
@@ -357,7 +448,6 @@ namespace = "publisher"
         assert_eq!(run.max_concurrency.unwrap().get(), 2);
         assert_eq!(run.prefix_cache_memory, Some(0));
         assert_eq!(run.prefix_cache_disk_limit, Some(0));
-        assert_eq!(run.prefix_cache_disk_transport, Some(Transport::Staged));
         assert_eq!(
             run.prefix_cache_disk.as_deref(),
             Some(Path::new("/explicit-prefix"))
@@ -376,7 +466,6 @@ namespace = "publisher"
         assert!(run.prefix_cache_disk.is_none());
         assert!(run.prefix_cache_memory.is_none());
         assert!(run.prefix_cache_disk_limit.is_none());
-        assert!(run.prefix_cache_disk_transport.is_none());
         assert_eq!(run.bind_address().to_string(), "127.0.0.1:8000");
         assert_eq!(config.api_key(None).unwrap(), "");
     }
@@ -461,6 +550,8 @@ namespace = "publisher"
             "[prefix_cache]\nmemory='many'",
             "[prefix_cache]\ndisk_limit='-1'",
             "[prefix_cache]\ndisk_transport='invalid'",
+            "[prefix_cache]\ndisk_transport='staged'",
+            "[prefix_cache]\ndisk_transport='direct'",
             "[paths]\npackage_cache=12",
         ] {
             assert!(Configuration::parse(text).is_err(), "{text}");
@@ -489,10 +580,6 @@ namespace = "publisher"
             assert_eq!(peer.prefix_cache_memory, root.prefix_cache_memory);
             assert_eq!(peer.prefix_cache_disk, root.prefix_cache_disk);
             assert_eq!(peer.prefix_cache_disk_limit, root.prefix_cache_disk_limit);
-            assert_eq!(
-                peer.prefix_cache_disk_transport,
-                root.prefix_cache_disk_transport
-            );
         }
     }
 
@@ -556,13 +643,12 @@ namespace = "publisher"
             );
         }
         let (_, run) = configured(
-            "[prefix_cache]\nmemory=''\ndisk_limit=''\ndisk_transport=''\n[paths]\nprefix_cache=''",
+            "[prefix_cache]\nmemory=''\ndisk_limit=''\n[paths]\nprefix_cache=''",
             &["flare", "run", "model"],
             &[],
         );
         assert!(run.prefix_cache_memory.is_none());
         assert!(run.prefix_cache_disk_limit.is_none());
-        assert!(run.prefix_cache_disk_transport.is_none());
         assert!(run.prefix_cache_disk.is_none());
     }
 }

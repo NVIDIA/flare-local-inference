@@ -1306,6 +1306,7 @@ fn speculative_every_committed_prefix_updates_counts_and_tokens_once() {
         assert_eq!(s.request(h).unwrap().scheduled_consumed, 65 + count as u64);
     }
 }
+
 #[test]
 fn speculative_rounds_allow_lookahead_and_use_actual_counts() {
     let (mut s, h) = speculative_scheduler(65, 32);

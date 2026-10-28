@@ -1,0 +1,50 @@
+[package]
+name = "flare-selene-manager"
+version = "0.1.0"
+license = "Apache-2.0"
+edition = "2024"
+rust-version = "1.88"
+publish = false
+
+[lib]
+name = "selene_manager"
+
+[[bin]]
+name = "selene"
+path = "src/main.rs"
+
+[features]
+default = []
+test-support = ["dep:rcgen", "flare-selene/test-support"]
+rdma = ["dep:ibverbs-sys", "flare-selene/rdma"]
+
+[dependencies]
+flare-eos = { path = "../eos" }
+rcgen = { version = "0.14", features = ["pem"], optional = true }
+flare-selene = { path = "../selene" }
+blake2 = "0.10"
+ibverbs-sys = { version = "0.3.2", optional = true }
+libc = "0.2"
+socket2 = "0.6"
+prost = "0.14"
+tokio = { version = "1.53.1", features = ["rt-multi-thread", "net", "sync", "time", "macros", "signal", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-stream = { version = "0.1", features = ["net", "sync"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "router"] }
+tonic-prost = "0.14"
+
+[dev-dependencies]
+tonic = { version = "0.14", default-features = false, features = ["tls-ring"] }
+tower = { version = "0.5", features = ["util"] }
+flare-selene = { path = "../selene", features = ["test-support"] }
+flare-selene-manager = { path = ".", features = ["test-support"] }
+rcgen = { version = "0.14", features = ["pem"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+
+[lints.clippy]
+collapsible_if = "allow"
+
+[[test]]
+name = "rank_processes"
+required-features = ["test-support"]

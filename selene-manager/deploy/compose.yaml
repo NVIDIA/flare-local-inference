@@ -1,0 +1,41 @@
+# Use a system uid for the manager and local instances, or configure logind
+# RemoveIPC=no on the host so logout cannot delete their shared-memory regions.
+# One host: a selene manager for the Flare instances on that host.
+#
+# Run the manager and every Flare instance with the same uid and gid (CACHE_UID and
+# CACHE_GID, default 1000), share /run/selene (the socket) and /dev/shm/selene (the
+# windows) with them at identical paths, and create both directories and the data
+# directory with that ownership first. Instances in other containers need the same two
+# bind mounts and the same PID namespace as the manager.
+#
+#   MANAGER_IMAGE   manager image (default selene:local; from the Flare repository root, `docker build -f selene-manager/Dockerfile -t selene:local .`)
+#   SELENE_DATA     host directory on local NVMe for the durable records (default /var/lib/selene)
+services:
+  manager:
+    image: ${MANAGER_IMAGE:-selene:local}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    pid: host
+    command:
+      - --name
+      - pool
+      - --socket
+      - /run/selene/pool.sock
+      - --root
+      - /var/lib/selene
+      - --memory
+      - 8G
+      - --nvme
+      - 256G
+      - --staging
+      - 512M
+      - --metrics
+      - 127.0.0.1:9108
+    network_mode: host
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+      - ${SELENE_DATA:-/var/lib/selene}:/var/lib/selene
+    # The disk threads need io_uring, which Docker's default seccomp profile blocks. This
+    # profile is Docker's default plus io_uring_setup, io_uring_enter and io_uring_register.
+    security_opt: ["seccomp=./seccomp-io-uring.json"]
+    restart: unless-stopped

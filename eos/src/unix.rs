@@ -38,6 +38,19 @@ pub fn direct_file(path: &Path, write: bool) -> io::Result<File> {
         .open(path)
 }
 
+/// Open without following symlinks, preserving existing bytes when writing.
+pub fn direct_update_file(path: &Path, write: bool) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options
+        .read(true)
+        .write(write)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_DIRECT);
+    if write {
+        options.create(true).truncate(false);
+    }
+    options.open(path)
+}
+
 pub fn direct_reopen(file: &File) -> io::Result<File> {
     direct_file(
         Path::new(&format!("/proc/self/fd/{}", file.as_raw_fd())),

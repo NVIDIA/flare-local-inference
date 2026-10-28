@@ -1,0 +1,45 @@
+# Use a system uid for the manager and local instances, or configure logind
+# RemoveIPC=no on the host so logout cannot delete their shared-memory regions.
+# A manager that also serves instances on other hosts over TLS.
+# See docs/network-operations.md for client address forms, trust and startup warnings.
+#
+# TLS material, mounted read-only at /tls: server.pem and server-key.pem. Instances on this
+# host still connect through /run/selene; share it and /dev/shm/selene as in compose.yaml.
+services:
+  manager:
+    image: ${MANAGER_IMAGE:-selene:local}
+    user: "${CACHE_UID:-1000}:${CACHE_GID:-1000}"
+    pid: host
+    command:
+      - --name
+      - pool
+      - --socket
+      - /run/selene/pool.sock
+      - --root
+      - /var/lib/selene
+      - --memory
+      - 16G
+      - --nvme
+      - 1T
+      - --staging
+      - 1G
+      - --listen
+      - 0.0.0.0:9200
+      - --tls-cert
+      - /tls/server.pem
+      - --tls-key
+      - /tls/server-key.pem
+      - --metrics
+      - 127.0.0.1:9108
+    volumes:
+      - /run/selene:/run/selene
+      - /dev/shm/selene:/dev/shm/selene
+      - ${SELENE_DATA:-/var/lib/selene}:/var/lib/selene
+      - ./tls:/tls:ro
+    ports:
+      - "9200:9200"
+      - "9201:9201"
+    # The disk threads need io_uring, which Docker's default seccomp profile blocks. This
+    # profile is Docker's default plus io_uring_setup, io_uring_enter and io_uring_register.
+    security_opt: ["seccomp=./seccomp-io-uring.json"]
+    restart: unless-stopped

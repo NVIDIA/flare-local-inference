@@ -308,6 +308,13 @@ instantaneous gauges.
 | `host_bytes_in` | Bytes copied from the host store into GPU pages and rows | `flare_host_cache_bytes_in_total` |
 | `learned_drafter` | Boolean: the model has a learned drafter | none |
 
+Host retention also exports `flare_host_cache_held_total{tier}` and
+`flare_host_cache_dropped_total{tier,reason}`, with `dram` and `nvme` tiers and
+`end_of_chain`, `oversize`, `io_error` drop reasons. The gauge
+`flare_host_cache_parked_records` counts complete DRAM copies awaiting disk
+writes. `flare_host_cache_store_skipped_total` still includes duplicates and
+retries; it is not a dropped-record counter.
+
 Dashboard DEPTH is the change in `verification_drafts` divided by the change in
 `verification_rounds` over the sampling window. It averages each request's planned
 draft-prefix length, including zero-draft rounds, rather than graph width or batch

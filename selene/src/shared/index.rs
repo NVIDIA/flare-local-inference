@@ -7,11 +7,14 @@
 //! pins, access order, and the bucket map that makes lookup cost proportional
 //! to the tokens a request adds beyond its resident GPU checkpoint.
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+};
 
 use crate::{HASH_BLOCK_TOKENS, History, PrefixKey, Result};
 
-use super::geometry::invalid;
+use crate::geometry::invalid;
 
 #[derive(Clone, Debug)]
 pub struct Node<L> {
@@ -40,6 +43,10 @@ impl<L> Node<L> {
     pub fn pinned(&self) -> bool {
         self.pins > 0
     }
+    /// Access order: larger is more recent.
+    pub fn accessed(&self) -> u64 {
+        self.accessed
+    }
 }
 
 /// A chain of records that restores the endpoint `key` on top of a GPU
@@ -57,6 +64,31 @@ pub struct Match {
     pub pages: usize,
 }
 
+/// What happened to a node that an observer of the index should hear about.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NodeEvent {
+    /// The node is complete and readable: new, or ready again, or its row was refilled.
+    Ready,
+    /// The node left the index or stopped being readable.
+    Gone,
+    /// The node keeps its pages and lost its row.
+    RowDropped,
+}
+
+/// A node as it was when `event` happened to it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct NodeNotice {
+    pub event: NodeEvent,
+    pub key: PrefixKey,
+    pub parent: Option<PrefixKey>,
+    pub bucket: [u8; 16],
+    pub tail_pages: usize,
+    pub row: bool,
+}
+
+/// Where an index records its nodes' events, for a pool that announces them.
+pub type NodeNotices = Arc<Mutex<Vec<NodeNotice>>>;
+
 #[derive(Debug)]
 pub enum Eviction<L> {
     /// Removed leaves, deepest first; page-only ancestors left childless follow their child.
@@ -70,6 +102,7 @@ pub struct Index<L> {
     nodes: HashMap<PrefixKey, Node<L>>,
     buckets: HashMap<[u8; 16], Vec<PrefixKey>>,
     clock: u64,
+    notices: Option<NodeNotices>,
 }
 
 impl<L> Index<L> {
@@ -79,6 +112,71 @@ impl<L> Index<L> {
             nodes: HashMap::new(),
             buckets: HashMap::new(),
             clock: 0,
+            notices: None,
+        }
+    }
+
+    /// Record the events of nodes from now on in `sink`. Nodes already ready
+    /// are not replayed; see [`Index::ready_notices`].
+    pub fn observe(&mut self, sink: NodeNotices) {
+        self.notices = Some(sink);
+    }
+
+    /// One `Ready` notice for every node that is ready now.
+    pub fn ready_notices(&self) -> Vec<NodeNotice> {
+        self.nodes
+            .values()
+            .filter(|node| node.ready)
+            .map(|node| Self::notice(NodeEvent::Ready, node))
+            .collect()
+    }
+
+    fn notice(event: NodeEvent, node: &Node<L>) -> NodeNotice {
+        NodeNotice {
+            event,
+            key: node.key,
+            parent: node.parent,
+            bucket: node.bucket,
+            tail_pages: node.tail_pages,
+            row: node.row,
+        }
+    }
+
+    fn notify(&self, event: NodeEvent, node: &Node<L>) {
+        if let Some(sink) = &self.notices {
+            sink.lock().unwrap().push(Self::notice(event, node));
+        }
+    }
+
+    /// Mark a node readable or not, reporting the change.
+    pub fn set_ready(&mut self, key: &PrefixKey, ready: bool) -> Result<()> {
+        let node = self
+            .nodes
+            .get_mut(key)
+            .ok_or_else(|| invalid("cannot change the readiness of an unindexed host record"))?;
+        if node.ready != ready {
+            node.ready = ready;
+            let node = &self.nodes[key];
+            self.notify(
+                if ready {
+                    NodeEvent::Ready
+                } else {
+                    NodeEvent::Gone
+                },
+                node,
+            );
+        }
+        Ok(())
+    }
+
+    /// Drop a node's row, keeping its pages; reports the change.
+    pub fn drop_row(&mut self, key: &PrefixKey) {
+        if let Some(node) = self.nodes.get_mut(key)
+            && node.row
+        {
+            node.row = false;
+            let node = &self.nodes[key];
+            self.notify(NodeEvent::RowDropped, node);
         }
     }
 
@@ -168,7 +266,42 @@ impl<L> Index<L> {
                 accessed,
             },
         );
+        if ready {
+            self.notify(NodeEvent::Ready, &self.nodes[&key]);
+        }
         Ok(())
+    }
+
+    pub fn access_at(&mut self, key: &PrefixKey, tick: u64) {
+        self.clock = self.clock.max(tick);
+        if let Some(node) = self.nodes.get_mut(key) {
+            node.accessed = tick;
+        }
+    }
+
+    /// Remove exactly one unpinned leaf, preserving its ancestry anchors.
+    pub fn remove_node(&mut self, key: &PrefixKey) -> Result<Node<L>> {
+        let node = self
+            .nodes
+            .get(key)
+            .ok_or_else(|| invalid("cannot remove an unindexed host record"))?;
+        if node.children != 0 || node.pinned() {
+            return Err(invalid(
+                "cannot remove a pinned host record or one with children",
+            ));
+        }
+        let node = self.nodes.remove(key).unwrap();
+        if let Some(keys) = self.buckets.get_mut(&node.bucket) {
+            keys.retain(|k| k != key);
+            if keys.is_empty() {
+                self.buckets.remove(&node.bucket);
+            }
+        }
+        if let Some(parent) = node.parent {
+            self.nodes.get_mut(&parent).unwrap().children -= 1;
+        }
+        self.notify(NodeEvent::Gone, &node);
+        Ok(node)
     }
 
     pub fn touch(&mut self, key: &PrefixKey) {
@@ -251,7 +384,32 @@ impl<L> Index<L> {
     }
 
     pub fn complete(&self, key: &PrefixKey) -> bool {
-        self.chain(key, 0, &|node| node.ready).is_some()
+        self.complete_with(key, &|node| node.ready)
+    }
+
+    pub(crate) fn complete_with(
+        &self,
+        key: &PrefixKey,
+        usable: &impl Fn(&Node<L>) -> bool,
+    ) -> bool {
+        let Some(endpoint) = self.nodes.get(key).filter(|node| node.row) else {
+            return false;
+        };
+        let mut node = endpoint;
+        let mut pages = 0;
+        loop {
+            if !usable(node) {
+                return false;
+            }
+            pages += node.tail_pages;
+            match node.parent {
+                None => return pages as u64 == key.consumed_tokens / self.page_tokens,
+                Some(parent) => match self.nodes.get(&parent) {
+                    Some(parent) => node = parent,
+                    None => return false,
+                },
+            }
+        }
     }
 
     fn chain(
@@ -329,19 +487,19 @@ impl<L> Index<L> {
                     next = Some(parent);
                 }
             }
+            self.notify(NodeEvent::Gone, &node);
             removed.push(node);
         }
         Ok(removed)
     }
 
-    /// Retire the oldest eligible leaf or, when `need_row`, compactable ancestor.
-    pub fn evict(
-        &mut self,
+    /// The oldest eligible leaf or, when `need_row`, compactable ancestor.
+    pub fn candidate(
+        &self,
         need_row: bool,
         evictable: impl Fn(&Node<L>) -> bool,
-    ) -> Option<Eviction<L>> {
-        let candidate = self
-            .nodes
+    ) -> Option<PrefixKey> {
+        self.nodes
             .values()
             .filter(|node| {
                 node.ready
@@ -350,12 +508,33 @@ impl<L> Index<L> {
                     && (node.children == 0 || (need_row && node.row && node.children == 1))
             })
             .min_by_key(|node| (node.accessed, node.key.consumed_tokens))
-            .map(|node| node.key)?;
+            .map(|node| node.key)
+    }
+
+    /// Retire the oldest eligible leaf or, when `need_row`, compactable ancestor.
+    pub fn evict(
+        &mut self,
+        need_row: bool,
+        evictable: impl Fn(&Node<L>) -> bool,
+    ) -> Option<Eviction<L>> {
+        let candidate = self.candidate(need_row, evictable)?;
         if self.nodes[&candidate].children == 0 {
             return self.remove(&candidate).ok().map(Eviction::Leaves);
         }
-        self.nodes.get_mut(&candidate).unwrap().row = false;
+        self.drop_row(&candidate);
         Some(Eviction::Compacted(candidate))
+    }
+}
+
+impl<L> std::ops::Index<&PrefixKey> for Index<L> {
+    type Output = Node<L>;
+    fn index(&self, key: &PrefixKey) -> &Self::Output {
+        &self.nodes[key]
+    }
+}
+impl<L> std::ops::IndexMut<&PrefixKey> for Index<L> {
+    fn index_mut(&mut self, key: &PrefixKey) -> &mut Self::Output {
+        self.nodes.get_mut(key).unwrap()
     }
 }
 
@@ -450,6 +629,26 @@ mod tests {
                     .is_none()
             );
         }
+    }
+
+    #[test]
+    fn a_retained_checkpoint_requires_its_row_and_every_ancestor() {
+        let mut index = Index::new(64);
+        let full = history(256);
+        let root = full.key_at(64).unwrap();
+        let leaf = full.key_at(192).unwrap();
+        insert(&mut index, &full, 64, None);
+        insert(&mut index, &full, 192, Some(64));
+        assert!(index.complete(&leaf));
+        index.set_ready(&root, false).unwrap();
+        assert!(!index.complete(&leaf));
+        assert!(index.complete_with(&leaf, &|_| true));
+        index.set_ready(&root, true).unwrap();
+        index.nodes.get_mut(&leaf).unwrap().row = false;
+        assert!(!index.complete(&leaf));
+        index.nodes.get_mut(&leaf).unwrap().row = true;
+        index.remove(&leaf).unwrap();
+        assert!(!index.complete(&leaf));
     }
 
     #[test]
@@ -646,5 +845,153 @@ mod tests {
         let third = index.lookup_below(&full, 0, 710, |n| n.ready).unwrap();
         assert_eq!(third.consumed_tokens, 701);
         assert!(index.lookup_below(&full, 0, 701, |n| n.ready).is_none());
+    }
+
+    #[test]
+    fn an_observed_index_reports_ready_gone_and_dropped_rows_and_only_those() {
+        let sink: NodeNotices = Default::default();
+        let mut index = Index::new(64);
+        index.observe(sink.clone());
+        let full = history(2000);
+        insert(&mut index, &full, 700, None);
+        insert(&mut index, &full, 1300, Some(700));
+        let events = |sink: &NodeNotices| {
+            sink.lock()
+                .unwrap()
+                .drain(..)
+                .map(|n| (n.event, n.key.consumed_tokens, n.row))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            events(&sink),
+            [
+                (NodeEvent::Ready, 700, true),
+                (NodeEvent::Ready, 1300, true)
+            ]
+        );
+        let child = full.key_at(1300).unwrap();
+        // Readiness reports changes only.
+        index.set_ready(&child, true).unwrap();
+        assert!(events(&sink).is_empty());
+        index.set_ready(&child, false).unwrap();
+        index.set_ready(&child, true).unwrap();
+        assert_eq!(
+            events(&sink),
+            [
+                (NodeEvent::Gone, 1300, true),
+                (NodeEvent::Ready, 1300, true)
+            ]
+        );
+        index.drop_row(&child);
+        index.drop_row(&child);
+        assert_eq!(events(&sink), [(NodeEvent::RowDropped, 1300, false)]);
+        // The older parent compacts first, then the leaf goes and takes the
+        // page-only parent with it.
+        assert!(matches!(
+            index.evict(true, |_| true),
+            Some(Eviction::Compacted(_))
+        ));
+        assert_eq!(events(&sink), [(NodeEvent::RowDropped, 700, false)]);
+        let Some(Eviction::Leaves(leaves)) = index.evict(true, |_| true) else {
+            panic!("the leaf is evicted");
+        };
+        assert_eq!(leaves.len(), 2);
+        assert_eq!(
+            events(&sink),
+            [
+                (NodeEvent::Gone, 1300, false),
+                (NodeEvent::Gone, 700, false)
+            ]
+        );
+        assert!(index.ready_notices().is_empty());
+        insert(&mut index, &full, 700, None);
+        assert_eq!(index.ready_notices().len(), 1);
+    }
+    fn test_key(tokens: u64) -> PrefixKey {
+        PrefixKey {
+            consumed_tokens: tokens,
+            digest: (tokens as u128 * 7919).to_le_bytes(),
+        }
+    }
+
+    #[test]
+    fn parent_links_pages_and_removal_remain_consistent() {
+        for pt in [64, 128, 256] {
+            let mut tree = Index::new(pt);
+            let keys = [test_key(700), test_key(1300), test_key(1990)];
+            for (index, key) in keys.iter().enumerate() {
+                let parent = index.checked_sub(1).map(|index| keys[index]);
+                let pages = key.consumed_tokens / pt
+                    - parent.map_or(0, |parent| parent.consumed_tokens / pt);
+                tree.insert(*key, parent, [4; 16], pages as usize, true, true, ())
+                    .unwrap();
+                tree.access_at(key, index as u64 + 1);
+            }
+            let parent = tree.node(&keys[2]).unwrap().parent.unwrap();
+            assert_eq!(parent, keys[1]);
+            assert_eq!(tree.node(&parent).unwrap().parent, Some(keys[0]));
+            let available =
+                tree.node(&parent).unwrap().tail_pages + tree.node(&keys[2]).unwrap().tail_pages;
+            let skip = (1000 / pt - 700 / pt) as usize;
+            assert_eq!(available - skip, (1990 / pt - 1000 / pt) as usize);
+            assert!(
+                tree.insert(
+                    test_key(2000),
+                    Some(test_key(1999)),
+                    [0; 16],
+                    0,
+                    true,
+                    true,
+                    ()
+                )
+                .is_err()
+            );
+            assert!(
+                tree.insert(test_key(2000), Some(keys[2]), [0; 16], 20, true, true, ())
+                    .is_err()
+            );
+            assert_eq!(tree.node(&keys[2]).unwrap().children(), 0);
+            assert!(tree.remove_node(&keys[0]).is_err());
+            tree.pin(&keys[2]).unwrap();
+            assert!(tree.remove_node(&keys[2]).is_err());
+            tree.unpin(&keys[2]).unwrap();
+            assert_eq!(tree.remove_node(&keys[2]).unwrap().key, keys[2]);
+            assert_eq!(tree.node(&keys[1]).unwrap().children(), 0);
+        }
+    }
+
+    #[test]
+    fn leaf_lru_compaction_and_cascade() {
+        let mut tree = Index::new(64);
+        for (tokens, parent) in [(200, None), (400, Some(200)), (600, Some(400))] {
+            tree.insert(
+                test_key(tokens),
+                parent.map(test_key),
+                [0; 16],
+                (tokens / 64 - parent.unwrap_or(0) / 64) as usize,
+                true,
+                true,
+                (),
+            )
+            .unwrap();
+            tree.access_at(&test_key(tokens), tokens);
+        }
+        tree.access_at(&test_key(200), 1000);
+        tree.pin(&test_key(600)).unwrap();
+        assert!(tree.evict(false, |_| true).is_none());
+        assert!(
+            matches!(tree.evict(true, |_| true), Some(Eviction::Compacted(k)) if k == test_key(400))
+        );
+        assert!(!tree.node(&test_key(400)).unwrap().row);
+        assert!(tree.node(&test_key(600)).unwrap().row);
+        tree.unpin(&test_key(600)).unwrap();
+        let Some(Eviction::Leaves(removed)) = tree.evict(false, |_| true) else {
+            panic!("leaves")
+        };
+        assert_eq!(
+            removed.iter().map(|node| node.key).collect::<Vec<_>>(),
+            [test_key(600), test_key(400)]
+        );
+        assert_eq!(tree.len(), 1);
     }
 }

@@ -62,7 +62,7 @@ use std::{
 
 use crate::{Error, PrefixKey, Result};
 
-use super::geometry::{BLOCK_BYTES, CacheGeometry, Layout, RankLayout, invalid};
+use crate::geometry::{BLOCK_BYTES, CacheGeometry, Layout, RankLayout, invalid};
 
 pub const MAGIC: [u8; 8] = *b"FLARECKP";
 pub const VERSION: u32 = 1;
@@ -72,8 +72,6 @@ const SUFFIX: &str = ".ckpt";
 
 /// Bytes of the fixed header fields that precede the rank entries.
 const FIXED_FIELD_BYTES: usize = 177;
-/// Length of a record file name: 16 hexadecimal digits, a hyphen, 32 digits, and `.ckpt`.
-const FILE_NAME_LENGTH: usize = 16 + 1 + 32 + SUFFIX.len();
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RankSizes {
@@ -82,11 +80,11 @@ pub struct RankSizes {
 }
 
 impl RankSizes {
-    fn page_record_bytes(&self) -> u64 {
+    pub fn page_record_bytes(&self) -> u64 {
         self.planes.iter().map(|size| padded(*size)).sum()
     }
 
-    fn row_record_bytes(&self) -> u64 {
+    pub fn row_record_bytes(&self) -> u64 {
         padded(self.row_bytes)
     }
 
@@ -128,13 +126,34 @@ impl Header {
         created: SystemTime,
     ) -> Result<Self> {
         let layout = Layout::new(geometry)?;
-        let ranks = geometry
-            .iter()
-            .map(|rank| RankSizes {
-                planes: rank.planes.iter().map(|plane| plane.unit_bytes).collect(),
-                row_bytes: rank.row.unit_bytes,
-            })
-            .collect();
+        let ranks = rank_sizes(geometry);
+        Self::from_sizes(
+            layout.page_tokens,
+            ranks,
+            identity,
+            fingerprint,
+            key,
+            parent,
+            bucket,
+            tail_pages,
+            created
+                .duration_since(UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs()),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_sizes(
+        page_tokens: u64,
+        ranks: Vec<RankSizes>,
+        identity: [u8; 32],
+        fingerprint: [u8; 16],
+        key: PrefixKey,
+        parent: Option<PrefixKey>,
+        bucket: [u8; 16],
+        tail_pages: u32,
+        created: u64,
+    ) -> Result<Self> {
         let mut header = Self {
             identity,
             fingerprint,
@@ -142,15 +161,13 @@ impl Header {
             key,
             parent,
             bucket,
-            page_tokens: layout.page_tokens,
+            page_tokens,
             tail_pages,
             ranks,
             page_segment: 0,
             row_segment: 0,
             row_checksum: 0,
-            created: created
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |elapsed| elapsed.as_secs()),
+            created,
         };
         let derived = header.derive()?;
         header.page_segment = derived.page_segment;
@@ -425,7 +442,11 @@ impl Header {
         self.ranks.iter().map(RankSizes::row_record_bytes).sum()
     }
 
-    /// File length when the row segment is present.
+    /// File length with or without the state row.
+    pub fn length(&self, row: bool) -> u64 {
+        self.row_segment + if row { self.row_record_bytes() } else { 0 }
+    }
+
     pub fn length_with_row(&self) -> u64 {
         self.row_segment + self.row_record_bytes()
     }
@@ -546,7 +567,7 @@ impl<'a> Reader<'a> {
     }
 }
 
-fn hex(bytes: &[u8]) -> String {
+pub fn hex(bytes: &[u8]) -> String {
     let mut text = String::with_capacity(bytes.len() * 2);
     for byte in bytes {
         write!(text, "{byte:02x}").unwrap();
@@ -575,11 +596,11 @@ pub fn directory_name(identity: &[u8; 32], fingerprint: &[u8; 16]) -> String {
 }
 
 pub fn file_name(key: &PrefixKey) -> String {
-    format!(
-        "{:016x}-{}.{EXTENSION}",
-        key.consumed_tokens,
-        hex(&key.digest)
-    )
+    file_name_with_suffix(key, SUFFIX)
+}
+
+pub fn file_name_with_suffix(key: &PrefixKey, suffix: &str) -> String {
+    format!("{:016x}-{}{suffix}", key.consumed_tokens, hex(&key.digest))
 }
 
 pub fn temporary_name(key: &PrefixKey) -> String {
@@ -587,13 +608,17 @@ pub fn temporary_name(key: &PrefixKey) -> String {
 }
 
 pub fn parse_file_name(name: &str) -> Option<PrefixKey> {
-    if name.len() != FILE_NAME_LENGTH || !name.is_ascii() {
+    parse_file_name_with_suffix(name, SUFFIX)
+}
+
+pub fn parse_file_name_with_suffix(name: &str, expected_suffix: &str) -> Option<PrefixKey> {
+    if name.len() != 49 + expected_suffix.len() || !name.is_ascii() {
         return None;
     }
     let (consumed, rest) = name.split_at(16);
     let rest = rest.strip_prefix('-')?;
     let (digest, suffix) = rest.split_at(32);
-    if suffix != SUFFIX {
+    if suffix != expected_suffix {
         return None;
     }
     let consumed = u64::from_be_bytes(hex_digits(consumed)?.try_into().ok()?);
@@ -602,6 +627,17 @@ pub fn parse_file_name(name: &str) -> Option<PrefixKey> {
         consumed_tokens: consumed,
         digest,
     })
+}
+
+/// The record sizes carried by a runtime geometry.
+pub fn rank_sizes(geometry: &[CacheGeometry]) -> Vec<RankSizes> {
+    geometry
+        .iter()
+        .map(|rank| RankSizes {
+            planes: rank.planes.iter().map(|plane| plane.unit_bytes).collect(),
+            row_bytes: rank.row.unit_bytes,
+        })
+        .collect()
 }
 
 /// A record found by the startup scan.
@@ -708,7 +744,8 @@ pub fn scan(
     directory: &DirectoryLock,
     identity: &[u8; 32],
     fingerprint: &[u8; 16],
-    geometry: &[CacheGeometry],
+    page_tokens: u64,
+    ranks: &[RankSizes],
 ) -> Result<Vec<Scanned>> {
     let directory = directory.path();
     let entries = fs::read_dir(directory).map_err(|error| {
@@ -754,7 +791,7 @@ pub fn scan(
         if !name.ends_with(SUFFIX) {
             continue;
         }
-        match inspect(&path, name, &metadata, identity, fingerprint, geometry) {
+        match inspect(&path, name, &metadata, identity, fingerprint, page_tokens, ranks) {
             Inspection::Record(scanned) => records.push(scanned),
             Inspection::Absent => {}
             Inspection::Invalid => remove(&path)?,
@@ -799,7 +836,8 @@ fn inspect(
     metadata: &fs::Metadata,
     identity: &[u8; 32],
     fingerprint: &[u8; 16],
-    geometry: &[CacheGeometry],
+    page_tokens: u64,
+    ranks: &[RankSizes],
 ) -> Inspection {
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
@@ -828,7 +866,8 @@ fn inspect(
     let bytes = metadata.len();
     let belongs_here = header.identity == *identity
         && header.fingerprint == *fingerprint
-        && header.matches(geometry);
+        && header.page_tokens == page_tokens
+        && header.ranks == ranks;
     let named_by_key = parse_file_name(name) == Some(header.key);
     let covers_pages = bytes >= header.row_segment;
     if !belongs_here || !named_by_key || !covers_pages {
@@ -1218,7 +1257,7 @@ mod tests {
 
         let lock = DirectoryLock::acquire(&directory).unwrap();
         assert!(
-            scan(&lock, &IDENTITY, &FINGERPRINT, &geometry)
+            scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
                 .is_empty()
         );
@@ -1274,7 +1313,7 @@ mod tests {
         #[cfg(unix)]
         symlink("/nonexistent/target.ckpt", &link).unwrap();
 
-        let records = scan(&lock, &IDENTITY, &FINGERPRINT, &geometry).unwrap();
+        let records = scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry)).unwrap();
         assert_eq!(
             names(&records),
             [&root, &sibling, &child, &grandchild]
@@ -1296,7 +1335,7 @@ mod tests {
         #[cfg(unix)]
         assert!(fs::symlink_metadata(&link).unwrap().is_symlink());
 
-        let again = scan(&lock, &IDENTITY, &FINGERPRINT, &geometry).unwrap();
+        let again = scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry)).unwrap();
         assert_eq!(again, records);
 
         let mut index = Index::new(64);
@@ -1338,7 +1377,7 @@ mod tests {
 
         // Deleting the child orphans the grandchild on the next scan.
         fs::remove_file(directory.join(file_name(&child.key))).unwrap();
-        let pruned = scan(&lock, &IDENTITY, &FINGERPRINT, &geometry).unwrap();
+        let pruned = scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry)).unwrap();
         assert_eq!(
             names(&pruned),
             [file_name(&root.key), file_name(&sibling.key)]
@@ -1377,13 +1416,13 @@ mod tests {
             root.length_with_row(),
         );
         fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
-        let error = scan(&lock, &IDENTITY, &FINGERPRINT, &geometry)
+        let error = scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
             .unwrap_err()
             .to_string();
         assert!(error.contains(&file_name(&root.key)), "{error}");
         assert!(path.exists());
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
-        let records = scan(&lock, &IDENTITY, &FINGERPRINT, &geometry).unwrap();
+        let records = scan(&lock, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry)).unwrap();
         assert_eq!(names(&records), [file_name(&root.key)]);
         drop(lock);
         fs::remove_dir_all(&directory).unwrap();
@@ -1400,7 +1439,7 @@ mod tests {
         let geometry = geometries().remove(0);
         let owner = DirectoryLock::acquire(&directory).unwrap();
         assert!(
-            scan(&owner, &IDENTITY, &FINGERPRINT, &geometry)
+            scan(&owner, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
                 .is_empty()
         );
@@ -1417,7 +1456,7 @@ mod tests {
         drop(owner);
         let next = DirectoryLock::acquire(&directory).unwrap();
         assert!(
-            scan(&next, &IDENTITY, &FINGERPRINT, &geometry)
+            scan(&next, &IDENTITY, &FINGERPRINT, geometry[0].page_tokens, &rank_sizes(&geometry))
                 .unwrap()
                 .is_empty()
         );

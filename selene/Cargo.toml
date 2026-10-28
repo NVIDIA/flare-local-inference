@@ -12,13 +12,25 @@ crate-type = ["rlib"]
 
 [features]
 default = []
+# The instance's end of the RDMA data channel (experimental).
+rdma = ["dep:ibverbs-sys"]
 # Fixtures that tests of other crates share with this crate's own tests.
 test-support = []
 
 [dependencies]
 flare-eos = { path = "../eos" }
 blake2 = "0.10"
+hyper-util = { version = "0.1", features = ["tokio"] }
+ibverbs-sys = { version = "0.3.2", optional = true }
 libc = "0.2.189"
+prost = "0.14"
+tokio = { version = "1.53.1", features = ["rt", "net", "sync", "time", "macros", "io-util"] }
+tokio-stream = "0.1"
+tokio-rustls = { version = "0.26", default-features = false }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen"] }
+tonic-prost = "0.14"
+tower = { version = "0.5", features = ["util"] }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 
 [target.'cfg(windows)'.dependencies]
@@ -26,3 +38,16 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Storage
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = "0.7"
+
+[build-dependencies]
+tonic-prost-build = "0.14"
+
+[dev-dependencies]
+rcgen = { version = "0.14", features = ["pem"] }
+tokio = { version = "1.53.1", features = ["rt-multi-thread"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { version = "0.14", default-features = false, features = ["transport", "codegen", "tls-ring", "router"] }
+
+[[example]]
+name = "rank_node"
+required-features = ["test-support"]

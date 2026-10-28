@@ -87,7 +87,7 @@ pub(super) fn prepare_inference_cached(
     request: &super::inference::Request,
     index: usize,
     count_only: bool,
-    input_store: Option<&crate::offload::input::InputStore>,
+    input_store: Option<&flare_selene::input::InputStore>,
 ) -> Result<PreparedInference> {
     use super::inference::{Constraint, Input, RawPrompt, ToolChoice};
     let opts = &request.options;
@@ -650,7 +650,7 @@ mod tests {
     #[test]
     fn source_cache_coalesces_decoding_and_preserves_media_validation() {
         use crate::frontend::images::{ImageLimits, ImageSettings};
-        use crate::offload::input::{DiskBudget, InputStore};
+        use flare_selene::input::{DiskBudget, InputStore};
         use std::sync::{Arc, Barrier};
 
         let processor = ImageProcessor::load(ImageSettings::Deepseek4 {}, ImageLimits::default()).unwrap();
@@ -812,7 +812,7 @@ mod tests {
 fn describe_images(
     sources: &[String],
     processor: Option<&ImageProcessor>,
-    input_store: Option<&crate::offload::input::InputStore>,
+    input_store: Option<&flare_selene::input::InputStore>,
 ) -> Result<Vec<crate::frontend::images::ImageInput>> {
     use crate::frontend::images::{ImageDescription, ImageEncoding, ImageInput};
     use std::sync::Arc;
@@ -887,7 +887,7 @@ fn describe_images(
                 let description = processor.describe_image(&image)
                     .map_err(|error| error.admission_context(AdmissionError::Image))?;
                 if let Some(store) = input_store {
-                    store.insert(source_key, Arc::new(crate::offload::input::PreparedInputRecord {
+                    store.insert(source_key, Arc::new(flare_selene::input::PreparedInputRecord {
                         metadata: description.encode()?.into(),
                         payload: None,
                     }));

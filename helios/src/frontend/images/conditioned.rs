@@ -143,7 +143,7 @@ impl PreparedImageInput {
     #[cfg(feature = "server")]
     pub fn materialize_cached(
         &self,
-        store: Option<&crate::offload::input::InputStore>,
+        store: Option<&flare_selene::input::InputStore>,
     ) -> Result<ProcessedImages> {
         if let Some(record) = store.and_then(|s| s.get_blocking(self.identity, true)) {
             if let Some(bytes) = &record.payload {
@@ -166,7 +166,7 @@ impl PreparedImageInput {
                 .checked_add(metadata.len())
                 .ok_or("prepared image record extent overflows")?;
             store.insert_with(self.identity, bytes as u64, || {
-                Ok(crate::offload::input::PreparedInputRecord {
+                Ok(flare_selene::input::PreparedInputRecord {
                     metadata: Arc::from(metadata),
                     payload: Some(Arc::new(images.encode()?)),
                 })
@@ -672,10 +672,10 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn processed_cache_hit_skips_decode_and_patch_preparation() {
-        let store = crate::offload::input::InputStore::start(
+        let store = flare_selene::input::InputStore::start(
             64 << 20,
             None,
-            crate::offload::input::DiskBudget::new(0, 0),
+            flare_selene::input::DiskBudget::new(0, 0),
         )
         .unwrap();
         let processor = processor(ImageSettings::Step {});
@@ -700,10 +700,10 @@ mod tests {
     #[cfg(feature = "server")]
     #[test]
     fn cached_tensor_extents_are_validated_before_use() {
-        let store = crate::offload::input::InputStore::start(
+        let store = flare_selene::input::InputStore::start(
             64 << 20,
             None,
-            crate::offload::input::DiskBudget::new(0, 0),
+            flare_selene::input::DiskBudget::new(0, 0),
         )
         .unwrap();
         let processor = processor(ImageSettings::Moonvit {});
@@ -718,7 +718,7 @@ mod tests {
         malformed.position_ids.pop();
         store.insert(
             prepared.identity,
-            Arc::new(crate::offload::input::PreparedInputRecord {
+            Arc::new(flare_selene::input::PreparedInputRecord {
                 metadata: Arc::from(&b"flare-prepared-image-v1"[..]),
                 payload: Some(Arc::new(malformed.encode().unwrap())),
             }),

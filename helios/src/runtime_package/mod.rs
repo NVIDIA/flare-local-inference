@@ -91,7 +91,7 @@ pub struct NativeResources {
     // An integrated GPU (GB10) registers host memory without pinning it.
     integrated: bool,
     events: HashMap<String, Handle>,
-    cache: Option<crate::offload::CacheGeometry>,
+    cache: Option<flare_selene::CacheGeometry>,
     #[cfg(windows)]
     host_mappings: Vec<(u64, usize)>,
 }
@@ -1058,7 +1058,7 @@ impl NativeResources {
     }
 
     /// The rank's prefix checkpoint storage, present after cache allocation.
-    pub fn cache_geometry(&self) -> Option<&crate::offload::CacheGeometry> {
+    pub fn cache_geometry(&self) -> Option<&flare_selene::CacheGeometry> {
         self.cache.as_ref()
     }
 

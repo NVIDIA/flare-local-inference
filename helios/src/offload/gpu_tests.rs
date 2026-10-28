@@ -59,7 +59,8 @@ mod memory {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn memory_store_round_trips_a_multi_window_checkpoint() {
-        use crate::{cuda::Stream, offload::CacheGeometry};
+        use crate::cuda::Stream;
+        use flare_selene::CacheGeometry;
 
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
@@ -196,7 +197,8 @@ mod memory {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn memory_store_round_trips_a_checkpoint_through_a_loaded_package() {
-        use crate::{cuda::Stream, offload::CacheGeometry};
+        use crate::cuda::Stream;
+        use flare_selene::CacheGeometry;
 
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
@@ -352,7 +354,7 @@ mod memory {
         assert_eq!(hit.key, checkpoint.key);
         assert_eq!(hit.pages, 3);
         assert_eq!(hit.bytes, layout.record_bytes(3));
-        assert_eq!(hit.tier, Tier::Memory);
+        assert_eq!(hit.tier, Tier::Dram);
         assert!(hit.estimated_seconds > 0.0);
         let ticket = InboundTicket {
             key: checkpoint.key,
@@ -553,7 +555,8 @@ mod composite {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn composite_writes_a_child_published_while_its_parent_is_in_flight() {
-        use crate::{cuda::Stream, offload::geometry::fingerprint};
+        use crate::cuda::Stream;
+        use flare_selene::geometry::fingerprint;
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
@@ -789,7 +792,7 @@ mod composite {
         // Restart: a fresh composite over the scanned directory and an empty memory pool.
         let directory_lock = record::DirectoryLock::acquire(&directory).unwrap();
         let scanned =
-            crate::offload::record::scan(&directory_lock, &IDENTITY, &fingerprint, &geometry)
+            flare_selene::record::scan(&directory_lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &flare_selene::record::rank_sizes(&geometry))
                 .unwrap();
         assert_eq!(scanned.len(), 7);
         let mut pool = SlabPool::new(
@@ -819,7 +822,7 @@ mod composite {
         let hit = store.lookup(&history, 0, u64::MAX).unwrap();
         assert_eq!(
             (hit.key, hit.pages, hit.tier),
-            (grandchild.key, 4, Tier::Disk)
+            (grandchild.key, 4, Tier::Nvme)
         );
         let targets: Vec<PageId> = (base + 10..base + 14).map(PageId).collect();
         let ticket = InboundTicket {
@@ -873,7 +876,8 @@ mod composite {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn composite_round_trips_through_memory_and_disk_on_a_loaded_package() {
-        use crate::{cuda::Stream, offload::geometry::fingerprint};
+        use crate::cuda::Stream;
+        use flare_selene::geometry::fingerprint;
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
@@ -1056,7 +1060,7 @@ mod composite {
         let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
         assert_eq!(
             (hit.key, hit.pages, hit.tier, hit.bytes),
-            (first.key, 3, Tier::Memory, record_bytes)
+            (first.key, 3, Tier::Dram, record_bytes)
         );
         let ticket = || InboundTicket {
             key: first.key,
@@ -1139,7 +1143,7 @@ mod composite {
         write_pages(&mut write_unit, &targets, &|_, _| 0xCC);
         write_row(&mut write_unit, target_slot, 0xCC);
         let hit = store.lookup(&histories[0], 0, u64::MAX).unwrap();
-        assert_eq!((hit.key, hit.tier), (first.key, Tier::Disk));
+        assert_eq!((hit.key, hit.tier), (first.key, Tier::Nvme));
         assert!(hit.estimated_seconds > record_bytes as f64 / INITIAL_MEMORY_RATE);
         store.fetch(hit, ticket()).unwrap();
         match super::wait_event(&mut store, 120) {
@@ -1191,7 +1195,8 @@ mod composite {
                 &store.disk().directory_lock,
                 &IDENTITY,
                 &fingerprint,
-                &geometry
+                geometry[0].page_tokens,
+                &record::rank_sizes(&geometry)
             )
             .unwrap()
             .len(),
@@ -1229,7 +1234,7 @@ mod composite {
                 Transfers::start(&[(context, device)], geometry.clone(), &staging_pool).unwrap(),
             ));
             let lock = record::DirectoryLock::acquire(&directory).unwrap();
-            let scanned = record::scan(&lock, &IDENTITY, &fingerprint, &geometry).unwrap();
+            let scanned = record::scan(&lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
             let disk = DiskStore::new(
                 lock,
                 IDENTITY,
@@ -1302,7 +1307,7 @@ mod composite {
                     assert_eq!(key, first.key);
                     assert_eq!(result.unwrap(), record_bytes);
                 }
-                StoreEvent::Deferred { .. } => panic!("unexpected deferred event"),
+                _ => panic!("unexpected event"),
             }
         }
         assert!(stored_keys.contains(&short.key) && stored_keys.contains(&large.key));
@@ -1331,7 +1336,7 @@ mod composite {
         write_pages(&mut write_unit, &targets, &|_, _| 0xA5);
         write_row(&mut write_unit, target_slot, 0xA5);
         let hit = store.lookup(&fresh, 0, u64::MAX).unwrap();
-        assert_eq!((hit.key, hit.pages, hit.tier), (large.key, 3, Tier::Disk));
+        assert_eq!((hit.key, hit.pages, hit.tier), (large.key, 3, Tier::Nvme));
         store
             .fetch(
                 hit,
@@ -1371,7 +1376,8 @@ mod disk_store {
     };
 
     use flare_selene::{
-        HostStore, InboundTicket, Layout, PageId, StateSlotId, StoreEvent, StoreOutcome, Tier,
+        HostStore, InboundTicket, Layout, PageId, PublishedCheckpoint, StateSlotId, StoreEvent,
+        StoreOutcome, Tier,
         disk::DiskThread,
         disk_store::{DiskStore, Staged},
         record::{self, Scanned},
@@ -1401,7 +1407,8 @@ mod disk_store {
     #[test]
     #[ignore = "requires FLARE_OFFLOAD_TEST_PACKAGE naming an exported package and a free GPU 0"]
     fn staged_store_round_trips_records_through_files_and_a_restart() {
-        use crate::{cuda::Stream, offload::geometry::fingerprint};
+        use crate::cuda::Stream;
+        use flare_selene::geometry::fingerprint;
         let Some(package) = std::env::var_os("FLARE_OFFLOAD_TEST_PACKAGE") else {
             eprintln!("skipping: FLARE_OFFLOAD_TEST_PACKAGE is unset");
             return;
@@ -1522,7 +1529,7 @@ mod disk_store {
             (pool.free_pages(), pool.free_rows())
         }
         let scan = |lock: &record::DirectoryLock| {
-            record::scan(lock, &IDENTITY, &fingerprint, &geometry).unwrap()
+            record::scan(lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap()
         };
 
         assert!(scan(&record::DirectoryLock::acquire(&directory).unwrap()).is_empty());
@@ -1570,7 +1577,7 @@ mod disk_store {
         let hit = store.lookup(&full, 0, u64::MAX).unwrap();
         assert_eq!(
             (hit.key, hit.pages, hit.tier),
-            (root.key, PAGES as usize, Tier::Disk)
+            (root.key, PAGES as usize, Tier::Nvme)
         );
         store
             .fetch(

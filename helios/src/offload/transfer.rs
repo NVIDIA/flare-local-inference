@@ -245,7 +245,9 @@ struct RankWorker {
     rank: usize,
     geometry: CacheGeometry,
     layout: RankLayout,
-    part: RankPart,
+    /// Resolves slab identities to GPU addresses; without it host addresses are
+    /// already GPU-addressable, as for memory registered with identical addresses.
+    part: Option<RankPart>,
     stream: Stream,
     event: Event,
     descriptors: Vec<Descriptor>,
@@ -263,7 +265,7 @@ impl RankWorker {
         device: i32,
         geometry: CacheGeometry,
         layout: RankLayout,
-        part: RankPart,
+        part: Option<RankPart>,
     ) -> Result<Self> {
         let stream = Stream::open_lowest_priority(context, device)?;
         let event = stream.blocking_event()?;
@@ -294,7 +296,7 @@ impl RankWorker {
         expand(
             &self.geometry,
             &self.layout,
-            Some(&self.part),
+            self.part.as_ref(),
             job,
             &mut self.descriptors,
         )?;
@@ -380,7 +382,32 @@ impl Transfers {
             )));
         }
         let layout = Layout::new(&geometry)?;
-        let parts = pool.device_parts(&layout)?;
+        let parts = pool.device_parts(&layout)?.into_iter().map(Some).collect();
+        Self::start_parts(contexts, geometry, layout, parts)
+    }
+
+    /// Start threads that copy to and from host memory registered with identical
+    /// host and device addresses, which a job names directly. The shared pool
+    /// regions map and register during startup, so no slab pool describes them.
+    pub fn start_unmapped(contexts: &[(usize, i32)], geometry: Vec<CacheGeometry>) -> Result<Self> {
+        if contexts.is_empty() || contexts.len() != geometry.len() {
+            return Err(invalid(format!(
+                "transfer threads need one context per rank: {} contexts for {} ranks",
+                contexts.len(),
+                geometry.len()
+            )));
+        }
+        let layout = Layout::new(&geometry)?;
+        let parts = vec![None; contexts.len()];
+        Self::start_parts(contexts, geometry, layout, parts)
+    }
+
+    fn start_parts(
+        contexts: &[(usize, i32)],
+        geometry: Vec<CacheGeometry>,
+        layout: Layout,
+        parts: Vec<Option<RankPart>>,
+    ) -> Result<Self> {
         let (reply_sender, receiver) = mpsc::channel();
         let mut transfers = Self {
             layout,
@@ -1410,7 +1437,7 @@ mod tests {
     #[test]
     #[ignore = "requires two CUDA devices"]
     fn split_pools_cost_each_device_its_part_and_round_trip_units() {
-        use super::super::{Plane, slab::SlabPool};
+        use flare_selene::{Plane, slab::SlabPool};
         use crate::runtime_package::driver::Driver as Loader;
         const PAGES: u64 = 80;
         const ROWS: u64 = 4;
@@ -1724,5 +1751,15 @@ mod tests {
                     .unwrap();
             }
         }
+    }
+}
+
+pub(crate) struct Copiers;
+impl flare_selene::offload::CopierFactory for Copiers {
+    fn mapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>, slabs: &flare_selene::slab::SlabPool) -> flare_selene::Result<flare_selene::SharedCopier> {
+        Ok(std::sync::Arc::new(std::sync::Mutex::new(Transfers::start(contexts, geometry, slabs)?)))
+    }
+    fn unmapped(&self, contexts: &[(usize, i32)], geometry: Vec<flare_selene::CacheGeometry>) -> flare_selene::Result<Box<dyn flare_selene::PageCopier>> {
+        Ok(Box::new(Transfers::start_unmapped(contexts, geometry)?))
     }
 }

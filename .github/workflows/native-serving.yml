@@ -34,7 +34,13 @@ jobs:
         run: cargo build --locked --release --manifest-path flare/Cargo.toml
       - name: Test host OS helpers
         run: cargo test --locked --release --manifest-path eos/Cargo.toml --target-dir flare/target
-      - name: Test host cache tiers
+      - name: Test Selene and its manager on Linux
+        if: runner.os == 'Linux'
+        run: |
+          cargo test --locked --release --manifest-path selene/Cargo.toml --features test-support --target-dir flare/target
+          cargo test --locked --release --manifest-path selene-manager/Cargo.toml --features test-support --target-dir flare/target
+      - name: Test host cache tiers on Windows
+        if: runner.os == 'Windows'
         run: cargo test --locked --release --manifest-path selene/Cargo.toml --target-dir flare/target
       - name: Test native runtime on Linux
         if: runner.os == 'Linux'
@@ -65,3 +71,16 @@ jobs:
         with:
           name: flare-windows-native
           path: flare/target/release/flare.exe
+
+  rdma:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install RDMA build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build clang libclang-dev pkg-config protobuf-compiler libnl-3-dev libnl-route-3-dev libibverbs-dev librdmacm-dev liburing-dev
+      - name: Compile experimental RDMA
+        run: |
+          cargo check --locked --manifest-path selene/Cargo.toml --tests --features rdma
+          cargo check --locked --manifest-path selene-manager/Cargo.toml --tests --features rdma

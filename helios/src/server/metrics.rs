@@ -6,7 +6,7 @@ use std::{
 pub(super) mod scheduler;
 
 pub(super) fn input_metrics(
-    stats: crate::offload::input::InputStats,
+    stats: flare_selene::input::InputStats,
     preparation: crate::frontend::images::ImagePreparationCounts,
 ) -> Vec<(&'static str, &'static str, &'static str, u64)> {
     vec![
@@ -37,10 +37,10 @@ pub(super) fn input_metrics(
 }
 
 use serde::{Deserialize, Serialize};
+use flare_selene::StoreStats;
 
 use crate::{
     execution::{CompletionRecord, GraphKind},
-    offload::StoreStats,
     scheduler::SchedulerStats,
 };
 
@@ -262,6 +262,9 @@ pub(super) struct Metrics {
     host_prefill_ns: [AtomicU64; 8],
     host_store_skipped: AtomicU64,
     host_store_failed: AtomicU64,
+    host_held: [AtomicU64; 2],
+    host_dropped: [AtomicU64; 6],
+    host_parked: AtomicU64,
     host_fetched: AtomicU64,
     host_fetch_failed: AtomicU64,
     host_bytes_out: AtomicU64,
@@ -462,8 +465,8 @@ impl Metrics {
         self.host_lookup_outcomes[outcome as usize].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn host_store_outcome(&self, outcome: crate::offload::StoreOutcome) {
-        use crate::offload::{StoreOutcome, StoreReason};
+    pub(super) fn host_store_outcome(&self, outcome: flare_selene::StoreOutcome) {
+        use flare_selene::{StoreOutcome, StoreReason};
         let reason = match outcome {
             StoreOutcome::Queued => return,
             StoreOutcome::Present => 0,
@@ -476,7 +479,7 @@ impl Metrics {
         self.host_store_reasons[reason].fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn host_lookup_cost(&self, hit: &crate::offload::HostHit, rate: f64) {
+    pub(super) fn host_lookup_cost(&self, hit: &flare_selene::HostHit, rate: f64) {
         let missing = hit.consumed_tokens - hit.resident_tokens;
         for (index, (buckets, value, limits)) in [
             (&self.host_missing_tokens, missing, HOST_TOKEN_BUCKETS),
@@ -504,11 +507,20 @@ impl Metrics {
     /// Lookups, hits, and reused tokens come from the scheduler, which applies
     /// the fetch policy.
     pub fn store(&self, stats: StoreStats) {
+        for (counter, value) in self
+            .host_held
+            .iter()
+            .chain(&self.host_dropped)
+            .zip(stats.held.into_iter().chain(stats.dropped))
+        {
+            counter.store(value, Ordering::Relaxed);
+        }
         for (target, value) in [
             (&self.host_stored, stats.stored),
             (&self.host_row_refills, stats.row_refills),
             (&self.host_store_skipped, stats.store_skipped),
             (&self.host_store_failed, stats.store_failed),
+            (&self.host_parked, stats.parked_records as u64),
             (&self.host_fetched, stats.fetched),
             (&self.host_fetch_failed, stats.fetch_failed),
             (&self.host_bytes_out, stats.bytes_out),
@@ -534,6 +546,24 @@ impl Metrics {
 
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
+        text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
+        for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_held_total{{tier=\"{tier}\"}} {}",
+                self.host_held[i].load(Ordering::Relaxed)
+            );
+            for (reason, counter) in ["end_of_chain", "oversize", "io_error"]
+                .into_iter()
+                .zip(&self.host_dropped[i * 3..i * 3 + 3])
+            {
+                let _ = writeln!(
+                    text,
+                    "flare_host_cache_dropped_total{{tier=\"{tier}\",reason=\"{reason}\"}} {}",
+                    counter.load(Ordering::Relaxed)
+                );
+            }
+        }
         for (name, labels, counters) in [
             (
                 "host_cache_lookup_outcomes_total",
@@ -971,6 +1001,11 @@ impl Metrics {
                 &self.host_outbound_in_flight,
             ),
             (
+                "host_cache_parked_records",
+                "Complete DRAM records waiting for a disk write.",
+                &self.host_parked,
+            ),
+            (
                 "host_cache_inbound_in_flight",
                 "Host store restores in progress.",
                 &self.host_inbound_in_flight,
@@ -1074,7 +1109,8 @@ mod tests {
 
     #[test]
     fn host_outcomes_and_capacity_have_bounded_labels_and_cost_histograms() {
-        use crate::offload::{HostHit, LookupOutcome, StoreOutcome, StoreReason, Tier};
+        use flare_selene::{HostHit, StoreOutcome, StoreReason, Tier};
+        use crate::offload::LookupOutcome;
         let metrics = Metrics::default();
         for outcome in [
             LookupOutcome::NoMatch,
@@ -1099,7 +1135,7 @@ mod tests {
             consumed_tokens: 1024,
             digest: [0; 16],
         };
-        let chain = crate::offload::index::Match {
+        let chain = flare_selene::index::Match {
             key,
             consumed_tokens: 1024,
             resident_tokens: 0,
@@ -1114,7 +1150,7 @@ mod tests {
                 resident_tokens: 0,
                 pages: 16,
                 bytes: 1 << 20,
-                tier: Tier::Disk,
+                tier: Tier::Nvme,
                 estimated_seconds: 0.001,
                 chain,
             },
@@ -1348,6 +1384,9 @@ mod tests {
         metrics.store(StoreStats {
             bytes_out: 1 << 20,
             memory_records: 3,
+            parked_records: 2,
+            held: [3, 4],
+            dropped: [1, 2, 3, 4, 5, 6],
             outbound_rate: 2.5e9,
             ..StoreStats::default()
         });
@@ -1370,6 +1409,23 @@ mod tests {
         assert!(text.contains("flare_host_cache_inbound_waiting 1\n"));
         assert!(text.contains("flare_host_cache_bytes_out_total 1048576\n"));
         assert!(text.contains("flare_host_cache_memory_records 3\n"));
+        assert!(text.contains("# TYPE flare_host_cache_parked_records gauge\n"));
+        assert!(text.contains("flare_host_cache_parked_records 2\n"));
+        for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            assert!(text.contains(&format!(
+                "flare_host_cache_held_total{{tier=\"{tier}\"}} {}\n",
+                i + 3
+            )));
+            for (j, reason) in ["end_of_chain", "oversize", "io_error"]
+                .into_iter()
+                .enumerate()
+            {
+                assert!(text.contains(&format!(
+                    "flare_host_cache_dropped_total{{tier=\"{tier}\",reason=\"{reason}\"}} {}\n",
+                    i * 3 + j + 1
+                )));
+            }
+        }
         assert!(text.contains("flare_host_cache_outbound_bytes_per_second 2500000000\n"));
         assert!(text.contains("flare_cache_misses_total 3\n"));
         assert!(text.contains("flare_cache_reused_tokens_total 192\n"));

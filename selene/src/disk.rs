@@ -26,7 +26,10 @@ use std::{
     fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
-    sync::mpsc::{self, Receiver, SyncSender, TrySendError},
+    sync::{
+        Arc,
+        mpsc::{self, Receiver, SyncSender, TrySendError},
+    },
 };
 
 #[cfg(unix)]
@@ -42,6 +45,98 @@ use super::{
     record::{HEADER_BYTES, Header, checksum, io_failure},
 };
 
+#[cfg(any(test, feature = "test-support"))]
+use std::{
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::Duration,
+};
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Debug)]
+pub struct IoGate {
+    armed: AtomicBool,
+    entered: SyncSender<()>,
+    release: std::sync::Mutex<Receiver<()>>,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl IoGate {
+    pub fn new() -> (Arc<Self>, Receiver<()>, SyncSender<()>) {
+        let (entered, ready) = mpsc::sync_channel(1);
+        let (release, proceed) = mpsc::sync_channel(1);
+        (
+            Arc::new(Self {
+                armed: AtomicBool::new(true),
+                entered,
+                release: std::sync::Mutex::new(proceed),
+            }),
+            ready,
+            release,
+        )
+    }
+    pub fn arm(&self) {
+        assert!(
+            !self.armed.swap(true, Ordering::AcqRel),
+            "disk gate is already armed"
+        );
+    }
+    fn wait(&self) -> io::Result<()> {
+        if self.armed.swap(false, Ordering::AcqRel) {
+            self.entered
+                .send(())
+                .map_err(|_| io::Error::other("disk gate observer dropped"))?;
+            self.release
+                .lock()
+                .unwrap()
+                .recv()
+                .map_err(|_| io::Error::other("disk gate released without a signal"))?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Clone, Debug, Default)]
+pub struct Faults {
+    pub io_gate: Option<Arc<IoGate>>,
+    pub read_gate: Option<Arc<IoGate>>,
+    pub pause_at: Option<String>,
+    pub signal: Option<PathBuf>,
+    pub disk_full: Option<PathBuf>,
+    pub delay_ms: u64,
+    pub trace: Option<Arc<std::sync::Mutex<Vec<u8>>>>,
+}
+#[cfg(any(test, feature = "test-support"))]
+impl Faults {
+    pub fn checkpoint(&self, point: &str) {
+        if self.pause_at.as_deref() == Some(point) {
+            if let Some(path) = &self.signal {
+                fs::write(path, point).unwrap();
+                while path.exists() {
+                    thread::sleep(Duration::from_millis(2));
+                }
+            }
+        }
+    }
+    fn trace(&self, kind: u8) {
+        if let Some(trace) = &self.trace {
+            trace.lock().unwrap().push(kind);
+        }
+    }
+    fn before_io(&self) -> io::Result<()> {
+        if let Some(gate) = &self.io_gate {
+            gate.wait()?;
+        }
+        if self.delay_ms > 0 {
+            thread::sleep(Duration::from_millis(self.delay_ms));
+        }
+        if self.disk_full.as_ref().is_some_and(|path| path.exists()) {
+            return Err(io::Error::from_raw_os_error(libc::ENOSPC));
+        }
+        Ok(())
+    }
+}
+
 pub const CHUNK_BYTES: usize = 8 << 20;
 /// Jobs the submitting store may have outstanding; `submit` fails when full.
 pub const QUEUE_DEPTH: usize = 64;
@@ -56,6 +151,8 @@ pub const MAX_TAIL_PAGES: u32 = (CHECKSUM_SCRATCH_BYTES / 8) as u32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Operation {
+    ReadRecord,
+    WriteRecord,
     Create,
     WritePages,
     WriteRow,
@@ -75,6 +172,22 @@ pub enum Operation {
 /// untouched until the job's reply arrives.
 #[derive(Debug)]
 pub enum Job {
+    /// Read an encoded record span. The caller verifies its page and row checksums.
+    #[cfg(unix)]
+    ReadRecord {
+        id: JobId,
+        file: Arc<File>,
+        span: Span,
+    },
+    /// Write a prevalidated, checksummed record span, optionally syncing and publishing it.
+    /// The caller retains the buffer and temporary path until the reply.
+    #[cfg(unix)]
+    WriteRecord {
+        id: JobId,
+        temporary: PathBuf,
+        span: Span,
+        publish: Option<(PathBuf, u64)>,
+    },
     /// Create the temporary file for a record and keep it open under `id`.
     Create {
         id: JobId,
@@ -135,6 +248,29 @@ pub enum Job {
     },
 }
 
+impl Job {
+    /// The caller retains `data` until the reply, as for page and row jobs.
+    #[cfg(unix)]
+    pub fn write_record(
+        id: JobId,
+        temporary: PathBuf,
+        offset: u64,
+        data: &[u8],
+        publish: Option<(PathBuf, u64)>,
+    ) -> Self {
+        Self::WriteRecord {
+            id,
+            temporary,
+            span: Span {
+                address: data.as_ptr() as usize,
+                offset,
+                length: data.len(),
+            },
+            publish,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Reply {
     pub id: JobId,
@@ -143,6 +279,7 @@ pub struct Reply {
     pub result: Result<()>,
     /// Bytes moved by this job; for `Commit`, every byte written for the record.
     pub bytes: u64,
+    pub elapsed: std::time::Duration,
     /// The header read by `Open`.
     pub header: Option<Header>,
 }
@@ -158,13 +295,38 @@ pub struct DiskThread {
 impl DiskThread {
     /// Spawn the thread under `name` with its ring and scratch allocated.
     pub fn start(name: &str) -> Result<Self> {
+        Self::start_inner(
+            name,
+            #[cfg(any(test, feature = "test-support"))]
+            Faults::default(),
+        )
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn start_with_faults(name: &str, faults: Faults) -> Result<Self> {
+        Self::start_inner(name, faults)
+    }
+
+    fn start_inner(
+        name: &str,
+        #[cfg(any(test, feature = "test-support"))] faults: Faults,
+    ) -> Result<Self> {
         let ring = Ring::new()?;
         let scratch = AlignedBuffer::new(HEADER_BYTES + CHECKSUM_SCRATCH_BYTES)?;
         let (sender, jobs) = mpsc::sync_channel(QUEUE_DEPTH);
         let (replies, receiver) = mpsc::channel();
         let thread = std::thread::Builder::new()
             .name(name.to_owned())
-            .spawn(move || run(ring, scratch, jobs, replies))
+            .spawn(move || {
+                run(
+                    ring,
+                    scratch,
+                    jobs,
+                    replies,
+                    #[cfg(any(test, feature = "test-support"))]
+                    faults,
+                )
+            })
             .map_err(|error| io_failure(format!("spawn disk thread {name}"), error))?;
         Ok(Self {
             sender: Some(sender),
@@ -176,20 +338,23 @@ impl DiskThread {
 
     /// Enqueue without waiting; an error means the queue is full or the thread stopped.
     pub fn submit(&self, job: Job) -> Result<()> {
-        let sender = self
-            .sender
-            .as_ref()
-            .ok_or_else(|| invalid("disk thread is closed"))?;
-        match sender.try_send(job) {
-            Ok(()) => {
-                self.outstanding.set(self.outstanding.get() + 1);
-                Ok(())
-            }
+        match self.try_submit(job) {
+            Ok(()) => Ok(()),
             Err(TrySendError::Full(_)) => Err(invalid(format!(
                 "disk thread queue is full with {QUEUE_DEPTH} jobs outstanding"
             ))),
             Err(TrySendError::Disconnected(_)) => Err(invalid("disk thread stopped")),
         }
+    }
+
+    /// Return an unsubmitted job so the caller can retain its buffers and retry.
+    pub fn try_submit(&self, job: Job) -> std::result::Result<(), TrySendError<Job>> {
+        let Some(sender) = &self.sender else {
+            return Err(TrySendError::Disconnected(job));
+        };
+        sender.try_send(job)?;
+        self.outstanding.set(self.outstanding.get() + 1);
+        Ok(())
     }
 
     pub fn poll(&self, replies: &mut Vec<Reply>) {
@@ -251,15 +416,26 @@ pub fn aligned(value: u64) -> bool {
     value.is_multiple_of(BLOCK_BYTES)
 }
 
-fn run(ring: Ring, scratch: AlignedBuffer, jobs: Receiver<Job>, replies: mpsc::Sender<Reply>) {
+fn run(
+    ring: Ring,
+    scratch: AlignedBuffer,
+    jobs: Receiver<Job>,
+    replies: mpsc::Sender<Reply>,
+    #[cfg(any(test, feature = "test-support"))] faults: Faults,
+) {
     lower_priority();
     let mut worker = Worker {
         ring,
         scratch,
         records: HashMap::new(),
+        #[cfg(any(test, feature = "test-support"))]
+        faults,
     };
     while let Ok(job) = jobs.recv() {
-        if replies.send(worker.execute(job)).is_err() {
+        let started = std::time::Instant::now();
+        let mut reply = worker.execute(job);
+        reply.elapsed = started.elapsed();
+        if replies.send(reply).is_err() {
             break;
         }
     }
@@ -299,6 +475,8 @@ struct Worker {
     ring: Ring,
     scratch: AlignedBuffer,
     records: HashMap<JobId, Record>,
+    #[cfg(any(test, feature = "test-support"))]
+    faults: Faults,
 }
 
 impl Drop for Worker {
@@ -314,6 +492,51 @@ impl Drop for Worker {
 impl Worker {
     fn execute(&mut self, job: Job) -> Reply {
         match job {
+            #[cfg(unix)]
+            Job::ReadRecord { id, file, span } => {
+                let result = (|| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    if let Some(gate) = &self.faults.read_gate {
+                        gate.wait().map_err(Error::carrying)?;
+                    }
+                    self.ring.transfer(&file, &[span], false)
+                })();
+                #[cfg(any(test, feature = "test-support"))]
+                self.faults.trace(b'R');
+                reply(id, Operation::ReadRecord, 0, result)
+            }
+            #[cfg(unix)]
+            Job::WriteRecord {
+                id,
+                temporary,
+                span,
+                publish,
+            } => {
+                let result = (|| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    {
+                        self.faults.before_io().map_err(Error::carrying)?;
+                        if publish
+                            .as_ref()
+                            .is_some_and(|(_, size)| *size == span.length as u64)
+                        {
+                            self.faults.checkpoint("parent_write");
+                        }
+                    }
+                    let file = flare_eos::direct_update_file(&temporary, true)
+                        .map_err(|e| io_failure("open record writer", e))?;
+                    let bytes = self.ring.transfer(&file, &[span], true)?;
+                    if let Some((path, final_length)) = publish {
+                        file.set_len(final_length)
+                            .map_err(|e| io_failure("size record", e))?;
+                        self.publish(&file, &temporary, &path, true)?;
+                    }
+                    Ok(bytes)
+                })();
+                #[cfg(any(test, feature = "test-support"))]
+                self.faults.trace(b'W');
+                reply(id, Operation::WriteRecord, 0, result)
+            }
             Job::Create {
                 id,
                 temporary,
@@ -344,6 +567,7 @@ impl Worker {
                     window: 0,
                     result: Ok(()),
                     bytes,
+                    elapsed: std::time::Duration::ZERO,
                     header: Some(header),
                 },
                 Err(error) => reply(id, Operation::Open, 0, Err(error)),
@@ -364,7 +588,14 @@ impl Worker {
             }
             Job::Close { id } => reply(id, Operation::Close, 0, self.close(id)),
             Job::Truncate { id, path, length } => {
-                reply(id, Operation::Truncate, 0, truncate(&path, length))
+                let result = (|| {
+                    #[cfg(any(test, feature = "test-support"))]
+                    self.faults.before_io().map_err(Error::carrying)?;
+                    truncate(&path, length)
+                })();
+                #[cfg(any(test, feature = "test-support"))]
+                self.faults.trace(b'W');
+                reply(id, Operation::Truncate, 0, result)
             }
             Job::Unlink { id, path } => reply(id, Operation::Unlink, 0, unlink(&path)),
         }
@@ -402,6 +633,8 @@ impl Worker {
     /// the transfer completed, so a failed write keeps `Commit` from renaming
     /// a record with an unwritten page into place.
     fn write_pages(&mut self, id: JobId, first: u32, buffers: &[usize]) -> Result<u64> {
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.before_io().map_err(Error::carrying)?;
         let writing = writing(&mut self.records, id)?;
         let page_bytes = writing.header.page_record_bytes();
         let pages = page_range(&writing.header, first, buffers.len())?;
@@ -503,25 +736,26 @@ impl Worker {
             });
         }
         writing.bytes += self.ring.transfer(&writing.file, &spans, true)?;
-        if sync {
-            writing.file.sync_data().map_err(|error| {
-                io_failure(
-                    format!("fdatasync record file {}", writing.temporary.display()),
-                    error,
-                )
-            })?;
-        }
-        fs::rename(&writing.temporary, path).map_err(|error| {
-            io_failure(
-                format!(
-                    "rename record file {} to {}",
-                    writing.temporary.display(),
-                    path.display()
-                ),
-                error,
-            )
-        })?;
+        self.publish(&writing.file, &writing.temporary, path, sync)?;
         Ok(writing.bytes)
+    }
+
+    fn publish(&self, file: &File, temporary: &Path, path: &Path, sync: bool) -> Result<()> {
+        if sync {
+            file.sync_data().map_err(|e| io_failure("sync record", e))?;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.checkpoint("before_rename");
+        fs::rename(temporary, path)
+            .map_err(|e| io_failure(format!("rename record {}", path.display()), e))?;
+        if sync {
+            File::open(path.parent().unwrap())
+                .and_then(|f| f.sync_all())
+                .map_err(|e| io_failure("sync record directory", e))?;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.faults.checkpoint("after_rename");
+        Ok(())
     }
 
     fn abort(&mut self, id: JobId) -> Result<u64> {
@@ -662,6 +896,7 @@ fn reply(id: JobId, operation: Operation, window: u32, outcome: Result<u64>) -> 
         window,
         result,
         bytes,
+        elapsed: std::time::Duration::ZERO,
         header: None,
     }
 }
@@ -749,10 +984,10 @@ fn unlink(path: &Path) -> Result<u64> {
 
 /// One contiguous direct-I/O transfer between a buffer and a file offset.
 #[derive(Clone, Copy, Debug)]
-struct Span {
-    address: usize,
-    offset: u64,
-    length: usize,
+pub struct Span {
+    pub address: usize,
+    pub offset: u64,
+    pub length: usize,
 }
 
 /// A span piece of at most [`CHUNK_BYTES`], the unit the ring carries.
@@ -1137,6 +1372,170 @@ impl Drop for AlignedBuffer {
     }
 }
 
+/// Bytes of one block a [`ReadAhead`] reads at a time.
+const AHEAD_BLOCK_BYTES: usize = 4 << 20;
+/// Blocks one ring transfer carries, and so the reads the device has in flight.
+const AHEAD_BATCH: usize = 4;
+/// Blocks a [`ReadAhead`] owns: the batch being read and the ones waiting to be consumed.
+const AHEAD_BLOCKS: usize = 3 * AHEAD_BATCH;
+
+/// A block read ahead: where in the file it came from and how much of the buffer is valid.
+struct AheadBlock {
+    buffer: AlignedBuffer,
+    offset: u64,
+    length: usize,
+}
+
+/// Sequential reads of one file range past the page cache, with the device kept busy: a
+/// thread reads the range ahead of the consumer in [`AHEAD_BLOCK_BYTES`] blocks, several in
+/// flight through the same ring the disk thread moves records with, while the consumer copies
+/// what was read out. A consumer that reads the range window by window, each read waiting for
+/// the device, leaves the device idle between windows and keeps one request in flight; this
+/// keeps [`AHEAD_BATCH`] and is not slowed by the consumer's own work.
+pub struct ReadAhead {
+    blocks: Receiver<Result<AheadBlock>>,
+    free: Option<mpsc::Sender<AlignedBuffer>>,
+    thread: Option<std::thread::JoinHandle<()>>,
+    current: Option<AheadBlock>,
+    /// The file offset the next byte handed out comes from.
+    next: u64,
+    end: u64,
+}
+
+impl ReadAhead {
+    /// Read `start..end` of `file`, which must have been opened for direct I/O. `start` and
+    /// `end` are multiples of [`BLOCK_BYTES`].
+    pub fn start(file: File, start: u64, end: u64) -> Result<Self> {
+        if !aligned(start) || !aligned(end) || end < start {
+            return Err(invalid("read-ahead range is not block aligned"));
+        }
+        let ring = Ring::new()?;
+        let (free, recycled) = mpsc::channel::<AlignedBuffer>();
+        let (sender, blocks) = mpsc::channel::<Result<AheadBlock>>();
+        let count = AHEAD_BLOCKS.min(((end - start) as usize).div_ceil(AHEAD_BLOCK_BYTES).max(1));
+        for _ in 0..count {
+            let _ = free.send(AlignedBuffer::new(AHEAD_BLOCK_BYTES)?);
+        }
+        let thread = std::thread::Builder::new()
+            .name("selene-read-ahead".into())
+            .spawn(move || read_ahead(ring, file, start, end, recycled, sender))
+            .map_err(|error| io_failure("spawn the read-ahead thread", error))?;
+        Ok(Self {
+            blocks,
+            free: Some(free),
+            thread: Some(thread),
+            current: None,
+            next: start,
+            end,
+        })
+    }
+
+    /// Whether the next byte this hands out is the one at `offset`.
+    pub fn at(&self, offset: u64) -> bool {
+        self.next == offset
+    }
+
+    /// Copy the next `dst.len()` bytes of the range into `dst`.
+    pub fn read(&mut self, dst: &mut [u8]) -> Result<()> {
+        if self.next + dst.len() as u64 > self.end {
+            return Err(invalid("read-ahead read runs past its range"));
+        }
+        let mut done = 0;
+        while done < dst.len() {
+            if self.current.is_none() {
+                self.current = Some(
+                    self.blocks
+                        .recv()
+                        .map_err(|_| invalid("the read-ahead thread stopped"))??,
+                );
+            }
+            let block = self.current.as_ref().expect("a block");
+            let at = (self.next - block.offset) as usize;
+            let take = (block.length - at).min(dst.len() - done);
+            dst[done..done + take].copy_from_slice(&block.buffer.as_slice()[at..at + take]);
+            done += take;
+            self.next += take as u64;
+            if at + take == block.length {
+                let block = self.current.take().expect("a block");
+                if let Some(free) = &self.free {
+                    let _ = free.send(block.buffer);
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ReadAhead {
+    fn drop(&mut self) {
+        // The thread waits for buffers; with the sender gone it ends after the transfer it
+        // may be in the middle of, which is the last thing to touch its buffers.
+        self.free.take();
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn read_ahead(
+    mut ring: Ring,
+    file: File,
+    start: u64,
+    end: u64,
+    recycled: Receiver<AlignedBuffer>,
+    blocks: mpsc::Sender<Result<AheadBlock>>,
+) {
+    let mut offset = start;
+    while offset < end {
+        // Take what buffers are free, at least one, up to a batch.
+        let Ok(first) = recycled.recv() else { return };
+        let mut batch = vec![first];
+        while batch.len() < AHEAD_BATCH {
+            match recycled.try_recv() {
+                Ok(buffer) => batch.push(buffer),
+                Err(_) => break,
+            }
+        }
+        let mut spans = Vec::with_capacity(batch.len());
+        let mut lengths = Vec::with_capacity(batch.len());
+        let mut at = offset;
+        for buffer in &batch {
+            let length = (end - at).min(AHEAD_BLOCK_BYTES as u64) as usize;
+            if length == 0 {
+                break;
+            }
+            spans.push(Span {
+                address: buffer.address(),
+                offset: at,
+                length,
+            });
+            lengths.push((at, length));
+            at += length as u64;
+        }
+        batch.truncate(spans.len());
+        let result = ring.transfer(&file, &spans, false);
+        match result {
+            Ok(_) => {
+                for (buffer, (block_offset, length)) in batch.into_iter().zip(lengths) {
+                    let block = AheadBlock {
+                        buffer,
+                        offset: block_offset,
+                        length,
+                    };
+                    if blocks.send(Ok(block)).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(error) => {
+                let _ = blocks.send(Err(error));
+                return;
+            }
+        }
+        offset = at;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,6 +1548,69 @@ mod tests {
         io::{Seek, SeekFrom, Write as _},
         time::{Duration, Instant, SystemTime},
     };
+
+    #[cfg(unix)]
+    #[test]
+    fn record_reads_finish_while_writes_are_blocked() {
+        let Some(directory) = test_directory("record-priority") else {
+            return;
+        };
+        let (gate, entered, release) = IoGate::new();
+        let writes = DiskThread::start_with_faults(
+            "record-write",
+            Faults {
+                io_gate: Some(gate),
+                ..Faults::default()
+            },
+        )
+        .unwrap();
+        let reads = DiskThread::start("record-read").unwrap();
+        let mut buffer = AlignedBuffer::new(4096).unwrap();
+        buffer.as_mut_slice().fill(7);
+        for id in 0..8 {
+            writes
+                .submit(Job::write_record(
+                    JobId(id),
+                    directory.join(format!("{id}.tmp")),
+                    0,
+                    buffer.as_slice(),
+                    None,
+                ))
+                .unwrap();
+            if id == 0 {
+                entered.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+        let source = directory.join("source");
+        fs::write(&source, vec![9; 4096]).unwrap();
+        let mut output = AlignedBuffer::new(4096).unwrap();
+        reads
+            .submit(Job::ReadRecord {
+                id: JobId(99),
+                file: Arc::new(flare_eos::direct_file(&source, false).unwrap()),
+                span: Span {
+                    address: output.address(),
+                    offset: 0,
+                    length: 4096,
+                },
+            })
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let mut replies = Vec::new();
+        while replies.is_empty() && Instant::now() < deadline {
+            reads.poll(&mut replies);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        release.send(()).unwrap();
+        assert_eq!(replies.len(), 1, "read waited for persistence");
+        replies.pop().unwrap().result.unwrap();
+        assert_eq!(output.as_mut_slice(), &[9; 4096]);
+        for reply in wait(&writes, 8) {
+            reply.result.unwrap();
+        }
+        drop((writes, reads));
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     /// A fresh directory for one test under `FLARE_OFFLOAD_TEST_DIR` or the
     /// system temporary directory, or `None` when it refuses direct I/O.
@@ -2170,5 +2632,52 @@ mod tests {
         assert!(aligned(0));
         assert!(aligned(8192));
         assert!(!aligned(8193));
+    }
+
+    #[test]
+    fn a_read_ahead_hands_out_a_file_range_in_any_window_sizes_and_can_be_dropped_early() {
+        let Some(directory) = test_directory("read-ahead") else {
+            return;
+        };
+        let path = directory.join("range");
+        let length = 3 * AHEAD_BLOCK_BYTES + 5 * 4096;
+        let bytes: Vec<u8> = (0..length).map(|i| (i * 7 + i / 4096) as u8).collect();
+        fs::write(&path, &bytes).unwrap();
+        let start = 4096u64;
+        let end = (length - 4096) as u64;
+        let mut ahead =
+            ReadAhead::start(flare_eos::direct_file(&path, false).unwrap(), start, end).unwrap();
+        assert!(ahead.at(start) && !ahead.at(0));
+        let mut at = start as usize;
+        for size in [4096, 1 << 20, 3 * 4096, AHEAD_BLOCK_BYTES + 4096, 8192] {
+            let mut got = vec![0u8; size];
+            ahead.read(&mut got).unwrap();
+            assert_eq!(got, bytes[at..at + size]);
+            at += size;
+            assert!(ahead.at(at as u64));
+        }
+        // The rest of the range, then nothing more.
+        let mut rest = vec![0u8; end as usize - at];
+        ahead.read(&mut rest).unwrap();
+        assert_eq!(rest, bytes[at..end as usize]);
+        assert!(ahead.read(&mut [0u8; 4096]).is_err());
+        // A reader dropped with most of its range unread stops cleanly.
+        let mut early = ReadAhead::start(
+            flare_eos::direct_file(&path, false).unwrap(),
+            0,
+            length as u64,
+        )
+        .unwrap();
+        let mut first = vec![0u8; 4096];
+        early.read(&mut first).unwrap();
+        assert_eq!(first, bytes[..4096]);
+        drop(early);
+        // A range of one block.
+        let mut small =
+            ReadAhead::start(flare_eos::direct_file(&path, false).unwrap(), 8192, 16384).unwrap();
+        let mut got = vec![0u8; 8192];
+        small.read(&mut got).unwrap();
+        assert_eq!(got, bytes[8192..16384]);
+        fs::remove_dir_all(&directory).unwrap();
     }
 }

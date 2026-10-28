@@ -29,6 +29,8 @@ type StreamCreatePriority = unsafe extern "C" fn(*mut Handle, c_uint, c_int) -> 
 type PriorityRange = unsafe extern "C" fn(*mut c_int, *mut c_int) -> c_int;
 type HostRegister = unsafe extern "C" fn(Handle, usize, c_uint) -> c_int;
 type HostUnregister = unsafe extern "C" fn(Handle) -> c_int;
+#[cfg(feature = "runtime-package")]
+type DeviceUuid = unsafe extern "C" fn(*mut [u8; 16], c_int) -> c_int;
 type DeviceAttribute = unsafe extern "C" fn(*mut c_int, c_int, c_int) -> c_int;
 type AddressReserve = unsafe extern "C" fn(*mut u64, usize, usize, u64, u64) -> c_int;
 type AddressFree = unsafe extern "C" fn(u64, usize) -> c_int;
@@ -166,6 +168,8 @@ struct Driver {
     host_register: HostRegister,
     host_unregister: HostUnregister,
     device_attribute: DeviceAttribute,
+    #[cfg(feature = "runtime-package")]
+    device_uuid: DeviceUuid,
     event_synchronize: StreamOperation,
     memcpy_batch: MemcpyBatch,
     address_reserve: AddressReserve,
@@ -228,6 +232,8 @@ impl Driver {
                 host_register: symbol!("cuMemHostRegister_v2"),
                 host_unregister: symbol!("cuMemHostUnregister"),
                 device_attribute: symbol!("cuDeviceGetAttribute"),
+                #[cfg(feature = "runtime-package")]
+                device_uuid: symbol!("cuDeviceGetUuid"),
                 event_synchronize: symbol!("cuEventSynchronize"),
                 memcpy_batch: symbol!("cuMemcpyBatchAsync_v2"),
                 address_reserve: symbol!("cuMemAddressReserve"),
@@ -305,6 +311,18 @@ pub(crate) fn device_integrated(context: usize) -> Result<bool> {
         (driver.device_attribute)(&mut value, ATTRIBUTE_INTEGRATED, device)
     })?;
     Ok(value != 0)
+}
+
+/// The UUID of the device with this ordinal, which names the GPU across restarts.
+#[cfg(feature = "runtime-package")]
+pub(crate) fn device_uuid(device: i32) -> Result<[u8; 16]> {
+    let driver = Driver::load()?;
+    let mut uuid = [0u8; 16];
+    // SAFETY: `uuid` is a valid 16-byte output for the call.
+    driver.check("cuDeviceGetUuid", unsafe {
+        (driver.device_uuid)(&mut uuid, device)
+    })?;
+    Ok(uuid)
 }
 
 /// Page-locked registration of process memory, released on drop.

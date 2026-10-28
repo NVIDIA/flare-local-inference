@@ -943,3 +943,181 @@ fn oldest_ancestor_compacts_before_a_newer_unpinned_leaf() {
         assert_eq!(cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
     }
 }
+
+#[test]
+fn retirement_names_the_key_and_the_compaction_heir() {
+    let full = history(3, 0);
+    let mut cache = cache();
+    let root = created(&mut cache, &full, &proposal(None, 64, &[0], 0, 0));
+    let child = created(&mut cache, &full, &proposal(Some(root), 128, &[1], 1, 0));
+    let root_key = cache.checkpoint(root).unwrap().prefix();
+    let child_key = cache.checkpoint(child).unwrap().prefix();
+    let report = cache.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    assert_eq!(report.retired[0].checkpoint, root);
+    assert_eq!(report.retired[0].key, root_key);
+    assert_eq!(report.retired[0].heir, Some(child));
+    let report = cache.evict(EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    });
+    assert_eq!(report.retired[0].key, child_key);
+    assert_eq!(report.retired[0].heir, None);
+    assert_eq!(cache.ready_by_prefix(&child_key), None);
+}
+
+#[test]
+fn ready_by_prefix_skips_unready_checkpoints() {
+    let full = history(2, 0);
+    let mut cache = cache();
+    let pending = created(&mut cache, &full, &proposal(None, 64, &[0], 0, 5));
+    let key = cache.checkpoint(pending).unwrap().prefix();
+    assert_eq!(cache.ready_by_prefix(&key), None);
+    cache.advance_completed(Fence(5)).unwrap();
+    assert_eq!(cache.ready_by_prefix(&key), Some(pending));
+}
+
+fn sorted<T: Ord>(mut values: Vec<T>) -> Vec<T> {
+    values.sort();
+    values
+}
+
+/// Pins `id`, evicts everything, and returns what retired: the oracle for the projection.
+fn evicted_after_pin(cache: &mut PrefixCheckpointCache, id: CheckpointId) -> Reclaimable {
+    cache.pin(id).unwrap();
+    let mut out = Reclaimable::default();
+    let report = cache.evict(EvictionTarget {
+        pages: usize::MAX,
+        snapshots: usize::MAX,
+    });
+    for retired in report.retired {
+        out.snapshots.push(retired.snapshot);
+        out.pages.extend(retired.pages);
+    }
+    out
+}
+
+#[test]
+fn projection_matches_eviction_for_chains_branches_and_compaction() {
+    // A chain of four with a branch off the second, a second tree, and an unready leaf.
+    let build = || {
+        let full = history(5, 0);
+        let mut branch = PrefixHistory::new([7; 32]);
+        let tokens: Vec<u32> = (0..64).chain(1000..1000 + 256).collect();
+        branch.append(&tokens, &[]).unwrap();
+        let other = history(3, 100);
+        let mut cache = cache();
+        let a = created(&mut cache, &full, &proposal(None, 64, &[0], 0, 0));
+        let b = created(&mut cache, &full, &proposal(Some(a), 128, &[1], 1, 0));
+        let c = created(&mut cache, &full, &proposal(Some(b), 192, &[3], 2, 0));
+        let d = created(&mut cache, &full, &proposal(Some(c), 256, &[4], 3, 0));
+        // Diverges after the first block, so it branches off `a`.
+        let e = created(&mut cache, &branch, &proposal(Some(a), 128, &[5], 4, 0));
+        let f = created(&mut cache, &other, &proposal(None, 64, &[7], 5, 0));
+        let g = created(&mut cache, &other, &proposal(Some(f), 128, &[8], 6, 9));
+        (cache, [a, b, c, d, e, f, g])
+    };
+    let (probe, ids) = build();
+    for (n, id) in ids.into_iter().enumerate() {
+        if !probe.checkpoint(id).unwrap().ready() {
+            assert!(probe.reclaimable_if_pinned(id).is_ok());
+            continue;
+        }
+        let (mut cache, ids) = build();
+        let projected = cache.reclaimable_if_pinned(ids[n]).unwrap();
+        let actual = evicted_after_pin(&mut cache, ids[n]);
+        assert_eq!(
+            sorted(projected.pages),
+            sorted(actual.pages),
+            "pages, pin {n}"
+        );
+        assert_eq!(
+            sorted(projected.snapshots),
+            sorted(actual.snapshots),
+            "snapshots, pin {n}"
+        );
+    }
+}
+
+#[test]
+fn projection_counts_running_pins_and_leaves_the_cache_untouched() {
+    let full = history(3, 0);
+    let mut cache = cache();
+    let a = created(&mut cache, &full, &proposal(None, 64, &[0], 0, 0));
+    let b = created(&mut cache, &full, &proposal(Some(a), 128, &[1], 1, 0));
+    let c = created(&mut cache, &full, &proposal(Some(b), 192, &[2], 2, 0));
+    cache.pin(b).unwrap();
+    // Pinning the endpoint protects its whole chain; `b` is already protected.
+    let projected = cache.reclaimable_if_pinned(c).unwrap();
+    assert!(projected.pages.is_empty());
+    // Nothing branches and only `b` is directly pinned, so the root compacts.
+    assert_eq!(sorted(projected.snapshots), [SnapshotId(0)]);
+    assert_eq!(cache.checkpoint(c).unwrap().pin_count(), 0);
+    assert_eq!(cache.stats().owned_pages, 3);
+    assert!(cache.reclaimable_if_pinned(CheckpointId::new(99)).is_err());
+}
+
+#[test]
+fn eviction_keeps_lru_leaf_and_compaction_rules() {
+    let mut cache = cache();
+    let h = history(3, 0);
+    let parent = created(&mut cache, &h, &proposal(None, 64, &[0], 0, 0));
+    let child = created(&mut cache, &h, &proposal(Some(parent), 128, &[1], 1, 0));
+    let leaf = created(
+        &mut cache,
+        &history(1, 1000),
+        &proposal(None, 64, &[2], 2, 0),
+    );
+    cache.pin(child).unwrap();
+    let target = EvictionTarget {
+        pages: 0,
+        snapshots: 1,
+    };
+    // Touch the ancestor so the independent leaf is oldest.
+    cache.lookup(&history(1, 0)).unwrap();
+    assert_eq!(
+        cache
+            .evict(EvictionTarget {
+                pages: 1,
+                snapshots: 0
+            })
+            .retired[0]
+            .checkpoint,
+        leaf
+    );
+    cache.pin(parent).unwrap();
+    assert!(cache.evict(target).retired.is_empty());
+    cache.unpin(parent).unwrap();
+    let compacted = cache.evict(target).retired;
+    assert_eq!(compacted[0].checkpoint, parent);
+    assert_eq!(compacted[0].heir, Some(child));
+    assert_eq!(cache.page_chain(child).unwrap(), [PageId(0), PageId(1)]);
+    cache.unpin(child).unwrap();
+    assert_eq!(cache.reclaimable(&[]).pages, [PageId(0), PageId(1)]);
+}
+
+#[test]
+fn reclamation_excludes_pins_branches_and_unready_checkpoints() {
+    let mut cache = cache();
+    let h = history(3, 0);
+    let a = created(&mut cache, &h, &proposal(None, 64, &[0], 0, 0));
+    let b = created(&mut cache, &h, &proposal(Some(a), 128, &[1], 1, 0));
+    let mut fork = history(1, 0);
+    fork.append(&[99; 64], &[]).unwrap();
+    created(&mut cache, &fork, &proposal(Some(a), 128, &[2], 2, 0));
+    created(
+        &mut cache,
+        &history(1, 1000),
+        &proposal(None, 64, &[3], 3, 1),
+    );
+    cache.pin(b).unwrap();
+    let reclaimed = cache.reclaimable(&[]);
+    assert_eq!(reclaimed.pages, [PageId(2)]);
+    assert!(reclaimed.snapshots.contains(&SnapshotId(0))); // Compacting a retains its pages in b.
+    cache.unpin(b).unwrap();
+    let mut reclaimed = cache.reclaimable(&[]).pages;
+    reclaimed.sort();
+    assert_eq!(reclaimed, [PageId(0), PageId(1), PageId(2)]);
+}
