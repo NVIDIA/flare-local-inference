@@ -4481,6 +4481,103 @@ mod tests {
             .unwrap();
     }
 
+    /// The durability refresh and scheduling after a publish must not grow with the number of
+    /// records held, even with a backlog of records that are not durable. (It calls them
+    /// directly rather than publishing.) Release builds only: `cargo test --release --features test-support -- --ignored`.
+    #[test]
+    #[ignore = "scale test; release builds only"]
+    fn publishing_into_a_large_store_takes_under_a_millisecond() {
+        let (mut store, base, _directory) = store_with_root("scale", 1 << 20);
+        let value = descriptor();
+        let id = store.register_namespace(value.clone()).unwrap();
+        let extent = || Some(Arc::new(DiskExtent::new(base.join("record"))));
+        let insert = |store: &mut Store, key: Key, parent: Option<Key>, on_disk: bool| {
+            let header = crate::record::new_header(&value, key, parent, [0; 16], 1).unwrap();
+            let location = Location {
+                header,
+                memory: None,
+                disk: if on_disk { extent() } else { None },
+                durable: false,
+                writing: false,
+                job: None,
+                retry: Instant::now(),
+                bytes: 0,
+            };
+            let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
+            tree.insert(key, parent, [0; 16], 1, true, true, location)
+                .unwrap();
+        };
+        let mut last = None;
+        for chain in 0..6_250u64 {
+            let mut parent = None;
+            for depth in 0..16u64 {
+                let mut digest = [0; 16];
+                digest[..8].copy_from_slice(&chain.to_le_bytes());
+                digest[8] = depth as u8;
+                let key = Key {
+                    consumed_tokens: (depth + 1) * 64,
+                    digest,
+                };
+                insert(&mut store, key, parent, true);
+                parent = Some(key);
+            }
+            last = parent;
+        }
+        store.refresh_durability(id, None);
+        assert!(store.namespaces[&id].tree.nodes().all(|n| n.location.durable));
+        // A backlog of records that are not on disk yet.
+        for i in 0..10_000u64 {
+            let mut digest = [7; 16];
+            digest[..8].copy_from_slice(&i.to_le_bytes());
+            let key = Key {
+                consumed_tokens: 17 * 64,
+                digest,
+            };
+            insert(&mut store, key, last, false);
+            store.refresh_durability(id, Some(key));
+        }
+        assert_eq!(store.namespaces[&id].undurable.len(), 10_000);
+        let leaf = Key {
+            consumed_tokens: 17 * 64,
+            digest: [255; 16],
+        };
+        // A put published from memory is not on disk yet, so the backlog is not scanned.
+        insert(&mut store, leaf, last, false);
+        let started = Instant::now();
+        store.refresh_durability(id, Some(leaf));
+        let elapsed = started.elapsed();
+        store.schedule();
+        assert!(store.namespaces[&id].undurable.contains(&leaf));
+        assert!(elapsed < Duration::from_millis(1), "took {elapsed:?}");
+        // A streamed publish arrives with its disk extent and a durable parent.
+        let streamed = Key {
+            consumed_tokens: 17 * 64,
+            digest: [254; 16],
+        };
+        insert(&mut store, streamed, last, true);
+        let started = Instant::now();
+        store.refresh_durability(id, Some(streamed));
+        let elapsed = started.elapsed();
+        assert!(store.namespaces[&id].tree[&streamed].location.durable);
+        assert!(elapsed < Duration::from_millis(1), "streamed took {elapsed:?}");
+        // The incremental refreshes agree with a full rescan.
+        let flags = |store: &Store| {
+            let mut all: Vec<_> = store.namespaces[&id]
+                .tree
+                .nodes()
+                .map(|node| (node.key, node.location.durable))
+                .collect();
+            all.sort_unstable();
+            all
+        };
+        let incremental = flags(&store);
+        store.refresh_durability(id, None);
+        assert!(incremental == flags(&store), "a full rescan changed durability");
+        assert_eq!(store.namespaces[&id].undurable.len(), 10_001);
+        drop(store);
+        let _ = fs::remove_dir_all(base);
+    }
+
     #[test]
     fn catalog_snapshot_precedes_ordered_unbounded_deltas() {
         let (mut store, directory) = store("catalog");
@@ -4661,6 +4758,80 @@ mod tests {
         );
         drop(store);
         let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn replacing_a_durable_record_makes_its_children_wait_for_the_rewrite() {
+        let (mut store, base, _root) = store_with_root("replace-durable", 1 << 20);
+        let value = descriptor();
+        store.hello(1, std::process::id(), value.clone()).unwrap();
+        let id = value.namespace_id();
+        let parent = Key {
+            consumed_tokens: 64,
+            digest: [1; 16],
+        };
+        let child = Key {
+            consumed_tokens: 128,
+            digest: [2; 16],
+        };
+        for (key, above, tail) in [(parent, None, 1), (child, Some(parent), 1)] {
+            let header = crate::record::new_header(&value, key, above, [0; 16], tail).unwrap();
+            let location = Location {
+                header,
+                memory: None,
+                disk: Some(Arc::new(DiskExtent::new(base.join(format!("old-{}", key.digest[0]))))),
+                durable: false,
+                writing: false,
+                job: None,
+                retry: Instant::now(),
+                bytes: 0,
+            };
+            let tree = &mut store.namespaces.get_mut(&id).unwrap().tree;
+            tree.insert(key, above, [0; 16], tail as usize, true, true, location)
+                .unwrap();
+        }
+        store.refresh_durability(id, None);
+        assert!(store.namespaces[&id].tree.nodes().all(|n| n.location.durable));
+        // Compaction left the parent page-only, so a complete put replaces it.
+        store.namespaces.get_mut(&id).unwrap().tree[&parent].row = false;
+        let (events, _answers) = tokio::sync::mpsc::channel(8);
+        store.submit_put(
+            1,
+            1,
+            PutRequest {
+                namespace: id,
+                key: parent,
+                published_parent: None,
+                bucket: [0; 16],
+                chain_pages: 1,
+                published_tail_pages: 1,
+                row: true,
+            },
+            events,
+        );
+        store.dispatch();
+        let header = put_of(&mut store).header.clone();
+        put_of(&mut store).memory = Some(Arc::new(
+            store.memory.allocate(header.length_with_row() as usize).unwrap(),
+        ));
+        store.publish_put(1, 1, None);
+        let namespace = &store.namespaces[&id];
+        assert!(!namespace.tree[&parent].location.durable);
+        assert!(
+            !namespace.tree[&child].location.durable,
+            "a child cannot stay durable under a replaced parent"
+        );
+        assert!(namespace.undurable.contains(&child));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !store.namespaces[&id].tree[&child].location.durable {
+            assert!(Instant::now() < deadline, "the rewrite never completed");
+            store.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(store.namespaces[&id].tree[&parent].location.durable);
+        assert!(store.namespaces[&id].undurable.is_empty());
+        drop(store);
+        let _ = fs::remove_dir_all(base);
     }
 
     #[test]
