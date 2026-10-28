@@ -50,7 +50,7 @@ enum NodeState {
     /// Pinned in the memory index; its slabs supply the upload.
     Resident,
     /// Allocated in the memory index and being filled from its file.
-    Reading { started: Instant },
+    Reading,
     /// Another fetch is filling its memory copy; this fetch attaches once the copy is complete.
     Waiting,
 }
@@ -74,6 +74,8 @@ struct Inbound {
     disk_pinned: Vec<PrefixKey>,
     /// Read jobs whose replies are awaited.
     reads: usize,
+    disk_started: Option<Instant>,
+    disk_bytes: u64,
     error: Option<Error>,
     /// The upload from memory slabs has been handed to the memory store.
     uploading: bool,
@@ -764,9 +766,8 @@ impl CompositeStore {
             }
             match self.start_read(fetch, key, tail_pages, bucket, row) {
                 Ok(()) => {
-                    inbound.nodes[index].state = NodeState::Reading {
-                        started: Instant::now(),
-                    };
+                    inbound.disk_started.get_or_insert_with(Instant::now);
+                    inbound.nodes[index].state = NodeState::Reading;
                     inbound.reads += 1;
                 }
                 Err(error) => {
@@ -784,7 +785,7 @@ impl CompositeStore {
                 NodeState::Resident => {
                     let _ = self.memory.unpin_record(&node.key);
                 }
-                NodeState::Reading { .. } => {
+                NodeState::Reading => {
                     let _ = self.memory.complete_record(&node.key, false);
                 }
                 NodeState::Waiting => {}
@@ -862,12 +863,18 @@ impl CompositeStore {
         };
         inbound.reads = inbound.reads.saturating_sub(1);
         let position = inbound.nodes.iter().position(|entry| {
-            entry.key == node && matches!(entry.state, NodeState::Reading { .. })
+            entry.key == node && matches!(entry.state, NodeState::Reading)
         });
         match (result, position) {
             (Ok(bytes), Some(index)) => {
-                if let NodeState::Reading { started } = inbound.nodes[index].state {
-                    self.disk_inbound_rate.observe(bytes, started.elapsed());
+                inbound.disk_bytes += bytes;
+                if inbound.reads == 0
+                    && let Some(started) = inbound.disk_started
+                {
+                    self.disk_inbound_rate
+                        .observe(inbound.disk_bytes, started.elapsed());
+                    inbound.disk_started = None;
+                    inbound.disk_bytes = 0;
                 }
                 // The copy is complete: a durable resident, pinned for the upload.
                 let pinned = self
@@ -1119,6 +1126,8 @@ impl HostStore for CompositeStore {
             nodes,
             disk_pinned: Vec::new(),
             reads: 0,
+            disk_started: None,
+            disk_bytes: 0,
             error: None,
             uploading: false,
         };
@@ -2397,6 +2406,54 @@ mod tests {
     }
 
     #[test]
+    fn parallel_disk_reads_are_timed_as_one_fetch() {
+        let Some(directory) = test_directory("composite", "parallel-read-rate") else {
+            return;
+        };
+        let mut store = composite(&directory, 32, 4, 1 << 30);
+        let full = history(1280);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 640, None, pages(0..10), 10, StateSlotId(1));
+        let child = checkpoint(
+            &mut ids,
+            &full,
+            1280,
+            Some(640),
+            pages(0..20),
+            10,
+            StateSlotId(2),
+        );
+        written(&mut store, &root, None, 1);
+        written(&mut store, &child, Some(root.key), 2);
+        for key in [root.key, child.key] {
+            store.memory.remove_record(&key).unwrap();
+        }
+        let hit = store.lookup(&full, 0, u64::MAX).unwrap();
+        store
+            .fetch(
+                hit,
+                InboundTicket {
+                    key: child.key,
+                    pages: pages(100..120),
+                    slot: StateSlotId(3),
+                },
+            )
+            .unwrap();
+        assert_eq!(store.inbound[&child.key].reads, 2);
+        // Give both outstanding reads the same measured wall interval.
+        let started = Instant::now() - Duration::from_secs(1);
+        store.inbound.get_mut(&child.key).unwrap().disk_started = Some(started);
+        let before = started.elapsed();
+        poll_until(&mut store, &mut Vec::new(), |s| s.jobs.is_empty());
+        let bytes = (20 * PAGE_RECORD + ROW_RECORD) as f64;
+        assert!(store.disk_inbound_rate.0 >= bytes / started.elapsed().as_secs_f64());
+        assert!(store.disk_inbound_rate.0 <= bytes / before.as_secs_f64());
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn a_fetch_attaches_to_a_record_another_fetch_is_reading() {
         let Some(directory) = test_directory("composite", "attach") else {
             return;
@@ -2448,7 +2505,7 @@ mod tests {
         ));
         assert!(matches!(
             store.inbound[&right.key].nodes[1].state,
-            NodeState::Reading { .. }
+            NodeState::Reading
         ));
         assert_eq!(store.disk.index().node(&root.key).unwrap().pins(), 2);
         assert_eq!(store.memory.index().node(&root.key).unwrap().pins(), 1);
