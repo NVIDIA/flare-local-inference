@@ -90,6 +90,11 @@ pub struct Namespace {
     pub disk: Option<DiskThread>,
     reads: Option<DiskThread>,
     pub inflight: HashSet<Key>,
+    /// Records that are not durable yet, so durability and scheduling visit only these.
+    /// Invariant: when the namespace has a disk, every record that is not durable is in this
+    /// set, so code that inserts into `tree` must call `refresh_durability` for the new key.
+    /// A removed record may linger here until the next refresh drops it.
+    undurable: HashSet<Key>,
 }
 
 impl Namespace {
@@ -653,7 +658,7 @@ impl Store {
                 store.charged += bytes;
             }
             store.namespaces.insert(id, namespace);
-            store.refresh_durability(id);
+            store.refresh_durability(id, None);
         }
         recovered_age.sort_unstable();
         for (_, id, key) in recovered_age {
@@ -728,6 +733,7 @@ impl Store {
             disk,
             reads,
             inflight: HashSet::new(),
+            undurable: HashSet::new(),
         })
     }
 
@@ -851,24 +857,59 @@ impl Store {
         }
     }
 
-    /// Recomputes chain-closed durability parents-first, emitting `changed` on flips.
-    fn refresh_durability(&mut self, id: NamespaceId) {
-        let namespace = &self.namespaces[&id];
-        let mut keys: Vec<Key> = namespace.tree.nodes().map(|node| node.key).collect();
+    /// Recomputes chain-closed durability parents-first, emitting `changed` on flips. With a
+    /// `touched` record it visits that record, and also the not-yet-durable set when the
+    /// record has children and has just become durable (only that can make another record
+    /// durable, and a parent exists before its children; a durable record only becomes
+    /// non-durable when its own record is replaced, which passes `None`). With `None` it
+    /// visits every record and rebuilds the set.
+    fn refresh_durability(&mut self, id: NamespaceId, touched: Option<Key>) {
+        let namespace = self.namespaces.get_mut(&id).unwrap();
+        if namespace.disk.is_none() {
+            return; // nothing is durable without a disk
+        }
+        let mut keys: Vec<Key> = match touched {
+            Some(key) => {
+                let became = namespace.tree.node(&key).is_some_and(|node| {
+                    node.children() > 0
+                        && !node.location.durable
+                        && node.location.disk.is_some()
+                        && namespace.parent_durable(node.parent)
+                });
+                if became {
+                    namespace.undurable.iter().copied().chain([key]).collect()
+                } else {
+                    namespace.undurable.insert(key);
+                    vec![key]
+                }
+            }
+            None => {
+                namespace.undurable.clear();
+                namespace.tree.nodes().map(|node| node.key).collect()
+            }
+        };
         keys.sort_unstable_by_key(|key| key.consumed_tokens);
         let mut flipped = Vec::new();
         for key in keys {
-            let parent_ok = self.namespaces[&id].tree[&key]
+            let Some(node) = namespace.tree.node(&key) else {
+                namespace.undurable.remove(&key);
+                continue;
+            };
+            let parent_ok = node
                 .parent
-                .is_none_or(|parent| self.namespaces[&id].tree[&parent].location.durable);
-            let node = &mut self.namespaces.get_mut(&id).unwrap().tree[&key];
+                .is_none_or(|parent| namespace.tree[&parent].location.durable);
             let durable = node.location.disk.is_some() && parent_ok;
             if node.location.durable != durable {
-                node.location.durable = durable;
-                flipped.push((key, durable));
+                namespace.tree[&key].location.durable = durable;
+                flipped.push(key);
+            }
+            if durable {
+                namespace.undurable.remove(&key);
+            } else {
+                namespace.undurable.insert(key);
             }
         }
-        for (key, _) in flipped {
+        for key in flipped {
             self.delta(id, CatalogKind::Changed, key);
         }
     }
@@ -2284,7 +2325,7 @@ impl Store {
                 self.fail_put(connection, transfer, reason as u8, error);
             }
             Action::Publish => {
-                self.publish_put(connection, transfer, None, false);
+                self.publish_put(connection, transfer, None);
             }
         }
         if let Some(open) = self
@@ -2310,7 +2351,6 @@ impl Store {
         connection: u64,
         transfer: u64,
         disk: Option<Arc<DiskExtent>>,
-        durable: bool,
     ) {
         let Some((id, header)) = put_ref(&self.sessions, connection, transfer)
             .filter(|put| !put.finished)
@@ -2359,11 +2399,13 @@ impl Store {
             retry: Instant::now(),
             bytes,
         };
+        let mut rescan = false;
         let inserted = {
             let namespace = self.namespaces.get_mut(&id).unwrap();
             let inserted = if replace {
                 let node = namespace.tree.node_mut(&key).unwrap();
                 let old = std::mem::replace(&mut node.location, location);
+                rescan = old.durable;
                 node.row = true;
                 self.retired_records.push((id, key, old));
                 true
@@ -2415,12 +2457,7 @@ impl Store {
             .tree
             .access_at(&key, clock);
         self.charged = self.charged.saturating_sub(reservation) + bytes;
-        if durable {
-            if let Some(node) = self.namespaces.get_mut(&id).unwrap().tree.node_mut(&key) {
-                node.location.durable = true;
-            }
-        }
-        self.refresh_durability(id);
+        self.refresh_durability(id, (!rescan).then_some(key));
         self.metrics.puts_ok += 1;
         self.delta(
             id,
@@ -3077,7 +3114,7 @@ impl Store {
                     } else {
                         node.location.retry = Instant::now() + Duration::from_millis(100);
                     }
-                    self.refresh_durability(namespace);
+                    self.refresh_durability(namespace, Some(key));
                 }
                 Job::Chunk {
                     connection,
@@ -3121,7 +3158,7 @@ impl Store {
                         self.settle_put(connection, transfer);
                     } else {
                         final_extent.keep();
-                        self.publish_put(connection, transfer, Some(final_extent), true);
+                        self.publish_put(connection, transfer, Some(final_extent));
                     }
                 }
                 Job::Compact {
@@ -3157,7 +3194,7 @@ impl Store {
                         node.row = true;
                         self.delta(namespace, CatalogKind::Changed, key);
                     }
-                    self.refresh_durability(namespace);
+                    self.refresh_durability(namespace, Some(key));
                 }
                 Job::GetRead {
                     connection,
