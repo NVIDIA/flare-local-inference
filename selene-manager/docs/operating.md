@@ -110,8 +110,9 @@ reverse) runs on up to eight threads of the manager's host, overlapped with the 
 
 A pooled instance keeps a retiring record's local rows pinned until its put
 finishes. A slow manager can therefore exhaust the instance's rows and skip
-new host publications. Flare warns at startup when the local DRAM tier has
-fewer than twice `--max-concurrency` rows. Increase `--prefix-cache-memory`
+new host publications. Rows take one quarter of the local DRAM budget while
+preserving minimum page windows. Flare warns at startup when this leaves fewer than
+`--max-concurrency` rows. Increase `--prefix-cache-memory`
 or reduce concurrency; this threshold is a sizing warning, not a guarantee
 that an arbitrarily long persistence backlog will fit.
 

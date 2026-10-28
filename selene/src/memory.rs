@@ -1007,7 +1007,12 @@ impl MemoryStore {
     }
 
     pub(crate) fn headroom(&self) -> (usize, usize) {
-        self.core.headroom()
+        let (pages, rows) = self.core.headroom();
+        (pages.max(self.largest_pages()), rows)
+    }
+
+    pub(crate) fn largest_pages(&self) -> usize {
+        self.core.largest_pages
     }
 
     pub fn pool(&self) -> &SlabPool {
@@ -1384,6 +1389,10 @@ impl HostStore for MemoryStore {
         // Inside a composite the disk index supplies parents, so it flushes.
         if !self.core.flat {
             self.flush_announcements(&|_, parent| parent, &|_| None);
+            if self.core.spill {
+                let (pages, rows) = self.headroom();
+                self.core.retire_for(pages, rows);
+            }
         }
         Ok(())
     }
@@ -2463,6 +2472,40 @@ mod tests {
         );
         core.largest_pages = 90;
         assert_eq!(core.headroom(), (10, 1));
+    }
+
+    #[test]
+    fn progress_retires_before_a_record_larger_than_the_watermark_arrives() {
+        use crate::store::TierStore;
+
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 100, ROW, 16, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        store.announce_to(Announcer::new(Arc::new(tokio::sync::Notify::new())));
+        for salt in 1..=4 {
+            let h = history(22 * PT, salt);
+            let checkpoint = published(&h, 22 * PT, None, 0, salt);
+            assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.core.announced.len() != 4 {
+            assert!(Instant::now() < deadline, "records were not announced");
+            store.poll(&mut Vec::new()).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(store.core.headroom().0, 10);
+        assert_eq!(store.pool().free_pages(), 12);
+        store.set_spill(true);
+        store.poll(&mut Vec::new()).unwrap();
+        let retiring = store.take_retiring();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(retiring[0].tail_pages, 22);
+        store.retired(retiring[0].key, PoolTier::Dram, Retirement::Moved);
+        let h = history(22 * PT, 5);
+        let next = published(&h, 22 * PT, None, 0, 5);
+        assert_eq!(store.store(&next).unwrap(), StoreOutcome::Queued);
+        store.close().unwrap();
     }
 
     #[test]

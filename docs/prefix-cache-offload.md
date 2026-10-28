@@ -285,8 +285,8 @@ offload event.
 Transfers move records in windows of at most 64 pages plus the row. A window
 allocates its slabs, moves, and either retains or releases them according to
 the owning pool's policy before the next window is issued. The memory store's
-minimum size is two row slabs and 128 page slabs, one outbound and one inbound
-window; a smaller explicit configuration fails at startup with the minimum for
+minimum size holds two row slabs and 128 page slabs, one outbound and one inbound
+window. A smaller explicit configuration fails at startup with the minimum for
 the package.
 
 `SlabPool` is one anonymous mapping (`MAP_PRIVATE`, `MAP_ANONYMOUS`,
@@ -300,6 +300,15 @@ targets ordinary pages; the loader already uses this pattern for mapped host
 regions in `helios/src/runtime_package/mod.rs`. Allocation never blocks: when
 no slab is free and nothing is evictable, the requesting job fails, which
 skips an outbound and fails an inbound.
+
+Host memory pressure queues cold parked records through the existing disk spill
+path before allocation. The page watermark keeps room for at least the largest
+record seen, also when memory-only pool instances retire records to the manager.
+With long records near memory capacity, local memory spills most records soon
+after they land. A retry can still wait for that asynchronous write to
+release its slabs; neither publication nor admission waits for I/O. GPU-only
+retry records remain unpinned: even a brief retry pin can prevent admission when
+the next request needs its pages or snapshot.
 
 Registering host memory maps it into every device's page tables. On an RTX PRO
 6000 that costs each device about 2 MiB of device memory per GiB registered,
@@ -620,9 +629,10 @@ Offload limits interference through bounded work and explicit ownership:
 - Disk records move through registered host staging and batched stream copies.
 - The staged transport's staging pool size is derived; it is not a setting.
 - A memory store retains at most as many records as it has row slabs, and
-  rows take one quarter of the pool, so on Qwen, whose rows are 112 MiB, a
-  4 GiB pool holds eight records while the GPU cache holds dozens. A memory
-  tier that cannot hold more records than the GPU cache rarely has a record
+  rows take one quarter of the pool's bytes, preserving the minimum page windows.
+  Startup warns when rows fall below selected concurrency; twice concurrency
+  remains recommended, and publications may wait for spills when rows are scarce.
+  A memory tier that cannot hold more records than the GPU cache rarely has a record
   the GPU has already lost; the derived default's lower clamp exists for the
   staging minimum, and the sizing guidance for operators is a pool whose row
   slabs exceed the GPU's state rows.

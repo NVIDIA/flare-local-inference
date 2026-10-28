@@ -541,9 +541,8 @@ impl ModelRuntime {
                     .as_ref()
                     .and_then(|binding| binding.take())
                     .map(|prepared| {
-                        if prepared.pool.is_some()
-                            && let Some(warning) =
-                                prepared.pool_row_warning(worker_config.limits.max_active)
+                        if let Some(warning) =
+                            prepared.pool_row_warning(worker_config.limits.max_active)
                         {
                             eprintln!("warning: {warning}");
                         }

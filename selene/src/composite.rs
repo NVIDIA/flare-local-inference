@@ -3078,6 +3078,38 @@ mod tests {
     }
 
     #[test]
+    fn progress_spills_before_a_record_larger_than_the_watermark_arrives() {
+        let Some(directory) = test_directory("composite", "large-record-headroom") else {
+            return;
+        };
+        let mut store = composite(&directory, 100, 16, 1 << 30);
+        store.cascade();
+        let mut ids = Ids::new();
+        for salt in 1..=4 {
+            parked_root(&mut store, &mut ids, salt, 22 * PAGE_TOKENS);
+        }
+        assert_eq!(store.memory.headroom().0, 22);
+        assert_eq!(store.memory.pool().free_pages(), 12);
+        assert!(store.jobs.is_empty());
+        store.poll(&mut Vec::new()).unwrap();
+        assert!(store.parked.values().any(|record| record.writing));
+        poll_until(&mut store, &mut Vec::new(), |s| s.outbound.is_empty());
+        let next = checkpoint(
+            &mut ids,
+            &history(22 * PAGE_TOKENS),
+            22 * PAGE_TOKENS,
+            None,
+            pages(0..22),
+            22,
+            StateSlotId(5),
+        );
+        assert_eq!(store.store(&next).unwrap(), StoreOutcome::Queued);
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
     fn disk_pressure_parks_complete_dram_records_in_both_modes() {
         for pooled in [false, true] {
             let Some(directory) = test_directory("composite", "disk-pressure-parked") else {
@@ -3760,7 +3792,7 @@ mod tests {
         let Some(directory) = test_directory("composite", "pooled-spill-notice") else {
             return;
         };
-        let mut store = composite(&directory, 16, 4, 1 << 30);
+        let mut store = composite(&directory, 32, 4, 1 << 30);
         store.cascade();
         let announcer = Announcer::new(std::sync::Arc::new(tokio::sync::Notify::new()));
         announcer.begin_session();
@@ -3792,19 +3824,20 @@ mod tests {
                 .iter()
                 .any(|n| matches!(n, Notice::Saved(e) if e.tier == Pool::Nvme))
         );
-        // Memory needs the room: the file is written and announced...
+        // Memory needs the room: a larger record than any seen does not fit
+        // beside the first, so the first is written and announced...
         let mut other_history = PrefixHistory::new(IDENTITY);
-        let list: Vec<u32> = (0..640u32)
+        let list: Vec<u32> = (0..1536u32)
             .map(|t| t.wrapping_mul(2654435761).wrapping_add(2))
             .collect();
         other_history.append(&list, &[]).unwrap();
         let other = checkpoint(
             &mut ids,
             &other_history,
-            640,
+            1536,
             None,
-            pages(0..10),
-            10,
+            pages(0..24),
+            24,
             StateSlotId(2),
         );
         assert_eq!(

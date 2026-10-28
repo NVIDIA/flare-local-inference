@@ -227,10 +227,10 @@ impl Prepared {
     pub fn pool_row_warning(&self, max_concurrency: usize) -> Option<String> {
         let rows = self.memory_pool.as_ref()?.row_count();
         let recommended = max_concurrency.saturating_mul(2);
-        (rows < recommended).then(|| {
+        (rows < max_concurrency).then(|| {
             format!(
-                "pooled host memory has {rows} rows, fewer than twice max concurrency ({recommended}); \
-             publications may be skipped while older records wait for pool persistence; \
+                "host memory holds {rows} record rows for max concurrency {max_concurrency} ({recommended} recommended); \
+             publications may wait for spills; \
              increase --prefix-cache-memory or reduce --max-concurrency"
             )
         })
