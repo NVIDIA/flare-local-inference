@@ -93,7 +93,10 @@ def _rank(rank, directory, readiness):
                 tuner = prepared.tuning_graphs[binding.tuning_graph]
                 assert tuner.outputs == (binding.buffer,)
                 assert prepared.buffers[binding.buffer].data_ptr() == operation.plan.prepared.state.selector.data_ptr()
-                assert prepared.buffers[tuner.status_buffer] is producer.status
+                assert prepared.buffers["collective-tuning-0-status"] is producer.status
+                aggregate = prepared.buffers[tuner.status_buffer]
+                assert aggregate is not producer.status
+                assert aggregate.dtype == torch.int32 and aggregate.shape == (1,)
                 assert set(prepared.graphs) == {*signatures, binding.tuning_graph}
                 from ignition.preparation.startup_tuning import replay_startup_tuning
 

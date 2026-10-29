@@ -388,14 +388,14 @@ pub(super) fn collective_choices_overview(
     let mut totals = BTreeMap::new();
     let mut outputs = BTreeMap::new();
     for group in choices {
-        let modes = group.iter().map(|(_, bytes)| decode(bytes).0).collect::<BTreeSet<_>>();
-        let name = if modes.len() == 1 { modes.into_iter().next().unwrap() } else { "Mixed/unknown".into() };
-        *totals.entry(name).or_insert(0usize) += 1;
+        for (_, bytes) in group {
+            *totals.entry(decode(bytes).0).or_insert(0usize) += 1;
+        }
         outputs.extend(group.iter().map(|(name, bytes)| (name.as_str(), bytes.as_slice())));
     }
     let mut text = format!("  Collective choices · device {} · diagnostic\n", manifest.device);
     let counts = totals.iter().map(|(name, count)| {
-        format!("{name}: {count} group{}", if *count == 1 { "" } else { "s" })
+        format!("{name}: {count} binding{}", if *count == 1 { "" } else { "s" })
     }).collect::<Vec<_>>().join(" · ");
     writeln!(text, "  {counts}").unwrap();
     let mut graphs = manifest.graphs.iter().filter(|graph| !graph.tuned_bindings.is_empty()).collect::<Vec<_>>();

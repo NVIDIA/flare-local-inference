@@ -1,6 +1,7 @@
 """Persistent startup outputs remain separate from serving inputs and capacities."""
 
 from types import SimpleNamespace
+import os
 
 import pytest
 import torch
@@ -110,6 +111,7 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     from contextlib import contextmanager, nullcontext
     from ignition.preparation.runtime_package import _graphs
     from ignition.preparation.startup_tuning import CollectiveStartupTuning
+    from b12x.comm import pcie
 
     events = []
     class Graph:
@@ -152,6 +154,7 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     monkeypatch.setattr(torch.cuda, "current_stream", lambda ordinal: f"current-{ordinal}")
     monkeypatch.setattr(torch.cuda, "graph", capture)
     monkeypatch.setattr(torch.cuda, "synchronize", lambda ordinal: None)
+    monkeypatch.setattr(pcie, "run_joint_startup_tuners", lambda producers: events.append("run"))
     selector = torch.tensor([7], dtype=torch.uint32)
     owner = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=SimpleNamespace(selector=selector))))
     producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector),),
@@ -170,7 +173,10 @@ def test_catalog_retains_exportable_graph_and_selector_storage(monkeypatch):
     assert selector.item() == 5
     assert resources == (producer,)
     assert _graphs({name: value.graph for name, value in tuners.items()}) == [
-        dict(name="collective-tuning-0", graph=11, executable=12)]
+        dict(name="collective-tuning", graph=11, executable=12)]
+    assert buffers["collective-tuning-0-status"] is producer.status
+    assert tuners["collective-tuning"].status_buffer == "collective-tuning-status"
+    assert buffers["collective-tuning-status"].data_ptr() != producer.status.data_ptr()
     assert events == ["device-enter", "wait", "capture-enter", "run", "capture-exit",
                       "instantiate", "drain", "device-exit"]
 
@@ -220,4 +226,115 @@ def test_memory_report_deduplicates_shared_producer_allocations():
         return SimpleNamespace(memory_requirements=lambda: memory)
     registry = CollectiveStartupTuning(object())
     registry.groups = {"a": producer("a"), "b": producer("b")}
-    assert registry.memory_report() == dict(startup_tuning_bytes=4352, startup_tuning_producers=2)
+    assert registry.memory_report() == dict(startup_tuning_bytes=4360, startup_tuning_producers=2)
+
+
+def test_aggregate_status_preserves_group_failures_across_success_and_failure_replays():
+    from ignition.preparation.startup_tuning import _publish_group_status
+
+    first = torch.tensor([0], dtype=torch.int32)
+    second = torch.tensor([0], dtype=torch.int32)
+    status = torch.tensor([99], dtype=torch.int32)
+    scratch = torch.tensor([99], dtype=torch.int32)
+    groups = ((1, first), (5, second))
+    addresses = tuple(value.data_ptr() for value in (first, second, status, scratch))
+    for a, b, expected in ((0, 0, 0), (1, 0, 2), (0, 0, 0), (0, -1, 6), (-1, 9, 6), (0, 0, 0)):
+        first.fill_(a)
+        second.fill_(b)
+        status.zero_()
+        scratch.fill_(-7)
+        _publish_group_status(groups, status, scratch)
+        assert status.item() == expected
+        assert first.item() == a and second.item() == b
+        assert addresses == tuple(value.data_ptr() for value in (first, second, status, scratch))
+
+
+def test_catalog_prunes_unused_groups_and_preserves_individual_consumer_fields(monkeypatch):
+    from contextlib import nullcontext
+    from b12x.comm import pcie
+    from ignition.preparation.startup_tuning import CollectiveStartupTuning
+
+    captures, launched = [], []
+    class Graph:
+        def __init__(self, *, keep_graph):
+            assert keep_graph
+            captures.append(self)
+        def instantiate(self):
+            pass
+    class Stream:
+        def __init__(self, *, device):
+            assert device == 0
+        def wait_stream(self, stream):
+            pass
+        def synchronize(self):
+            pass
+    monkeypatch.setattr(torch.cuda, "CUDAGraph", Graph)
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    monkeypatch.setattr(torch.cuda, "device", lambda device: nullcontext())
+    monkeypatch.setattr(torch.cuda, "current_stream", lambda device: object())
+    monkeypatch.setattr(torch.cuda, "graph", lambda graph, stream, pool: nullcontext())
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda device: None)
+    monkeypatch.setattr(pcie, "run_joint_startup_tuners", lambda producers: launched.append(tuple(producers)))
+    registry = CollectiveStartupTuning(SimpleNamespace(device=SimpleNamespace(ordinal=0), capture=nullcontext,
+        benchmark_storage=SimpleNamespace(graph_pool=SimpleNamespace(id=(1, 7)))))
+    owners, producers = [], []
+    for index in range(3):
+        selector = torch.tensor([index + 1], dtype=torch.uint32)
+        owner = SimpleNamespace(plan=SimpleNamespace(prepared=SimpleNamespace(state=SimpleNamespace(selector=selector))))
+        producer = SimpleNamespace(specs=(SimpleNamespace(selector=selector),), status=torch.zeros(1, dtype=torch.int32))
+        owners.append(owner)
+        producers.append(producer)
+    registry.owners = owners
+    registry.groups = dict(enumerate(producers))
+    registry.owner_groups = {id(owner): index for index, owner in enumerate(owners)}
+    decode, prefill, unused = object(), object(), object()
+    registry.captures = {id(decode): {id(owners[0])}, id(prefill): {id(owners[2])}, id(unused): {id(owners[1])}}
+    buffers, tuners, bindings, resources = registry.catalog(dict(decode=decode, prefill=prefill))
+    assert len(captures) == len(tuners) == 1
+    assert resources == launched[0] == (producers[0], producers[2])
+    assert tuners["collective-tuning"].outputs == ("collective-tuning-0-selector-0", "collective-tuning-2-selector-0")
+    assert bindings == {
+        "decode": [TunedBinding("collective-tuning-0-selector-0", "collective-tuning")],
+        "prefill": [TunedBinding("collective-tuning-2-selector-0", "collective-tuning")],
+    }
+    assert "collective-tuning-1-status" not in buffers
+    assert buffers["collective-tuning-0-status"] is producers[0].status
+    assert buffers["collective-tuning-2-status"] is producers[2].status
+    registry.session.benchmark_storage = None
+    with pytest.raises(RuntimeError, match="requires package storage"):
+        registry.catalog(dict(decode=decode))
+    captures.clear()
+    assert registry.catalog({"unrecorded": object()}) == ({}, {}, {}, ())
+    assert not captures
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_TP_CUDA_TESTS") != "1", reason="requires an assigned CUDA device")
+def test_captured_aggregate_status_reads_changed_group_status_without_allocation():
+    from ignition.preparation.startup_tuning import _publish_group_status
+
+    assert os.environ.get("CUDA_VISIBLE_DEVICES"), "assign CUDA devices explicitly"
+    device = torch.cuda.current_device()
+    first = torch.zeros(1, dtype=torch.int32, device=device)
+    second = torch.zeros(1, dtype=torch.int32, device=device)
+    status = torch.empty(1, dtype=torch.int32, device=device)
+    scratch = torch.empty_like(status)
+    groups = ((1, first), (5, second))
+    _publish_group_status(groups, status, scratch)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        status.fill_(-1)
+        _publish_group_status(groups, status, scratch)
+    for a, b, expected in ((0, 0, 0), (1, 0, 2), (0, 0, 0), (0, -1, 6), (1, 1, 6), (0, 0, 0)):
+        first.fill_(a)
+        second.fill_(b)
+        status.zero_()
+        scratch.fill_(99)
+        torch.cuda.synchronize()
+        allocations = torch.cuda.memory_stats()["allocation.all.allocated"]
+        graph.replay()
+        torch.cuda.synchronize()
+        assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocations
+        assert status.item() == expected
+        assert first.item() == a and second.item() == b
+    graph.reset()

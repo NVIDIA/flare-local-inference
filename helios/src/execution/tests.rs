@@ -143,14 +143,14 @@ fn collective_overview_uses_graph_geometry_and_individual_bindings() {
     value.graphs[0].tuned_bindings = packed.tuned_bindings.clone();
     value.graphs.extend([packed, mixed]);
     let choices = vec![vec![
-        ("target-choice".into(), 4u32.to_ne_bytes().to_vec()),
-        ("mixed-choice".into(), ((1u32 << 16) | 64).to_ne_bytes().to_vec()),
+        ("target-choice".into(), ((5u32 << 16) | 1).to_ne_bytes().to_vec()),
+        ("mixed-choice".into(), ((6u32 << 16) | 64).to_ne_bytes().to_vec()),
     ]];
     let text = super::transport::collective_choices_overview(&value, &choices);
-    assert!(text.contains("Mixed/unknown: 1 group\n"));
-    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0 · Full (4 CTAs)\n"));
-    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0 · Full (4 CTAs)\n"));
-    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128 · Payload RSAG (64 CTAs)\n"));
+    assert!(text.contains("Mode 5: 1 binding · Mode 6: 1 binding\n"));
+    assert!(text.contains("arbitrary-decode-name · Decode b=4 t=1 rows=4 drafts=0 prefill=0 · Mode 5 (1 CTAs)\n"));
+    assert!(text.contains("arbitrary-target-name · Speculative b=4 t=6 rows=16 drafts=5 prefill=0 · Mode 5 (1 CTAs)\n"));
+    assert!(text.contains("arbitrary-mixed-name · Mixed b=4 t=1 rows=131 drafts=0 prefill=128 · Mode 6 (64 CTAs)\n"));
 }
 
 pub(super) fn manifest() -> ExecutionManifest {

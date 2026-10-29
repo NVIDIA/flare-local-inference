@@ -58,6 +58,29 @@ def test_invalid_bucket(changes):
         validate(data)
 
 
+@pytest.mark.parametrize("family", ["joint_latency", "joint_bandwidth"])
+@pytest.mark.parametrize("mode,counts", [("serial_push", [1]), ("queued_push", [1, 16, 64])])
+def test_destination_serialization_profiles_require_multiple_peers(family, mode, counts):
+    from b12x.comm.pcie._joint_profile import selected_profile
+
+    data = load(LADDER)
+    data["buckets"][0].update(implementation=family, profiles={mode: counts})
+    assert validate(data) is data
+    for count in counts:
+        assert selected_profile(family, 64, mode, count, world_size=4) & 0xffff == count
+    data["world_size"] = 2
+    with pytest.raises(UsageError, match="more than two ranks"):
+        validate(data)
+
+
+@pytest.mark.parametrize("counts", [[2], [1, 2]])
+def test_serial_destination_profile_rejects_multiple_active_ctas(counts):
+    data = load(LADDER)
+    data["buckets"][0]["profiles"] = {"serial_push": counts}
+    with pytest.raises(UsageError, match="one active CTA"):
+        validate(data)
+
+
 def test_runtime_requires_file_and_static_rejects_it(tmp_path):
     with pytest.raises(UsageError, match="requires --collective-ladder"):
         resolve("runtime", None)
@@ -106,7 +129,7 @@ def test_b12x_accepts_pinned_geometry_at_both_ends_of_every_bucket(effort):
                 assert configured.pinned == config
             for mode, counts in row["profiles"].items():
                 for count in counts:
-                    assert selected_profile(family, row["blocks"], mode, count) & 0xffff == count
+                    assert selected_profile(family, row["blocks"], mode, count, world_size=4) & 0xffff == count
             lower = row["max_bytes"] + 16
 
 

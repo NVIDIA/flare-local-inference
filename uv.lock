@@ -400,7 +400,7 @@ source = { directory = "heliopause" }
 [[package]]
 name = "flashinfer-python"
 version = "0.7.1"
-source = { git = "https://github.com/local-inference-lab/flashinfer.git?rev=f91f257e079d8fa632d64cc6db49a1e609ff02ed#f91f257e079d8fa632d64cc6db49a1e609ff02ed" }
+source = { git = "https://github.com/local-inference-lab/flashinfer.git?rev=7294648399133bae4997d0072590b0f977313145#7294648399133bae4997d0072590b0f977313145" }
 dependencies = [
     { name = "apache-tvm-ffi" },
     { name = "click" },
@@ -565,7 +565,7 @@ requires-dist = [
     { name = "cuda-python", marker = "extra == 'prepare'", specifier = "==13.3.1" },
     { name = "cuda-tile", extras = ["tileiras"], marker = "extra == 'prepare'", specifier = "==1.6.0" },
     { name = "flare-heliopause", marker = "extra == 'prepare'", directory = "heliopause" },
-    { name = "flashinfer-python", extras = ["b12x"], marker = "extra == 'prepare'", git = "https://github.com/local-inference-lab/flashinfer.git?rev=f91f257e079d8fa632d64cc6db49a1e609ff02ed" },
+    { name = "flashinfer-python", extras = ["b12x"], marker = "extra == 'prepare'", git = "https://github.com/local-inference-lab/flashinfer.git?rev=7294648399133bae4997d0072590b0f977313145" },
     { name = "huggingface-hub", marker = "extra == 'prepare'", specifier = "==1.33.0" },
     { name = "openai", marker = "extra == 'api-test'", specifier = ">=2,<3" },
     { name = "pillow", marker = "extra == 'prepare'", specifier = "==12.3.0" },

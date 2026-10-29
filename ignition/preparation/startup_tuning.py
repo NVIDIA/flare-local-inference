@@ -109,11 +109,13 @@ class CollectiveStartupTuning:
         from b12x.preparation import MemoryRequirements
 
         memory = MemoryRequirements.sequential(producer.memory_requirements() for producer in self.groups.values())
-        return {"startup_tuning_bytes": sum(entry.resident_nbytes for entry in memory.persistent),
+        # The catalog adds one aggregate status and one int32 scratch scalar.
+        return {"startup_tuning_bytes": sum(entry.resident_nbytes for entry in memory.persistent) + (8 if self.groups else 0),
                 "startup_tuning_producers": len(self.groups)}
 
     def catalog(self, graphs):
         import torch
+        from b12x.comm.pcie import run_joint_startup_tuners
 
         consumers = {name: self.captures.get(id(graph), set()) for name, graph in graphs.items()}
         needed = {self.owner_groups[owner] for owners in consumers.values() for owner in owners
@@ -122,6 +124,8 @@ class CollectiveStartupTuning:
         if needed and storage is None:
             raise RuntimeError("collective startup capture requires package storage")
         buffers, tuners, bindings, resources = {}, {}, {}, []
+        statuses, all_outputs = [], []
+        tuning_name = "collective-tuning"
         for index, (key, producer) in enumerate(self.groups.items()):
             if key not in needed:
                 continue
@@ -136,27 +140,56 @@ class CollectiveStartupTuning:
                     buffers[field] = spec.selector.view(torch.int32)
             status = f"{name}-status"
             buffers[status] = producer.status
-            device = self.session.device.ordinal
-            coordinator = getattr(self.session, "_coordinator", None)
-            if coordinator is not None:
-                coordinator.barrier(f"capture {name}", coordinator.ranks)
-            with torch.cuda.device(device):
-                stream = torch.cuda.Stream(device=device)
-                stream.wait_stream(torch.cuda.current_stream(device))
-                graph = torch.cuda.CUDAGraph(keep_graph=True)
-                with self.session.capture(), torch.cuda.graph(graph, pool=storage.graph_pool.id, stream=stream):
-                    producer.run()
-                graph.instantiate()
-                stream.synchronize()
-            tuners[name] = TuningGraph(graph, tuple(outputs), status)
+            all_outputs.extend(outputs)
+            statuses.append((index, producer.status))
             resources.append(producer)
             for serving, owners in consumers.items():
                 selected = {id(owner): owner for owner in self.owners if id(owner) in owners
                             and self.owner_groups[id(owner)] == key}
                 fields = {addresses[owner.plan.prepared.state.selector.data_ptr()] for owner in selected.values()}
-                bindings.setdefault(serving, []).extend(TunedBinding(field, name) for field in sorted(fields))
-        torch.cuda.synchronize(self.session.device.ordinal)
+                bindings.setdefault(serving, []).extend(TunedBinding(field, tuning_name) for field in sorted(fields))
+        if not resources:
+            return buffers, tuners, bindings, ()
+        device = self.session.device.ordinal
+        status_name = f"{tuning_name}-status"
+        scratch_name = f"{status_name}-scratch"
+        coordinator = getattr(self.session, "_coordinator", None)
+        if coordinator is not None:
+            coordinator.barrier(f"capture {tuning_name}", coordinator.ranks)
+        with torch.cuda.device(device):
+            status = resources[0].status.new_full((1,), -1)
+            scratch = status.new_empty((1,))
+            buffers[status_name], buffers[scratch_name] = status, scratch
+            _publish_group_status(statuses, status, scratch)
+            status.fill_(-1)
+            stream = torch.cuda.Stream(device=device)
+            stream.wait_stream(torch.cuda.current_stream(device))
+            graph = torch.cuda.CUDAGraph(keep_graph=True)
+            with self.session.capture(), torch.cuda.graph(graph, pool=storage.graph_pool.id, stream=stream):
+                status.fill_(-1)
+                run_joint_startup_tuners(resources)
+                _publish_group_status(statuses, status, scratch)
+            graph.instantiate()
+            stream.synchronize()
+        tuners[tuning_name] = TuningGraph(graph, tuple(all_outputs), status_name)
+        torch.cuda.synchronize(device)
         return buffers, tuners, bindings, tuple(resources)
+
+
+def _publish_group_status(groups, status, scratch):
+    """Publish zero or the highest failing prepared-group index plus one.
+
+    Per-group status buffers retain the original failure values. The aggregate
+    identifies a failing group without interpreting its protocol in native code.
+    All operations write caller-owned scalars and are captured with the race.
+    """
+    import torch
+
+    status.zero_()
+    for index, group_status in groups:
+        torch.ne(group_status, 0, out=scratch)
+        scratch.mul_(index + 1)
+        torch.maximum(status, scratch, out=status)
 
 
 def register_collective(owner, session):

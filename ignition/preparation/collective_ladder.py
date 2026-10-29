@@ -6,8 +6,8 @@ from pathlib import Path
 from ignition.errors import UsageError
 
 MODES = {
-    "joint_latency": ("full", "payload_rsag", "pull"),
-    "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull"),
+    "joint_latency": ("full", "payload_rsag", "pull", "serial_push", "queued_push"),
+    "joint_bandwidth": ("payload_rsag", "bulk_push", "bulk_pull", "pull", "serial_push", "queued_push"),
 }
 
 
@@ -45,9 +45,12 @@ def validate(data):
         require(isinstance(row["profiles"], dict) and bool(row["profiles"]), "profiles must be nonempty")
         for mode, counts in row["profiles"].items():
             require(mode in MODES[row["implementation"]], "mode does not belong to joint kernel")
+            require(data["world_size"] > 2 or mode not in ("serial_push", "queued_push"),
+                    "destination serialization requires more than two ranks")
             require(isinstance(counts, list) and bool(counts)
                     and all(type(v) is int and 1 <= v <= row["blocks"] for v in counts), "invalid active CTA counts")
             require(len(set(counts)) == len(counts), "duplicate active CTA counts")
+            require(mode != "serial_push" or counts == [1], "serial_push requires one active CTA")
     return data
 
 

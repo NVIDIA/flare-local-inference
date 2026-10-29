@@ -18,6 +18,17 @@ including configuration-file and recipe defaults. Static policy rejects the
 option. File contents travel with the preparation plan and package rebuild
 settings; workers do not reopen the path.
 
+Startup interleaves 21 timing samples per profile across the required reduction
+groups. Each sample measures a complete chain of reductions and uses the slowest
+rank's duration. Selection minimizes their sum, so stalls contribute to the
+decision; exact ties follow the profile order in the file. Every profile must
+pass the arithmetic checks before serving can start.
+
+The groups share one captured startup graph. Reducing serving concurrency or
+draft width at load time retains this graph and its workspace whenever a selected
+serving graph uses a runtime collective. A package containing only one reduction
+group has no other groups to separate its samples in time.
+
 ## Version 1 format
 
 ```json
@@ -46,7 +57,11 @@ Each bucket declares one kernel family, thread count, and physical CTA grid.
 `joint_latency` permits `full`, `payload_rsag`, and `pull`; `joint_bandwidth`
 permits `payload_rsag`, `bulk_push`, `bulk_pull`, and `pull`. Each profile lists
 active CTA counts between one and the physical grid size. Several counts may
-belong to the same submode. `cache_policy` controls the captured profile race's
+belong to the same submode. With more than two ranks, both families also permit
+`serial_push` and `queued_push`, which send payloads to one peer at a time.
+`serial_push` requires exactly one active CTA; `queued_push` distributes tiles
+among active CTAs without requiring the entire grid to be resident.
+`cache_policy` controls the captured profile race's
 cache treatment and accepts `cold` or `warm`.
 
 The ladder applies to eligible plain BF16 PCIe reductions. TP size, compute
