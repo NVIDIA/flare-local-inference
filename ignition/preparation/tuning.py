@@ -456,9 +456,18 @@ class RecordedPreparationSession(PreparationSession):
                 import torch.distributed as dist
 
                 # Candidate shards must cover the same local races on every rank.
-                self._sharded = self._coordinator.same_on_every_rank(
-                    (torch.cuda.get_device_properties(self.device.ordinal).name, _local_tuning_catalog(requests)))
+                name = torch.cuda.get_device_properties(self.device.ordinal).name
+                catalog = _local_tuning_catalog(requests)
+                same_name = self._coordinator.same_on_every_rank((name, catalog))
+                # A Max-Q card and its Workstation Edition sibling report different names for the
+                # same silicon. Ranks that differ only by that token must still share rank zero's
+                # selections and race new candidates together; independent races chose different
+                # MoE plans, and compiled forwards bind one rank's choices.
+                self._sharded = same_name or self._coordinator.same_on_every_rank(
+                    (name.replace(" Max-Q ", " "), catalog))
                 if self._sharded:
+                    if not same_name:
+                        self._coordinator.share_selections(self._selection_cache())
                     self.configure_tuning_shard(dist.get_rank(), self._coordinator.ranks)
                 elif self._coordinator.spans_hosts:
                     self._coordinator.share_selections(self._selection_cache())
