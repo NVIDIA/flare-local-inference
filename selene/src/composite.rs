@@ -352,7 +352,7 @@ impl CompositeStore {
             } else {
                 Tier::Nvme
             },
-            estimated_seconds: disk_bytes as f64 / self.disk_inbound_rate.0.max(1.0)
+            estimated_seconds: disk_bytes as f64 / self.disk_inbound_rate.get().max(1.0)
                 + bytes as f64 / memory_rate,
             chain,
         }
@@ -775,6 +775,7 @@ impl CompositeStore {
                         started: Instant::now(),
                     };
                     inbound.reads += 1;
+                    self.disk_inbound_rate.started();
                 }
                 Err(error) => {
                     inbound.error.get_or_insert(error);
@@ -2286,7 +2287,7 @@ mod tests {
             (0, 1, 0)
         );
         assert!(stats.inbound_rate > 0.0);
-        assert!(store.disk_inbound_rate.0 != INITIAL_STAGED_DISK_RATE);
+        assert!(store.disk_inbound_rate.get() != INITIAL_STAGED_DISK_RATE);
 
         // Resident again, the record is a memory hit whose upload is handed
         // to the memory store at once; without transfer threads that upload
@@ -2345,7 +2346,7 @@ mod tests {
         store.memory.remove_record(&child.key).unwrap();
         let hit = store.lookup(&full, 500, u64::MAX).unwrap();
         assert_eq!(hit.tier, Tier::Nvme);
-        let expected = (10 * PAGE_RECORD + ROW_RECORD) as f64 / store.disk_inbound_rate.0
+        let expected = (10 * PAGE_RECORD + ROW_RECORD) as f64 / store.disk_inbound_rate.get()
             + hit.bytes as f64 / store.memory.stats().inbound_rate;
         assert!((hit.estimated_seconds - expected).abs() < 1e-9);
         store
@@ -2370,6 +2371,31 @@ mod tests {
         store.close().unwrap();
         drop(store);
         fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn a_slow_disk_read_does_not_refuse_disk_restores_for_good() {
+        let Some(directory) = test_directory("composite", "slow-read-recovers") else {
+            return;
+        };
+        let mut store = composite(&directory, 32, 4, 1 << 30);
+        let full = history(1280);
+        let mut ids = Ids::new();
+        let root = checkpoint(&mut ids, &full, 640, None, pages(0..10), 10, StateSlotId(1));
+        written(&mut store, &root, None, 1);
+        store.memory.remove_record(&root.key).unwrap();
+        let seeded = store.lookup(&full, 0, u64::MAX).unwrap().estimated_seconds;
+        // The only disk read so far ran under contention.
+        store.disk_inbound_rate.observe(1 << 20, Duration::from_secs(5));
+        let slow = store.lookup(&full, 0, u64::MAX).unwrap().estimated_seconds;
+        assert!(slow > 1000.0 * seeded, "{slow} vs {seeded}");
+        // Refused restores read nothing; the estimate recovers on its own.
+        store.disk_inbound_rate.age(Duration::from_secs(200));
+        let later = store.lookup(&full, 0, u64::MAX).unwrap().estimated_seconds;
+        assert!(later < 2.0 * seeded, "{later} vs {seeded}");
+        store.close().unwrap();
+        drop(store);
+        fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]

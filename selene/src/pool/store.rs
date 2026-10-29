@@ -419,6 +419,7 @@ impl<S: crate::store::TierStore, P: PoolPort> HostStore for PooledStore<S, P> {
         let level = planned.plan.part.level;
         let bytes = hit.bytes;
         let started = Instant::now();
+        self.rates.started(level);
         let id = self.pool.fetch(PoolFetch {
             id: 0,
             page_tokens: self.page_tokens,
