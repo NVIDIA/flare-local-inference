@@ -642,11 +642,12 @@ fn publish_inner(
         }
         let payload_bytes = deployment.payloads.iter().map(|payload| payload.nbytes()).sum();
         let data_phase = progress.phase(if weights.is_some() { "Publish shared data" } else { "Verify and publish shared data" }, Some(payload_bytes));
-        // Copy the shared payloads the cache still lacks concurrently. The ordered loop below
-        // remains the only place that links, locates, and catalogs them, and finds these objects.
+        // Verify cached shared payloads and copy the ones the cache still lacks concurrently. The
+        // ordered loop below remains the only place that links, locates, and catalogs them, and
+        // finds these objects already verified.
         let mut installed = std::collections::HashSet::new();
         if let Destination::Cache(root, _) = &destination {
-            let mut missing = Vec::new();
+            let mut pending = Vec::new();
             let mut seen = std::collections::BTreeSet::new();
             for payload in &deployment.payloads {
                 let weight = matches!(
@@ -657,16 +658,15 @@ fn publish_inner(
                 if located.contains_key(&payload.id)
                     || (weight && (request.no_weights || reused))
                     || !seen.insert(payload.id)
-                    || root.payload(payload.id)?.is_some()
                 {
                     continue;
                 }
-                missing.push(payload);
+                pending.push(payload);
             }
-            if !missing.is_empty() {
-                data_phase.detail(format!("installing {} missing payloads", missing.len()));
-                verified.install(&missing, root, &data_phase)?;
-                installed.extend(missing.iter().map(|payload| source_address(payload)));
+            if !pending.is_empty() {
+                data_phase.detail(format!("installing {} shared payloads", pending.len()));
+                verified.install(&pending, root, &data_phase)?;
+                installed.extend(pending.iter().map(|payload| source_address(payload)));
             }
         }
         let mut reused_bytes = 0;
@@ -1054,7 +1054,7 @@ fn verify_payload_source(payload: &PublishPayload) -> Result<PayloadId, crate::E
 }
 
 /// Payload sources whose bytes already hashed to their assigned identity, keyed by address, and
-/// cache objects this export installed and verified ahead of the ordered publication loop.
+/// cache objects this export installed or hashed ahead of the ordered publication loop.
 #[derive(Default)]
 struct VerifiedSources {
     sources: std::collections::HashSet<usize>,
@@ -1143,10 +1143,11 @@ impl VerifiedSources {
         verify_payload_source(payload)
     }
 
-    /// Insert cache objects for `payloads`, which have distinct identities absent from `root`,
-    /// on the parallel readers. Each runs the ordered loop's miss path: check the source, copy it
-    /// into the cache, and hash the written object against its identity. The ordered loop then
-    /// links these objects without hashing them again.
+    /// Resolve cache objects for `payloads`, which have distinct identities, on the parallel
+    /// readers. Each runs the ordered loop's cache path: check the source, then hash a cached
+    /// object against its identity unless it is the very source span, or copy the source into the
+    /// cache and hash the written object. The ordered loop then links these objects without
+    /// hashing them again.
     fn install(
         &mut self,
         payloads: &[&PublishPayload],
@@ -1156,24 +1157,47 @@ impl VerifiedSources {
         let this = &*self;
         let (_, objects) = largest_first(payloads, |payload| {
             this.check(payload)?;
-            let object = root.insert_payload(payload.id, payload.nbytes(), payload.reader())?;
-            if object.id() != payload.id {
-                return Err(invalid(
-                    "cache payload identity differs from the signed identity",
-                ));
-            }
+            let object = match root.payload(payload.id)? {
+                Some(object) => {
+                    if object.length() != payload.nbytes() {
+                        return Err(invalid(format!(
+                            "cached payload {} length differs from its declaration",
+                            payload.id
+                        )));
+                    }
+                    if !same_bytes(object.slice(), &payload.source)
+                        && object.slice().digest()? != payload.id
+                    {
+                        return Err(invalid(format!(
+                            "cached payload {} bytes do not match their identity",
+                            payload.id
+                        )));
+                    }
+                    object
+                }
+                None => {
+                    let object =
+                        root.insert_payload(payload.id, payload.nbytes(), payload.reader())?;
+                    if object.id() != payload.id {
+                        return Err(invalid(
+                            "cache payload identity differs from the signed identity",
+                        ));
+                    }
+                    object
+                }
+            };
             phase.advance_bytes(payload.nbytes());
             Ok(object)
         })?;
         for (index, object) in objects {
-            // Each source was checked before it was copied.
+            // Each source was checked before its object was resolved.
             self.sources.insert(source_address(payloads[index]));
             self.installed.insert(object.id(), object);
         }
         Ok(())
     }
 
-    /// Whether `object` is the file this export installed and hashed under its identity.
+    /// Whether `object` is the file this export installed or hashed under its identity.
     fn installed(&self, object: &crate::package::cache::PayloadObject) -> bool {
         self.installed
             .get(&object.id())
@@ -3187,7 +3211,28 @@ mod tests {
         let installed = root.payload(fresh_id).unwrap().unwrap();
         assert_eq!(installed.slice().digest().unwrap(), fresh_id);
         assert_eq!(blobs(&cache_dir), 6);
-        drop((entry, installed, objects, object_a, object_b, root));
+        drop((entry, installed, objects, object_a, object_b));
+
+        // A cached object is hashed by the concurrent pass before it is linked: corrupting the
+        // cached state in place fails publication although its source is intact.
+        let state_object = root.payload(id_state).unwrap().unwrap();
+        let state_path = state_object.path().to_path_buf();
+        let state_end = (state_object.slice().offset() + state_object.slice().len()) as usize;
+        drop(state_object);
+        let mut permissions = std::fs::metadata(&state_path).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&state_path, permissions).unwrap();
+        let mut stored = std::fs::read(&state_path).unwrap();
+        stored[state_end - 1] ^= 0xff;
+        std::fs::write(&state_path, &stored).unwrap();
+        let mut staging = root.stage("model", "corrupted-cache").unwrap();
+        let error = publish(&reuse, &key, Destination::Cache(&root, &mut staging)).unwrap_err();
+        assert!(
+            error.to_string().contains(&format!("cached payload {id_state} bytes do not match their identity")),
+            "{error}"
+        );
+        drop((staging, root));
         let _ = std::fs::remove_dir_all(&work);
     }
 
