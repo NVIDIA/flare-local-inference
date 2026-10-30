@@ -34,7 +34,7 @@ def stage_windows(history, values, output, metadata, *, counts=None, first_posit
         torch.where((positions < m.starts[:, None])[:, :, None, None], previous, current), 0)
     if output.dtype == torch.float8_e4m3fn:
         staged = staged.clamp(-448, 448)
-    output.view(rows, capacity, *values.shape[1:]).copy_(staged)
+    output.view(rows, capacity, *values.shape[1:]).copy_(staged.to(output.dtype))
 
 
 def commit_window(history, values, row, start, length):

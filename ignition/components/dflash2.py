@@ -13,7 +13,7 @@ from ignition.components.linear import prepare_projection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.vocabulary import PreparedVocabularyProjection
-from ignition.components.window_attention import stage_windows
+from ignition.components.window_staging import PreparedWindowStaging
 
 PAGE_TOKENS = 128
 
@@ -174,6 +174,8 @@ class DraftAttention:
         rows = metadata.lengths.numel()
         count = (a.window + config.block_size + PAGE_TOKENS - 1) // PAGE_TOKENS
         self.staged_key, self.staged_value = scratch.window_key[:rows * count], scratch.window_value[:rows * count]
+        self.staging = PreparedWindowStaging(self.history_key, self.history_value, scratch.key, scratch.value,
+            self.staged_key, self.staged_value, metadata, session=session, name=name + ".staging")
         self.pages = torch.arange(rows * count, device=source.device, dtype=torch.int32).view(rows, count)
         self.lengths = buffers.zeros(metadata.lengths.shape, metadata.lengths.dtype)
         self.attention = PreparedPagedAttention(scratch.query, self.staged_key, self.staged_value,
@@ -191,8 +193,7 @@ class DraftAttention:
         s.query.copy_(_rotary(self.q_norm(q.view_as(s.query)), m.positions, self.inverse))
         s.key.copy_(_rotary(self.k_norm(k.view_as(s.key)), m.positions, self.inverse))
         s.value.copy_(v.view_as(s.value))
-        stage_windows(self.history_key, s.key, self.staged_key, m)
-        stage_windows(self.history_value, s.value, self.staged_value, m)
+        self.staging()
         self.lengths.copy_(torch.where(m.lengths > 0, m.starts.clamp(max=self.window) + m.lengths, 0).int())
         self.attention()
         return self.reduce(self.output(s.attended.flatten(1)))
