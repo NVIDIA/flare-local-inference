@@ -1664,11 +1664,15 @@ impl super::payload::Files for PayloadSource {
                 .relative
                 .get(&span.filename)
                 .ok_or_else(|| invalid("payload container has no relative name"))?;
-            Ok(self
-                .path
-                .parent()
-                .unwrap_or_else(|| std::path::Path::new("."))
-                .join(relative))
+            // An empty relative name means the payload is stored in the primary container.
+            Ok(if relative.is_empty() {
+                self.path.clone()
+            } else {
+                self.path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."))
+                    .join(relative)
+            })
         }
     }
     fn release_page_cache(&self) {}
