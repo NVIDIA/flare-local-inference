@@ -458,8 +458,8 @@ fn package_free(pointer: *mut c_void, transient: bool) {
                 Ok(handle)
             })?;
         }
-        a.mappings.remove(&address);
         if retain {
+            a.mappings.remove(&address);
             a.retained_mappings
                 .insert(RetainedMapping { address, size });
             return Ok(());
@@ -468,6 +468,7 @@ fn package_free(pointer: *mut c_void, transient: bool) {
             a.driver
                 .check("cuMemUnmap", (a.driver.unmap)(address, size))?;
         }
+        a.mappings.remove(&address);
         release_free_range(&mut a.free, address, size);
         Ok(())
     };
@@ -600,7 +601,12 @@ extern "C" fn flare_package_error() -> *const c_char {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
+
+    // Tests that install the global arena must not interleave with each other.
+    static ARENA_TEST_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn secondary_aborted_free_preserves_first_driver_error() {
@@ -1001,6 +1007,9 @@ mod tests {
 
     #[test]
     fn retention_finish_after_abort_makes_no_driver_calls() {
+        let _guard = ARENA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
         let Ok(mut driver) = Driver::load() else {
             return;
         };
@@ -1036,6 +1045,72 @@ mod tests {
         assert!(allocator.free.is_empty());
         assert_eq!(allocator.retained.handles, vec![(7, 4096)]);
         *arena = None;
+        *ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
+    }
+
+    static FREE_TEST_UNMAP_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    unsafe extern "C" fn failing_once_unmap(_address: u64, _size: usize) -> i32 {
+        if FREE_TEST_UNMAP_CALLS.fetch_add(1, Ordering::SeqCst) == 0 {
+            1
+        } else {
+            0
+        }
+    }
+
+    #[test]
+    fn package_free_keeps_mapping_when_unmap_fails() {
+        let _guard = ARENA_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let Ok(mut driver) = Driver::load() else {
+            return;
+        };
+        driver.unmap = failing_once_unmap;
+        {
+            let mut arena = ARENA.lock().unwrap_or_else(|error| error.into_inner());
+            *arena = Some(Arena {
+                driver,
+                device: 0,
+                granularity: 4096,
+                gpudirect: false,
+                host_base: 0,
+                free: Vec::new(),
+                mappings: BTreeMap::from([(0x10000, 4096)]),
+                retained: RetainedBacking::default(),
+                retained_mappings: RetainedMappingPool::default(),
+            });
+        }
+        let pointer = 0x10000 as *mut c_void;
+
+        flare_package_free(pointer, 4096, 0, null_mut());
+        let error = ERROR
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .as_ref()
+            .map(|error| error.to_string_lossy().into_owned());
+        assert!(
+            error
+                .as_deref()
+                .is_some_and(|error| error.contains("cuMemUnmap")),
+            "{error:?}"
+        );
+        {
+            let mut arena = ARENA.lock().unwrap_or_else(|error| error.into_inner());
+            let allocator = arena.as_mut().unwrap();
+            assert_eq!(allocator.mappings.get(&0x10000), Some(&4096));
+            assert!(allocator.free.is_empty());
+        }
+
+        flare_package_free(pointer, 4096, 0, null_mut());
+        {
+            let mut arena = ARENA.lock().unwrap_or_else(|error| error.into_inner());
+            let allocator = arena.as_mut().unwrap();
+            assert!(allocator.mappings.is_empty());
+            assert_eq!(allocator.free, vec![(0x10000, 4096)]);
+            *arena = None;
+        }
+        assert_eq!(FREE_TEST_UNMAP_CALLS.load(Ordering::SeqCst), 2);
         *ERROR.lock().unwrap_or_else(|error| error.into_inner()) = None;
     }
 
