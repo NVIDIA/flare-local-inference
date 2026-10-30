@@ -294,6 +294,7 @@ pub(crate) async fn connect(
     Unreachable,
 > {
     match &link.address {
+        #[cfg(unix)]
         PoolAddress::Unix(path) => {
             let path = path.clone();
             let channel = Endpoint::try_from("http://selene.local")
@@ -310,6 +311,12 @@ pub(crate) async fn connect(
                 .await
                 .map_err(|e| e.to_string())?;
             Ok((channel, wire::Encryption::Plaintext, None))
+        }
+        #[cfg(not(unix))]
+        PoolAddress::Unix(_) => {
+            return Err(Unreachable::Retry(
+                "unix-domain manager sockets are unsupported on this platform".into(),
+            ))
         }
         PoolAddress::Tcp(address) | PoolAddress::TcpPlaintext(address) => {
             let tls = if matches!(link.address, PoolAddress::Tcp(_)) {
