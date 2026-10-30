@@ -2,6 +2,7 @@
 
 import torch
 
+from .candidate_selector import PreparedCandidateSelector
 from .collectives import PreparedAllReduce
 from .draft_sampling import PreparedDraftDistribution, PreparedDraftBlockBroadcast
 from .paged_batch import Metadata, PreparedBatch
@@ -175,6 +176,8 @@ class PreparedParallelDraftRound:
 
             self.markov = PreparedMarkovEmbedding(o.weights, self.markov_token,
                                                   session=o.session, name=name + ".markov")
+        self.shortlisted_selector = (self.selector if self.markov is None
+            and isinstance(self.selector, PreparedCandidateSelector) else None)
         self.before = torch.zeros(b, dtype=torch.int64, device=device)
         self.active = torch.zeros(b, dtype=torch.bool, device=device)
         self.candidates = torch.zeros((b, w), dtype=torch.int64, device=device)
@@ -396,6 +399,8 @@ class PreparedParallelDraftRound:
                 o.inputs.live_rows,
             )
             self.draft()
+            if self.shortlisted_selector is not None:
+                self.shortlisted_selector.prepare_shortlists(self.draft.scratch.logits.view(b, block, -1))
             self.markov_token.copy_(torch.where(self.active, self.candidates[:, 0], 0))
             if self.argmax is not None:
                 # Greedy drafts: each position's shard logits plus its Markov bias, from the previous draft.
@@ -423,7 +428,9 @@ class PreparedParallelDraftRound:
                     )
                     if self.markov is not None:
                         self.logits[:, 0].add_(self.markov())
-                    if self.selector is not None:
+                    if self.shortlisted_selector is not None:
+                        self.shortlisted_selector.apply_shortlist(self.logits[:, 0], self.markov_token, i + o.logit_offset)
+                    elif self.selector is not None:
                         self.selector(self.logits[:, 0], self.markov_token, i + o.logit_offset)
                 if observer is not None:
                     observer.record_embedding(i, self.markov.embedding)
