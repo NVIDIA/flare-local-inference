@@ -8,10 +8,12 @@ import triton
 
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.gated_delta import GDNScratch, PreparedGDN
+from ignition.components.head_gate import PreparedHeadGate
 from ignition.components.linear import QuantizedProjection, prepare_projection
 from ignition.components.gdn_recovery import PreparedGDNCommit
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
+from ignition.components.rms_norm import PreparedRMSNorm
 from ignition.components.tensor_fp8 import TensorFP8Projection, TensorFP8Weight
 from ignition.components.vocabulary import PreparedVocabularyProjection
 
@@ -88,6 +90,16 @@ class GroupedMLP(torch.nn.Module):
         return self.down(self.intermediate)
 
 
+class RMSNorm(torch.nn.Module):
+    def __init__(self, canonical, source, output, *, session, name):
+        super().__init__()
+        self.operation = PreparedRMSNorm(source, canonical.weight, output, eps=canonical.eps,
+                                         zero_centered=True, session=session, name=name)
+
+    def forward(self, source):
+        return self.operation(source)
+
+
 def module_copy(module):
     result = copy(module)
     result._modules = module._modules.copy()
@@ -147,6 +159,11 @@ class FullAttention(torch.nn.Module):
             self.lengths, metadata.query_start_loc, self.attended.view(tokens, self.heads, self.dim),
             mode=mode, width=metadata.max_query_tokens if mode == "verify" else 1,
             session=session, workspace=workspace, name=name + ".attention")
+        self.output_gate = None
+        if mode != "prefill":
+            self.output_gate = PreparedHeadGate(self.attended.view(tokens * self.heads, self.dim, 1),
+                self.qg.view(tokens * self.heads, 2 * self.dim)[:, self.dim:],
+                session=session, name=name + ".output_gate")
 
     def write_cache(self, hidden_states, position_embeddings):
         from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb
@@ -168,7 +185,10 @@ class FullAttention(torch.nn.Module):
     def forward(self, hidden_states, position_embeddings, **kwargs):
         gate = self.write_cache(hidden_states, position_embeddings)
         self.attention()
-        self.attended.mul_(gate.reshape_as(self.attended).sigmoid())
+        if self.output_gate is None:
+            self.attended.mul_(gate.reshape_as(self.attended).sigmoid())
+        else:
+            self.output_gate()
         return self.projections["o_proj"](self.attended), None
 
 
@@ -200,10 +220,14 @@ class PreparedDecoder:
             for field in ("gate_proj", "up_proj"):
                 mlp_buffers[field] = zeros((source.shape[0], intermediate))
         mlp_input = zeros((source.shape[0], intermediate))
+        normalized = zeros(source.shape)
         self.layers = []
         for index, original in enumerate(weights.tree.layers):
             layer = module_copy(original)
             prefix = f"layers.{index}."
+            for field in ("input_layernorm", "post_attention_layernorm"):
+                setattr(layer, field, RMSNorm(getattr(original, field), source, normalized,
+                    session=session, name=name + "." + prefix + field))
             if original.block_type == "linear_attention":
                 inputs = (("in_proj_qkvz",) if prefix + "linear_attn.in_proj_qkvz" in weights.projections
                           else ("in_proj_qkv", "in_proj_z"))
