@@ -557,3 +557,27 @@ async fn the_nvme_limit_bounds_the_reservations_it_reports_however_many_puts_pas
     assert!(host.gauge("nvme_reserved_bytes") <= peak);
     assert_eq!(host.gauge("pool_quarantined_bytes"), 0);
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_freed_window_credit_is_granted_without_waiting_for_the_clock() {
+    // Windows of at most 64 pages: a record of 2048 pages takes 32 windows in a row. On one
+    // credit, granted only on the 10 ms clock they would wait 31 ticks; granted when each is
+    // reported filled, they take about as long as with a credit for every window. The two
+    // runs are compared, so the machine's speed cancels out.
+    let mut times = Vec::new();
+    for credits in [1, 32] {
+        let mut host = Host::dram_only(64 * 1024 * 1024);
+        host.config.limits.window_credits = credits;
+        host.run();
+        let mut pool = Pool::connect(&host.config.socket).await;
+        let mut writer = open(&mut pool, "writer").await;
+        let started = std::time::Instant::now();
+        store_chain(&mut writer, 1, &[64 * 2048]).await;
+        times.push(started.elapsed());
+    }
+    let (t1, t32) = (times[0], times[1]);
+    assert!(
+        t1 < 2 * t32,
+        "32 windows took {t1:?} on one credit and {t32:?} on 32"
+    );
+}

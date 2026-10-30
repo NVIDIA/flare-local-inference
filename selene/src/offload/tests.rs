@@ -219,7 +219,7 @@ fn zero_disk_limit_does_not_lock_or_scan_existing_records() {
     let fingerprint = geometry::fingerprint(&geometry);
     let directory = base.join(record::directory_name(&[0; 32], &fingerprint));
     std::fs::create_dir_all(&directory).unwrap();
-    let lock = record::DirectoryLock::acquire(&directory).unwrap();
+    let lock = crate::testing::directory_lock(&directory).unwrap();
     let active_write = directory.join("active-record.tmp");
     std::fs::write(&active_write, b"active writer payload").unwrap();
     let prepared = prepare(
@@ -332,10 +332,11 @@ fn pooled_row_warning_uses_the_allocated_tier_and_selected_concurrency() {
     };
     let prepared = build(&options);
     let rows = prepared.memory_pool.as_ref().unwrap().row_count();
-    assert!(prepared.pool_row_warning(rows / 2).is_none());
-    let warning = prepared.pool_row_warning(rows / 2 + 1).unwrap();
-    assert!(warning.contains(&format!("{rows} rows")));
-    assert!(warning.contains("publications may be skipped"));
+    assert!(prepared.pool_row_warning(rows).is_none());
+    let warning = prepared.pool_row_warning(rows + 1).unwrap();
+    assert!(warning.contains(&format!("{rows} record rows for max concurrency {}", rows + 1)));
+    assert!(warning.contains(&format!("({} recommended)", (rows + 1) * 2)));
+    assert!(warning.contains("publications may wait for spills"));
     options.memory_bytes = Some(0);
     assert!(build(&options).pool_row_warning(32).is_none());
 }

@@ -2882,6 +2882,9 @@ fn pinned_checkpoints_survive_eviction_pressure_until_unpinned() {
             .pin_count(),
         1
     );
+    let mut request = spec(193, 1);
+    request.prompt.fill(9);
+    assert!(scheduler.admit(request.clone()).is_err());
     assert!(scheduler.ensure_resources(4, 2).is_err());
     assert!(scheduler.cache().checkpoint(checkpoint).is_ok());
     assert_eq!(scheduler.stats().snapshot_evictions, 0);
@@ -2890,6 +2893,8 @@ fn pinned_checkpoints_survive_eviction_pressure_until_unpinned() {
     assert!(scheduler.cache().checkpoint(checkpoint).is_err());
     assert_eq!(free(&scheduler), (4, 2));
     assert!(scheduler.pin_checkpoint(checkpoint).is_err());
+    let admitted = scheduler.admit(request).unwrap();
+    scheduler.cancel(admitted).unwrap();
     // A checkpoint retired before its publication is taken is omitted.
     assert!(scheduler.take_publications().is_empty());
     scheduler.record_host_lookup();

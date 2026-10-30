@@ -1,7 +1,11 @@
 //! Fixtures for tests of this crate and of the crates that implement its seams.
 
 pub use crate::pool::{engine::RESTORE_DEADLINE, net::{Roots, trusted}, options::pool_address};
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
+};
 
 use blake2::{Blake2b, Digest, digest::consts::U16};
 
@@ -11,6 +15,27 @@ use crate::{
 };
 
 pub use crate::slab::rank_part;
+
+/// Retry locks briefly inherited by parallel subprocess tests before exec.
+pub fn directory_lock(directory: &Path) -> Result<crate::record::DirectoryLock> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match crate::record::DirectoryLock::acquire(directory) {
+            Ok(guard) => return Ok(guard),
+            Err(error) => {
+                let busy = error.cause().is_some_and(|cause| {
+                    cause
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+                });
+                if !busy || Instant::now() >= deadline {
+                    return Err(error);
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+    }
+}
 
 /// A token history with the key structure the index reads: a key at every
 /// hash-block boundary and at any endpoint between them. Digests chain, so two

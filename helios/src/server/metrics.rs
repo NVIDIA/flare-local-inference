@@ -255,7 +255,7 @@ pub(super) struct Metrics {
     host_lookup_outcomes: [AtomicU64; 5],
     host_store_reasons: [AtomicU64; 6],
     pub(super) host_retry_success: AtomicU64,
-    pub(super) host_retry_abandoned: AtomicU64,
+    pub(super) host_retry_abandoned: [AtomicU64; 6],
     host_cost_sums: [AtomicU64; 3],
     host_missing_tokens: [AtomicU64; 8],
     host_transfer_ns: [AtomicU64; 8],
@@ -263,6 +263,8 @@ pub(super) struct Metrics {
     host_store_skipped: AtomicU64,
     host_store_failed: AtomicU64,
     host_held: [AtomicU64; 2],
+    host_expired: [AtomicU64; 2],
+    host_rows: [AtomicU64; 2],
     host_dropped: [AtomicU64; 6],
     host_parked: AtomicU64,
     host_fetched: AtomicU64,
@@ -466,14 +468,11 @@ impl Metrics {
     }
 
     pub(super) fn host_store_outcome(&self, outcome: flare_selene::StoreOutcome) {
-        use flare_selene::{StoreOutcome, StoreReason};
+        use flare_selene::StoreOutcome;
         let reason = match outcome {
             StoreOutcome::Queued => return,
             StoreOutcome::Present => 0,
-            StoreOutcome::Retry(StoreReason::Inflight) => 1,
-            StoreOutcome::Retry(StoreReason::Slabs) => 2,
-            StoreOutcome::Retry(StoreReason::Queue) => 3,
-            StoreOutcome::Retry(StoreReason::Budget) => 4,
+            StoreOutcome::Retry(reason) => reason as usize + 1,
             StoreOutcome::Oversize => 5,
         };
         self.host_store_reasons[reason].fetch_add(1, Ordering::Relaxed);
@@ -511,7 +510,14 @@ impl Metrics {
             .host_held
             .iter()
             .chain(&self.host_dropped)
-            .zip(stats.held.into_iter().chain(stats.dropped))
+            .chain(&self.host_expired)
+            .zip(
+                stats
+                    .held
+                    .into_iter()
+                    .chain(stats.dropped)
+                    .chain(stats.expired),
+            )
         {
             counter.store(value, Ordering::Relaxed);
         }
@@ -531,6 +537,8 @@ impl Metrics {
             ),
             (&self.host_inbound_in_flight, stats.inbound_in_flight as u64),
             (&self.host_memory_records, stats.memory_records as u64),
+            (&self.host_rows[0], stats.rows_used as u64),
+            (&self.host_rows[1], stats.rows_total as u64),
             (&self.host_memory_bytes, stats.memory_bytes),
             (&self.host_disk_records, stats.disk_records as u64),
             (&self.host_disk_bytes, stats.disk_bytes),
@@ -547,7 +555,13 @@ impl Metrics {
     pub fn render(&self) -> String {
         let mut text = String::with_capacity(4096);
         text.push_str("# HELP flare_host_cache_held_total Records held because the next tier could not accept them.\n# TYPE flare_host_cache_held_total counter\n# HELP flare_host_cache_dropped_total Host records dropped at the local end or through oversize or I/O errors.\n# TYPE flare_host_cache_dropped_total counter\n");
+        text.push_str("# TYPE flare_host_cache_expired_total counter\n");
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {
+            let _ = writeln!(
+                text,
+                "flare_host_cache_expired_total{{tier=\"{tier}\"}} {}",
+                self.host_expired[i].load(Ordering::Relaxed)
+            );
             let _ = writeln!(
                 text,
                 "flare_host_cache_held_total{{tier=\"{tier}\"}} {}",
@@ -565,6 +579,13 @@ impl Metrics {
             }
         }
         for (name, labels, counters) in [
+            (
+                "host_cache_retry_abandoned_total",
+                &[
+                    "inflight", "slabs", "queue", "budget", "oversize", "io_error",
+                ][..],
+                &self.host_retry_abandoned[..],
+            ),
             (
                 "host_cache_lookup_outcomes_total",
                 &[
@@ -863,11 +884,6 @@ impl Metrics {
                 &self.host_retry_success,
             ),
             (
-                "host_cache_retry_abandoned_total",
-                "Deferred publications abandoned after eviction or permanent refusal.",
-                &self.host_retry_abandoned,
-            ),
-            (
                 "host_cache_stored_total",
                 "Published checkpoints whose copy to the host store completed.",
                 &self.host_stored,
@@ -1014,6 +1030,16 @@ impl Metrics {
                 "host_cache_inbound_waiting",
                 "Admitted requests waiting for a host store restore.",
                 &self.host_inbound_waiting,
+            ),
+            (
+                "host_cache_rows_in_use",
+                "Allocated host retention row slots.",
+                &self.host_rows[0],
+            ),
+            (
+                "host_cache_rows_total",
+                "Host retention row slot capacity.",
+                &self.host_rows[1],
             ),
             (
                 "host_cache_memory_records",
@@ -1385,6 +1411,9 @@ mod tests {
             bytes_out: 1 << 20,
             memory_records: 3,
             parked_records: 2,
+            rows_used: 3,
+            rows_total: 8,
+            expired: [7, 9],
             held: [3, 4],
             dropped: [1, 2, 3, 4, 5, 6],
             outbound_rate: 2.5e9,
@@ -1409,6 +1438,17 @@ mod tests {
         assert!(text.contains("flare_host_cache_inbound_waiting 1\n"));
         assert!(text.contains("flare_host_cache_bytes_out_total 1048576\n"));
         assert!(text.contains("flare_host_cache_memory_records 3\n"));
+        assert!(text.contains("flare_host_cache_rows_in_use 3\n"));
+        assert!(text.contains("flare_host_cache_rows_total 8\n"));
+        assert!(text.contains("flare_host_cache_expired_total{tier=\"dram\"} 7\n"));
+        assert!(text.contains("flare_host_cache_expired_total{tier=\"nvme\"} 9\n"));
+        for reason in [
+            "inflight", "slabs", "queue", "budget", "oversize", "io_error",
+        ] {
+            assert!(text.contains(&format!(
+                "flare_host_cache_retry_abandoned_total{{reason=\"{reason}\"}} 0\n"
+            )));
+        }
         assert!(text.contains("# TYPE flare_host_cache_parked_records gauge\n"));
         assert!(text.contains("flare_host_cache_parked_records 2\n"));
         for (i, tier) in ["dram", "nvme"].into_iter().enumerate() {

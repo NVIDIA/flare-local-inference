@@ -897,6 +897,8 @@ impl Core {
                 self.put_fail_by_key(key, v2::Reason::Invalid, &error.to_string());
             }
         }
+        // Credits are free, the window's or the failed put's: grant them now, not at the next tick.
+        self.pump_store_windows();
     }
 
     fn put_fail(&mut self, sid: u64, key: PutKey, reason: v2::Reason, detail: &str) {

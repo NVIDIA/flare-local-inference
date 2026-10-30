@@ -8,8 +8,9 @@
 //! to the tokens a request adds beyond its resident GPU checkpoint.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{HASH_BLOCK_TOKENS, History, PrefixKey, Result};
@@ -31,6 +32,7 @@ pub struct Node<L> {
     children: u32,
     pins: u32,
     accessed: u64,
+    pub last_used: SystemTime,
 }
 
 impl<L> Node<L> {
@@ -102,6 +104,9 @@ pub struct Index<L> {
     nodes: HashMap<PrefixKey, Node<L>>,
     buckets: HashMap<[u8; 16], Vec<PrefixKey>>,
     clock: u64,
+    order: BTreeSet<(u64, PrefixKey)>,
+    pub max_age: Duration,
+    swept: Option<Instant>,
     notices: Option<NodeNotices>,
 }
 
@@ -112,6 +117,9 @@ impl<L> Index<L> {
             nodes: HashMap::new(),
             buckets: HashMap::new(),
             clock: 0,
+            order: BTreeSet::new(),
+            max_age: Duration::ZERO,
+            swept: None,
             notices: None,
         }
     }
@@ -208,6 +216,10 @@ impl<L> Index<L> {
         self.nodes.values()
     }
 
+    pub fn ordered(&self) -> impl Iterator<Item = &Node<L>> {
+        self.order.iter().map(|(_, key)| &self.nodes[key])
+    }
+
     fn tick(&mut self) -> u64 {
         self.clock += 1;
         self.clock
@@ -250,6 +262,12 @@ impl<L> Index<L> {
             ));
         }
         let accessed = self.tick();
+        self.order.insert((accessed, key));
+        let last_used = if self.max_age.is_zero() {
+            SystemTime::UNIX_EPOCH
+        } else {
+            SystemTime::now()
+        };
         self.buckets.entry(bucket).or_default().push(key);
         self.nodes.insert(
             key,
@@ -264,8 +282,10 @@ impl<L> Index<L> {
                 children: 0,
                 pins: 0,
                 accessed,
+                last_used,
             },
         );
+        self.touch_ancestors(&key);
         if ready {
             self.notify(NodeEvent::Ready, &self.nodes[&key]);
         }
@@ -275,7 +295,9 @@ impl<L> Index<L> {
     pub fn access_at(&mut self, key: &PrefixKey, tick: u64) {
         self.clock = self.clock.max(tick);
         if let Some(node) = self.nodes.get_mut(key) {
+            self.order.remove(&(node.accessed, *key));
             node.accessed = tick;
+            self.order.insert((tick, *key));
         }
     }
 
@@ -291,6 +313,7 @@ impl<L> Index<L> {
             ));
         }
         let node = self.nodes.remove(key).unwrap();
+        self.order.remove(&(node.accessed, *key));
         if let Some(keys) = self.buckets.get_mut(&node.bucket) {
             keys.retain(|k| k != key);
             if keys.is_empty() {
@@ -304,11 +327,52 @@ impl<L> Index<L> {
         Ok(node)
     }
 
-    pub fn touch(&mut self, key: &PrefixKey) {
+    /// Move only this key to the newest LRU position.
+    pub fn access(&mut self, key: &PrefixKey) {
         let tick = self.tick();
-        if let Some(node) = self.nodes.get_mut(key) {
-            node.accessed = tick;
+        self.access_at(key, tick);
+    }
+
+    pub fn touch(&mut self, key: &PrefixKey) {
+        self.access(key);
+        self.touch_ancestors(key);
+    }
+
+    pub fn touch_ancestors(&mut self, key: &PrefixKey) {
+        if self.max_age.is_zero() {
+            return;
         }
+        let now = SystemTime::now();
+        let mut cursor = Some(*key);
+        while let Some(current) = cursor {
+            let Some(node) = self.nodes.get_mut(&current) else {
+                break;
+            };
+            node.last_used = now;
+            cursor = node.parent;
+        }
+    }
+
+    /// Select at most 64 expired leaves per minute, oldest first.
+    pub fn expired(&mut self, eligible: impl Fn(&Node<L>) -> bool) -> Vec<PrefixKey> {
+        if self.max_age.is_zero()
+            || self
+                .swept
+                .is_some_and(|at| at.elapsed() < Duration::from_secs(60))
+        {
+            return Vec::new();
+        }
+        self.swept = Some(Instant::now());
+        let now = SystemTime::now();
+        self.ordered()
+            .take_while(|node| {
+                node.children > 0
+                    || now.duration_since(node.last_used).unwrap_or_default() >= self.max_age
+            })
+            .filter(|node| node.children == 0 && eligible(node))
+            .take(64)
+            .map(|node| node.key)
+            .collect()
     }
 
     pub fn pin(&mut self, key: &PrefixKey) -> Result<()> {
@@ -473,6 +537,7 @@ impl<L> Index<L> {
         let mut next = Some(*key);
         while let Some(key) = next {
             let node = self.nodes.remove(&key).unwrap();
+            self.order.remove(&(node.accessed, key));
             if let Some(keys) = self.buckets.get_mut(&node.bucket) {
                 keys.retain(|k| *k != key);
                 if keys.is_empty() {
@@ -499,15 +564,13 @@ impl<L> Index<L> {
         need_row: bool,
         evictable: impl Fn(&Node<L>) -> bool,
     ) -> Option<PrefixKey> {
-        self.nodes
-            .values()
-            .filter(|node| {
+        self.ordered()
+            .find(|node| {
                 node.ready
                     && node.pins == 0
                     && evictable(node)
                     && (node.children == 0 || (need_row && node.row && node.children == 1))
             })
-            .min_by_key(|node| (node.accessed, node.key.consumed_tokens))
             .map(|node| node.key)
     }
 
@@ -993,5 +1056,88 @@ mod tests {
             [test_key(600), test_key(400)]
         );
         assert_eq!(tree.len(), 1);
+    }
+    #[test]
+    fn expiry_is_bounded_and_advances_past_pinned_records() {
+        let mut tree = Index::new(64);
+        let old = SystemTime::now() - Duration::from_secs(10800);
+        for n in 1..=130u64 {
+            let key = test_key(n * 64);
+            tree.insert(key, None, [0; 16], n as usize, true, true, ())
+                .unwrap();
+            tree.node_mut(&key).unwrap().last_used = old;
+            if n <= 64 {
+                tree.pin(&key).unwrap();
+            }
+        }
+        assert!(tree.expired(|node| !node.pinned()).is_empty());
+        tree.max_age = Duration::from_secs(7200);
+        let first = tree.expired(|node| !node.pinned());
+        assert_eq!(first.len(), 64);
+        assert_eq!(first[0], test_key(65 * 64));
+        for key in first {
+            tree.remove_node(&key).unwrap();
+        }
+        assert!(tree.expired(|node| !node.pinned()).is_empty());
+        tree.swept = Some(Instant::now() - Duration::from_secs(60));
+        tree.touch(&test_key(129 * 64));
+        assert_eq!(tree.expired(|node| !node.pinned()), [test_key(130 * 64)]);
+        tree.max_age = Duration::ZERO;
+        tree.swept = None;
+        assert!(tree.expired(|node| !node.pinned()).is_empty());
+
+        let mut tree = Index::new(64);
+        tree.max_age = Duration::from_secs(7200);
+        let h = history(192);
+        insert(&mut tree, &h, 64, None);
+        insert(&mut tree, &h, 128, Some(64));
+        insert(&mut tree, &h, 192, None);
+        // A fresh ancestor with an old tick must not hide an expired leaf.
+        tree.access_at(&h.key_at(64).unwrap(), 0);
+        let cold = h.key_at(192).unwrap();
+        tree.access_at(&cold, 1);
+        tree.node_mut(&cold).unwrap().last_used = old;
+        tree.max_age = Duration::from_secs(7200);
+        assert_eq!(tree.expired(|node| !node.pinned()), [cold]);
+    }
+
+    #[test]
+    fn child_publication_and_hits_refresh_ancestry_without_moving_parent_lru() {
+        let mut tree = Index::new(64);
+        tree.max_age = Duration::from_secs(7200);
+        let h = history(192);
+        insert(&mut tree, &h, 64, None);
+        let cold = test_key(256);
+        tree.insert(cold, None, [0; 16], 4, true, true, ()).unwrap();
+        let parent = h.key_at(64).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(10800);
+        tree.node_mut(&parent).unwrap().last_used = old;
+        let accessed = tree[&parent].accessed();
+        insert(&mut tree, &h, 128, Some(64));
+        assert!(tree.node(&parent).unwrap().last_used > old);
+        assert_eq!(tree[&parent].accessed(), accessed);
+        tree.node_mut(&parent).unwrap().last_used = old;
+        tree.touch(&h.key_at(128).unwrap());
+        assert!(tree[&parent].last_used > old);
+        assert_eq!(tree[&parent].accessed(), accessed);
+        tree.node_mut(&cold).unwrap().last_used = old;
+        tree.max_age = Duration::from_secs(7200);
+        assert_eq!(tree.expired(|node| !node.pinned()), [cold]);
+    }
+
+    #[test]
+    fn default_off_does_not_refresh_timestamps() {
+        let mut tree = Index::new(64);
+        let h = history(192);
+        insert(&mut tree, &h, 64, None);
+        let parent = h.key_at(64).unwrap();
+        let accessed = tree[&parent].accessed();
+        insert(&mut tree, &h, 128, Some(64));
+        tree.touch(&h.key_at(128).unwrap());
+        assert_eq!(tree[&parent].accessed(), accessed);
+        assert!(
+            tree.nodes()
+                .all(|node| node.last_used == SystemTime::UNIX_EPOCH)
+        );
     }
 }

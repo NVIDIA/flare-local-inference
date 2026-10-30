@@ -1042,7 +1042,9 @@ fn store_and_wait<S: HostStore>(store: &mut S, checkpoint: &PublishedCheckpoint)
                             return;
                         }
                     }
-                    StoreEvent::Deferred { checkpoint: id } if id == checkpoint.id => retry = true,
+                    StoreEvent::Deferred { checkpoint: id, .. } if id == checkpoint.id => {
+                        retry = true
+                    }
                     _ => {}
                 }
             }
@@ -1206,7 +1208,7 @@ fn a_record_cascades_from_memory_to_the_disk_tier_to_the_manager_store() {
     let (memory_transfers, gpu) = SimulatedGpu::shared(&geometry).unwrap();
     let pool = SlabPool::new(PAGE as u64, 4, ROW as u64, 4, true).unwrap();
     let memory = MemoryStore::new_flat([7; 32], pool, memory_transfers).unwrap();
-    let lock = record::DirectoryLock::acquire(&directory).unwrap();
+    let lock = flare_selene::testing::directory_lock(&directory).unwrap();
     let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
     let file_bytes = record::Header::new(
         &geometry,
@@ -1279,7 +1281,7 @@ fn drained_records_are_announced_and_claimable_after_restart() {
         let geometry = geo();
         let layout = Layout::new(&geometry).unwrap();
         let fingerprint = fingerprint(&geometry);
-        let lock = record::DirectoryLock::acquire(&directory).unwrap();
+        let lock = flare_selene::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
         let (memory_copier, gpu) = SimulatedGpu::shared(&geometry).unwrap();
         let memory = MemoryStore::new_flat(
@@ -1394,7 +1396,7 @@ fn large_recovered_nvme_records_restore_consecutively() {
         let geometry = geo();
         let layout = Layout::new(&geometry).unwrap();
         let fingerprint = fingerprint(&geometry);
-        let lock = record::DirectoryLock::acquire(&directory).unwrap();
+        let lock = flare_selene::testing::directory_lock(&directory).unwrap();
         let scanned = record::scan(&lock, &[7; 32], &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
         let (copier, gpu) = SimulatedGpu::shared(&geometry).unwrap();
         let store = DiskStore::new(

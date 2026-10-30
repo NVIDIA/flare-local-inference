@@ -70,6 +70,13 @@ def test_prefix_cache_settings_validate(tmp_path):
         with pytest.raises(UsageError, match="disk_transport"):
             load(tmp_path, f'[prefix_cache]\ndisk_transport = "{transport}"\n')
 
+    assert configuration.get("prefix_cache.max_age") == Setting("off", "default")
+    for value in ("off", "2h", "0.5s"):
+        assert load(tmp_path, f'[prefix_cache]\nmax_age="{value}"\n').get("prefix_cache.max_age").value == value
+    for value in ("on", "0", "-1s", "NaN", "2d"):
+        with pytest.raises(UsageError, match="max_age"):
+            load(tmp_path, f'[prefix_cache]\nmax_age="{value}"\n')
+
 
 def test_recipe_supplies_concurrency_when_the_file_is_silent(tmp_path):
     configuration = load(tmp_path, "[server]\nport = 8001\n")
