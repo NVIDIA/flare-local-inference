@@ -913,8 +913,8 @@ impl<'a> Downloader<'a> {
                 size,
                 self.stream
             ).map_err(|error| invalid(format!(
-                "scanning allocation {:?} ({}) at {:#x}+{}, offset {offset}: {error}",
-                allocation.name, allocation.memory, allocation.address + offset, size
+                "scanning allocation {:?} ({}) at {:#x}+{}, offset {offset} of recorded {}: {error}",
+                allocation.name, allocation.memory, allocation.address + offset, size, allocation.nbytes
             )))?;
             cu!(
                 self.cuda,
@@ -1110,7 +1110,7 @@ fn prepare_allocations(
     cuda: &Cuda,
     request: &CaptureRequest,
     recorder: Option<&Recorder>,
-) -> ExportResult<(Vec<Allocation>, Vec<(u64, u64)>)> {
+) -> ExportResult<(Vec<Allocation>, Vec<(u64, u64)>, Vec<String>)> {
     let mut allocations = request.allocations.clone();
     let mut external = Vec::new();
     if recorder.is_none() && (request.discover_allocations || !request.peer_mappings.is_empty()) {
@@ -1176,7 +1176,9 @@ fn prepare_allocations(
             external.push((recorded.address, recorded.nbytes));
         }
     }
-    allocations.extend(external_allocations(external.clone(), request.granularity)?);
+    let discovered = external_allocations(external.clone(), request.granularity)?;
+    let discovered_names: Vec<String> = discovered.iter().map(|a| a.name.clone()).collect();
+    allocations.extend(discovered);
     let inactive = merge_ranges(request.inactive.clone());
     let peer: HashSet<_> = request.peer_addresses.iter().copied().collect();
     allocations = allocations
@@ -1197,7 +1199,32 @@ fn prepare_allocations(
     for allocation in &mut allocations {
         without_zero_ranges(allocation, &zero);
     }
-    Ok((allocations, external))
+    Ok((allocations, external, discovered_names))
+}
+
+/// Whether a device allocation still reads end to end.
+///
+/// A released range can still be partially mapped, so a single probe is not enough: read the whole
+/// extent and let the driver report the first address that is no longer backed.
+fn allocation_readable(cuda: &Cuda, allocation: &Allocation) -> ExportResult<bool> {
+    let mut probe = vec![0u8; 8 << 20];
+    let mut offset = 0u64;
+    while offset < allocation.nbytes {
+        let size = (allocation.nbytes - offset).min(probe.len() as u64) as usize;
+        let copied = cu!(
+            cuda,
+            "cuMemcpyDtoH_v2",
+            (Handle, u64, usize),
+            probe.as_mut_ptr().cast::<c_void>(),
+            allocation.address + offset,
+            size
+        );
+        if copied.is_err() {
+            return Ok(false);
+        }
+        offset += size as u64;
+    }
+    Ok(true)
 }
 
 fn validate_allocations(allocations: &[Allocation]) -> ExportResult<()> {
@@ -1610,6 +1637,28 @@ fn write_allocation(
     if allocation.initialize == "zero" {
         return Ok((None, vec![]));
     }
+    // A recorded library allocation can be freed after recording; name that here instead of
+    // failing deep inside the copy loop with a bare CUDA error.
+    if allocation.memory == "device" {
+        let mut memory = 0i32;
+        let checked = cu!(
+            downloader.cuda,
+            "cuPointerGetAttribute",
+            (*mut c_void, c_int, u64),
+            (&mut memory as *mut i32).cast(),
+            2,
+            allocation.address
+        );
+        match checked {
+            Ok(()) if memory == 2 => {}
+            _ => {
+                return Err(invalid(format!(
+                    "storage allocation {:?} at {:#x}+{} is no longer device memory",
+                    allocation.name, allocation.address, allocation.nbytes
+                )))
+            }
+        }
+    }
     let (spans, mut stored) = allocation_scan_ranges(allocation, reused_numeric);
     phase.advance_bytes(stored.iter().map(|&(_, length)| length).sum());
     let mut file = if !persist || store.is_some() {
@@ -1644,7 +1693,9 @@ fn write_allocation(
             written_since_flush = 0;
         }
         Ok(())
-    })?;
+    }).map_err(|error| invalid(format!(
+        "copying storage allocation {:?} at {:#x}+{} failed: {error}",
+        allocation.name, allocation.address, allocation.nbytes)))?;
     let stored: Vec<_> = merge_ranges(stored.into_iter().map(|(start, length)| (start, start + length)).collect())
         .into_iter().map(|(start, end)| (start, end - start)).collect();
     let size = stored.iter().map(|&(_, n)| n).sum();
@@ -1811,7 +1862,13 @@ fn current_platform(cuda: &Cuda) -> ExportResult<Option<String>> {
     let slot = attribute("cuDeviceGetAttribute", 34, b"cuDeviceGetAttribute\0")?;
     let domain = attribute("cuDeviceGetAttribute", 50, b"cuDeviceGetAttribute\0")?;
     let bus_id = std::ffi::CString::new(format!("{domain:04x}:{bus:02x}:{slot:02x}.0"))?;
-    let library = unsafe { Library::new("libnvidia-ml.so.1") }
+    // NVML is a driver component, so its library name follows the driver's platform.
+    let soname = if cfg!(windows) {
+        "nvml.dll"
+    } else {
+        "libnvidia-ml.so.1"
+    };
+    let library = unsafe { Library::new(soname) }
         .map_err(|error| invalid(format!("NVML is required to name an export: {error}")))?;
     #[repr(C)]
     struct PciInfo {
@@ -2542,7 +2599,7 @@ pub(crate) fn capture_rank(
     if !request.allocations.is_empty() {
         validate_allocations(&request.allocations)?;
     }
-    let (allocations, external) = prepare_allocations(&cuda, request, recorder)?;
+    let (allocations, external, discovered) = prepare_allocations(&cuda, request, recorder)?;
     validate_allocations(&allocations)?;
     let dynamic: Vec<_> = allocations
         .iter()
@@ -3025,6 +3082,30 @@ pub(crate) fn capture_rank(
             .map(|root| super::blob::BlobStore::new(root, budget))
             .transpose()?
     };
+    // A recorder-derived allocation can be released while the exporter runs: preparation ends, the
+    // recorder stops, and a memory pool destroyed afterwards releases its blocks unseen. Such a
+    // record describes memory that no longer exists, so verify it at the point of use. A graph that
+    // references released storage is an export defect; a record reachable only through a data
+    // pointer is dropped, and forgetting it also stops later pointer hits from re-adding it.
+    for name in &discovered {
+        let Some(allocation) = allocations.iter().find(|a| &a.name == name) else {
+            continue;
+        };
+        if allocation_readable(&cuda, allocation)? {
+            continue;
+        }
+        if reach.reached.contains(name) {
+            return Err(invalid(format!(
+                "graph-referenced storage allocation {:?} at {:#x}+{} was released during export",
+                allocation.name, allocation.address, allocation.nbytes
+            )));
+        }
+        eprintln!(
+            "omitting released allocation {:#x}+{} recorded during preparation",
+            allocation.address, allocation.nbytes
+        );
+        reach.forget(name);
+    }
     let (_, committed_downloads) = with_allocation_commits(
         request.context,
         store.as_ref(),
