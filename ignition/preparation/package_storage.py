@@ -74,7 +74,7 @@ class PackageStorage:
             native.__file__, "flare_package_allocate", "flare_package_free")
         self._allocator = allocator
         self._transient_allocator = torch.cuda.memory.CUDAPluggableAllocator(
-            native.__file__, "flare_package_allocate", "flare_package_transient_free")
+            native.__file__, "flare_package_transient_allocate", "flare_package_transient_free")
         self.pool = torch.cuda.MemPool(allocator.allocator())
         self.graph_pool = torch.cuda.MemPool(allocator.allocator())
         self._preparation_pools = {self.pool.id}
