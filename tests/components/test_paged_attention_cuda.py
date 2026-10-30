@@ -314,3 +314,242 @@ def test_parallel_verification_has_per_query_windows(dimension, window, causal, 
                                                atol=.002, rtol=.02)
                 begin += count
         graph.reset()
+
+
+@pytest.mark.parametrize("mode", ["verify", "prefill"])
+@pytest.mark.parametrize("selected", [False, True])
+def test_attention_candidate_producer_restores_shared_schedule(monkeypatch, tmp_path, mode, selected):
+    import inspect
+
+    from b12x.attention.paged._preparation import _PagedState
+    from b12x.preparation import _measurement
+
+    bindings, checked, addresses = {}, [], set()
+    original_bind = _PagedState.bind
+    original_timer_init = _measurement._TimedCall.__init__
+
+    def bind(state, *args, **kwargs):
+        binding = original_bind(state, *args, **kwargs)
+        if not torch.cuda.is_current_stream_capturing():
+            fields = tuple(getattr(binding.scratch, name)
+                           for name in ("kv_chunk_size_ptr", "o_indptr"))
+            bindings[id(binding)] = (binding, fields, tuple(t.cpu().clone() for t in fields))
+        return binding
+
+    def timer_init(timer, call, *args, **kwargs):
+        original_timer_init(timer, call, *args, **kwargs)
+        if not inspect.isfunction(call.run):
+            return
+        binding = inspect.getclosurevars(call.run).nonlocals.get("binding")
+        if id(binding) not in bindings:
+            return
+        owner, fields, expected = bindings[id(binding)]
+        pointers = tuple(t.data_ptr() for t in fields)
+        addresses.add(pointers[0])
+        producers = []
+        for original_producer in timer.producers:
+            def produce(original_producer=original_producer):
+                # Other candidates reuse these locations before this call is timed.
+                for field in fields:
+                    field.fill_(-1)
+                original_producer()
+                assert tuple(t.data_ptr() for t in fields) == pointers
+                for field, value in zip(fields, expected):
+                    torch.testing.assert_close(field.cpu(), value, rtol=0, atol=0)
+                checked.append(id(owner))
+            producers.append(produce)
+        timer.producers = tuple(producers)
+
+    monkeypatch.setattr(_PagedState, "bind", bind)
+    monkeypatch.setattr(_measurement._TimedCall, "__init__", timer_init)
+    device = torch.device("cuda", 0)
+    batch, width, heads, dim = 2, 8, 16 if selected else 24, 128 if selected else 256
+    kv_heads = 1 if selected else 4
+    rows = batch * width if mode == "verify" else 66
+    query = torch.randn((rows, heads, dim), device=device, dtype=torch.bfloat16) * .1
+    key = (torch.randn((32, 128, kv_heads, dim), device=device) * .1).to(torch.float8_e4m3fn)
+    value = (torch.randn_like(key.float()) * .1).to(key.dtype)
+    pages = torch.zeros((batch, 2048), dtype=torch.int32, device=device)
+    lengths = torch.full((batch,), 4096, dtype=torch.int32, device=device)
+    cu = torch.tensor([0, rows // 2, rows], dtype=torch.int32, device=device)
+    blocks = torch.arange(16, dtype=torch.int32, device=device).expand(kv_heads, rows, 16).contiguous() if selected else None
+    with RecordedPreparationSession(device=device, checkpoint="attention-shared-schedule",
+            workload_schema="attention-shared-schedule", numerical_policy="default",
+            namespace={"test_directory": str(tmp_path)}) as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        attention = PreparedPagedAttention(query, key, value, pages, lengths, cu,
+            torch.empty_like(query), mode=mode, width=width, selected_blocks=blocks,
+            session=session, workspace=arena, name="attention")
+        assert not attention.decode
+        session.tune()
+    assert len(set(checked)) > 1
+    assert len(addresses) == 1
+
+
+@pytest.mark.parametrize("dim", [128, 256])
+@pytest.mark.parametrize("physical_pages", [3, 64])
+def test_attention_tuning_uses_available_distinct_pages(monkeypatch, tmp_path, dim, physical_pages):
+    import ignition.components.paged_attention as module
+    from b12x.preparation import autotune_effort
+
+    device = torch.device("cuda", 0)
+    query = torch.randn((16, 6, dim), device=device, dtype=torch.bfloat16) * .1
+    key = (torch.randn((physical_pages, 128, 1, dim), device=device) * .1).to(torch.float8_e4m3fn)
+    value = torch.empty_like(key).copy_(key)
+    table = torch.zeros((2, 32), device=device, dtype=torch.int32)
+    lengths = torch.full((2,), 128, device=device, dtype=torch.int32)
+    cu = torch.tensor([0, 8, 16], device=device, dtype=torch.int32)
+    output = torch.empty_like(query)
+    original = module.benchmark_resource
+    checked = []
+
+    def tracked(session, name, factory):
+        def allocate():
+            operands, seed = factory()
+            expected = torch.arange(64, device=device, dtype=torch.int64).reshape(2, 32) % physical_pages
+            torch.testing.assert_close(operands["page_table"], expected.to(table.dtype), rtol=0, atol=0)
+            assert operands["page_table"].data_ptr() != table.data_ptr()
+            assert operands["k_cache"] is key and operands["v_cache"] is value
+            assert torch.all(operands["cache_seqlens"] == 4096)
+            assert torch.all(table == 0) and torch.all(lengths == 128)
+            checked.append(True)
+            return operands, seed
+        return original(session, name, allocate)
+
+    monkeypatch.setattr(module, "benchmark_resource", tracked)
+    effort = "audit" if dim == 128 else "default"
+    with autotune_effort(effort), RecordedPreparationSession(device=device, checkpoint=f"attention-page-footprint-{dim}-{physical_pages}",
+            workload_schema="attention-page-footprint", numerical_policy="default",
+            autotune_effort=effort,
+            namespace={"test_directory": str(tmp_path)}) as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        attention = PreparedPagedAttention(query, key, value, table, lengths, cu, output,
+            mode="verify", width=8, session=session, workspace=arena, name="attention")
+        assert attention.decode == (dim == 128)
+        assert attention.plan.query.autotune_effort == effort
+        session.tune()
+        attention()
+        torch.cuda.synchronize()
+        assert checked and torch.isfinite(output).all()
+        assert torch.all(table == 0) and torch.all(lengths == 128)
+
+
+def test_attention_tuning_respects_virtual_cache_backing(monkeypatch, tmp_path):
+    import ignition.components.paged_attention as module
+    from ignition.preparation.virtual_storage import VirtualStorage
+
+    device = torch.device("cuda", 0)
+    query = torch.randn((32, 24, 256), device=device, dtype=torch.bfloat16) * .1
+    output = torch.empty_like(query)
+    storage = VirtualStorage(device)
+    backed, reserved = 40, 256
+    key = storage.device_allocate("key", (reserved, 128, 4, 256), torch.float8_e4m3fn,
+                                  group="KV_PAGES", maximum=reserved, units=backed)
+    value = storage.device_allocate("value", (reserved, 128, 4, 256), torch.float8_e4m3fn,
+                                    group="KV_PAGES", maximum=reserved, units=backed)
+    key[:backed].fill_(.125)
+    value[:backed].fill_(.25)
+    assert all(region.nbytes < region.extent for region in storage.dynamic_regions)
+    table = torch.zeros((4, 32), dtype=torch.int32, device=device)
+    lengths = torch.full((4,), 128, dtype=torch.int32, device=device)
+    cu = torch.arange(5, dtype=torch.int32, device=device) * 8
+    original = module.benchmark_resource
+    checked = []
+
+    def tracked(session, name, factory):
+        def allocate():
+            operands, seed = factory()
+            expected = (torch.arange(128, device=device).reshape(4, 32) % backed).to(table.dtype)
+            torch.testing.assert_close(operands["page_table"], expected, rtol=0, atol=0)
+            assert operands["k_cache"] is key and operands["v_cache"] is value
+            assert torch.all(operands["cache_seqlens"] == 4096)
+            checked.append(True)
+            return operands, seed
+        return original(session, name, allocate)
+
+    monkeypatch.setattr(module, "benchmark_resource", tracked)
+    with RecordedPreparationSession(device=device, checkpoint="attention-backed-pages",
+            workload_schema="attention-backed-pages", numerical_policy="default",
+            namespace={"test_directory": str(tmp_path)}) as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        attention = PreparedPagedAttention(query, key, value, table, lengths, cu, output,
+            mode="verify", width=8, tuning_page_count=backed,
+            session=session, workspace=arena, name="attention")
+        session.tune()
+        attention()
+        torch.cuda.synchronize()
+        assert checked and torch.isfinite(output).all()
+        torch.testing.assert_close(output, torch.full_like(output, .25), rtol=.02, atol=.002)
+        assert torch.all(table == 0) and torch.all(lengths == 128)
+        assert torch.all(key[:backed].float() == .125) and torch.all(value[:backed].float() == .25)
+    storage.close()
+
+
+@pytest.mark.parametrize("count", [0, -1, 5, True, 1.0])
+def test_attention_rejects_invalid_tuning_page_capacity(count):
+    query = torch.empty((8, 6, 256), dtype=torch.bfloat16, device="cuda")
+    key = torch.empty((4, 128, 1, 256), dtype=torch.bfloat16, device="cuda")
+    with pytest.raises(ValueError, match="backed page count"):
+        PreparedPagedAttention(query, key, key, None, None, None, query,
+            mode="verify", width=8, tuning_page_count=count, session=None, workspace=None, name="invalid")
+
+
+@pytest.mark.parametrize("recipe", ["mimo_v2", "muse_spark"])
+@pytest.mark.parametrize("mode", ["decode", "verify", "prefill"])
+def test_window_attention_tuning_uses_backed_continuation_rows(recipe, mode, tmp_path):
+    import importlib
+    from types import SimpleNamespace
+    from ignition.components.block_fp8 import BlockFP8Weight
+    from ignition.components.paged_batch import Metadata
+    from ignition.components.parallel import TensorParallelShard
+    from ignition.preparation.virtual_storage import VirtualStorage
+
+    attention_module = importlib.import_module(f"ignition.recipes.{recipe}.attention")
+    pool_module = importlib.import_module(f"ignition.recipes.{recipe}.pool")
+    device, shard = torch.device("cuda", 0), TensorParallelShard(0, 1)
+    geometry = SimpleNamespace(heads=8, kv_heads=2, key_dim=128, value_dim=128,
+        rotary_dim=64, theta=10000, window=128, local=lambda shard: (8, 2))
+    config = SimpleNamespace(layers=1, draft=None, attention=lambda layer: geometry,
+        qkv_chunks=lambda layer, shard: (),
+        text={"hidden_size": 128, "rms_norm_eps": 1e-5, "qk_scale_factor": 1.0})
+    tokens = 1 if mode == "decode" else 8
+    source = torch.zeros((tokens, 128), dtype=torch.bfloat16, device=device)
+    storage = VirtualStorage(device)
+    pool = pool_module.ContinuationPool.allocate(config, shard, 3, 7, device,
+        storage=storage, maximum_pages=32, maximum_rows=64, backed_slots=2)
+    region = next(r for r in storage.dynamic_regions if r.group == "STATE_ROWS")
+    assert region.nbytes < region.extent
+    pool.backing[:2].zero_()
+    scratch = attention_module.AttentionScratch.allocate(config, shard, tokens, device)
+    metadata = Metadata.allocate(tokens, 1, 32, device)
+    if recipe == "mimo_v2":
+        qkv = BlockFP8Weight(torch.zeros((1536, 128), dtype=torch.float8_e4m3fn, device=device),
+                            torch.ones((12, 1), dtype=torch.float32, device=device))
+    else:
+        qkv = torch.zeros((2560, 128), dtype=torch.bfloat16, device=device)
+    weights = SimpleNamespace(qkv=qkv, sink=None,
+        output=torch.zeros((128, 1024), dtype=torch.bfloat16, device=device))
+    with RecordedPreparationSession(device=device, checkpoint="window-backed-rows",
+            workload_schema="window-backed-rows", numerical_policy="default",
+            namespace={"test_directory": str(tmp_path)}) as session:
+        arena = ScratchArena(device)
+        session.register_scratch(arena)
+        prepared = attention_module.PreparedAttention(0, weights, config, shard, source,
+            scratch, metadata, pool, mode=mode, runtime=None, coordinator=None,
+            session=session, name="window", workspace=arena)
+        operation = prepared.attention
+        if mode == "decode":
+            expected = 2 if recipe == "mimo_v2" else pool.window_page_stride(0) + 1
+            assert operation.tuning_page_count == expected
+            key = pool.cache(0, "key") if recipe == "mimo_v2" else pool.window_pages(0, "key")
+            assert expected < key.shape[0]
+            assert key[:expected].float().count_nonzero() == 0
+            assert int(pool.memory_capacity[1]) == 7
+        else:
+            assert operation.tuning_page_count == prepared.staged_key.shape[0]
+            assert prepared.staged_key.untyped_storage().data_ptr() != region.address
+    torch.cuda.synchronize()
+    storage.close()

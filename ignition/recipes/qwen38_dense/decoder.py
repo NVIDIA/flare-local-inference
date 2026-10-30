@@ -157,6 +157,7 @@ class FullAttention(torch.nn.Module):
             key_cache, value_cache, self.slots, session=session, name=name + ".write")
         self.attention = PreparedPagedAttention(self.q, key_cache, value_cache, metadata.page_table,
             self.lengths, metadata.query_start_loc, self.attended.view(tokens, self.heads, self.dim),
+            tuning_page_count=int(pool.memory_capacity[1].item()),
             mode=mode, width=metadata.max_query_tokens if mode == "verify" else 1,
             session=session, workspace=workspace, name=name + ".attention")
         self.output_gate = None

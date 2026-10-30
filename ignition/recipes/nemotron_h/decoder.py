@@ -81,6 +81,7 @@ class PreparedDecoder:
             elif kind == "attention":
                 key, value = pool.attention(index, config)
                 block = PreparedAttention(w, source, metadata, key, value, config, mode=mode,
+                    tuning_page_count=int(pool.memory_capacity[1].item()),
                     key_scale=self.kv_scale, value_scale=self.kv_scale, cache_metadata=self.cache_metadata, **kwargs)
             else:
                 block = PreparedLatentMoE(w, source, config, index,

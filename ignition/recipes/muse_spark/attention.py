@@ -112,8 +112,14 @@ class PreparedAttention(torch.nn.Module):
         if geometry.window < 0 or mode == "decode":
             self.writer = PreparedPagedKVWriter(scratch.key, scratch.value, key, value, self.slots,
                                                   session=session, name=name + ".cache_write")
+        if geometry.window > 0:
+            tuning_page_count = (key.shape[0] if mode in ("prefill", "verify") else
+                                 (int(pool.memory_capacity[0].item()) - 1) * self.window_row_stride + geometry.window // PAGE_TOKENS)
+        else:
+            tuning_page_count = int(pool.memory_capacity[1].item())
         self.attention = PreparedPagedAttention(scratch.query, key, value, self.pages, self.lengths,
             metadata.query_start_loc, scratch.attended, mode=mode, window=window,
+            tuning_page_count=tuning_page_count,
             width=1 if mode == "prefill" else metadata.max_query_tokens,
             session=session, workspace=workspace, name=name + ".attention")
 

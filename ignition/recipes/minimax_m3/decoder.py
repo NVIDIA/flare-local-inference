@@ -120,7 +120,7 @@ class PreparedAttention:
             max_q_per_request=metadata.max_query_tokens)
         self.attention = PreparedPagedAttention(scratch.query, key, value, metadata.page_table,
             self.lengths, metadata.query_start_loc, scratch.attended.view_as(scratch.query),
-            selected_blocks=scratch.selected, mode=mode,
+            selected_blocks=scratch.selected, mode=mode, tuning_page_count=int(pool.memory_capacity[1].item()),
             width=metadata.max_query_tokens if mode == "verify" else 1,
             session=session, workspace=workspace, name=name + ".attention", schedules=schedules)
         self.output = projection(scratch.attended, weights.output, scratch.output, session=session,
