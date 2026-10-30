@@ -208,15 +208,28 @@ impl Drop for Pinned {
     }
 }
 
-/// Remove a kind directory's units that nothing pins, leaving transfers in progress.
-pub fn evict(directory: &Path, pins: &Pins) -> Result<Vec<PathBuf>, Failure> {
+/// Direct children owned by `flare_helios::package::cache::Root`.
+fn is_model_cache_directory(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("blobs" | "models" | "refs" | "sources" | "origins" | "staging" | "locks")
+    )
+}
+
+/// Remove unpinned cache units, leaving transfers in progress and other package-cache data alone.
+pub fn evict(directory: &Path, kind: &str, pins: &Pins) -> Result<Vec<PathBuf>, Failure> {
+    let package_cache = kind_directory(kind)? == "packages";
     let pins = pins.lock().unwrap();
     let mut removed = Vec::new();
     for entry in fs::read_dir(directory)? {
-        let path = entry?.path();
+        let entry = entry?;
+        let path = entry.path();
         let hidden = path
             .file_name()
             .is_none_or(|name| name.to_string_lossy().starts_with('.'));
+        if package_cache && is_model_cache_directory(&path) {
+            continue;
+        }
         if !hidden && !pins.contains_key(&path) {
             let Some(_lease) = Lease::evict(&path)? else {
                 continue;
@@ -582,11 +595,64 @@ mod tests {
         fs::write(package.join("model.safetensors"), b"held").unwrap();
         let lease = Lease::shared(&package).unwrap();
         let pins = Pins::default();
-        assert!(evict(&directory, &pins).unwrap().is_empty());
+        assert!(evict(&directory, "package", &pins).unwrap().is_empty());
         assert!(package.is_dir());
         drop(lease);
-        assert_eq!(evict(&directory, &pins).unwrap(), vec![package.clone()]);
+        assert_eq!(
+            evict(&directory, "package", &pins).unwrap(),
+            vec![package.clone()]
+        );
         assert!(!package.exists());
+    }
+
+    #[test]
+    fn agent_eviction_preserves_the_prepared_model_cache() {
+        let temporary = tempfile::tempdir().unwrap();
+        let packages = temporary.path().join("packages");
+        let model = packages.join("models/model-key/entry-id/model.safetensors");
+        let blob = packages.join("blobs/0123456789abcdef.safetensors");
+        let reference = packages.join("refs/model-key");
+        fs::create_dir_all(model.parent().unwrap()).unwrap();
+        fs::create_dir_all(blob.parent().unwrap()).unwrap();
+        fs::create_dir_all(reference.parent().unwrap()).unwrap();
+        fs::write(&model, b"prepared model").unwrap();
+        fs::write(&blob, b"shared payload").unwrap();
+        fs::write(&reference, b"entry-id\n").unwrap();
+        let other_model_cache_files = [
+            "sources/selector",
+            "origins/version",
+            "staging/transaction",
+            "locks/model-key",
+        ];
+        for relative in other_model_cache_files {
+            let path = packages.join(relative);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, b"prepared model metadata").unwrap();
+        }
+
+        let peer_package = packages.join("export-8-rank1");
+        let complete_package = packages.join("export-4");
+        fs::create_dir_all(&peer_package).unwrap();
+        fs::write(peer_package.join("model.safetensors"), b"peer package").unwrap();
+        fs::create_dir_all(&complete_package).unwrap();
+        fs::write(
+            complete_package.join("model.safetensors"),
+            b"complete package",
+        )
+        .unwrap();
+
+        let removed = evict(&packages, "package", &Pins::default()).unwrap();
+
+        assert!(removed.contains(&peer_package));
+        assert!(removed.contains(&complete_package));
+        assert!(!peer_package.exists());
+        assert!(!complete_package.exists());
+        assert!(model.is_file());
+        assert!(blob.is_file());
+        assert!(reference.is_file());
+        for relative in other_model_cache_files {
+            assert!(packages.join(relative).is_file());
+        }
     }
 
     #[test]
@@ -698,10 +764,10 @@ mod tests {
         let pins = Pins::default();
         let mut pinned = Pinned::new(&pins);
         pinned.pin(unit(cache, &path));
-        let removed = evict(&cache.join("packages"), &pins).unwrap();
+        let removed = evict(&cache.join("packages"), "package", &pins).unwrap();
         assert!(removed.is_empty() && path.exists());
         drop(pinned);
-        let removed = evict(&cache.join("packages"), &pins).unwrap();
+        let removed = evict(&cache.join("packages"), "package", &pins).unwrap();
         assert_eq!(removed, vec![cache.join("packages/e-8-rank1")]);
     }
 
@@ -923,7 +989,7 @@ mod tests {
             fs::metadata(&second).unwrap().ino()
         );
         assert_eq!(fs::metadata(&first).unwrap().mode() & 0o222, 0);
-        evict(&cache.join("packages"), &Pins::default()).unwrap();
+        evict(&cache.join("packages"), "package", &Pins::default()).unwrap();
         assert!(!first.exists() && !second.exists());
         assert!(cache.join("blobs").join(&blob).exists());
         assert!(have(cache, "package", &first_name, size).unwrap().is_some());
