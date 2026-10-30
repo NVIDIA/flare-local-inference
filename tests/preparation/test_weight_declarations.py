@@ -641,3 +641,27 @@ def test_misc_preserves_stable_and_tuned_storage_classes():
     misc = {view['name']: view['storage'] for view in declaration['views'] if view['group'] == 'misc'}
     assert misc == {'weights.embedding': STABLE, 'weights.head': STABLE,
                     "weights.vision['patch']": STABLE, 'weights.draft': TUNED}
+
+
+def test_packed_nvfp4_declaration_describes_retained_storage():
+    from b12x.gemm.blockscaled import PackedNVFP4LinearWeight
+    from ignition.components import weights as _registered_weights
+    from ignition.preparation import provenance
+
+    source = torch.zeros((64, 16), dtype=torch.uint8)
+    provenance.record(source, tensor_name="mlp.gate_up.weight", ranges=((0, 64), (0, 16)),
+                      packing="nvfp4", packing_parameters={"format": "nvfp4", "group_size": 16})
+    packed = PackedNVFP4LinearWeight(torch.zeros((64, 4), dtype=torch.int32),
+                                     torch.zeros((1, 2, 64), dtype=torch.uint8), torch.ones(()), 32, 64)
+    declaration = declare_weights({"projection": packed}, components=("projection",), layers=())
+    views = {view["name"]: view for view in weight_payload_declaration(declaration)["views"]}
+    assert set(views) == {"projection." + field for field in ("values", "scale_mma", "global_scale")}
+    values = views["projection.values"]
+    assert values["shape"] == [64, 4] and values["stride"] == [4, 1]
+    assert "packing" not in values and "sources" not in values
+    assert provenance.lookup(packed.values) is None
+    assert provenance.lookup(source)["packing"] == "nvfp4"
+    tensors = {name: tensor for name, _owner, tensor, _group, _storage in declared_views(declaration)}
+    assert tensors["projection.values"] is packed.values
+    assert tensors["projection.scale_mma"] is packed.scale_mma
+    assert tensors["projection.global_scale"] is packed.global_scale

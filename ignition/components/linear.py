@@ -177,6 +177,10 @@ class QuantizedProjection:
         self.weight = weight
         self.output = output
         self.activation_scale = getattr(weight, "activation_global_scale", None)
+        if isinstance(weight, blockscaled.PackedNVFP4LinearWeight):
+            if activation_mode == "quantized":
+                raise ValueError("packed dense W4A16 requires BF16 activations")
+            activation_mode = "a16"
         native = activation_mode == "auto" and getattr(session, "native_dense_activations", False)
         if native:
             activation_mode = "quantized"

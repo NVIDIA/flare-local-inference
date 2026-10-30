@@ -10,13 +10,13 @@ from ignition.preparation.compilation import compile_forward
 pytestmark = pytest.mark.skipif(os.environ.get('FLARE_RUN_CUDA_TESTS') != '1', reason='requires assigned CUDA GPU')
 
 
-@pytest.mark.parametrize('batch', [1, 2, 4])
+@pytest.mark.parametrize('batch', [1, 2, 4, 8])
 @torch.no_grad()
 def test_batched_shortlist_mutable_graph(batch):
     _check_shortlist_replay(batch, compiled_control=False)
 
 
-@pytest.mark.parametrize("batch", [1, 2, 4])
+@pytest.mark.parametrize("batch", [1, 2, 4, 8])
 @torch.no_grad()
 def test_batched_shortlist_compiled_control(batch):
     _check_shortlist_replay(batch, compiled_control=True)

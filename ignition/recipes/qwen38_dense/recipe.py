@@ -26,6 +26,7 @@ def prepare(snapshot, plan, *, compile_forwards, kernel_cache, progress, retain_
     config = PreparationConfig(benchmark_selection=selection, collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder, prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, autotune_effort=plan.autotune_effort, tuning_replica=plan.tuning_replica,
         native_dense_activations=plan.native_dense_activations,
+        packed_dense_w4a16=plan.packed_dense_w4a16,
         online_mxfp8=plan.online_mxfp8,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         max_active=plan.concurrency if selection is None else selection.max_batch, context=plan.context,

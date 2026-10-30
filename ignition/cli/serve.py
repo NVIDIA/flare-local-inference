@@ -201,7 +201,7 @@ def _export_hosts(args):
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
-                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations, packed_dense_w4a16=args.packed_dense_w4a16,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     environment.apply(configuration, local, plan.recipe.b12x_environment)
     options = _server_options(configuration, model, plan)
@@ -267,7 +267,7 @@ def _prepare(args):
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
                       compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
                       collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
-                      lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                      lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations, packed_dense_w4a16=args.packed_dense_w4a16,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
                       image_concurrency=args.image_concurrency,
                       speculation=speculation(args, model, configuration), prefill_chunk=args.prefill_chunk_size,
@@ -459,7 +459,7 @@ def debug_serve(args) -> int:
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
-                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+                   lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations, packed_dense_w4a16=args.packed_dense_w4a16,
                    shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning)
     if rendezvous is None:
         plan = tuning_devices(plan, host, args.tuning_gpus)

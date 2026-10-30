@@ -70,6 +70,8 @@ for _container, _fields in (
     ('b12x.gemm.blockscaled._linear.MXFP4LinearWeight', ('values', 'scale_mma')),
     ('b12x.gemm.blockscaled._a16.NVFP4LinearWeight',
      ('values', 'scale_mma', 'global_scale', 'activation_global_scale')),
+    ('b12x.gemm.blockscaled._packed_nvfp4.PackedNVFP4LinearWeight',
+     ('values', 'scale_mma', 'global_scale')),
     ('b12x.gemm.blockscaled._iq2_xs.BlockQuantLinearWeight', ('values', 'metadata')),
     ('ignition.recipes.step5.weights.LayerWeights',
      ('qkvg', 'output', 'q_norm', 'k_norm', 'input_norm', 'post_attention_norm',

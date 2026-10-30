@@ -35,7 +35,7 @@ def _fixture(heads, dim, batch):
     return history, values, outputs, m, output_storage
 
 
-@pytest.mark.parametrize('heads,dim,batch', [(8, 128, 1), (8, 128, 4), (16, 64, 2), (1, 128, 2), (2, 64, 1)])
+@pytest.mark.parametrize('heads,dim,batch', [(8, 128, 1), (8, 128, 4), (8, 128, 8), (16, 64, 2), (1, 128, 2), (2, 64, 1)])
 def test_compiled_mutable_staging(heads, dim, batch):
     torch.manual_seed(823)
     history, values, outputs, m, storage = _fixture(heads, dim, batch)

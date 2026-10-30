@@ -10,7 +10,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                                reason="requires assigned CUDA GPU")
 
 
-@pytest.mark.parametrize("rows", [8, 16, 32])
+@pytest.mark.parametrize("rows", [8, 16, 32, 64])
 @pytest.mark.parametrize("down_mode", ["auto", "a16", "quantized"])
 @torch.no_grad()
 def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, monkeypatch):
@@ -64,7 +64,7 @@ def test_checkpoint_grouped_mlp_matches_separate_projections(rows, down_mode, mo
                 else:
                     dense = DenseGemmConfig(backend="cutedsl", tile_m=64, tile_n=64, tile_k=512,
                         load_path="tma", split_k_slices=None, large_m_unroll=None,
-                        swap_ab=rows != 32, target_occupancy={8: 2, 16: 3, 32: 2}[rows])
+                        swap_ab=rows != 32, target_occupancy={8: 2, 16: 3, 32: 2, 64: 2}[rows])
                     config = blockscaled.BlockscaledConfig(mode="quantized", dense_config=asdict(dense),
                         fuse_swiglu=query.source_activation == "swiglu_bf16")
                 kwargs["override"] = config

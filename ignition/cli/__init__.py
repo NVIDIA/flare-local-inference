@@ -175,6 +175,10 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
                                " excludes mandatory width-one and ordinary graphs. Requires packed adaptive"
                                " learned speculation (default: see MODEL --help)")
     advanced = running.add_argument_group("advanced options")
+    advanced.add_argument("--packed-dense-w4a16", action="store_true",
+                          help="pack Qwen3.8 dense target NVFP4 MLP weights once for BF16 activation execution;"
+                               " GEMM geometry remains autotuned, draft head unchanged"
+                               " (conflicts with --native-dense-activations; default: off)")
     advanced.add_argument("--native-dense-activations", action="store_true",
                           help="use quantized activations instead of auto precision for dense projections:"
                                " A8 for FP8 weights and A4 for FP4 weights; explicit recipe precision is retained")

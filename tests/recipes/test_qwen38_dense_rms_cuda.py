@@ -10,7 +10,7 @@ pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
                               reason="requires an explicitly assigned CUDA device")
 
 
-@pytest.mark.parametrize("tokens", [8, 16, 32])
+@pytest.mark.parametrize("tokens", [8, 16, 32, 64])
 @torch.no_grad()
 def test_target_hidden_norm_checkpoint_compiled_replay(tokens):
     from b12x.preparation import PreparationSession

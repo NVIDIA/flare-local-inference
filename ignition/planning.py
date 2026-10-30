@@ -188,6 +188,7 @@ class Plan:
     shard_hyperconnections: bool = False
     lock_gpu_clocks: bool = False
     native_dense_activations: bool = False
+    packed_dense_w4a16: bool = False
     hub_cache: Path | None = None
     tuning_gpus: tuple[Gpu, ...] = ()
     tuning_replica: TuningReplica | None = None
@@ -199,6 +200,13 @@ class Plan:
     benchmark_selection: BenchmarkSelection | None = None
 
     def __post_init__(self):
+        if self.packed_dense_w4a16:
+            if self.recipe.name != "qwen38_dense":
+                raise UsageError("--packed-dense-w4a16 requires the Qwen3.8 dense recipe")
+            if any(gpu.capability not in ((12, 0), (12, 1)) for gpu in self.gpus):
+                raise UsageError("--packed-dense-w4a16 requires SM120 or SM121")
+            if self.native_dense_activations:
+                raise UsageError("--packed-dense-w4a16 conflicts with --native-dense-activations")
         if self.benchmark_selection is not None:
             selection = self.benchmark_selection
             if not isinstance(selection, BenchmarkSelection):
@@ -350,6 +358,7 @@ class Plan:
             "shard_hyperconnections": self.shard_hyperconnections,
             "lock_gpu_clocks": self.lock_gpu_clocks,
             "native_dense_activations": self.native_dense_activations,
+            "packed_dense_w4a16": self.packed_dense_w4a16,
             "tuning_gpus": [gpu.index for gpu in self.tuning_gpus],
             "speculative_token_capacity": self.speculative_token_capacity,
             "online_mxfp8": self.online_mxfp8, "language_model_only": self.language_model_only,

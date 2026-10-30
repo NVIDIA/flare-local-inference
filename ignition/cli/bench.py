@@ -113,7 +113,7 @@ def run(args):
         context_parallel=context_parallel(args, model), stream_overlap=stream_overlap(args, model),
         compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus,
         autotune_effort=args.autotune_effort, collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
-        lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
+        lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations, packed_dense_w4a16=args.packed_dense_w4a16,
         shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
         image_concurrency=args.image_concurrency, mixed_prefill=args.mixed_prefill,
         prompt_logprobs=args.prompt_logprobs, expert_scale_compression=args.expert_scale_compression,
@@ -181,7 +181,7 @@ def _measure(model, plan, configuration, settings, progress, *, compile_forwards
         "requested_max_concurrency": plan.concurrency, "prepared_request_capacity": max(settings.batches),
         "preparation": {key: preparation[key] for key in (
             "tensor_parallel", "prefill_chunk", "stream_overlap", "context_parallel",
-            "native_dense_activations", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
+            "native_dense_activations", "packed_dense_w4a16", "autotune_effort", "collective_tuning", "collective_ladder", "compile_workers",
             "speculative_token_capacity", "speculation", "expert_scale_compression", "mla_compute_mode",
             "online_mxfp8", "language_model_only")}}
 

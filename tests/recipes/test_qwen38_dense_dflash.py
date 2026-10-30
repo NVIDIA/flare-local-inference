@@ -208,3 +208,32 @@ def test_qad_precision_options_reach_preparation_plan(online, head):
     if head:
         with pytest.raises(ValueError, match="requires DFlash2"):
             PreparationConfig(mtp=False, draft_head_quantization=head)
+
+
+def test_packed_dense_w4a16_is_explicit_and_rejects_native_activations():
+    from dataclasses import replace
+    from ignition import planning
+    from ignition.cli import _parser
+    from ignition.cli.preparation import speculation
+    from ignition.errors import UsageError
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    parser = _parser()
+    plain = parser.parse_args(["bench", "qwen3.8-27b-qad"])
+    assert not plain.packed_dense_w4a16
+    args = parser.parse_args(["export", "qwen3.8-27b-qad", "--packed-dense-w4a16",
+                              "--max-concurrency", "8", "--speculative-token-capacity", "64",
+                              "--mtp-draft-tokens", "7", "--draft-head-quantization", "nvfp4"])
+    assert args.packed_dense_w4a16
+    model = resolve(args.model)
+    gpus = (planning.Gpu(0, "SM121", "GPU-0", 128 << 30, 120 << 30, (12, 1)),)
+    base = planning.fit(model.recipe, model.checkpoint, gpus, concurrency=8, reserve_bytes=0,
+                        speculation=speculation(args, model))
+    plan = replace(base, packed_dense_w4a16=True)
+    assert plan.to_dict()["packed_dense_w4a16"]
+    assert plan.speculative_token_capacity == 64
+    with pytest.raises(UsageError, match="conflicts"):
+        replace(plan, native_dense_activations=True)
+    with pytest.raises(ValueError, match="conflicts"):
+        PreparationConfig(draft_snapshot=Path("draft"), packed_dense_w4a16=True,
+                          native_dense_activations=True)

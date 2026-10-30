@@ -53,6 +53,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
     native_dense_activations: bool = False
+    packed_dense_w4a16: bool = False
     online_mxfp8: bool = False
     draft_head_quantization: str | None = None
     lock_gpu_clocks: bool = False
@@ -96,6 +97,10 @@ class PreparationConfig:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         if type(self.mtp) is not bool:
             raise TypeError("MTP selection must be a boolean")
+        if type(self.packed_dense_w4a16) is not bool:
+            raise TypeError("packed dense W4A16 selection must be a boolean")
+        if self.packed_dense_w4a16 and self.native_dense_activations:
+            raise ValueError("packed dense W4A16 conflicts with native dense activations")
         if type(self.online_mxfp8) is not bool:
             raise TypeError("online MXFP8 selection must be a boolean")
         if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
@@ -171,7 +176,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
     transient.enter_context(package_storage.transient())
     weights = ModelWeights.load(manifest, device, progress=progress, mtp=config.mtp,
         draft_snapshot=config.draft_snapshot, online_mxfp8=config.online_mxfp8,
-        draft_head_quantization=config.draft_head_quantization)
+        draft_head_quantization=config.draft_head_quantization, packed_dense_w4a16=config.packed_dense_w4a16)
     release_unused()
     layout = continuation_layout(weights.config, mtp=config.mtp)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
@@ -201,6 +206,7 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             "draft": None if weights.config.draft is None else weights.config.draft.text,
             "draft_headers": draft_headers,
             "online_mxfp8": config.online_mxfp8,
+            "packed_dense_w4a16": config.packed_dense_w4a16,
             "draft_head_quantization": config.draft_head_quantization,
             "contract": "qwen38-dense.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(

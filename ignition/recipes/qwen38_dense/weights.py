@@ -25,7 +25,7 @@ class ModelWeights:
 
     @classmethod
     def load(cls, manifest, device, *, progress=None, mtp=False, draft_snapshot=None,
-             online_mxfp8=False, draft_head_quantization=None):
+             online_mxfp8=False, draft_head_quantization=None, packed_dense_w4a16=False):
         from transformers import Qwen3_5TextConfig, Qwen3_5TextModel
 
         config = ModelConfig.load(manifest.snapshot)
@@ -99,6 +99,14 @@ class ModelWeights:
                         projections[prefix + "in_proj_qkvz"] = loader.load_linear_group(qkvz)
                         for field in ("qkv", "z"):
                             projections.pop(prefix + "in_proj_" + field)
+        if packed_dense_w4a16:
+            from b12x.gemm.blockscaled import NVFP4LinearWeight
+
+            for name in projections:
+                weight = projections[name]
+                if ".mlp." in name and isinstance(weight, NVFP4LinearWeight):
+                    projections[name] = _pack_dense_w4a16(weight)
+            del weight
         draft = None
         draft_head = None
         if mtp:
@@ -114,3 +122,15 @@ class ModelWeights:
                 draft_head = converters[draft_head_quantization](head)
         return cls(config, tree, projections, head, torch.cuda.memory_allocated(device) - before,
                    draft=draft, draft_head=draft_head)
+
+
+def _pack_dense_w4a16(weight):
+    from b12x.gemm.blockscaled import pack_nvfp4_a16_linear_weight
+    from b12x.gemm.blockscaled._a16 import scale_storage
+    from b12x.moe._shared.kernels.w4a16.host import unswizzle_block_scale
+
+    if weight.global_scale_kind != "multiplier" or weight.in_features != weight.padded_in_features:
+        raise ValueError("packed dense W4A16 requires unpadded NVFP4 rows and multiplier calibration")
+    raw = scale_storage(weight.scale_mma, weight.out_features, weight.in_features, 16)
+    scales = unswizzle_block_scale(raw, weight.out_features, weight.in_features // 16)
+    return pack_nvfp4_a16_linear_weight(weight.values, scales.to(torch.float8_e4m3fn), weight.global_scale)
