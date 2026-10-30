@@ -1079,6 +1079,66 @@ pub(crate) fn publish_payload(
 
 type Materialized = (helios_core::package::PayloadId, u64, PathBuf);
 
+const MAX_PLANE_WORKERS: usize = 8;
+
+/// Resolve each `(span, staging name)` plane with [`payload_source`] on parallel readers, largest
+/// first. Each plane is hashed by one synchronous reader, so hashing the planes one at a time
+/// leaves the device mostly idle. Returns the sources in the order of `planes`; the first error
+/// stops scheduling and is returned once running planes finish.
+fn plane_sources(
+    payload: &[FilePart],
+    planes: &[(&wire::Span, String)],
+    staging: &Path,
+) -> Result<
+    Vec<(
+        helios_core::package::PayloadId,
+        u64,
+        helios_core::package::container::Slice,
+    )>,
+> {
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |workers| workers.get())
+        .min(MAX_PLANE_WORKERS)
+        .min(planes.len());
+    let mut order: Vec<usize> = (0..planes.len()).collect();
+    order.sort_by_key(|&index| std::cmp::Reverse(planes[index].0.nbytes));
+    let cursor = AtomicUsize::new(0);
+    let failure = Mutex::new(None);
+    let resolved = Mutex::new((0..planes.len()).map(|_| None).collect::<Vec<_>>());
+    std::thread::scope(|scope| {
+        for _ in 0..workers {
+            scope.spawn(|| loop {
+                if failure.lock().unwrap().is_some() {
+                    break;
+                }
+                let Some(&index) = order.get(cursor.fetch_add(1, Ordering::Relaxed)) else {
+                    break;
+                };
+                let (span, name) = &planes[index];
+                match payload_source(payload, span, staging, name) {
+                    Ok(source) => resolved.lock().unwrap()[index] = Some(source),
+                    Err(error) => {
+                        failure.lock().unwrap().get_or_insert(error);
+                        break;
+                    }
+                }
+            });
+        }
+    });
+    if let Some(error) = failure.into_inner().unwrap() {
+        return Err(error);
+    }
+    Ok(resolved
+        .into_inner()
+        .unwrap()
+        .into_iter()
+        .map(|source| source.expect("every plane resolved"))
+        .collect())
+}
+
 fn payload_source(
     payload: &[FilePart],
     span: &wire::Span,
@@ -1347,27 +1407,62 @@ fn package_engram(
         }),
         role: pwire::PayloadRole::Weights as i32,
     };
-    let mut tables = Vec::new();
+    // Validate every table and list its planes first, so the planes can be hashed together.
+    let mut planes = Vec::new();
     for (index, table) in engram.tables.iter().enumerate() {
-        let (weights, scales, shards) = if table.shards.is_empty() {
-            let weights = payload_source(
-                payload,
+        if table.shards.is_empty() {
+            planes.push((
                 table
                     .weights
                     .as_ref()
                     .ok_or_else(|| invalid("engram table lacks weights"))?,
-                staging,
-                &format!("engram-{index}-w.payload"),
-            )?;
-            let scales = payload_source(
-                payload,
+                format!("engram-{index}-w.payload"),
+            ));
+            planes.push((
                 table
                     .scales
                     .as_ref()
                     .ok_or_else(|| invalid("engram table lacks scales"))?,
-                staging,
-                &format!("engram-{index}-s.payload"),
-            )?;
+                format!("engram-{index}-s.payload"),
+            ));
+            continue;
+        }
+        if table.weights.is_some() || table.scales.is_some() {
+            return Err(invalid(
+                "partitioned engram table cannot also carry shared planes",
+            ));
+        }
+        let mut shard_ranks = BTreeSet::new();
+        for (position, shard) in table.shards.iter().enumerate() {
+            if !shard_ranks.insert(shard.rank) {
+                return Err(invalid(format!(
+                    "engram table repeats shard rank {}",
+                    shard.rank
+                )));
+            }
+            planes.push((
+                shard
+                    .weights
+                    .as_ref()
+                    .ok_or_else(|| invalid("engram shard lacks weights"))?,
+                format!("engram-{index}-shard-{position}-w.payload"),
+            ));
+            planes.push((
+                shard
+                    .scales
+                    .as_ref()
+                    .ok_or_else(|| invalid("engram shard lacks scales"))?,
+                format!("engram-{index}-shard-{position}-s.payload"),
+            ));
+        }
+    }
+    let mut sources = plane_sources(payload, &planes, staging)?.into_iter();
+    let mut next = || sources.next().expect("one source per listed plane");
+    let mut tables = Vec::new();
+    for (index, table) in engram.tables.iter().enumerate() {
+        let (weights, scales, shards) = if table.shards.is_empty() {
+            let weights = next();
+            let scales = next();
             for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
                 installed.push(helios_core::package::export::PublishPayload {
                     role: pwire::PayloadRole::Weights,
@@ -1383,38 +1478,10 @@ fn package_engram(
                 Vec::new(),
             )
         } else {
-            if table.weights.is_some() || table.scales.is_some() {
-                return Err(invalid(
-                    "partitioned engram table cannot also carry shared planes",
-                ));
-            }
             let mut shards = Vec::with_capacity(table.shards.len());
-            let mut shard_ranks = BTreeSet::new();
             for (position, shard) in table.shards.iter().enumerate() {
-                if !shard_ranks.insert(shard.rank) {
-                    return Err(invalid(format!(
-                        "engram table repeats shard rank {}",
-                        shard.rank
-                    )));
-                }
-                let weights = payload_source(
-                    payload,
-                    shard
-                        .weights
-                        .as_ref()
-                        .ok_or_else(|| invalid("engram shard lacks weights"))?,
-                    staging,
-                    &format!("engram-{index}-shard-{position}-w.payload"),
-                )?;
-                let scales = payload_source(
-                    payload,
-                    shard
-                        .scales
-                        .as_ref()
-                        .ok_or_else(|| invalid("engram shard lacks scales"))?,
-                    staging,
-                    &format!("engram-{index}-shard-{position}-s.payload"),
-                )?;
+                let weights = next();
+                let scales = next();
                 for (plane, materialized) in [("weights", &weights), ("scales", &scales)] {
                     installed.push(helios_core::package::export::PublishPayload {
                         role: pwire::PayloadRole::Weights,
@@ -3812,6 +3879,52 @@ mod payload_export_tests {
         let mut bytes = [0; 4];
         source.read_at(0, &mut bytes).unwrap();
         assert_eq!(&bytes, b"cdef");
+    }
+
+    #[test]
+    fn plane_sources_keep_declared_order_and_report_failures() {
+        use helios_core::package::PayloadId;
+        let base = std::env::temp_dir().join(format!("flare-plane-sources-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let staging = base.join("staging");
+        fs::create_dir_all(&staging).unwrap();
+        let small = vec![0x01; 16];
+        let large = vec![0x02; 4096];
+        let split_a = vec![0x03; 100];
+        let split_b = vec![0x04; 50];
+        let mut payload = Vec::new();
+        let mut cursor = 0u64;
+        for (name, bytes) in [("small", &small), ("large", &large), ("split-a", &split_a), ("split-b", &split_b)] {
+            let path = base.join(name);
+            fs::write(&path, bytes).unwrap();
+            payload.push(FilePart {
+                offset: cursor,
+                source: FileSource { path, offset: 0, nbytes: bytes.len() as u64 },
+            });
+            cursor += bytes.len() as u64;
+        }
+        let span = |offset, nbytes| wire::Span { offset, nbytes, filename: String::new() };
+        let small_span = span(0, 16);
+        let large_span = span(16, 4096);
+        // Crosses two source files, so it is materialized into staging rather than pinned.
+        let split_span = span(16 + 4096, 150);
+        let planes = vec![
+            (&small_span, "small.payload".to_string()),
+            (&split_span, "split.payload".to_string()),
+            (&large_span, "large.payload".to_string()),
+        ];
+        // Planes are scheduled largest first but returned in declared order.
+        let sources = plane_sources(&payload, &planes, &staging).unwrap();
+        let split = [split_a, split_b].concat();
+        assert_eq!(sources.len(), 3);
+        for ((id, nbytes, _), bytes) in sources.iter().zip([&small, &split, &large]) {
+            assert_eq!(*id, PayloadId::of(bytes));
+            assert_eq!(*nbytes, bytes.len() as u64);
+        }
+        let beyond = span(cursor, 8);
+        let planes = vec![(&large_span, "a.payload".to_string()), (&beyond, "b.payload".to_string())];
+        assert!(plane_sources(&payload, &planes, &staging).is_err());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
