@@ -369,7 +369,7 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
     with storage.retain_transient_backing():
         compiled = cache.prepare_many(functions, signatures, materialize=lambda: None, warmup=warmup)
     assert storage._snapshot()["retained_handles"] == 0
-    assert storage._snapshot()["retained_bytes"] == 0
+    assert storage._snapshot()["retained_reference_bytes"] == 0
     assert len(warmed) == 2 * len(functions)
     graph = torch.cuda.CUDAGraph()
     for name, forward in functions.items():
@@ -382,6 +382,89 @@ def test_compiled_variants_release_warmup_storage(tmp_path, mailbox_storage):
         assert torch.cuda.memory_allocated() == allocated
         torch.testing.assert_close(forward.output, forward.source.square().sin())
         graph.reset()
+    assert storage.error is None
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                    reason="requires an explicitly assigned CUDA device")
+def test_transient_retention_reuses_retained_physical_backing(mailbox_storage):
+    import torch
+
+    storage = mailbox_storage
+
+    segment_size = 16 << 20
+    sizes = [segment_size] * 12
+    reusable_address = None
+    with storage.retain_transient_backing():
+        for index, size in enumerate(sizes):
+            with storage.transient():
+                temporary = torch.empty(size, dtype=torch.uint8, device="cuda")
+                mapping_extent = storage.mappings[temporary.data_ptr()].nbytes
+                assert mapping_extent >= size
+                if reusable_address is None:
+                    reusable_address = temporary.data_ptr()
+                    reusable_extent = mapping_extent
+                else:
+                    assert temporary.data_ptr() == reusable_address
+                    assert mapping_extent == reusable_extent
+                del temporary
+
+            snapshot = storage._snapshot()
+            assert snapshot["retained_handles"] == index + 1
+            assert snapshot.get("retained_reusable_handles", 0) == 1
+            assert snapshot.get("retained_reusable_bytes", 0) == reusable_extent
+    snapshot = storage._snapshot()
+    assert snapshot["retained_handles"] == 0
+    assert snapshot["retained_reference_bytes"] == 0
+    assert reusable_address not in storage.mappings
+    assert storage.error is None
+
+
+@pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1",
+                    reason="requires an explicitly assigned CUDA device")
+def test_transient_mapping_inventory_records_full_pooled_extent(mailbox_storage):
+    import ctypes as C
+    import torch
+
+    storage = mailbox_storage
+    allocate = storage.library.flare_package_transient_allocate
+    allocate.argtypes = [C.c_size_t, C.c_int, C.c_void_p]
+    allocate.restype = C.c_void_p
+    transient_free = storage.library.flare_package_transient_free
+    transient_free.argtypes = [C.c_void_p, C.c_size_t, C.c_int, C.c_void_p]
+    transient_free.restype = None
+
+    segment_size = 16 << 20
+    smaller_size = segment_size // 2
+    value = C.c_ubyte()
+    free_before = torch.cuda.mem_get_info()[0]
+    with storage.retain_transient_backing():
+        first = allocate(segment_size, storage.device, None)
+        assert first is not None
+        assert storage.mappings[first].nbytes == segment_size
+        transient_free(first, segment_size, storage.device, None)
+
+        second = allocate(smaller_size, storage.device, None)
+        assert second is not None
+        assert storage.mappings[second].nbytes == segment_size
+        storage.cuda.call("cuMemsetD8_v2", C.c_uint64(second), C.c_ubyte(19),
+                          C.c_size_t(smaller_size))
+        storage.cuda.call("cuMemcpyDtoH_v2", C.byref(value), C.c_uint64(second),
+                          C.c_size_t(1))
+        assert value.value == 19
+        snapshot = storage._snapshot()
+        assert snapshot["retained_handles"] == 1
+        assert snapshot["retained_reusable_handles"] == 0
+        transient_free(second, smaller_size, storage.device, None)
+        snapshot = storage._snapshot()
+        assert snapshot["retained_handles"] == 2
+        assert snapshot["retained_reusable_handles"] == 1
+        assert snapshot["retained_reusable_bytes"] == segment_size
+        assert free_before - torch.cuda.mem_get_info()[0] < segment_size + storage.granularity
+    snapshot = storage._snapshot()
+    assert snapshot["retained_handles"] == 0
+    assert snapshot["retained_reference_bytes"] == 0
+    assert torch.cuda.mem_get_info()[0] >= free_before - storage.granularity
     assert storage.error is None
 
 
