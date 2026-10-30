@@ -211,9 +211,10 @@ Keep ordinary tests and measurements; do not add development audit artifacts.
   Ordinary NVFP4, CSF NVFP4, and MXFP4 expert storage use the same b12x MoE
   execution API. Dense weight formats likewise share `blockscaled.mm`; format
   handling belongs in loading and preparation, not recipe inference branches.
-  Reject fusion of NVFP4 projections except routed MoE w1/w3, whose dedicated
-  loader validates the shared scales. Never silently rescale or requantize
-  weights to make a fusion possible.
+  Group NVFP4 projections only when their weight and activation global scales
+  match exactly; concatenate the original packed rows and block scales without
+  changing calibration. Reject incompatible groups or retain separate projections.
+  Never silently rescale or requantize weights to make a fusion possible.
 - **Separate weight storage from arithmetic precision.** Keep BF16 weights in
   BF16 when the required accumulation/output is FP32; use
   [UnquantizedProjection](../ignition/components/linear.py) for that contract. Do not

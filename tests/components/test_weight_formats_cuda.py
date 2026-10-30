@@ -482,3 +482,100 @@ def test_native_mxfp8_dense_graph(rows):
             assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
             torch.testing.assert_close(output.float().cpu(), expected, rtol=.025, atol=.015)
         graph.reset()
+
+
+@pytest.mark.parametrize("rows", [1, 8, 16, 32])
+@pytest.mark.parametrize("native", [False, True])
+@torch.no_grad()
+def test_nvfp4_grouped_mlp_layout_and_mutable_replay(tmp_path, rows, native):
+    from b12x._lib.intrinsics.reference import swizzle_block_scale
+    from ignition.components.mlp import MLPScratch, PreparedMLP
+    from ignition.components.weights import MLPWeights
+    from ignition.preparation.scratch import ScratchArena
+    from ignition.preparation.tuning import RecordedPreparationSession
+    from ignition.reference.qwen38_quant import Nvfp4Projection, nvfp4_linear_reference
+
+    gen = torch.Generator().manual_seed(871)
+    tensors, parts = {}, []
+    for part in ("gate", "up"):
+        stored, _ = packed(256, 512, "nvfp4", gen)
+        stored["input_scale"] = torch.tensor(.03125)
+        parts.append(stored)
+        tensors.update({part + "." + name: value for name, value in stored.items()})
+    manifest = checkpoint(tmp_path, tensors,
+        {part: {"quant_algo": "NVFP4", "group_size": 16} for part in ("gate", "up")})
+    with DirectWeightLoader(manifest, "cuda:0") as loader:
+        weight = loader.load_linear_group(("gate", "up"))
+    assert torch.equal(weight.values.cpu(), torch.cat([part["weight"] for part in parts]))
+    scales = torch.cat([part["weight_scale"] for part in parts]).cuda()
+    from b12x.gemm.blockscaled._a16 import scale_storage
+
+    assert torch.equal(scale_storage(weight.scale_mma, 512, 512, 16),
+                       swizzle_block_scale(scales).view(torch.uint8).flatten())
+    cpu = (torch.randn(rows, 512, generator=gen) * .5).bfloat16()
+    down = (torch.randn(512, 256, generator=gen) / 16).bfloat16()
+    x = cpu.cuda()
+    scratch = MLPScratch.allocate(rows, 512, 256, x.device)
+    arena = ScratchArena(x.device)
+    with RecordedPreparationSession(device=x.device, checkpoint="nvfp4-grouped-mlp",
+            workload_schema="packed-swiglu", numerical_policy="auto", autotune_effort="off",
+            native_dense_activations=native) as session:
+        session.register_scratch(arena)
+        mlp = PreparedMLP(x, MLPWeights(weight, down.cuda()), scratch.gate_up, scratch.intermediate,
+                          scratch.output, session=session, name="mlp", workspace=arena)
+        session.tune(show_progress=False)
+        mlp(x)
+        session.freeze()
+        graph = torch.cuda.CUDAGraph()
+        with session.capture(), torch.cuda.graph(graph):
+            mlp(x)
+        for factor in (1, -.5):
+            current = (cpu * factor).bfloat16()
+            x.copy_(current)
+            references = []
+            for part in parts:
+                stored = Nvfp4Projection(part["weight"], part["weight_scale"], part["weight_scale_2"],
+                    part["input_scale"] if mlp.up_projection.plan.selection.config.mode == "quantized" else None)
+                references.append(nvfp4_linear_reference(current, stored).bfloat16())
+            gate, up = references
+            intermediate = (torch.nn.functional.silu(gate.float()).bfloat16() * up).bfloat16()
+            expected = intermediate.float() @ down.float().T
+            scratch.gate_up.fill_(float("nan"))
+            scratch.intermediate.fill_(float("nan"))
+            scratch.output.fill_(float("nan"))
+            allocated = torch.cuda.memory_stats()["allocation.all.allocated"]
+            graph.replay()
+            torch.cuda.synchronize()
+            assert torch.cuda.memory_stats()["allocation.all.allocated"] == allocated
+            torch.testing.assert_close(scratch.gate_up.float().cpu(), torch.cat(references, -1).float(),
+                                       rtol=.025, atol=.015)
+            actual = scratch.output.float().cpu()
+            assert torch.isfinite(actual).all()
+            assert (actual - expected).norm() / expected.norm() < .025
+        graph.reset()
+
+
+@pytest.mark.parametrize("difference", ["weight_scale_2", "input_scale"])
+def test_mixed_nvfp4_group_preserves_unequal_calibration(tmp_path, difference):
+    from ignition.components.weights import GroupedLinearWeights
+
+    gen = torch.Generator().manual_seed(871)
+    tensors = {}
+    for part in ("gate", "up"):
+        stored, _ = packed(128, 256, "nvfp4", gen)
+        stored["input_scale"] = torch.tensor(.03125)
+        if part == "up":
+            stored[difference] *= 2
+        tensors.update({part + "." + name: value for name, value in stored.items()})
+    manifest = checkpoint(tmp_path, tensors,
+        {part: {"quant_algo": "NVFP4", "group_size": 16} for part in ("gate", "up")})
+    with DirectWeightLoader(manifest, "cuda:0") as loader:
+        with pytest.raises(ValueError, match="identical weight and activation calibration"):
+            loader.load_linear_group(("gate", "up"))
+        result = loader.load_mixed_linear_group(("gate", "up"))
+    assert isinstance(result, GroupedLinearWeights)
+    assert result.widths == (128, 128)
+    for name, part in zip(("gate", "up"), result.parts, strict=True):
+        assert torch.equal(part.values.cpu(), tensors[name + ".weight"])
+        assert torch.equal(part.global_scale.cpu(), tensors[name + ".weight_scale_2"])
+        assert torch.equal(part.activation_global_scale.cpu(), tensors[name + ".input_scale"].reciprocal())

@@ -34,6 +34,8 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state(chec
     assert (target / "config.json").is_file() and (draft / "model.safetensors").is_file()
     weights = ModelWeights.load(inspect_indexed_checkpoint(target), torch.device("cuda:0"), mtp=True, draft_snapshot=draft, online_mxfp8=online_mxfp8)
     if checkpoint == "qwen3.8-27b-qad":
+        assert sum(name.endswith(".mlp.gate_up") for name in weights.projections) == 64
+        assert not any(name.endswith((".mlp.gate_proj", ".mlp.up_proj")) for name in weights.projections)
         from ignition.recipes.qwen38_dense.config import TEXT_PREFIX
         from ignition.reference.qwen38_quant import CheckpointTensors
 

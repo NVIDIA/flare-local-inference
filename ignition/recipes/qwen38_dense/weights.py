@@ -39,7 +39,23 @@ class ModelWeights:
         before = torch.cuda.memory_allocated(device)
         with DirectWeightLoader(manifest, device, prefixes=(TEXT_PREFIX + ".", "lm_head."),
                                 progress=progress) as loader:
+            mlp_groups = {
+                f"layers.{index}.mlp.": tuple(TEXT_PREFIX + f".layers.{index}.mlp." + field
+                                            for field in ("gate_proj", "up_proj"))
+                for index in range(len(tree.layers))
+                if all(loader.linear_format(TEXT_PREFIX + f".layers.{index}.mlp." + field) == "nvfp4"
+                       for field in ("gate_proj", "up_proj"))
+                and loader._nvfp4_calibration(TEXT_PREFIX + f".layers.{index}.mlp.gate_proj")
+                    == loader._nvfp4_calibration(TEXT_PREFIX + f".layers.{index}.mlp.up_proj")
+            }
+            grouped_names = {part.removeprefix(TEXT_PREFIX + ".") + ".weight"
+                             for parts in mlp_groups.values() for part in parts}
             for name, parameter in tree.named_parameters():
+                if name in grouped_names:
+                    stored = manifest.tensors[TEXT_PREFIX + "." + name].shape
+                    if len(stored) != 2 or (stored[0], 2 * stored[1]) != tuple(parameter.shape):
+                        raise ValueError(f"{name}: checkpoint projection shape differs from the model")
+                    continue
                 prefix = TEXT_PREFIX + "." + name.removesuffix(".weight")
                 if name.endswith(".weight") and prefix in config.quantization:
                     weight = loader.load_linear(prefix)
@@ -58,6 +74,12 @@ class ModelWeights:
                     if convert:
                         continue
                 setattr(tree.get_submodule(parent), field, torch.nn.Parameter(tensor, requires_grad=False))
+            for prefix, parts in mlp_groups.items():
+                combined = loader.load_linear_group(parts)
+                expected = (2 * config.text["intermediate_size"], config.hidden)
+                if (combined.out_features, combined.in_features) != expected:
+                    raise ValueError(f"{prefix}gate_up: checkpoint projection shape differs from the model")
+                projections[prefix + "gate_up"] = combined
             head = loader.load_linear("lm_head")
             head_shape = tuple(head.shape) if isinstance(head, torch.Tensor) else (head.out_features, head.in_features)
             if head_shape != (config.vocabulary, config.hidden):

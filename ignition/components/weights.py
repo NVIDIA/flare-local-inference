@@ -781,50 +781,75 @@ class DirectWeightLoader:
                        for weight in parts)
         return GroupedLinearWeights(parts, widths)
 
-    def _load_nvfp4_linear(self, prefix, *, rows=None, columns=None):
+    def _nvfp4_calibration(self, prefix):
+        import torch
+
+        algorithm = self.quantization[prefix]["quant_algo"]
+        names = ("weight_scale_2", "input_scale") if algorithm == "NVFP4" else ("weight_scale_2",)
+        values = []
+        for name in names:
+            scalar = self._sources[f"{prefix}.{name}"]
+            if (scalar.dtype != torch.float32 or scalar.numel() != 1
+                    or not bool((torch.isfinite(scalar) & (scalar > 0)).all())):
+                raise ValueError(f"{prefix}.{name} must be a positive finite FP32 scalar")
+            values.append(float(scalar.item()))
+        return algorithm, tuple(values)
+
+    def _load_nvfp4_group(self, prefixes, *, row_ranges, columns=None):
         import torch
         from b12x._lib.intrinsics.reference import swizzle_block_scale
         from b12x.gemm.blockscaled import pack_weight
+        from ignition.preparation import provenance
 
-        source = self._sources[f"{prefix}.weight"]
-        scale = self._sources[f"{prefix}.weight_scale"]
-        scalar = self._sources[f"{prefix}.weight_scale_2"]
-        if source.ndim != 2 or source.dtype != torch.uint8:
-            raise ValueError(f"{prefix}: NVFP4 weight must be a packed uint8 matrix")
-        n, packed_k = source.shape
-        k = packed_k * 2
-        if (k % 16 or scale.ndim != 2 or scale.dtype != torch.float8_e4m3fn
-                or scale.shape[0] < n or scale.shape[1] < k // 16):
-            raise ValueError(f"{prefix}: NVFP4 block scale geometry or dtype mismatch")
-        if (scalar.dtype != torch.float32 or scalar.numel() != 1
-                or not bool((torch.isfinite(scalar) & (scalar > 0)).all())):
-            raise ValueError(f"{prefix}.weight_scale_2 must be a positive finite FP32 scalar")
-        r0, r1 = _aligned_range(rows, n, 1)
-        c0, c1 = _aligned_range(columns, k, 16)
-        logical_k = c1 - c0
+        calibration = self._nvfp4_calibration(prefixes[0])
+        if any(self._nvfp4_calibration(prefix) != calibration for prefix in prefixes[1:]):
+            raise ValueError("fused NVFP4 projections require identical weight and activation calibration")
+        parts, sources = [], []
+        for prefix, rows in zip(prefixes, row_ranges, strict=True):
+            source = self._sources[f"{prefix}.weight"]
+            scale = self._sources[f"{prefix}.weight_scale"]
+            if source.ndim != 2 or source.dtype != torch.uint8:
+                raise ValueError(f"{prefix}: NVFP4 weight must be a packed uint8 matrix")
+            n, packed_k = source.shape
+            k = packed_k * 2
+            if (k % 16 or scale.ndim != 2 or scale.dtype != torch.float8_e4m3fn
+                    or scale.shape[0] < n or scale.shape[1] < k // 16):
+                raise ValueError(f"{prefix}: NVFP4 block scale geometry or dtype mismatch")
+            r0, r1 = _aligned_range(rows, n, 1)
+            c0, c1 = _aligned_range(columns, k, 16)
+            parts.append((source[r0:r1, c0 // 2:c1 // 2], scale[r0:r1, c0 // 16:c1 // 16]))
+            sources.append(dict(tensor=f"{prefix}.weight", ranges=((r0, r1), (c0 // 2, c1 // 2))))
+        logical_k = parts[0][0].shape[1] * 2
+        if any(part.shape[1] * 2 != logical_k for part, _ in parts):
+            raise ValueError("packed projections must share input width")
         stored_k = (logical_k + 127) // 128 * 128
-        values = torch.zeros((r1 - r0, stored_k // 2), dtype=torch.uint8, device=self.device)
-        scales = torch.zeros((r1 - r0, stored_k // 16), dtype=torch.float8_e4m3fn, device=self.device)
+        total_rows = sum(part.shape[0] for part, _ in parts)
+        values = torch.zeros((total_rows, stored_k // 2), dtype=torch.uint8, device=self.device)
+        scales = torch.zeros((total_rows, stored_k // 16), dtype=torch.float8_e4m3fn, device=self.device)
+        offset = 0
+        for source, scale in parts:
+            end = offset + source.shape[0]
+            self._copy(values[offset:end, :logical_k // 2], source)
+            self._copy(scales[offset:end, :logical_k // 16], scale)
+            offset = end
+        scalar = self._sources[f"{prefixes[0]}.weight_scale_2"]
         gain = torch.empty(scalar.shape, dtype=torch.float32, device=self.device)
-        self._copy(values[:, :logical_k // 2], source[r0:r1, c0 // 2:c1 // 2])
-        self._copy(scales[:, :logical_k // 16], scale[r0:r1, c0 // 16:c1 // 16])
         self._copy(gain, scalar)
         activation_scale = None
-        if self.quantization[prefix]["quant_algo"] == "NVFP4":
-            activation = self._sources[f"{prefix}.input_scale"]
-            if (activation.dtype != torch.float32 or activation.numel() != 1
-                    or not bool((torch.isfinite(activation) & (activation > 0)).all())):
-                raise ValueError(f"{prefix}.input_scale must be a positive finite FP32 scalar")
+        if calibration[0] == "NVFP4":
+            activation = self._sources[f"{prefixes[0]}.input_scale"]
             reciprocal = activation.reciprocal()
             if not bool(torch.isfinite(reciprocal).all()):
-                raise ValueError(f"{prefix}.input_scale reciprocal must remain finite")
+                raise ValueError(f"{prefixes[0]}.input_scale reciprocal must remain finite")
             activation_scale = torch.empty_like(activation, device=self.device)
             self._copy(activation_scale, reciprocal)
         self._session.flush()
         weight = pack_weight(values, swizzle_block_scale(scales), recipe="nvfp4",
                              global_scale=gain, global_scale_kind="multiplier",
                              activation_global_scale=activation_scale)
-        _record_nvfp4_linear_provenance(values, prefix, r0=r0, r1=r1, c0=c0, c1=c1)
+        provenance.record_sources(values, sources, packing="nvfp4", statistics_domain="tensor",
+            concatenation_axis=0 if len(sources) > 1 else None,
+            packing_parameters=dict(format="nvfp4", group_size=16))
         return replace(weight, in_features=logical_k)
 
     def _selected_names(self):
@@ -1080,8 +1105,7 @@ class DirectWeightLoader:
             (rows,) = tuple(row_ranges)
             return self._load_tensor_fp8_linear(prefixes[0], rows=rows, columns=column_range)
         if fmt == "nvfp4":
-            (rows,) = tuple(row_ranges)
-            return self._load_nvfp4_linear(prefixes[0], rows=rows, columns=column_range)
+            return self._load_nvfp4_group(prefixes, row_ranges=row_ranges, columns=column_range)
         if fmt in ("iq2_xxs", "q8_0"):
             from b12x._lib.quant.block_codec import block_codec
 

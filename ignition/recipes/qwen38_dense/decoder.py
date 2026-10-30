@@ -8,7 +8,7 @@ import triton
 
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.gated_delta import GDNScratch, PreparedGDN
-from ignition.components.linear import prepare_projection
+from ignition.components.linear import QuantizedProjection, prepare_projection
 from ignition.components.gdn_recovery import PreparedGDNCommit
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
@@ -49,6 +49,43 @@ class Projection(torch.nn.Module):
 
     def forward(self, source):
         return self.operation(source)
+
+
+class GroupedMLP(torch.nn.Module):
+    """Concatenated gate/up projection with the canonical BF16 activation."""
+
+    def __init__(self, canonical, source, gate_up_weight, down_weight, gate_up, intermediate, output,
+                 *, session, name, workspace):
+        super().__init__()
+        self.activation = canonical.act_fn
+        self.intermediate = intermediate
+        self.gate_up = prepare_projection(source, gate_up_weight, gate_up,
+            activation_mode="auto", session=session, workspace=workspace, name=name + ".gate_up")
+        from b12x.gemm.blockscaled import NVFP4LinearWeight
+        from transformers.activations import SiLUActivation
+        from ignition.components import sm103_projection
+
+        canonical_silu = (type(self.activation) is SiLUActivation
+                          or type(self.activation) is torch.nn.SiLU and not self.activation.inplace)
+        self.down_source_is_gate_up = (
+            canonical_silu
+            and isinstance(down_weight, NVFP4LinearWeight) and not sm103_projection.is_sm103(source.device)
+        )
+        if self.down_source_is_gate_up:
+            self.down = QuantizedProjection(gate_up, down_weight, output,
+                source_activation="swiglu_bf16", activation_mode="auto", session=session,
+                workspace=workspace, name=name + ".down")
+        else:
+            self.down = prepare_projection(intermediate, down_weight, output,
+                activation_mode="auto", session=session, workspace=workspace, name=name + ".down")
+
+    def forward(self, source):
+        projected = self.gate_up(source)
+        if self.down_source_is_gate_up:
+            return self.down(projected)
+        gate, up = projected.chunk(2, dim=-1)
+        self.intermediate.copy_(self.activation(gate) * up)
+        return self.down(self.intermediate)
 
 
 def module_copy(module):
@@ -154,11 +191,15 @@ class PreparedDecoder:
             ("k", config.text["num_key_value_heads"] * config.text["head_dim"]),
             ("v", config.text["num_key_value_heads"] * config.text["head_dim"]),
             ("key", config.text["num_key_value_heads"] * config.text["head_dim"]), ("output", config.hidden))}
-        mlp_buffers = {field: zeros((source.shape[0], width))
-                       for field, width in (("gate_proj", config.text["intermediate_size"]),
-                                            ("up_proj", config.text["intermediate_size"]),
-                                            ("down_proj", config.hidden))}
-        mlp_input = zeros(mlp_buffers["gate_proj"].shape)
+        intermediate = config.text["intermediate_size"]
+        mlp_buffers = {"down_proj": zeros((source.shape[0], config.hidden))}
+        grouped = tuple(f"layers.{i}.mlp.gate_up" in weights.projections for i in range(len(weights.tree.layers)))
+        if any(grouped):
+            mlp_buffers["gate_up"] = zeros((source.shape[0], 2 * intermediate))
+        if not all(grouped):
+            for field in ("gate_proj", "up_proj"):
+                mlp_buffers[field] = zeros((source.shape[0], intermediate))
+        mlp_input = zeros((source.shape[0], intermediate))
         self.layers = []
         for index, original in enumerate(weights.tree.layers):
             layer = module_copy(original)
@@ -178,13 +219,19 @@ class PreparedDecoder:
                 layer.self_attn = FullAttention(original.self_attn, weights, source, metadata, pool, index,
                     mode=mode, session=session, workspace=workspace, name=name + "." + prefix + "attention",
                     buffers=attention_buffers, projection_staging=scratch.quantized)
-            layer.mlp = module_copy(original.mlp)
-            for field in ("gate_proj", "up_proj", "down_proj"):
-                weight = weights.projections[prefix + "mlp." + field]
-                inputs = source if field != "down_proj" else mlp_input
-                output = mlp_buffers[field]
-                setattr(layer.mlp, field, Projection(prepare_projection(inputs, weight, output,
-                    activation_mode="auto", session=session, workspace=workspace, name=name + "." + prefix + field)))
+            if grouped[index]:
+                layer.mlp = GroupedMLP(original.mlp, source,
+                    weights.projections[prefix + "mlp.gate_up"], weights.projections[prefix + "mlp.down_proj"],
+                    mlp_buffers["gate_up"], mlp_input, mlp_buffers["down_proj"], session=session,
+                    name=name + "." + prefix + "mlp", workspace=workspace)
+            else:
+                layer.mlp = module_copy(original.mlp)
+                for field in ("gate_proj", "up_proj", "down_proj"):
+                    weight = weights.projections[prefix + "mlp." + field]
+                    inputs = source if field != "down_proj" else mlp_input
+                    output = mlp_buffers[field]
+                    setattr(layer.mlp, field, Projection(prepare_projection(inputs, weight, output,
+                        activation_mode="auto", session=session, workspace=workspace, name=name + "." + prefix + field)))
             self.layers.append(layer)
         rotary = config.text["rope_parameters"]
         dim = int(config.text["head_dim"] * rotary["partial_rotary_factor"])

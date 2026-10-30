@@ -157,6 +157,7 @@ class QuantizedProjection:
         session: PreparationSession,
         name: str,
         activation_mode: str = "quantized",
+        source_activation: str = "identity",
         bias: torch.Tensor | None = None,
         workspace: ScratchArena | torch.Tensor | None = None,
         mxfp8_min_amax: float | None = None,
@@ -188,6 +189,8 @@ class QuantizedProjection:
         self.workspace = workspace
         self.encoded = self.quantizer_plan = None
         self.sm103 = sm103_projection.is_sm103(source.device)
+        if source_activation != "identity" and (self.sm103 or not isinstance(weight, NVFP4LinearWeight)):
+            raise ValueError("rounded SwiGLU projection requires b12x NVFP4 execution")
         if mxfp8_min_amax is not None or encoded is not None:
             from b12x.quantization import mxfp8
 
@@ -304,6 +307,7 @@ class QuantizedProjection:
                 weight=parts(weight)[:2])
         else:
             query = blockscaled.query_from_call(source, weight, out=output, activation_mode=activation_mode,
+                                               source_activation=source_activation,
                                                workspace=None if isinstance(workspace, ScratchArena) else workspace)
             if workspace is None or isinstance(workspace, ScratchArena):
                 query = replace(query, workspace_form="provided", workspace_nbytes=None)
