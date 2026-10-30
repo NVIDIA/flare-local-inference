@@ -792,6 +792,7 @@ impl Core {
                     Ok(false) => {
                         events.push(StoreEvent::Deferred {
                             checkpoint: checkpoint.id,
+                            reason: StoreReason::Slabs,
                         });
                         finished.push(checkpoint.key);
                         continue;
@@ -823,7 +824,10 @@ impl Core {
         let result = match pending.error {
             None => {
                 for node in &nodes {
-                    self.index.touch(node);
+                    self.index.access(node);
+                }
+                if let Some(key) = nodes.last() {
+                    self.index.touch_ancestors(key);
                 }
                 self.stats.fetched += 1;
                 self.stats.bytes_in += pending.bytes;
@@ -865,6 +869,8 @@ impl Core {
             outbound_in_flight: self.outbound.len() + self.deferred.len(),
             inbound_in_flight: self.inbound.len(),
             memory_records: self.index.len(),
+            rows_used: self.pool.row_count() - self.pool.free_rows(),
+            rows_total: self.pool.row_count(),
             memory_bytes: self.resident_bytes(),
             outbound_rate: self.outbound_rate.0,
             inbound_rate: self.inbound_rate.0,
@@ -982,6 +988,10 @@ impl MemoryStore {
         self.core.flat
     }
 
+    pub fn index_mut(&mut self) -> &mut Index<MemoryRecord> {
+        &mut self.core.index
+    }
+
     pub fn index(&self) -> &Index<MemoryRecord> {
         &self.core.index
     }
@@ -1007,7 +1017,12 @@ impl MemoryStore {
     }
 
     pub(crate) fn headroom(&self) -> (usize, usize) {
-        self.core.headroom()
+        let (pages, rows) = self.core.headroom();
+        (pages.max(self.largest_pages()), rows)
+    }
+
+    pub(crate) fn largest_pages(&self) -> usize {
+        self.core.largest_pages
     }
 
     pub fn pool(&self) -> &SlabPool {
@@ -1334,6 +1349,7 @@ impl HostStore for MemoryStore {
         if let Some(node) = self.core.index.node(&checkpoint.key) {
             if node.ready && node.row {
                 self.core.stats.store_skipped += 1;
+                self.core.index.touch_ancestors(&checkpoint.key);
                 return Ok(StoreOutcome::Present);
             }
             if node.pinned() {
@@ -1383,7 +1399,16 @@ impl HostStore for MemoryStore {
         events.append(&mut self.events);
         // Inside a composite the disk index supplies parents, so it flushes.
         if !self.core.flat {
+            for key in self.core.index.expired(|node| !node.pinned()) {
+                if self.core.remove_record(&key).is_ok() {
+                    self.core.stats.expired[0] += 1;
+                }
+            }
             self.flush_announcements(&|_, parent| parent, &|_| None);
+            if self.core.spill {
+                let (pages, rows) = self.headroom();
+                self.core.retire_for(pages, rows);
+            }
         }
         Ok(())
     }
@@ -2262,10 +2287,10 @@ mod tests {
             matches!(&events[0], StoreEvent::Stored { key, result: Ok(_), .. } if *key == root.key)
         );
         assert!(
-            matches!(&events[1], StoreEvent::Deferred { checkpoint } if *checkpoint == child.id)
+            matches!(&events[1], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs } if *checkpoint == child.id)
         );
         assert!(
-            matches!(&events[2], StoreEvent::Deferred { checkpoint } if *checkpoint == grandchild.id)
+            matches!(&events[2], StoreEvent::Deferred { checkpoint, reason: StoreReason::Slabs } if *checkpoint == grandchild.id)
         );
         assert!(core.deferred.is_empty());
         assert!(core.outbound.is_empty());
@@ -2466,6 +2491,40 @@ mod tests {
     }
 
     #[test]
+    fn progress_retires_before_a_record_larger_than_the_watermark_arrives() {
+        use crate::store::TierStore;
+
+        let geometry = [geometry(PT, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let pool = SlabPool::new(PAGE, 100, ROW, 16, true).unwrap();
+        let mut store = MemoryStore::new(IDENTITY, pool, copier).unwrap();
+        store.announce_to(Announcer::new(Arc::new(tokio::sync::Notify::new())));
+        for salt in 1..=4 {
+            let h = history(22 * PT, salt);
+            let checkpoint = published(&h, 22 * PT, None, 0, salt);
+            assert_eq!(store.store(&checkpoint).unwrap(), StoreOutcome::Queued);
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while store.core.announced.len() != 4 {
+            assert!(Instant::now() < deadline, "records were not announced");
+            store.poll(&mut Vec::new()).unwrap();
+            std::thread::yield_now();
+        }
+        assert_eq!(store.core.headroom().0, 10);
+        assert_eq!(store.pool().free_pages(), 12);
+        store.set_spill(true);
+        store.poll(&mut Vec::new()).unwrap();
+        let retiring = store.take_retiring();
+        assert_eq!(retiring.len(), 1);
+        assert_eq!(retiring[0].tail_pages, 22);
+        store.retired(retiring[0].key, PoolTier::Dram, Retirement::Moved);
+        let h = history(22 * PT, 5);
+        let next = published(&h, 22 * PT, None, 0, 5);
+        assert_eq!(store.store(&next).unwrap(), StoreOutcome::Queued);
+        store.close().unwrap();
+    }
+
+    #[test]
     fn a_spilling_store_holds_the_coldest_announced_leaf_until_its_move_ends() {
         let mut core = store_core(4, 4, false);
         let (one, two, three) = (history(600, 1), history(600, 2), history(600, 3));
@@ -2571,5 +2630,33 @@ mod tests {
         core.index.unpin(&cold.key).unwrap();
         core.finish_retired();
         assert!(!core.index.contains(&cold.key));
+    }
+    #[test]
+    fn expired_memory_records_release_their_slabs() {
+        let geometry = [crate::testing::geometry(64, &[("kv", PAGE)], ROW)];
+        let (copier, _) = crate::testing::SimulatedGpu::shared(&geometry).unwrap();
+        let mut store = MemoryStore::new(
+            IDENTITY,
+            SlabPool::new(PAGE, 2, ROW, 2, true).unwrap(),
+            copier,
+        )
+        .unwrap();
+        store.index_mut().max_age = std::time::Duration::from_secs(7200);
+        let checkpoint = published(&history(64, 1), 64, None, 0, 1);
+        store.store(&checkpoint).unwrap();
+        assert_eq!((store.stats().rows_used, store.stats().rows_total), (1, 2));
+        store
+            .index_mut()
+            .node_mut(&checkpoint.key)
+            .unwrap()
+            .last_used = std::time::SystemTime::UNIX_EPOCH;
+        store.poll(&mut Vec::new()).unwrap();
+        assert_eq!(store.stats().expired, [1, 0]);
+        assert_eq!((store.stats().rows_used, store.stats().rows_total), (0, 2));
+        assert_eq!(
+            (store.pool().free_pages(), store.pool().free_rows()),
+            (2, 2)
+        );
+        store.close().unwrap();
     }
 }

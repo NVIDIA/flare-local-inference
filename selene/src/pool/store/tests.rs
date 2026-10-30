@@ -48,7 +48,6 @@ struct LocalState {
     /// How each offered record's move ended, in order.
     retired: Vec<(PrefixKey, Retirement)>,
     spill: Option<bool>,
-    cascaded: bool,
     /// Keys the local tiers were asked to copy, and the answer given.
     stored: Vec<PrefixKey>,
     store_outcome: Option<StoreOutcome>,
@@ -113,9 +112,6 @@ impl crate::store::TierStore for FakeLocal {
             Some(reason) => Err(reason),
             None => Ok(Box::new(NoPin(key))),
         }
-    }
-    fn cascade(&mut self) {
-        self.0.lock().unwrap().cascaded = true;
     }
     fn set_spill(&mut self, enabled: bool) {
         self.0.lock().unwrap().spill = Some(enabled);
@@ -775,7 +771,6 @@ impl Rig {
 #[test]
 fn a_retiring_record_is_put_and_released_only_when_the_manager_commits_it() {
     let mut rig = rig();
-    assert!(rig.local.0.lock().unwrap().cascaded);
     rig.ready(true);
     let record = rig.retiring(5);
     rig.offer(std::slice::from_ref(&record));

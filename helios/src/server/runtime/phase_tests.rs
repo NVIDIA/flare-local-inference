@@ -4111,50 +4111,82 @@ fn publications_copy_immediately_even_without_gpu_pressure() {
 #[test]
 fn publication_retries_wait_for_progress_and_abandon_evicted_ids() {
     use flare_selene::{StoreOutcome::*, StoreReason};
-    let mut fixture = Fixture::new();
-    fixture.config.limits.pages = 2;
-    let (_sender, receiver) = mpsc::channel();
-    let mut worker = fixture.worker(receiver);
-    let mut store = FakeStore::new(None);
-    store
-        .store_outcomes
-        .extend([Retry(StoreReason::Slabs), Queued]);
-    worker.attach_store(Some(Box::new(store)));
-    let id = unpinned_checkpoint(&mut worker, 0, 64);
-    worker.service_store().unwrap();
-    assert_eq!(pins(&worker, id), 0);
-    assert_eq!(worker.deferred_stores, [id]);
-    assert!(!worker.service_store().unwrap());
-    assert_eq!(fake_store(&mut worker).stored.len(), 1);
-    fake_store(&mut worker).progress += 1;
-    worker.service_store().unwrap();
-    assert!(worker.deferred_stores.is_empty());
-    assert_eq!(pins(&worker, id), 1);
-    assert_eq!(
-        fixture.metrics.host_retry_success.load(Ordering::Relaxed),
-        1
-    );
-    fake_store(&mut worker)
-        .events
-        .push_back(flare_selene::StoreEvent::Deferred { checkpoint: id });
-    worker.service_store().unwrap();
-    assert_eq!(pins(&worker, id), 0);
-    assert_eq!(worker.deferred_stores, [id]);
-    let spec = RequestSpec {
-        prompt: vec![1; 70],
-        message_boundaries: vec![],
-        conditioning: vec![],
-        max_new_tokens: 1,
-        grammar_constrained: false,
-        host_stops: false,
-        prompt_logprobs: false,
-        growable_output: true,
-    };
-    worker.scheduler.admit(spec).unwrap();
-    worker.service_store().unwrap();
-    assert!(worker.deferred_stores.is_empty());
-    assert_eq!(
-        fixture.metrics.host_retry_abandoned.load(Ordering::Relaxed),
-        1
-    );
+    for reason in [
+        StoreReason::Inflight,
+        StoreReason::Slabs,
+        StoreReason::Queue,
+        StoreReason::Budget,
+    ] {
+        let mut fixture = Fixture::new();
+        fixture.config.limits.pages = 2;
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.store_outcomes.extend([Retry(reason), Queued]);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert_eq!(worker.deferred_stores, [(id, reason)]);
+        assert!(!worker.service_store().unwrap());
+        assert_eq!(fake_store(&mut worker).stored.len(), 1);
+        fake_store(&mut worker).progress += 1;
+        worker.service_store().unwrap();
+        assert!(worker.deferred_stores.is_empty());
+        assert_eq!(pins(&worker, id), 1);
+        assert_eq!(
+            fixture.metrics.host_retry_success.load(Ordering::Relaxed),
+            1
+        );
+        fake_store(&mut worker)
+            .events
+            .push_back(flare_selene::StoreEvent::Deferred {
+                checkpoint: id,
+                reason: reason,
+            });
+        worker.service_store().unwrap();
+        assert_eq!(pins(&worker, id), 0);
+        assert_eq!(worker.deferred_stores, [(id, reason)]);
+        let spec = RequestSpec {
+            prompt: vec![1; 70],
+            message_boundaries: vec![],
+            conditioning: vec![],
+            max_new_tokens: 1,
+            grammar_constrained: false,
+            host_stops: false,
+            prompt_logprobs: false,
+            growable_output: true,
+        };
+        worker.scheduler.admit(spec).unwrap();
+        worker.service_store().unwrap();
+        assert!(worker.deferred_stores.is_empty());
+        assert_eq!(
+            fixture.metrics.host_retry_abandoned[reason as usize].load(Ordering::Relaxed),
+            1
+        );
+    }
+}
+
+#[test]
+fn publication_losses_classify_oversize_and_copy_failure() {
+    use flare_selene::StoreOutcome;
+    for (outcome, reason) in [(StoreOutcome::Oversize, 4), (StoreOutcome::Queued, 5)] {
+        let fixture = Fixture::new();
+        let (_sender, receiver) = mpsc::channel();
+        let mut worker = fixture.worker(receiver);
+        let mut store = FakeStore::new(None);
+        store.store_outcomes.push_back(outcome);
+        worker.attach_store(Some(Box::new(store)));
+        let id = unpinned_checkpoint(&mut worker, 0, 64);
+        worker.service_store().unwrap();
+        if outcome == StoreOutcome::Queued {
+            complete_store(&mut worker, id, false);
+            worker.service_store().unwrap();
+        }
+        assert_eq!(
+            fixture.metrics.host_retry_abandoned[reason].load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(pins(&worker, id), 0);
+    }
 }

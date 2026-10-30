@@ -92,11 +92,6 @@ impl crate::store::TierStore for Tiers {
             None => Err(ExportRefusal::NotFound),
         }
     }
-    fn cascade(&mut self) {
-        if let Some(tiers) = &mut self.0 {
-            tiers.cascade();
-        }
-    }
     fn set_spill(&mut self, enabled: bool) {
         if let Some(tiers) = &mut self.0 {
             tiers.set_spill(enabled);

@@ -1076,6 +1076,7 @@ mod tests {
                 disk: Some("unopened-prefix-cache".into()),
                 disk_limit: Some(0),
                 drain_on_shutdown: Default::default(),
+                max_age: std::time::Duration::ZERO,
                 pool: None,
             },
         ] {

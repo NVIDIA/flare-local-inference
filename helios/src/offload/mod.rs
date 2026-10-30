@@ -23,7 +23,7 @@ use crate::Result;
 
 pub use flare_selene::offload::{
     Binding, PrefixCacheOffload, Preparation, Prepared, Resolved, Shared, input_memory_bytes,
-    parse_drain_on_shutdown, parse_size,
+    parse_drain_on_shutdown, parse_max_age, parse_size,
 };
 
 pub fn prepare(

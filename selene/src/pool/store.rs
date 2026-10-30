@@ -177,7 +177,6 @@ impl<S: crate::store::TierStore> PooledStore<S, PoolClient> {
 impl<S: crate::store::TierStore, P: PoolPort> PooledStore<S, P> {
     pub fn new(mut inner: S, pool: P, identity: Identity, layout: &crate::Layout) -> Self {
         inner.announce_to(pool.announcer());
-        inner.cascade();
         Self {
             inner,
             pool,

@@ -44,7 +44,7 @@ selects one of them or none:
 
 | Memory size | Disk limit | Store | Behavior |
 |---|---|---|---|
-| nonzero | nonzero | `CompositeStore` | Records are retained in registered memory and written through to disk; disk reads warm the memory store when capacity permits. |
+| nonzero | nonzero | `CompositeStore` | Records are retained in registered memory and spilled to disk under pressure; disk reads warm the memory store when capacity permits. |
 | nonzero | zero | `MemoryStore` | Records are retained in pinned host memory only, each rank's part mapped by that rank's device alone. |
 | zero | nonzero | `DiskStore` | Records live on disk and stream through a bounded registered staging pool. |
 | zero | zero | none | The worker holds no store. |
@@ -232,8 +232,8 @@ The deferred direct transport requirements are in section 2.6.
 trait by orchestrating them:
 
 - `store` with the staged transport runs `memory.store`; when the copy-out
-  lands, local mode runs `write_from` with that record's memory slabs;
-  pooled mode delays the write until headroom or allocation pressure needs it.
+  lands, both modes park the record until headroom or allocation pressure
+  needs its slabs. `write_from` writes those same memory slabs.
   Completion makes the memory copy durable. If disk reservation fails, the
   complete record stays parked in DRAM, restorable and announced there, with
   its parent pinned until reservation succeeds. Its chain metadata is indexed
@@ -258,7 +258,7 @@ trait by orchestrating them:
   its file commits. Filesystem-full or quota errors retain it and retry with a
   short backoff. Terminal disk I/O errors may discard it and are counted.
 - The staged transport retains its bounded staging pool inside the composite.
-  Memory slabs supply write-through and read-through buffers when retention
+  Memory slabs supply spill and read-through buffers when retention
   fits; disk staging handles records and chains that cannot be retained.
   The staging pool is additional to the configured retention-memory budget
   and appears separately in the startup summary.
@@ -285,8 +285,8 @@ offload event.
 Transfers move records in windows of at most 64 pages plus the row. A window
 allocates its slabs, moves, and either retains or releases them according to
 the owning pool's policy before the next window is issued. The memory store's
-minimum size is two row slabs and 128 page slabs, one outbound and one inbound
-window; a smaller explicit configuration fails at startup with the minimum for
+minimum size holds two row slabs and 128 page slabs, one outbound and one inbound
+window. A smaller explicit configuration fails at startup with the minimum for
 the package.
 
 `SlabPool` is one anonymous mapping (`MAP_PRIVATE`, `MAP_ANONYMOUS`,
@@ -300,6 +300,15 @@ targets ordinary pages; the loader already uses this pattern for mapped host
 regions in `helios/src/runtime_package/mod.rs`. Allocation never blocks: when
 no slab is free and nothing is evictable, the requesting job fails, which
 skips an outbound and fails an inbound.
+
+Host memory pressure queues cold parked records through the existing disk spill
+path before allocation. The page watermark keeps room for at least the largest
+record seen, also when memory-only pool instances retire records to the manager.
+With long records near memory capacity, local memory spills most records soon
+after they land. A retry can still wait for that asynchronous write to
+release its slabs; neither publication nor admission waits for I/O. GPU-only
+retry records remain unpinned: even a brief retry pin can prevent admission when
+the next request needs its pages or snapshot.
 
 Registering host memory maps it into every device's page tables. On an RTX PRO
 6000 that costs each device about 2 MiB of device memory per GiB registered,
@@ -358,17 +367,17 @@ arise only from interrupted operations or external changes.
 A process killed mid-restore releases its directory lock without changing
 committed record files; the next scan can reuse those files. Publication and a
 completed GPU-to-RAM copy
-do not imply disk durability: local write-through commits asynchronously after
-copy-out, and SIGKILL loses RAM copies and queued writes. Only records renamed
+do not imply disk durability: files commit under pressure or an enabled shutdown
+drain, and SIGKILL loses RAM copies and queued writes. Only records renamed
 into place survive a process restart; partial temporary files are discarded.
 Waiting after restart cannot recover a write the killed process never committed.
-In pool mode, a RAM record reserves a disk-index entry and disk budget, but its
+A RAM record reserves a disk-index entry and disk budget, but its
 file is written only under memory pressure or an enabled shutdown drain. The disk-record
 count includes these reservations; it does not count only committed files. An
 idle wait does not flush them. A default clean stop or crash loses these RAM-only records;
 records whose file commits completed remain recoverable.
 
-`--prefix-cache-drain-on-shutdown[=DURATION]` saves pooled DRAM-only records to
+`--prefix-cache-drain-on-shutdown[=DURATION]` saves DRAM-only records to
 local disk for a warm restart. It is off by default because larger DRAM tiers
 extend stop time. A bare flag drains until done; `=90s` limits new writes, and
 `=off` disables a configured drain. `[prefix_cache] drain_on_shutdown` accepts
@@ -377,6 +386,29 @@ Recent endpoints drain first, after their required ancestors; committed files
 are preserved. Limits and write failures do not fail shutdown; accepted transfers
 still drain before memory is released. Size a container's stop grace as Flare's
 usual stop time plus DRAM bytes ÷ measured disk write rate.
+
+Host record expiry is off by default. Enable it with
+`--prefix-cache-max-age DURATION|off` or `[prefix_cache] max_age = "2h"`;
+positive durations accept ms, s, m, h, or bare seconds. `off` disables expiry.
+Publication, reuse, restore and child publication refresh the record and its
+required ancestors in memory only. Recovery uses file mtime, from the last write
+when a record was spilled cold or drained. After a restart, a record reused from
+disk but never rewritten may expire up to one max age early. The cost is a
+recompute, never wrong output. With expiry off, hits do not refresh last use;
+enabling it later may expire old files on the first sweep.
+In pool mode, instance hits do not refresh manager copies, whose max age counts
+from their last put or restore; this is acceptable for a cold-tier copy because
+an instance that keeps the prefix hot re-cascades it on eviction.
+
+At most once a minute, the model-thread poll walks from the oldest entry,
+skipping interior nodes and records that cannot be dropped, and stopping at
+the first fresh leaf or 64 expired leaves. Expired leaves are dropped outright;
+they are never sent down the cascade. Page-only ancestors are removed with their
+last child; in-flight copies and exports retain their storage. LRU positions change only for the accessed key.
+A fresh former interior node left as a leaf by pressure eviction can delay a
+sweep by up to one max age. The manager sweeps every namespace on its existing
+tick, using each index's own once-a-minute limit. The GPU tier keeps its existing
+eviction policy.
 
 The disk thread owns an `io_uring` ring over files opened with `O_DIRECT`,
 chunks transfers at 8 MiB, and computes and verifies checksums. Before accepting
@@ -544,7 +576,7 @@ the store and its transfer threads.
 Policy:
 
 - Outbound: copy each published checkpoint into the first host tier. In local
-  composite mode, write through to disk; in pool mode, move records down the
+  composite mode, spill to disk; in pool mode, move records down the
   eviction cascade only when the preceding tier needs room. Only queued copies
   pin GPU checkpoints. A capacity refusal waits for host progress before retry;
   admission uses ordinary cache eviction and existing pin and retirement fences.
@@ -620,9 +652,10 @@ Offload limits interference through bounded work and explicit ownership:
 - Disk records move through registered host staging and batched stream copies.
 - The staged transport's staging pool size is derived; it is not a setting.
 - A memory store retains at most as many records as it has row slabs, and
-  rows take one quarter of the pool, so on Qwen, whose rows are 112 MiB, a
-  4 GiB pool holds eight records while the GPU cache holds dozens. A memory
-  tier that cannot hold more records than the GPU cache rarely has a record
+  rows take one quarter of the pool's bytes, preserving the minimum page windows.
+  Startup warns when rows fall below selected concurrency; twice concurrency
+  remains recommended, and publications may wait for spills when rows are scarce.
+  A memory tier that cannot hold more records than the GPU cache rarely has a record
   the GPU has already lost; the derived default's lower clamp exists for the
   staging minimum, and the sizing guidance for operators is a pool whose row
   slabs exceed the GPU's state rows.
@@ -931,9 +964,9 @@ same completion events the store produces.
   Manager loss releases waiting selections; started moves keep their pins until
   their drained terminal event. While a manager is unavailable or busy, local
   disk LRU makes room; with DRAM alone, durable DRAM LRU is the local end.
-  Local mode keeps write-through and LRU unlink on demand, with the same parking
-  and completed-maintenance budget accounting. Only end-of-chain eviction,
-  infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
+  Local mode uses the same parked/spill path and LRU unlink at the end of its
+  chain, with the same completed-maintenance budget accounting. Only end-of-chain eviction,
+  expiry, infeasible footprints (`Oversize`) and terminal disk I/O errors discard data.
   GPU publication announces the GPU holding and starts its first host copy;
   GPU eviction sends the existing notice and never starts a late copy.
 - **Retention metrics.** `flare_host_cache_held_total{tier}` counts record
@@ -942,6 +975,13 @@ same completion events the store produces.
   `io_error`). Tiers are `dram` and `nvme`. The existing `parked_records` count is
   exported as `flare_host_cache_parked_records`, a gauge. `store_skipped` retains
   its existing meaning, including duplicates and retries.
+  `flare_host_cache_expired_total{tier}` counts direct age removals. Row-slot
+  gauges `flare_host_cache_rows_in_use` and `flare_host_cache_rows_total` report
+  actual allocated slabs and capacity, including rows held by in-flight copies.
+  `flare_host_cache_retry_abandoned_total{reason}` retains the existing metric
+  name and adds the last retry cause (`inflight`, `slabs`,
+  `queue`, `budget`) when a GPU checkpoint disappears. Terminal `oversize` and
+  `io_error` losses are counted too; store-reason counters still count attempts.
 - **Publication outcomes.** `Present` requires a committed local copy; a lookup
   hint is not sufficient. `Oversize` includes required ancestor files that
   cannot coexist within the disk limit even without unrelated records, and
@@ -1077,7 +1117,7 @@ on the file format fixed in step 5.
    test repeated through each store's `store` and `fetch`, and CPU tests of
    each store's event sequencing with a transfer stub.
 
-9. **Composite store.** `selene/src/composite.rs`: write-through,
+9. **Composite store.** `selene/src/composite.rs`: pressure-driven spills,
    read-through into the memory store, durability marking, subset
    maintenance, and failure handling. Acceptance: CPU tests with transfer and
    disk stubs covering a memory hit, a disk hit that becomes resident, a

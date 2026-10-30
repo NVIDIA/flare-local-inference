@@ -28,6 +28,20 @@ upgrades for `selene`. The wire contract is [PROTOCOL.md](../PROTOCOL.md) and
   identical paths, and (in containers) share a PID namespace so peer credentials are real.
   Instances that cannot meet this still work over `--listen`, without shared memory.
 
+Record expiry is off by default. `--max-age DURATION|off`
+accepts positive durations in ms, s, m, h, or bare seconds; `off` disables expiry.
+Puts, gets and child publication refresh the required chain in memory only.
+Recovery uses file mtime from its last write. After a restart, a record reused
+from disk but never rewritten may expire up to one max age early. The cost is a
+recompute, never wrong output. With expiry off, hits do not refresh last use;
+enabling it later may expire old files at once.
+The existing tick sweeps every namespace, with each index limited to once a
+minute. It walks from the oldest entry, skipping interior nodes, pinned records
+and active I/O. It stops at the first fresh leaf or 64 expired leaves, removing
+page-only ancestors with their last child. LRU order uses a store-wide counter,
+independently of timestamps.
+`selene_expired_total{tier="dram"|"nvme"}` counts those removals.
+
 ## Sizing
 
 The service is CPU-only and never touches GPU memory. Three budgets are configured
@@ -110,8 +124,9 @@ reverse) runs on up to eight threads of the manager's host, overlapped with the 
 
 A pooled instance keeps a retiring record's local rows pinned until its put
 finishes. A slow manager can therefore exhaust the instance's rows and skip
-new host publications. Flare warns at startup when the local DRAM tier has
-fewer than twice `--max-concurrency` rows. Increase `--prefix-cache-memory`
+new host publications. Rows take one quarter of the local DRAM budget while
+preserving minimum page windows. Flare warns at startup when this leaves fewer than
+`--max-concurrency` rows. Increase `--prefix-cache-memory`
 or reduce concurrency; this threshold is a sizing warning, not a guarantee
 that an arbitrarily long persistence backlog will fit.
 

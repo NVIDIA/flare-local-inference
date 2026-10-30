@@ -611,7 +611,7 @@ mod composite {
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
         let disk = DiskStore::new(
-            record::DirectoryLock::acquire(&directory).unwrap(),
+            flare_selene::testing::directory_lock(&directory).unwrap(),
             IDENTITY,
             fingerprint,
             1 << 40,
@@ -790,7 +790,7 @@ mod composite {
         drop(store);
 
         // Restart: a fresh composite over the scanned directory and an empty memory pool.
-        let directory_lock = record::DirectoryLock::acquire(&directory).unwrap();
+        let directory_lock = flare_selene::testing::directory_lock(&directory).unwrap();
         let scanned =
             flare_selene::record::scan(&directory_lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &flare_selene::record::rank_sizes(&geometry))
                 .unwrap();
@@ -959,7 +959,7 @@ mod composite {
         ));
         let memory = MemoryStore::new_flat(IDENTITY, pool, transfers.clone()).unwrap();
         let disk = DiskStore::new(
-            record::DirectoryLock::acquire(&directory).unwrap(),
+            flare_selene::testing::directory_lock(&directory).unwrap(),
             IDENTITY,
             fingerprint,
             1 << 40,
@@ -1233,7 +1233,7 @@ mod composite {
             let transfers = Arc::new(Mutex::new(
                 Transfers::start(&[(context, device)], geometry.clone(), &staging_pool).unwrap(),
             ));
-            let lock = record::DirectoryLock::acquire(&directory).unwrap();
+            let lock = flare_selene::testing::directory_lock(&directory).unwrap();
             let scanned = record::scan(&lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap();
             let disk = DiskStore::new(
                 lock,
@@ -1513,7 +1513,7 @@ mod disk_store {
             ));
             let disk = DiskThread::start("flare-offload-disk").unwrap();
             DiskStore::new(
-                record::DirectoryLock::acquire(&directory).unwrap(),
+                flare_selene::testing::directory_lock(&directory).unwrap(),
                 IDENTITY,
                 fingerprint,
                 limit,
@@ -1532,7 +1532,7 @@ mod disk_store {
             record::scan(lock, &IDENTITY, &fingerprint, geometry[0].page_tokens, &record::rank_sizes(&geometry)).unwrap()
         };
 
-        assert!(scan(&record::DirectoryLock::acquire(&directory).unwrap()).is_empty());
+        assert!(scan(&flare_selene::testing::directory_lock(&directory).unwrap()).is_empty());
         let mut store = open(Vec::new(), 1 << 40);
         assert_eq!(store.store(&root).unwrap(), StoreOutcome::Queued);
         assert_eq!(store.stats().outbound_in_flight, 1);
@@ -1649,7 +1649,7 @@ mod disk_store {
         drop(store);
 
         // A store opened over a fresh scan serves the same record.
-        let scanned = scan(&record::DirectoryLock::acquire(&directory).unwrap());
+        let scanned = scan(&flare_selene::testing::directory_lock(&directory).unwrap());
         assert_eq!(scanned.len(), 1);
         let mut store = open(scanned, 1 << 40);
         assert_eq!(store.used(), header.length_with_row());
@@ -1764,7 +1764,7 @@ mod disk_store {
         // Under a limit the two records fill, with the child pinned, a third
         // record of only a row cannot be placed, and making room compacts the
         // root: its file is truncated at the row segment.
-        let scanned = scan(&record::DirectoryLock::acquire(&directory).unwrap());
+        let scanned = scan(&flare_selene::testing::directory_lock(&directory).unwrap());
         assert_eq!(scanned.len(), 2);
         let mut store = open(scanned, bytes + child_bytes);
         assert_eq!(store.used(), store.limit());
