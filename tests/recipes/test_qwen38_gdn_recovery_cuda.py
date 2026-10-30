@@ -44,12 +44,12 @@ def _reference(tensors, columns):
     gdn_decode.run(gdn_decode.bind(plan, **tensors), eps=1e-6)
 
 
-def _backing(initial):
+def _backing(initial, prefix=4096, padding=8192):
     # Recurrent state as a pool would hold it: one region of a wider byte row per slot.
     slots = initial.shape[0]
     region = initial[0].numel() * 4
-    backing = torch.zeros((slots, region + 8192), dtype=torch.uint8, device=initial.device)
-    state = backing[:, 4096:4096 + region].view(torch.float32).view_as(initial)
+    backing = torch.zeros((slots, region + padding), dtype=torch.uint8, device=initial.device)
+    state = backing[:, prefix:prefix + region].view(torch.float32).view_as(initial)
     state.copy_(initial)
     return backing, state
 
@@ -111,20 +111,23 @@ def _recurrence(case, state, records):
     ((4,), (3,)), ((6, 6, 0, 6), (1, 6, 0, 2)), ((5, 2), (5, 1)),
     *[((8,), (accepted,)) for accepted in range(1, 9)],
 ])
-def test_recorded_verification_and_commit_match_checkpointing_decode(lengths, accepted):
+@pytest.mark.parametrize(("prefix", "padding", "alignment"), [(4096, 8192, 4), (4100, 8192, 1), (4096, 8196, 1)])
+def test_recorded_verification_and_commit_match_checkpointing_decode(lengths, accepted, prefix, padding, alignment):
     from ignition.components.gdn_recovery import GDNLayerRecords, PreparedGDNCommit
 
     case = _case(lengths)
     initial, metadata, model_slots = case["initial"], case["metadata"], case["model_slots"]
     expected, reference_state, slots = case["expected"], case["reference_state"], case["slots"]
-    backing, state = _backing(initial)
+    backing, state = _backing(initial, prefix, padding)
     stacked = GDNLayerRecords.allocate((3,), slots, torch.device("cuda"), key_heads=KEY_HEADS, value_heads=VALUE_HEADS)
     gated = _recurrence(case, state, stacked[3])
     # Verification leaves committed state untouched.
     assert torch.equal(state, initial)
     counts = torch.tensor(accepted, dtype=torch.int32, device="cuda")
-    PreparedGDNCommit(backing, {3: state}, stacked, metadata, counts, key_heads=KEY_HEADS,
-                      value_heads=VALUE_HEADS)()
+    commit = PreparedGDNCommit(backing, {3: state}, stacked, metadata, counts, key_heads=KEY_HEADS,
+                               value_heads=VALUE_HEADS)
+    assert commit.options["STATE_ALIGNMENT"] == alignment
+    commit()
 
     torch.testing.assert_close(gated, expected, rtol=2**-6, atol=2e-2)
     assert (gated == expected).float().mean() > 0.99
@@ -173,6 +176,6 @@ def test_compilation_sees_every_recovery_store():
             "a_stride": 1, "b_stride": 1, "state_stride": 1, "slot_stride": 1, "IN_PLACE": in_place})
         assert verify == stores
     commit = mutated(gdn_recovery._commit, ("State", "LayerOffsets", "Delta", "KeyRecords", "Decay", "Slots",
-        "Counts", "NumSeqs"), {**geometry, "ROWS_CAPACITY": 3, "state_stride": 1, "slot_stride": 1})
+        "Counts", "NumSeqs"), {**geometry, "ROWS_CAPACITY": 3, "state_stride": 1, "slot_stride": 1, "STATE_ALIGNMENT": 1})
     # The analysis may conservatively report every operand; it must include the state backing.
     assert "State" in commit

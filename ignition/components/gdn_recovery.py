@@ -30,7 +30,7 @@ from ignition.preparation.triton import launch_triton, warmup_triton
 # Verified tokens per round: the eight checkpoint columns of verification metadata.
 WINDOW = 8
 ROWS = 16
-# One warp per request, value head and 16 value rows. The launch configuration
+# One warp per request, value head and value-row tile. The launch configuration
 # rides on the kernels so whole-forward compilation, which drops launch keywords, keeps it.
 _CONFIG = triton.Config({}, num_warps=1, num_stages=2)
 
@@ -63,13 +63,13 @@ def _verify(Mixed, A, B, ALog, DtBias, State, Starts, Slots, NumSeqs, Output, De
             state = tl.load(State + offsets)
             a_scale = tl.exp(tl.load(ALog + head).to(tl.float32))
             bias = tl.load(DtBias + head).to(tl.float32)
-            for position in tl.static_range(WINDOW):
+            for position in tl.range(0, WINDOW, loop_unroll_factor=1):
                 if position < end - start:
                     token = (start + position).to(tl.int64)
                     q = tl.load(Mixed + token * mixed_stride + key_head * 128 + keys).to(tl.float32)
                     k = tl.load(Mixed + token * mixed_stride + KEY_HEADS * 128 + key_head * 128 + keys).to(tl.float32)
-                    q = q * (1.0 / tl.sqrt_rn(tl.sum(q * q, 0) + 1.0e-6)) * SCALE
-                    k = k * (1.0 / tl.sqrt_rn(tl.sum(k * k, 0) + 1.0e-6))
+                    q = q * tl.rsqrt(tl.sum(q * q, 0) + 1.0e-6) * SCALE
+                    k = k * tl.rsqrt(tl.sum(k * k, 0) + 1.0e-6)
                     a = tl.load(A + token * a_stride + head).to(tl.float32) + bias
                     softplus = tl.where(a <= 20.0, libdevice.log1p(tl.exp(a)), a)
                     decay = tl.exp(-a_scale * softplus)
@@ -96,7 +96,7 @@ def _verify(Mixed, A, B, ALog, DtBias, State, Starts, Slots, NumSeqs, Output, De
 @triton.jit
 def _commit(State, LayerOffsets, Delta, KeyRecords, Decay, Slots, Counts, NumSeqs, state_stride, slot_stride,
             ROWS_CAPACITY: tl.constexpr, KEY_HEADS: tl.constexpr, VALUE_HEADS: tl.constexpr, WINDOW: tl.constexpr,
-            ROWS: tl.constexpr):
+            ROWS: tl.constexpr, STATE_ALIGNMENT: tl.constexpr):
     # Every argument a store reaches is a kernel operand, so whole-forward compilation sees the
     # mutation of the state backing: each layer's recurrent region sits at its offset in a row.
     tile, request, layer_head = tl.program_id(0), tl.program_id(1), tl.program_id(2)
@@ -109,12 +109,12 @@ def _commit(State, LayerOffsets, Delta, KeyRecords, Decay, Slots, Counts, NumSeq
         if (slot != 0) & (count > 0):
             rows = tile * ROWS + tl.arange(0, ROWS)
             keys = tl.arange(0, 128)
-            offsets = (tl.load(LayerOffsets + layer) + slot * state_stride + head * (128 * 128)
-                       + rows[:, None] * 128 + keys[None, :])
+            base = tl.multiple_of(tl.load(LayerOffsets + layer) + slot * state_stride, STATE_ALIGNMENT)
+            offsets = base + head * (128 * 128) + rows[:, None] * 128 + keys[None, :]
             state = tl.load(State + offsets)
             # Records are stacked [layer, request row, head, position, 128].
             owner = layer * ROWS_CAPACITY + request
-            for position in tl.static_range(WINDOW):
+            for position in tl.range(0, WINDOW, loop_unroll_factor=1):
                 if position < count:
                     k = tl.load(KeyRecords + ((owner * KEY_HEADS + key_head) * WINDOW + position) * 128 + keys)
                     delta = tl.load(Delta + ((owner * VALUE_HEADS + head) * WINDOW + position) * 128 + rows)
@@ -187,9 +187,10 @@ class PreparedRecoveredRecurrence:
         self.args = (mixed_qkv, a, b, A_log, dt_bias, state, metadata.query_start_loc, slots, metadata.num_seqs,
                      output, delta, keys, decay, mixed_qkv.stride(0), a.stride(0),
                      b.stride(0), state.stride(0), metadata.state_indices.stride(0))
+        verify_rows = 8 if sequences * value_heads >= 192 else 4
         self.options = {"KEY_HEADS": key_heads, "VALUE_HEADS": value_heads, "SCALE": 1.0 / math.sqrt(128),
-                        "WINDOW": WINDOW, "ROWS": ROWS, "IN_PLACE": records is None}
-        self.grid = (128 // ROWS, sequences * value_heads, 1)
+                        "WINDOW": WINDOW, "ROWS": verify_rows, "IN_PLACE": records is None}
+        self.grid = (128 // verify_rows, sequences * value_heads, 1)
         self.compiled = warmup_triton(_verify.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)
 
@@ -216,12 +217,13 @@ class PreparedGDNCommit:
                 raise ValueError("GDN commit requires recurrent views of the state backing rows")
         if counts.shape != (metadata.query_start_loc.numel() - 1,) or counts.numel() > records.delta.shape[1]:
             raise ValueError("GDN commit requires a count and records per request")
-        offsets = torch.tensor([states[layer].storage_offset() - floats.storage_offset() for layer in records.layers],
-                               dtype=torch.int64, device=backing.device)
+        layer_offsets = [states[layer].storage_offset() - floats.storage_offset() for layer in records.layers]
+        state_alignment = math.gcd(4, floats.data_ptr() // 4, floats.stride(0), *layer_offsets)
+        offsets = torch.tensor(layer_offsets, dtype=torch.int64, device=backing.device)
         self.args = (floats, offsets, records.delta, records.keys, records.decay, metadata.state_indices[:, 0],
                      counts, metadata.num_seqs, floats.stride(0), metadata.state_indices.stride(0))
         self.options = {"ROWS_CAPACITY": records.delta.shape[1], "KEY_HEADS": key_heads, "VALUE_HEADS": value_heads,
-                        "WINDOW": WINDOW, "ROWS": ROWS}
+                        "WINDOW": WINDOW, "ROWS": ROWS, "STATE_ALIGNMENT": state_alignment}
         self.grid = (128 // ROWS, counts.numel(), len(records.layers) * value_heads)
         self.compiled = warmup_triton(_commit.fn, self.args, self.grid, num_warps=_CONFIG.num_warps,
                                       num_stages=_CONFIG.num_stages, **self.options)
