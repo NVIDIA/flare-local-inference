@@ -307,6 +307,14 @@ impl Metrics {
         }
     }
 
+    pub fn cache_hit_rate(&self) -> f64 {
+        let lookups = self.cache_lookups.load(Ordering::Relaxed);
+        if lookups == 0 {
+            return 0.0;
+        }
+        self.cache_hits.load(Ordering::Relaxed) as f64 / lookups as f64
+    }
+
     pub fn snapshot(&self, learned_drafter: bool) -> Snapshot {
         let mut snapshot = Snapshot {
             draft_steps: if learned_drafter { self.learned_draft_steps.load(Ordering::Relaxed) } else { 0 },

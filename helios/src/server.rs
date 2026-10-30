@@ -399,6 +399,7 @@ fn router(state: Arc<HttpState>, served_names: &[String], max_body_bytes: usize)
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
+        .route("/v1/loads", get(loads))
         .layer(DefaultBodyLimit::max(max_body_bytes))
         .with_state(state)
 }
@@ -412,6 +413,55 @@ async fn health(State(state): State<Arc<HttpState>>) -> Response {
             "prepared model runtime is unavailable",
         )
     }
+}
+
+async fn loads(State(state): State<Arc<HttpState>>) -> Response {
+    let metrics = state.model.metrics();
+    let snapshot = metrics.snapshot(false);
+    Json(load_report(
+        &snapshot,
+        metrics.cache_hit_rate(),
+        state.generated_last_minute() as f64 / 60.0,
+        state.model.config().limits.max_active,
+    ))
+    .into_response()
+}
+
+fn load_report(
+    snapshot: &Snapshot,
+    cache_hit_rate: f64,
+    gen_throughput: f64,
+    max_running: usize,
+) -> Value {
+    let used_pages = snapshot.total_pages.saturating_sub(snapshot.free_pages);
+    let token_usage = if snapshot.total_pages == 0 {
+        0.0
+    } else {
+        used_pages as f64 / snapshot.total_pages as f64
+    };
+    let utilization = if max_running == 0 {
+        0.0
+    } else {
+        snapshot.active as f64 / max_running as f64
+    };
+    json!({
+        "timestamp": "",
+        "dp_rank_count": 1,
+        "loads": [{
+            "dp_rank": 0,
+            "num_running_reqs": snapshot.active,
+            "num_waiting_reqs": snapshot.pending,
+            "num_waiting_uncached_tokens": 0,
+            "num_total_reqs": snapshot.active + snapshot.pending,
+            "num_used_tokens": used_pages.saturating_mul(snapshot.page_tokens),
+            "max_total_num_tokens": snapshot.total_pages.saturating_mul(snapshot.page_tokens),
+            "token_usage": token_usage,
+            "gen_throughput": gen_throughput,
+            "cache_hit_rate": cache_hit_rate,
+            "utilization": utilization,
+            "max_running_requests": max_running,
+        }],
+    })
 }
 async fn metrics(State(state): State<Arc<HttpState>>, uri: Uri, headers: HeaderMap) -> Response {
     let accept = headers.get(header::ACCEPT).and_then(|value| value.to_str().ok());
@@ -658,6 +708,39 @@ mod observation_tests {
                 .raw_os_error(),
             Some(13)
         );
+    }
+
+    #[test]
+    fn load_report_exposes_one_rank_of_scheduler_gauges() {
+        let snapshot = Snapshot {
+            active: 3,
+            pending: 2,
+            free_pages: 90,
+            total_pages: 100,
+            page_tokens: 128,
+            ..Snapshot::default()
+        };
+        let report = load_report(&snapshot, 0.75, 42.0, 32);
+        assert_eq!(report["dp_rank_count"], 1);
+        assert_eq!(report["loads"].as_array().unwrap().len(), 1);
+        let rank = &report["loads"][0];
+        assert_eq!(rank["dp_rank"], 0);
+        assert_eq!(rank["num_running_reqs"], 3);
+        assert_eq!(rank["num_waiting_reqs"], 2);
+        assert_eq!(rank["num_total_reqs"], 5);
+        assert_eq!(rank["num_used_tokens"], 10 * 128);
+        assert_eq!(rank["max_total_num_tokens"], 100 * 128);
+        assert_eq!(rank["token_usage"].as_f64().unwrap(), 0.1);
+        assert_eq!(rank["gen_throughput"].as_f64().unwrap(), 42.0);
+        assert_eq!(rank["cache_hit_rate"].as_f64().unwrap(), 0.75);
+        assert_eq!(rank["utilization"].as_f64().unwrap(), 3.0 / 32.0);
+        assert_eq!(rank["max_running_requests"], 32);
+        let empty = load_report(&Snapshot::default(), 0.0, 0.0, 0);
+        assert_eq!(empty["loads"][0]["token_usage"].as_f64().unwrap(), 0.0);
+        assert_eq!(empty["loads"][0]["utilization"].as_f64().unwrap(), 0.0);
+        assert_eq!(empty["loads"][0]["max_total_num_tokens"], 0);
+        let text = empty.to_string();
+        assert!(!text.contains("NaN"), "{text}");
     }
 
     #[tokio::test]

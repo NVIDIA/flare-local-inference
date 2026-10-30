@@ -255,6 +255,10 @@ drains before its resources are reclaimed. Output queues remain bounded.
 HTTP 503 with an error object otherwise. Neither this route nor `/metrics`
 requires the serving key: both report aggregate state without request content.
 
+`GET /v1/loads` returns the scheduler's load as one data-parallel rank in the
+JSON schema cache-aware gateways (Shepherd Model Gateway, SGLang routers) probe
+natively. Like `/health` and `/metrics`, it requires no serving key.
+
 `GET /metrics` returns Prometheus text exposition format 0.0.4 by default.
 Counter and gauge names start with `flare_`, such as
 `flare_generated_tokens_total`, `flare_active_requests`, and
