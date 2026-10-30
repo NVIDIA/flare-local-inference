@@ -154,8 +154,9 @@ impl RetainedMappingPool {
         self.mappings.entry(mapping.size).or_default().push(mapping);
     }
 
+    /// The mapping `pop` removes next.
     fn peek(&self) -> Option<&RetainedMapping> {
-        self.mappings.values().flatten().next()
+        self.mappings.values().next()?.last()
     }
 
     fn pop(&mut self) -> Option<RetainedMapping> {
@@ -678,6 +679,43 @@ mod tests {
                 .retain(1, || panic!("overflow must precede retain"))
                 .is_err()
         );
+    }
+
+    #[test]
+    fn retention_finish_unmaps_every_pooled_mapping_once() {
+        let mut retained = RetainedBacking::default();
+        retained.begin().unwrap();
+        retained.retain(0x1000, || Ok(7)).unwrap();
+        retained.retain(0x1000, || Ok(8)).unwrap();
+        let mut retained_mappings = RetainedMappingPool::default();
+        retained_mappings.insert(RetainedMapping {
+            address: 0x10000,
+            size: 0x1000,
+        });
+        retained_mappings.insert(RetainedMapping {
+            address: 0x20000,
+            size: 0x1000,
+        });
+        let mut free = Vec::new();
+        let mut unmapped = Vec::new();
+
+        finish_retention(
+            &mut retained,
+            &mut retained_mappings,
+            &mut free,
+            |address, size| {
+                unmapped.push((address, size));
+                Ok(())
+            },
+            |_| Ok(()),
+        )
+        .unwrap();
+
+        unmapped.sort_unstable();
+        assert_eq!(unmapped, vec![(0x10000, 0x1000), (0x20000, 0x1000)]);
+        assert_eq!(retained_mappings.len(), 0);
+        assert_eq!(free, vec![(0x10000, 0x1000), (0x20000, 0x1000)]);
+        assert!(retained.handles.is_empty());
     }
 
     #[test]
