@@ -145,6 +145,7 @@ impl RetainedMappingPool {
     fn take(&mut self, size: usize) -> Option<RetainedMapping> {
         let mapping_size = self.mappings.range(size..).next().map(|(&size, _)| size)?;
         let mappings = self.mappings.get_mut(&mapping_size)?;
+        debug_assert!(!mappings.is_empty());
         let mapping = mappings.pop()?;
         if mappings.is_empty() {
             self.mappings.remove(&mapping_size);
@@ -867,6 +868,102 @@ mod tests {
         assert_eq!(retained_mappings.len(), 1);
         assert_eq!(retained.handles, vec![(7, 4096)]);
         assert!(free.is_empty());
+    }
+
+    #[test]
+    fn retention_finish_restores_pool_when_unmap_fails() {
+        fn drain_order(pool: &mut RetainedMappingPool) -> Vec<(u64, usize)> {
+            let mut order = Vec::new();
+            while let Some(mapping) = pool.pop() {
+                order.push((mapping.address, mapping.size));
+            }
+            order
+        }
+
+        let mut retained = RetainedBacking::default();
+        retained.begin().unwrap();
+        retained.retain(0x1000, || Ok(7)).unwrap();
+        retained.retain(0x2000, || Ok(8)).unwrap();
+        let mut pool = RetainedMappingPool::default();
+        pool.insert(RetainedMapping {
+            address: 0x10000,
+            size: 0x1000,
+        });
+        pool.insert(RetainedMapping {
+            address: 0x30000,
+            size: 0x1000,
+        });
+        pool.insert(RetainedMapping {
+            address: 0x50000,
+            size: 0x2000,
+        });
+        let mut free = Vec::new();
+        let mut calls = 0;
+
+        let result = finish_retention(
+            &mut retained,
+            &mut pool,
+            &mut free,
+            |address, _| {
+                calls += 1;
+                if address == 0x10000 {
+                    Err(invalid("unmap failed"))
+                } else {
+                    Ok(())
+                }
+            },
+            |_| panic!("release must not run while unmap fails"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls, 2);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.bytes(), 0x3000);
+        assert_eq!(
+            drain_order(&mut pool),
+            vec![(0x10000, 0x1000), (0x50000, 0x2000)]
+        );
+        assert_eq!(free, vec![(0x30000, 0x1000)]);
+        assert_eq!(retained.handles, vec![(7, 0x1000), (8, 0x2000)]);
+        assert_eq!(retained.reference_bytes, 0x3000);
+
+        let mut retained = RetainedBacking::default();
+        retained.begin().unwrap();
+        retained.retain(0x1000, || Ok(9)).unwrap();
+        let mut pool = RetainedMappingPool::default();
+        pool.insert(RetainedMapping {
+            address: 0x10000,
+            size: 0x1000,
+        });
+        pool.insert(RetainedMapping {
+            address: 0x50000,
+            size: 0x2000,
+        });
+        let mut free = Vec::new();
+        let mut calls = 0;
+
+        let result = finish_retention(
+            &mut retained,
+            &mut pool,
+            &mut free,
+            |_, _| {
+                calls += 1;
+                Err(invalid("unmap failed"))
+            },
+            |_| panic!("release must not run while unmap fails"),
+        );
+
+        assert!(result.is_err());
+        assert_eq!(calls, 1);
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.bytes(), 0x3000);
+        assert_eq!(
+            drain_order(&mut pool),
+            vec![(0x10000, 0x1000), (0x50000, 0x2000)]
+        );
+        assert!(free.is_empty());
+        assert_eq!(retained.handles, vec![(9, 0x1000)]);
+        assert_eq!(retained.reference_bytes, 0x1000);
     }
 
     #[test]
