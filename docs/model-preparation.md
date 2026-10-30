@@ -352,6 +352,21 @@ architecture as the serving device:
 .venv/bin/ignition convert CACHE_ENTRY --form packed --output /data/flare-runtime/qwen38-27b-tp1.safetensors
 ```
 
+`qwen3.8-27b-qad` selects the pinned
+`local-inference-lab/Qwen3.8-27B-NVFP4-QAD` checkpoint. Its calibrated NVFP4 MLPs,
+MXFP8 GDN projections, BF16 full-attention and vocabulary weights, and trained
+FP32 normalization weights retain their stored precision by default.
+`--online-mxfp8` converts eligible BF16 target attention/MLP projections and
+DFlash2 context, attention, and MLP projections to MXFP8 while loading. Existing
+packed weights, normalization, grouped-convolution parameters, and candidate
+selector weights are unchanged. With a BF16 checkpoint vocabulary head,
+`--draft-head-quantization nvfp4` or `mxfp8` creates a separate proposal head;
+the target vocabulary head retains BF16 precision. For example:
+
+```sh
+.venv/bin/ignition bench qwen3.8-27b-qad --online-mxfp8 --draft-head-quantization nvfp4 --gpus 0
+```
+
 Use `--mtp-draft-tokens N` to select the prepared draft depth. Width-one rounds
 retain draft context so adaptive verification can resume wider rounds.
 `--no-mtp` skips the draft download and omits its weights and state during preparation;

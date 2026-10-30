@@ -506,7 +506,7 @@ def qwen_dense_weights(first_layer_seed=1.0):
     tree.norm = torch.nn.Parameter(torch.zeros(2))
     tree.layers = torch.nn.ModuleList([LayerModule(1), LayerModule(2)])
     return SimpleNamespace(
-        tree=tree, head=torch.zeros(2), draft=None,
+        tree=tree, head=torch.zeros(2), draft=None, draft_head=None,
         projections={
             'layers.0.self_attn.q_proj': torch.full((2, 2), first_layer_seed),
             'layers.1.self_attn.q_proj': torch.full((2, 2), 2.0),

@@ -9,7 +9,7 @@ from ignition.components.candidate_selector import PreparedCandidateSelector
 from ignition.components.collectives import PreparedAllReduce, PreparedChunkedAllGather
 from ignition.components.embedding import PreparedShardedEmbedding
 from ignition.components.grouped_convolution import PreparedGroupedConvolution
-from ignition.components.linear import UnquantizedProjection
+from ignition.components.linear import prepare_projection
 from ignition.components.mlp import MLPScratch, PreparedMLP
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.vocabulary import PreparedVocabularyProjection
@@ -54,19 +54,19 @@ class PreparedContext:
         scratch = buffers.fork()
         self.local = scratch.zeros((tokens, hidden // weights.shard.world_size), torch.bfloat16)
         self.projected = scratch.zeros((tokens, hidden), torch.bfloat16)
-        self.kv = scratch.zeros((tokens, weights.draft.context_kv.shape[0]), torch.bfloat16)
         _, kv_heads = a.local(weights.shard)
+        self.kv = scratch.zeros((tokens, c.layers * kv_heads * (a.key_dim + a.value_dim)), torch.bfloat16)
         self.key = scratch.zeros((tokens, kv_heads, a.key_dim), torch.bfloat16)
         self.value = scratch.zeros((tokens, kv_heads, a.value_dim), torch.bfloat16)
         self.slots = scratch.full((tokens,), -1, torch.int64)
         self.inverse = _inverse(a, auxiliary.device)
-        self.project = UnquantizedProjection(auxiliary, weights.draft.projection, self.local,
-            session=session, name=name + ".project")
+        self.project = prepare_projection(auxiliary, weights.draft.projection, self.local,
+            session=session, name=name + ".project", workspace=workspace)
         self.gather = PreparedChunkedAllGather(self.local, self.projected, runtime=runtime,
             coordinator=coordinator, session=session, name=name + ".gather")
         self.norm = _norm(weights.draft.hidden_norm, c.text["rms_norm_eps"])
-        self.project_kv = UnquantizedProjection(self.projected, weights.draft.context_kv, self.kv,
-            session=session, name=name + ".kv")
+        self.project_kv = prepare_projection(self.projected, weights.draft.context_kv, self.kv,
+            session=session, name=name + ".kv", workspace=workspace)
         self.layers = []
         for index, layer in enumerate(weights.draft.layers):
             norm = _norm(layer.key_norm, c.text["rms_norm_eps"])
@@ -165,7 +165,7 @@ class DraftAttention:
                  runtime, coordinator, session, name, workspace, buffers):
         self.scratch, self.metadata = scratch, metadata
         a, self.window = config.attention, config.attention.window
-        self.qkv = UnquantizedProjection(source, weights.qkv, scratch.qkv, session=session, name=name + ".qkv")
+        self.qkv = prepare_projection(source, weights.qkv, scratch.qkv, session=session, name=name + ".qkv", workspace=workspace)
         self.q_norm = _norm(weights.query_norm, config.text["rms_norm_eps"])
         self.k_norm = _norm(weights.key_norm, config.text["rms_norm_eps"])
         self.inverse = _inverse(a, source.device)
@@ -180,8 +180,8 @@ class DraftAttention:
             self.pages, self.lengths, metadata.query_start_loc, scratch.attended,
             mode="verify", width=config.block_size, window=a.window - 1, causal=False,
             session=session, workspace=workspace, name=name + ".attention")
-        self.output = UnquantizedProjection(scratch.attended.flatten(1), weights.output, scratch.partial,
-            session=session, name=name + ".output")
+        self.output = prepare_projection(scratch.attended.flatten(1), weights.output, scratch.partial,
+            session=session, name=name + ".output", workspace=workspace)
         self.reduce = PreparedAllReduce(scratch.partial, scratch.output, runtime=runtime, coordinator=coordinator,
             session=session, name=name + ".reduce")
 

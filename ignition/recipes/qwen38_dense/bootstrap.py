@@ -53,6 +53,8 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     compile_workers: int | None = None
     native_dense_activations: bool = False
+    online_mxfp8: bool = False
+    draft_head_quantization: str | None = None
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
     tuning_replica: TuningReplica | None = None
@@ -94,6 +96,12 @@ class PreparationConfig:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
         if type(self.mtp) is not bool:
             raise TypeError("MTP selection must be a boolean")
+        if type(self.online_mxfp8) is not bool:
+            raise TypeError("online MXFP8 selection must be a boolean")
+        if self.draft_head_quantization not in (None, "mxfp8", "nvfp4"):
+            raise ValueError("draft head quantization must be mxfp8 or nvfp4")
+        if self.draft_head_quantization is not None and not self.mtp:
+            raise ValueError("draft head quantization requires DFlash2")
         if self.mtp and self.draft_snapshot is None:
             raise ValueError("Qwen DFlash2 preparation requires a draft checkpoint")
         parallel_speculative_shapes(self.max_active, self.speculative_widths, self.speculative_token_capacity,
@@ -131,7 +139,7 @@ def _declared_weight_roots(weights):
     declared `layers.N.` prefix here, never by native path inference.
     """
     roots = {'embedding': weights.tree.embed_tokens, 'norm': weights.tree.norm,
-             'head': weights.head, 'draft': weights.draft}
+             'head': weights.head, 'draft': weights.draft, 'draft_head': weights.draft_head}
     components = {name: name for name in roots}
     prepared = dict(weights.projections)
     for index, layer in enumerate(weights.tree.layers):
@@ -161,7 +169,9 @@ def prepare(snapshot, config, *, progress=None, package_storage):
                          if config.mtp else [])
     transient = contextlib.ExitStack()
     transient.enter_context(package_storage.transient())
-    weights = ModelWeights.load(manifest, device, progress=progress, mtp=config.mtp, draft_snapshot=config.draft_snapshot)
+    weights = ModelWeights.load(manifest, device, progress=progress, mtp=config.mtp,
+        draft_snapshot=config.draft_snapshot, online_mxfp8=config.online_mxfp8,
+        draft_head_quantization=config.draft_head_quantization)
     release_unused()
     layout = continuation_layout(weights.config, mtp=config.mtp)
     snapshots = layout.snapshot_capacity(config.snapshot_budget_bytes)
@@ -190,6 +200,8 @@ def prepare(snapshot, config, *, progress=None, package_storage):
             "config": weights.config.text, "headers": [s.header_sha256 for s in manifest.shards],
             "draft": None if weights.config.draft is None else weights.config.draft.text,
             "draft_headers": draft_headers,
+            "online_mxfp8": config.online_mxfp8,
+            "draft_head_quantization": config.draft_head_quantization,
             "contract": "qwen38-dense.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,

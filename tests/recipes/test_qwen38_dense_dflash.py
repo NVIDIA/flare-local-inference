@@ -180,3 +180,31 @@ def test_pinned_checkpoint_metadata_rejects_precision_and_non_square_shape_error
     del tensors["candidate_selector.predecessor_codebook"]
     with pytest.raises(ValueError, match="tensor names"):
         validate_metadata(replace(manifest, tensors=tensors), config.draft)
+
+
+@pytest.mark.parametrize("online", [False, True])
+@pytest.mark.parametrize("head", [None, "mxfp8", "nvfp4"])
+def test_qad_precision_options_reach_preparation_plan(online, head):
+    from ignition import planning
+    from ignition.cli import _parser
+    from ignition.cli.preparation import speculation
+    from ignition.recipes.qwen38_dense.bootstrap import PreparationConfig
+
+    flags = (["--online-mxfp8"] if online else []) + (["--draft-head-quantization", head] if head else [])
+    args = _parser().parse_args(["bench", "qwen3.8-27b-qad", *flags])
+    model = resolve(args.model)
+    assert model.checkpoint.repository == "local-inference-lab/Qwen3.8-27B-NVFP4-QAD"
+    assert model.checkpoint.revision == "b9389787cbb5a09fbcf3517bdf673b5a56b16b02"
+    assert resolve("qwen3.8-27b").checkpoint.repository == "nvidia/Qwen3.8-27B-NVFP4"
+    gpus = (planning.Gpu(0, "SM120", "GPU-0", 96 << 30, 95 << 30, (12, 0)),)
+    plan = planning.fit(model.recipe, model.checkpoint, gpus, concurrency=1, reserve_bytes=0,
+                        online_mxfp8=args.online_mxfp8, speculation=speculation(args, model))
+    assert plan.online_mxfp8 == online
+    assert plan.speculation.draft_head_quantization == head
+    assert plan.to_dict()["online_mxfp8"] == online
+    assert plan.to_dict()["speculation"]["draft_head_quantization"] == head
+    config = PreparationConfig(draft_snapshot=Path("draft"), online_mxfp8=online, draft_head_quantization=head)
+    assert config.online_mxfp8 == online and config.draft_head_quantization == head
+    if head:
+        with pytest.raises(ValueError, match="requires DFlash2"):
+            PreparationConfig(mtp=False, draft_head_quantization=head)

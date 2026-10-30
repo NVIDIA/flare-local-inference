@@ -181,7 +181,8 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--draft-head-quantization", choices=("nvfp4", "mxfp8"),
                           help="prepare a separate quantized vocabulary head for learned draft proposals;"
                                " target verification retains its precision (NVFP4: DeepSeek V4/V4.1;"
-                               " MXFP8: DeepSeek V4.1; default: checkpoint precision)")
+                               " MXFP8: DeepSeek V4.1; both: Qwen3.8 dense with a BF16 checkpoint head;"
+                               " default: checkpoint precision)")
     advanced.add_argument("--markov-head-quantization", choices=("nvfp4", "fp8"),
                           help="prepare the draft Markov transition projection as NVFP4"
                                " or row-scaled E4M3 FP8 (FP8: DeepSeek V4.1; default: checkpoint precision)")
@@ -227,9 +228,10 @@ def _preparation_arguments(running, *, model_default="defaults.model"):
     advanced.add_argument("--no-compile", action="store_true",
                           help="development: capture graphs without compiling forwards")
     advanced.add_argument("--online-mxfp8", action="store_true",
-                          help="store the recipe's eligible BF16 projections as MXFP8 while loading; faster"
-                               " decode at reduced precision (Kimi K3 KDA, MLA except batched key/value, shared"
+                          help="store the recipe's eligible BF16 projections as MXFP8 while loading"
+                               " (Kimi K3 KDA, MLA except batched key/value, shared"
                                " experts, MoE latent projections, and DSpark draft context, outputs and MLPs;"
+                               " Qwen3.8 dense target attention/MLPs and DFlash2 context, attention and MLPs;"
                                " default: checkpoint precision)")
     advanced.add_argument("--language-model-only", action="store_true",
                           help="prepare no vision encoder and reject images; its weights and scratch become KV"

@@ -8,7 +8,7 @@ import triton
 
 from ignition.components.embedding import PreparedEmbedding
 from ignition.components.gated_delta import GDNScratch, PreparedGDN
-from ignition.components.linear import QuantizedProjection, UnquantizedProjection
+from ignition.components.linear import prepare_projection
 from ignition.components.gdn_recovery import PreparedGDNCommit
 from ignition.components.paged_attention import PreparedPagedAttention, PreparedPagedKVWriter
 from ignition.components.recurrent import DeltaMetadata, _commit_convolution
@@ -92,7 +92,8 @@ class FullAttention(torch.nn.Module):
             if isinstance(weight, TensorFP8Weight):
                 return TensorFP8Projection(inputs, weight, output, session=session, name=name + "." + field,
                                            staging=projection_staging)
-            return UnquantizedProjection(inputs, weight, output, session=session, name=name + "." + field)
+            return prepare_projection(inputs, weight, output, session=session, name=name + "." + field,
+                                      workspace=workspace)
         operands = (
             ("q_proj", source, self.qg), ("k_proj", source, self.k),
             ("v_proj", source, self.v), ("o_proj", self.attended, self.output))
@@ -163,8 +164,10 @@ class PreparedDecoder:
             layer = module_copy(original)
             prefix = f"layers.{index}."
             if original.block_type == "linear_attention":
+                inputs = (("in_proj_qkvz",) if prefix + "linear_attn.in_proj_qkvz" in weights.projections
+                          else ("in_proj_qkv", "in_proj_z"))
                 projections = {field: weights.projections[prefix + "linear_attn." + field]
-                               for field in ("in_proj_qkv", "in_proj_z", "in_proj_ba", "out_proj")}
+                               for field in (*inputs, "in_proj_ba", "out_proj")}
                 layer.linear_attn = RecurrentAttention(PreparedGDN(original.linear_attn, projections, source,
                     scratch.gdn, pool.recurrent(index), self.delta,
                     mode="decode" if mode == "verify" else mode, session=session,
@@ -180,7 +183,7 @@ class PreparedDecoder:
                 weight = weights.projections[prefix + "mlp." + field]
                 inputs = source if field != "down_proj" else mlp_input
                 output = mlp_buffers[field]
-                setattr(layer.mlp, field, Projection(QuantizedProjection(inputs, weight, output,
+                setattr(layer.mlp, field, Projection(prepare_projection(inputs, weight, output,
                     activation_mode="auto", session=session, workspace=workspace, name=name + "." + prefix + field)))
             self.layers.append(layer)
         rotary = config.text["rope_parameters"]

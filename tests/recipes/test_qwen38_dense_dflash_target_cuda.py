@@ -12,8 +12,9 @@ from ignition.recipes import resolve
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires assigned CUDA GPU")
 
 
+@pytest.mark.parametrize("checkpoint,online_mxfp8", [("qwen3.8-27b", False), ("qwen3.8-27b-qad", False), ("qwen3.8-27b-qad", True)])
 @torch.no_grad()
-def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state():
+def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state(checkpoint, online_mxfp8):
     from b12x.preparation import PreparationSession
     from ignition.components.completion import CompletionOutputs
     from ignition.components.paged_batch import BatchInputs
@@ -28,10 +29,20 @@ def test_checkpoint_compiled_packed_round_preserves_taps_and_inactive_state():
     from ignition.recipes.qwen38_dense.weights import ModelWeights
 
     hub = Path.home() / ".cache/huggingface/hub"
-    target = resolve("qwen3.8-27b").snapshot(hub)
+    target = resolve(checkpoint).snapshot(hub)
     draft = hub / "models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5"
     assert (target / "config.json").is_file() and (draft / "model.safetensors").is_file()
-    weights = ModelWeights.load(inspect_indexed_checkpoint(target), torch.device("cuda:0"), mtp=True, draft_snapshot=draft)
+    weights = ModelWeights.load(inspect_indexed_checkpoint(target), torch.device("cuda:0"), mtp=True, draft_snapshot=draft, online_mxfp8=online_mxfp8)
+    if checkpoint == "qwen3.8-27b-qad":
+        from ignition.recipes.qwen38_dense.config import TEXT_PREFIX
+        from ignition.reference.qwen38_quant import CheckpointTensors
+
+        with CheckpointTensors(inspect_indexed_checkpoint(target), byte_budget=2 << 20) as reader:
+            for name in ("layers.0.input_layernorm.weight", "layers.0.post_attention_layernorm.weight", "norm.weight"):
+                actual = weights.tree.get_parameter(name)
+                original = reader.read(TEXT_PREFIX + "." + name)
+                assert actual.dtype == original.dtype == torch.float32
+                assert torch.equal(actual.cpu(), original)
     pool = ContinuationPool.for_model(weights.config, 3, 2, "cuda:0", mtp=True)
     requests = DeviceRequestState.allocate("cuda:0", vocab_size=weights.config.vocabulary, capacity=2)
     inputs = BatchInputs.allocate(16, 1, "cuda:0", capacity=2)

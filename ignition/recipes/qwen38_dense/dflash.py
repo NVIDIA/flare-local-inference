@@ -32,7 +32,8 @@ class SpeculativePreparation:
 
         self.forwards = SimpleNamespace(decoder=decoder,
             context=partial(PreparedContext, runtime=None, coordinator=None, buffers=context_buffers.cursor()),
-            draft=partial(PreparedDraft, embedding=weights.tree.embed_tokens.weight, head=weights.head,
+            draft=partial(PreparedDraft, embedding=weights.tree.embed_tokens.weight,
+                head=weights.head if weights.draft_head is None else weights.draft_head,
                 output_multiplier=1., final_logit_softcapping=None,
                 embedding_runtime=None, buffers=buffers), markov=None)
         self.rng = SpeculativeRngState.allocate(pool.backing.device, capacity=requests.capacity)

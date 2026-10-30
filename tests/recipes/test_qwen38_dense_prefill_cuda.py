@@ -11,8 +11,9 @@ from ignition.recipes import resolve
 pytestmark = pytest.mark.skipif(os.environ.get("FLARE_RUN_CUDA_TESTS") != "1", reason="requires assigned CUDA GPU")
 
 
+@pytest.mark.parametrize("checkpoint,online_mxfp8", [("qwen3.8-27b", False), ("qwen3.8-27b-qad", False), ("qwen3.8-27b-qad", True)])
 @torch.no_grad()
-def test_checkpoint_captured_chunked_prefill_preserves_counts_and_state():
+def test_checkpoint_captured_chunked_prefill_preserves_counts_and_state(checkpoint, online_mxfp8):
     from b12x.preparation import PreparationSession
     from ignition.components.dflash2 import PreparedContext
     from ignition.components.paged_batch import Metadata
@@ -25,9 +26,9 @@ def test_checkpoint_captured_chunked_prefill_preserves_counts_and_state():
 
     device = torch.device("cuda:0")
     hub = Path.home() / ".cache/huggingface/hub"
-    target = resolve("qwen3.8-27b").snapshot(hub)
+    target = resolve(checkpoint).snapshot(hub)
     draft = hub / "models--incoai--Qwen3.8-27B-DFlash2/snapshots/015e795645c74b1a0eeef3b570031fb62e769bc5"
-    weights = ModelWeights.load(inspect_indexed_checkpoint(target), device, mtp=True, draft_snapshot=draft)
+    weights = ModelWeights.load(inspect_indexed_checkpoint(target), device, mtp=True, draft_snapshot=draft, online_mxfp8=online_mxfp8)
     pool = ContinuationPool.for_model(weights.config, 3, 2, device, mtp=True)
     metadata = Metadata.allocate(128, 1, 1, device)
     source, target_buffers, context_buffers = (GraphBufferPool(device, chunk_bytes=2 << 20) for _ in range(3))
