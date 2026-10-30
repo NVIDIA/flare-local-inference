@@ -121,6 +121,19 @@ def test_copy_lowering_preserves_destination_for_offset_or_strided_sources(offse
     assert any(call.target is torch.ops.aten.copy_.default for call in calls) is opaque
 
 
+@pytest.mark.parametrize('overlapping', [False, True])
+def test_copy_lowering_preserves_destination_for_sources_gathered_from_it(overlapping):
+    from ignition.preparation.compilation import ForwardTracer, _lower_storage
+
+    output = torch.zeros((4, 8), dtype=torch.int32)
+    physical = output[:2]
+    destination = output if overlapping else torch.zeros_like(output)
+    indices = torch.zeros(4, dtype=torch.int64)
+    module = ForwardTracer()(lambda: destination.copy_(physical[indices]))
+    calls = _lower_storage(module)
+    assert any(call.target is torch.ops.aten.copy_.default for call in calls) is overlapping
+
+
 class CountedShortConvolution:
     def __init__(self, session):
         from b12x.sequence import short_conv

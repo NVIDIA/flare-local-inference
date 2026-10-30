@@ -502,8 +502,10 @@ def _lower_storage(module):
         mutable_keys = {key_for(arg) for arg in mutated}
         # Opaque operands retain their prepared alignment and contiguous layout.
         source = node.args[1].meta['val'] if target is torch.ops.aten.copy_.default else None
+        # A source that reads the destination region would be gathered in place by the writeback.
         if (target is torch.ops.aten.copy_.default
                 and source.is_contiguous() and source.storage_offset() == 0
+                and mutable_keys.isdisjoint(accesses[node.args[1]])
                 and not any(last_write.get(key, -1) > positions[node] for key in accesses[node.args[1]])
                 and all(complete_write(arg) for arg in mutated)):
             continue
