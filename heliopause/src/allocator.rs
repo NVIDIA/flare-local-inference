@@ -136,6 +136,8 @@ struct RetainedMapping {
 
 #[derive(Default)]
 struct RetainedMappingPool {
+    // Buckets are never empty: insert creates the vector it pushes into, and
+    // every removal drops a bucket when it empties.
     mappings: BTreeMap<usize, Vec<RetainedMapping>>,
 }
 
@@ -154,14 +156,10 @@ impl RetainedMappingPool {
         self.mappings.entry(mapping.size).or_default().push(mapping);
     }
 
-    /// The mapping `pop` removes next.
-    fn peek(&self) -> Option<&RetainedMapping> {
-        self.mappings.values().next()?.last()
-    }
-
     fn pop(&mut self) -> Option<RetainedMapping> {
         let size = self.mappings.keys().next().copied()?;
         let mappings = self.mappings.get_mut(&size)?;
+        debug_assert!(!mappings.is_empty());
         let mapping = mappings.pop()?;
         if mappings.is_empty() {
             self.mappings.remove(&size);
@@ -527,10 +525,12 @@ fn finish_retention(
     mut release: impl FnMut(u64) -> Result<()>,
 ) -> Result<()> {
     retained.check_finishable()?;
-    while let Some(mapping) = retained_mappings.peek() {
+    while let Some(mapping) = retained_mappings.pop() {
         let (address, size) = (mapping.address, mapping.size);
-        unmap(address, size)?;
-        retained_mappings.pop();
+        if let Err(error) = unmap(address, size) {
+            retained_mappings.insert(mapping);
+            return Err(error);
+        }
         release_free_range(free, address, size);
     }
     retained.finish(|handle| release(handle))
@@ -716,6 +716,131 @@ mod tests {
         assert_eq!(retained_mappings.len(), 0);
         assert_eq!(free, vec![(0x10000, 0x1000), (0x20000, 0x1000)]);
         assert!(retained.handles.is_empty());
+    }
+
+    #[test]
+    fn retention_finish_drains_each_pool_shape_once() {
+        let cases: Vec<(&str, Vec<RetainedMapping>, Option<usize>, Vec<(u64, usize)>)> = vec![
+            ("empty pool", Vec::new(), None, Vec::new()),
+            (
+                "one bucket with one mapping",
+                vec![RetainedMapping {
+                    address: 0x10000,
+                    size: 0x1000,
+                }],
+                None,
+                vec![(0x10000, 0x1000)],
+            ),
+            (
+                "three buckets with one mapping each",
+                vec![
+                    RetainedMapping {
+                        address: 0x10000,
+                        size: 0x1000,
+                    },
+                    RetainedMapping {
+                        address: 0x30000,
+                        size: 0x2000,
+                    },
+                    RetainedMapping {
+                        address: 0x50000,
+                        size: 0x3000,
+                    },
+                ],
+                None,
+                vec![(0x10000, 0x1000), (0x30000, 0x2000), (0x50000, 0x3000)],
+            ),
+            (
+                "two buckets with several mappings each",
+                vec![
+                    RetainedMapping {
+                        address: 0x10000,
+                        size: 0x1000,
+                    },
+                    RetainedMapping {
+                        address: 0x30000,
+                        size: 0x1000,
+                    },
+                    RetainedMapping {
+                        address: 0x50000,
+                        size: 0x2000,
+                    },
+                    RetainedMapping {
+                        address: 0x70000,
+                        size: 0x2000,
+                    },
+                    RetainedMapping {
+                        address: 0x90000,
+                        size: 0x1000,
+                    },
+                    RetainedMapping {
+                        address: 0xb0000,
+                        size: 0x2000,
+                    },
+                ],
+                None,
+                vec![
+                    (0x90000, 0x1000),
+                    (0x30000, 0x1000),
+                    (0x10000, 0x1000),
+                    (0xb0000, 0x2000),
+                    (0x70000, 0x2000),
+                    (0x50000, 0x2000),
+                ],
+            ),
+            (
+                "pool after take emptied a bucket",
+                vec![
+                    RetainedMapping {
+                        address: 0x10000,
+                        size: 0x1000,
+                    },
+                    RetainedMapping {
+                        address: 0x30000,
+                        size: 0x2000,
+                    },
+                    RetainedMapping {
+                        address: 0x50000,
+                        size: 0x2000,
+                    },
+                ],
+                Some(0x1000),
+                vec![(0x50000, 0x2000), (0x30000, 0x2000)],
+            ),
+        ];
+
+        for (name, mappings, take_size, expected) in cases {
+            let mut retained = RetainedBacking::default();
+            retained.begin().unwrap();
+            let mut retained_mappings = RetainedMappingPool::default();
+            for mapping in mappings {
+                retained_mappings.insert(mapping);
+            }
+            if let Some(size) = take_size {
+                retained_mappings.take(size).unwrap();
+            }
+            let mut free = Vec::new();
+            let mut unmapped = Vec::new();
+
+            finish_retention(
+                &mut retained,
+                &mut retained_mappings,
+                &mut free,
+                |address, size| {
+                    unmapped.push((address, size));
+                    Ok(())
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+
+            assert_eq!(unmapped, expected, "{name}");
+            let mut expected_free = expected.clone();
+            expected_free.sort_unstable();
+            assert_eq!(free, expected_free, "{name}");
+            assert_eq!(retained_mappings.len(), 0, "{name}");
+            assert_eq!(retained_mappings.bytes(), 0, "{name}");
+        }
     }
 
     #[test]
