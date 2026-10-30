@@ -3046,10 +3046,7 @@ impl Staging {
             fs::create_dir_all(parent).map_err(failure)?;
         }
         fs::copy(object.path(), &destination).map_err(failure)?;
-        File::open(&destination)
-            .map_err(failure)?
-            .sync_all()
-            .map_err(failure)?;
+        sync_file(&destination).map_err(failure)?;
         self.copied = true;
         Ok(())
     }
@@ -3075,12 +3072,16 @@ impl Staging {
         if self.copied {
             return Err("copied payloads belong to a standalone export".into());
         }
-        let _publication = Lock::shared(self.root.publication_lock())?;
-        synchronize(&self.directory)?;
-        seal(&self.directory)?;
-        let _coordination = Lock::exclusive(self.root.lock_path("models", &self.model))?;
+        let _publication = Lock::shared(self.root.publication_lock())
+            .map_err(|error| format!("lock cache publication: {error}"))?;
+        synchronize(&self.directory)
+            .map_err(|error| format!("sync staged entry: {error}"))?;
+        seal(&self.directory).map_err(|error| format!("seal staged entry: {error}"))?;
+        let _coordination = Lock::exclusive(self.root.lock_path("models", &self.model))
+            .map_err(|error| format!("lock model coordination: {error}"))?;
         let models = self.root.path().join("models").join(&self.model);
-        fs::create_dir_all(&models).map_err(failure)?;
+        fs::create_dir_all(&models)
+            .map_err(|error| format!("create model directory {}: {error}", models.display()))?;
         let destination = models.join(&self.entry);
         match fs::symlink_metadata(&destination) {
             Ok(_) => {
@@ -3091,16 +3092,27 @@ impl Staging {
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
             Err(error) => return Err(failure(error)),
         }
-        fs::rename(&self.directory, &destination).map_err(failure)?;
-        syncdir(&models)?;
-        syncdir(&self.root.path().join("models"))?;
-        syncdir(&self.root.path().join("staging/trees"))?;
+        fs::rename(&self.directory, &destination).map_err(|error| {
+            format!(
+                "move staged entry {} to {}: {error}",
+                self.directory.display(),
+                destination.display()
+            )
+        })?;
+        syncdir(&models).map_err(|error| format!("sync model directory: {error}"))?;
+        syncdir(&self.root.path().join("models"))
+            .map_err(|error| format!("sync models directory: {error}"))?;
+        syncdir(&self.root.path().join("staging/trees"))
+            .map_err(|error| format!("sync staging trees directory: {error}"))?;
         // A named reservation already holds this entry's lock exclusively on one descriptor;
         // downgrading that same descriptor avoids acquiring a second shared lock on a new
         // descriptor while the exclusive lock is held, which would deadlock.
         let lease = match self.reservation.take() {
-            Some(reservation) => reservation.downgrade()?,
-            None => Lock::shared(self.root.entry_lock(&self.model, &self.entry))?,
+            Some(reservation) => reservation
+                .downgrade()
+                .map_err(|error| format!("downgrade entry reservation: {error}"))?,
+            None => Lock::shared(self.root.entry_lock(&self.model, &self.entry))
+                .map_err(|error| format!("lock entry lease: {error}"))?,
         };
         let (model, id) = (self.model.clone(), self.entry.clone());
         self.published = true;
@@ -3297,7 +3309,7 @@ impl Lock {
 
     /// Convert this lock to shared on the same open file description.
     fn downgrade(self) -> Result<Self> {
-        lock(&self.0, false, true).map_err(failure)?;
+        downgrade_lock(&self.0).map_err(failure)?;
         Ok(self)
     }
 
@@ -3305,9 +3317,25 @@ impl Lock {
         let file = open_lock(path.as_ref())?;
         match lock(&file, true, false) {
             Ok(()) => Ok(Some(Self(file))),
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) if contention(&error) => Ok(None),
             Err(error) => Err(failure(error)),
         }
+    }
+}
+
+/// Whether a failed non-blocking lock reports contention rather than a defect.
+fn contention(error: &io::Error) -> bool {
+    if error.kind() == io::ErrorKind::WouldBlock {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        // Windows reports lock contention as ERROR_LOCK_VIOLATION.
+        return error.raw_os_error() == Some(33);
+    }
+    #[cfg(not(windows))]
+    {
+        false
     }
 }
 
@@ -3359,6 +3387,32 @@ fn lock(file: &File, exclusive: bool, blocking: bool) -> io::Result<()> {
         flags |= LOCKFILE_FAIL_IMMEDIATELY;
     }
     if unsafe { LockFileEx(handle, flags, 0, u32::MAX, u32::MAX, &mut overlapped) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn downgrade_lock(file: &File) -> io::Result<()> {
+    lock(file, false, true)
+}
+
+/// Windows cannot change a lock's type in place, so the exclusive lock is released first.
+#[cfg(windows)]
+fn downgrade_lock(file: &File) -> io::Result<()> {
+    unlock(file)?;
+    lock(file, false, true)
+}
+
+#[cfg(windows)]
+fn unlock(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::HANDLE;
+    use windows_sys::Win32::Storage::FileSystem::UnlockFileEx;
+    use windows_sys::Win32::System::IO::OVERLAPPED;
+    let handle = file.as_raw_handle() as HANDLE;
+    let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+    if unsafe { UnlockFileEx(handle, 0, u32::MAX, u32::MAX, &mut overlapped) } == 0 {
         return Err(io::Error::last_os_error());
     }
     Ok(())
@@ -3698,6 +3752,25 @@ fn make_immutable(path: &Path) -> Result<()> {
     fs::set_permissions(path, permissions).map_err(failure)
 }
 
+/// Flush one file to its device.
+///
+/// Windows requires write access to flush a file's buffers, and a sealed (read-only) file cannot be
+/// opened for writing. Sealing follows the writer's own flush, so such a file is skipped rather
+/// than failed; a writable file that cannot be flushed is still an error.
+#[cfg(windows)]
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    match OpenOptions::new().write(true).open(path) {
+        Ok(file) => file.sync_all(),
+        Err(error) if error.kind() == io::ErrorKind::PermissionDenied => Ok(()),
+        Err(error) => Err(error),
+    }
+}
+
+#[cfg(not(windows))]
+pub(crate) fn sync_file(path: &Path) -> io::Result<()> {
+    File::open(path)?.sync_all()
+}
+
 pub(crate) fn synchronize(directory: &Path) -> Result<()> {
     for item in read_dir(directory)? {
         let metadata = fs::symlink_metadata(&item).map_err(failure)?;
@@ -3708,10 +3781,7 @@ pub(crate) fn synchronize(directory: &Path) -> Result<()> {
         if kind.is_dir() {
             synchronize(&item)?;
         } else if kind.is_file() {
-            File::open(&item)
-                .map_err(failure)?
-                .sync_all()
-                .map_err(failure)?;
+            sync_file(&item).map_err(failure)?;
         } else {
             return Err(format!("staged entry is not a regular file: {}", item.display()).into());
         }
@@ -4983,6 +5053,20 @@ mod tests {
         publisher
     }
 
+    /// Windows refuses to replace a read-only destination, and a published package is
+    /// sealed; clear the attribute before the rename.
+    fn replace_file(temporary: &std::path::Path, path: &std::path::Path) {
+        #[cfg(windows)]
+        if path.exists() {
+            let mut permissions = fs::metadata(path).unwrap().permissions();
+            if permissions.readonly() {
+                permissions.set_readonly(false);
+                fs::set_permissions(path, permissions).unwrap();
+            }
+        }
+        fs::rename(temporary, path).unwrap();
+    }
+
     fn rewrite_primary(
         directory: &std::path::Path,
         locations: Vec<wire::PayloadLocation>,
@@ -5062,7 +5146,9 @@ mod tests {
         }
         writer.finish().unwrap();
         output.sync_all().unwrap();
-        fs::rename(temporary, path).unwrap();
+        // Windows cannot rename a file that is still open.
+        std::mem::drop(output);
+        replace_file(&temporary, &path);
     }
 
 
@@ -5123,7 +5209,9 @@ mod tests {
         }
         writer.finish().unwrap();
         output.sync_all().unwrap();
-        fs::rename(temporary, path).unwrap();
+        // Windows cannot rename a file that is still open.
+        drop(output);
+        replace_file(&temporary, &path);
     }
 
 

@@ -772,7 +772,7 @@ fn open_relative_impl(root: &Path, relative: &str) -> Result<(PathBuf, Arc<File>
     let file = options
         .open(&path)
         .map_err(|e| io("open package payload", e))?;
-    let canonical_root = fs::canonicalize(root).map_err(|e| io("resolve package root", e))?;
+    let canonical_root = comparable_root(root)?;
     let actual = opened_path(&file)?;
     if !actual.starts_with(&canonical_root) {
         return Err(invalid(format!(
@@ -825,6 +825,23 @@ fn opened_path(file: &File) -> Result<PathBuf> {
             "handle-confined package opens require a supported platform",
         ))
     }
+}
+
+/// The package root in the form `opened_path` reports.
+///
+/// Both paths come from the Windows handle resolver, which returns verbatim paths; `opened_path`
+/// drops the verbatim prefix, so the root is compared in the same form.
+#[cfg(not(unix))]
+fn comparable_root(root: &Path) -> Result<PathBuf> {
+    let canonical = fs::canonicalize(root).map_err(|e| io("resolve package root", e))?;
+    #[cfg(windows)]
+    {
+        let text = canonical.to_string_lossy();
+        if let Some(stripped) = text.strip_prefix(r"\\?\") {
+            return Ok(PathBuf::from(stripped));
+        }
+    }
+    Ok(canonical)
 }
 
 /// Opens one package file beneath `root`, confined to the opened handle.

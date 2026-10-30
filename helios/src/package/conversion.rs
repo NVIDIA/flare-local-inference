@@ -309,8 +309,7 @@ pub fn unpack_selected(source: &Path, output: &Path, selected: Option<&[usize]>)
             Source::Bytes(locations),
         )?;
         writer.finish()?;
-        File::open(&primary)
-            .and_then(|file| file.sync_all())
+        crate::package::cache::sync_file(&primary)
             .map_err(|e| invalid(format!("sync package primary: {e}")))?;
         // Companion entries must be durable before the directory becomes visible,
         // and an existing destination is never replaced.
@@ -2075,8 +2074,7 @@ fn inject_dependency_descriptors(
         writer.add(name, slice.len(), Source::Slice(slice))?;
     }
     writer.finish()?;
-    File::open(&temporary)
-        .and_then(|file| file.sync_all())
+    crate::package::cache::sync_file(&temporary)
         .map_err(|e| invalid(format!("sync rewritten manifest: {e}")))?;
     fs::rename(&temporary, &primary)
         .map_err(|e| invalid(format!("publish rewritten manifest: {e}")))?;
@@ -2249,8 +2247,7 @@ pub fn emit_derivations(
         Source::Bytes(encoded_derivations),
     )?;
     writer.finish()?;
-    File::open(&staging)
-        .and_then(|file| file.sync_all())
+    crate::package::cache::sync_file(&staging)
         .map_err(|e| invalid(format!("sync rewritten primary: {e}")))?;
     fs::rename(&staging, &primary)
         .map_err(|e| invalid(format!("publish rewritten primary: {e}")))?;
@@ -2501,8 +2498,7 @@ fn sync_parent(_path: &Path) -> Result<()> {
 }
 
 fn publish_staged_file(staging: &Path, destination: &Path) -> Result<()> {
-    let result = File::open(staging)
-        .and_then(|file| file.sync_all())
+    let result = crate::package::cache::sync_file(staging)
         .map_err(|e| invalid(format!("sync packed package: {e}")))
         .and_then(|()| {
             fs::hard_link(staging, destination)
