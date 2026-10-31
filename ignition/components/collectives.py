@@ -8,7 +8,8 @@ Ranks on one host communicate through b12x PCIe runtimes; ranks on separate
 DGX Sparks through RoCEnante (b12x.comm.roce), whose one-shot all-reduce and
 all-gather are captured in the same graphs. A component given no runtime serves
 one rank: the reduction or gather is the rank's own values, copied into the
-output its consumers read.
+output its consumers read, or, for a reduction constructed without an output,
+the producer's storage itself.
 """
 
 import itertools
@@ -75,19 +76,29 @@ class PreparedAllReduce:
     Every participating rank must declare the same operation name and enter
     preparation together. Graph ownership must retain this component and its
     runtime until every rank has drained native replay.
+
+    One rank reduces nothing. With an output, the source is copied into it. With
+    ``output=None`` (valid only without a runtime) ``output`` is the source tensor
+    and no operation runs: consumers must read ``reduction.output``, and the source
+    storage must stay unwritten from the producer's completion until the last
+    consumer has read it. Callers that cannot guarantee this, or whose consumers
+    read a fixed tensor, pass an output.
     """
 
     def __init__(self, source, output, *, runtime, session, coordinator, name):
         import torch.distributed as dist
         from b12x.comm import pcie
 
-        self.runtime, self.output = runtime, output
-        startup_joint = False
         # Traced forwards test this flag, never the runtime: compile workers see a runtime that
         # owns RDMA or IPC resources only as a placeholder.
         self.single = runtime is None
+        self.aliased = output is None
+        if self.aliased and not self.single:
+            raise ValueError("a reduction across ranks requires an output")
+        self.runtime, self.output = runtime, source if self.aliased else output
+        startup_joint = False
         if runtime is None:
-            if source.shape != output.shape or source.dtype != output.dtype:
+            if source.shape != self.output.shape or source.dtype != self.output.dtype:
                 raise ValueError("a single-rank reduction copies its source into a matching output")
             return
         if _roce(runtime):
@@ -171,7 +182,12 @@ class PreparedAllReduce:
 
     def __call__(self, source):
         if self.single:
-            self.output.copy_(source)
+            if not self.aliased:
+                self.output.copy_(source)
+            elif source is not self.output and (source.shape != self.output.shape
+                    or source.dtype != self.output.dtype or source.stride() != self.output.stride()
+                    or source.data_ptr() != self.output.data_ptr()):
+                raise ValueError("an aliased single-rank reduction takes the producer value it was bound to")
             return self.output
         _all_reduce(source, self.output, self.handle)
         return self.output

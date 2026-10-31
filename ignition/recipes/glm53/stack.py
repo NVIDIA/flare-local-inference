@@ -123,7 +123,7 @@ class PreparedDecoder:
                 language.layers, weights.layers, state.layers, strict=True)):
             indexed = module.block_type == "indexed_attention"
             layer = PreparedGlmLayer(module, layer_weights.attention, layer_weights.mlp, layer_weights.residual,
-                scratch.residual if index == 0 else scratch.mlp_output, scratch.residual,
+                scratch.residual if index == 0 else self.layers[-1].result, scratch.residual,
                 scratch.layer(module.block_type, sparse=isinstance(layer_weights.mlp, MoEWeights)), layer_state,
                 metadata.indexed if indexed else metadata.recurrent, mode=mode, runtime=runtime,
                 coordinator=coordinator, session=session, name=f"{name}.layer{index}", workspace=workspace,

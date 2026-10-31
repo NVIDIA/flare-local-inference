@@ -245,7 +245,7 @@ def test_glm_experts_preserve_clamped_swiglu(glm_manifest, tokens):
     assert any(clamped), "reference inputs must exercise the checkpoint's clamp"
 
 
-@pytest.mark.parametrize("tokens", [1, 24, 512])
+@pytest.mark.parametrize("tokens", [1, 24, 128, 512, 4096])
 def test_glm_a4_experts_preserve_distinct_input_scales(glm_manifest, tokens):
     from ignition.components.parallel import TensorParallelShard
     from ignition.recipes.glm53.weights import GlmWeightLoader
@@ -271,7 +271,7 @@ def test_glm_a4_experts_preserve_distinct_input_scales(glm_manifest, tokens):
     _run_component(experts, tokens, reference, compiled=True, source_scale=32.)
 
 
-@pytest.mark.parametrize("tokens", [1, 512])
+@pytest.mark.parametrize("tokens", [1, 512, 4093, 4096])
 def test_glm_a4_shared_reduction_preserves_distinct_input_scales(glm_manifest, tokens):
     from ignition.components.parallel import TensorParallelShard
     from ignition.recipes.glm53.weights import GlmWeightLoader
@@ -285,22 +285,28 @@ def test_glm_a4_shared_reduction_preserves_distinct_input_scales(glm_manifest, t
 
 
 @pytest.mark.parametrize("hidden", [2560, 4096])
-def test_routed_nvfp4_quantization_matches_flashinfer(hidden):
-    from ignition.components.moe_sm103 import _fp4_quantizer, _quantize_routes
+@pytest.mark.parametrize("tokens,top_k,count", [(17, 2, 4), (301, 8, 288)])
+def test_routed_nvfp4_quantization_matches_flashinfer(hidden, tokens, top_k, count):
+    from ignition.components.moe_sm103 import (
+        _QUANTIZE_BLOCK,
+        _fp4_quantizer,
+        _quantize_routes,
+        route_quantization_grid,
+    )
 
     assert os.environ.get("CUDA_VISIBLE_DEVICES")
     if torch.cuda.get_device_capability(0) != (10, 3):
         pytest.skip("requires SM103")
     torch.manual_seed(1034)
-    tokens, top_k, count = 17, 2, 4
     source = torch.randn(tokens, hidden, device="cuda", dtype=torch.bfloat16)
     source[0].zero_()
     ids = torch.randint(count, (tokens, top_k), device="cuda", dtype=torch.int32)
-    globals = torch.tensor([.3, 1., 25., 100.], device="cuda")
+    globals = (torch.tensor([.3, 1., 25., 100.], device="cuda") if count == 4
+               else torch.rand(count, device="cuda") * 99.7 + .3)
     values = torch.empty(tokens * top_k, hidden // 2, device="cuda", dtype=torch.uint8)
     scales = torch.empty(tokens * top_k, hidden // 16, device="cuda", dtype=torch.uint8)
-    _quantize_routes[((tokens * top_k + 3) // 4, (hidden + 1023) // 1024, 1)](
-        source, ids, globals, values, scales, tokens * top_k, hidden, top_k, num_warps=4)
+    _quantize_routes[route_quantization_grid(tokens, hidden)](
+        source, ids, globals, values, scales, tokens * top_k, hidden, top_k, _QUANTIZE_BLOCK, num_warps=4)
     reference_values = torch.empty(1, hidden // 2, device="cuda", dtype=torch.uint8)
     reference_scales = torch.empty(16 * hidden // 16, device="cuda", dtype=torch.uint8)
     quantize = _fp4_quantizer().fp4_quantize

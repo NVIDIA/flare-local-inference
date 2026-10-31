@@ -24,10 +24,14 @@ CONTRACT = native_contract(component_id=COMPONENT, query_type=BlockFP8Query,
 
 
 class PreparedBlockFP8:
-    def __init__(self, mma_sm):
-        self.mma_sm = mma_sm
+    def __init__(self, mma_sm, in_features, ordinal):
+        from .block_fp8 import load_quantizer
 
-    def run_serialized(self, values, activation_scales, weight, scales, global_scale, **options):
+        self.mma_sm = mma_sm
+        # Load the compiled activation quantizer while preparing; serving freezes kernel resolution.
+        load_quantizer(in_features, ordinal)
+
+    def run_serialized(self, values, activation_scales, weight, scales, global_scale, out=None, **options):
         from flashinfer.gemm import gemm_fp8_nt_groupwise
 
         if global_scale is not None:
@@ -39,9 +43,18 @@ class PreparedBlockFP8:
         b_scale = scales.T.contiguous() if small else scales
         return gemm_fp8_nt_groupwise(values, weight, a_scale, b_scale,
             scale_major_mode="MN" if small else "K", mma_sm=self.mma_sm,
-            out_dtype=torch.bfloat16, backend="cutlass")
+            out=out, out_dtype=torch.bfloat16, backend="cutlass")
 
 
 def plan(rows, in_features, out_features, device):
+    from .block_fp8 import quantization_job
+
+
+    def ordinal():
+        index = torch.device(device).index
+        return torch.cuda.current_device() if index is None else index
+
     return native_plan(contract=CONTRACT, query=BlockFP8Query(rows, in_features, out_features),
-                       device=device, scratch_bytes=lambda tactic: 0, materialize=PreparedBlockFP8)
+                       device=device, scratch_bytes=lambda tactic: 0,
+                       materialize=lambda tactic: PreparedBlockFP8(tactic, in_features, ordinal()),
+                       compile_jobs=lambda tactic, detected: (quantization_job(in_features, detected.ordinal),))

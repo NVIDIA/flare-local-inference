@@ -158,7 +158,7 @@ def test_glm_mla_checkpoint_native_replay(model_weights, mode, rows, overlap):
                                                          dtype=torch.int32, device=device))
             if mode == "decode":
                 metadata.requests.copy_(torch.arange(rows, dtype=torch.int32, device=device))
-            stages = {key: getattr(scratch, key) for key in (
+            stages = {key: getattr(attention.scratch, key) for key in (
                 "query_input", "query_residual", "latent_input", "latent", "query", "absorbed_query",
                 "attended", "expanded", "output")}
             persistent = (state.cache, state.index.cache, state.index.tail)

@@ -19,9 +19,14 @@ def _run_shared_expert(source, weights, scales, gains, scale_kinds, outputs,
         if scales[index] is None:
             bf16_out(value, weights[index], output, plans[index])
         elif scale_kinds[index] == 3:
-            from ignition.components.block_fp8 import _project
+            from ignition.components.block_fp8 import (
+                _project, _project_into, takes_output, writes_in_place,
+            )
 
-            output.copy_(_project(value, weights[index], scales[index], plans[index]))
+            if writes_in_place(output) and takes_output(plans[index]):
+                _project_into(value, weights[index], scales[index], output, plans[index])
+            else:
+                output.copy_(_project(value, weights[index], scales[index], plans[index]))
         else:
             packed_out_workspace(
                 value, weights[index], scales[index], gains[index], None, output,

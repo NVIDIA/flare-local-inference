@@ -93,9 +93,33 @@ class Sm103SparseIndexer:
             self.page_table, self.width, output=self.logits, enforce_admission=False)
 
     def run(self, query, weights, cache, page_table, lengths, output, logits):
-        import flashinfer
+        """Score and select with the tensors the custom op received.
 
-        self.plan.run()
+        Compiled forwards can pass temporaries rather than this selector's persistent scratch, so the
+        logits program is launched on the call's operands (as b12x's indexer does), never on the
+        pointers the plan bound at construction. The plan supplies the loaded program and its argument
+        plan; the program's arguments are rebuilt from the call without allocating device memory.
+        """
+        import flashinfer
+        import tvm_ffi
+        from flashinfer.experimental.deepgemm_dense_mqa import paged_mqa
+
+        rows, heads, _ = self.query.shape
+        if (query.shape != self.query.shape or query.dtype != self.query.dtype or not query.is_contiguous()
+                or weights.shape != self.weights.shape or not weights.is_contiguous()
+                or lengths.shape != self.lengths.shape or not lengths.is_contiguous()
+                or page_table.shape != self.page_table.shape or page_table.stride(1) != 1
+                or cache.dtype != torch.uint8 or cache.ndim != 2 or not cache.is_contiguous()
+                or cache.shape[1] != _PAGE_RECORDS * _RECORD_BYTES
+                or logits.shape != self.logits.shape or not logits.is_contiguous()):
+            raise ValueError("SM103 index selection operands differ from the prepared geometry")
+        bindings = paged_mqa.logits_bindings(
+            query.view(rows, 1, heads, 128), cache.view(cache.shape[0], _PAGE_RECORDS, 1, _RECORD_BYTES),
+            weights, lengths.view(rows, 1), page_table, logits, num_sms=self.plan.num_sms)
+        module, record = self.plan._programs[0]
+        arguments = tuple(bindings[key] for _, key in record["arg_plan"])
+        with tvm_ffi.use_torch_stream():
+            module[record["ffi_entry"]](*arguments)
         flashinfer.top_k_varlen(logits, lengths, self.topk, out_indices=output)
 
     def __call__(self):

@@ -86,7 +86,7 @@ def _rank(rank, world, rendezvous, snapshot, mode, capacity, layer_index, follow
             following = None
             if following_dense:
                 following = PreparedGlmLayer(model.model.language_model.layers[layer_index + 1], *following_weights,
-                    scratch.mlp_output, output, scratch, following_state, metadata, mode=mode, runtime=runtime,
+                    layer.result, output, scratch, following_state, metadata, mode=mode, runtime=runtime,
                     coordinator=coordinator, session=session, name=f"layer{layer_index + 1}", workspace=arena,
                     carry=scratch.mlp_hc)
             session.tune()
@@ -136,7 +136,7 @@ def _rank(rank, world, rendezvous, snapshot, mode, capacity, layer_index, follow
                 metadata.num_tokens.fill_(count)
             stages = {
                 "attention_norm": scratch.attention_hc.normalized,
-                "attention": scratch.attention_output,
+                "attention": layer.attention_reduce.output,
                 "mlp_input": scratch.mlp_hc.normalized,
             }
             if layer_index >= 3:

@@ -17,8 +17,9 @@ from ignition.components import sm103_projection
 from ignition.preparation.fixtures import bf16_gemv as bf16_fixtures
 from ignition.preparation.fixtures import blockscaled_gemm as gemm_fixtures
 from ignition.preparation.fixtures.projection import input_factory
+from ignition.preparation.rebuild_manifest import weight_views
 from ignition.preparation.scratch import ScratchArena, prime_owners, scratch_storage
-from ignition.preparation.tensor_metadata import record_numeric_tensor
+from ignition.preparation.tensor_metadata import record_numeric_tensor, subtract_ranges, tensor_ranges
 from ignition.preparation.tuning import benchmark_resource, declare, register_context_plan, register_finalizer
 
 
@@ -30,6 +31,8 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
     if isinstance(weight, GroupedLinearWeights):
         return PreparedProjectionGroup(source, weight, output, session=session, name=name, workspace=workspace,
                                        activation_mode=activation_mode, staging=staging)
+    if not isinstance(output, torch.Tensor):
+        raise TypeError("separate projection outputs require grouped weights")
     if isinstance(weight, torch.Tensor):
         return UnquantizedProjection(source, weight, output, session=session, name=name)
     if isinstance(weight, BlockFP8Weight):
@@ -38,15 +41,51 @@ def prepare_projection(source, weight, output, *, session, name, workspace, acti
                                workspace=workspace, activation_mode=activation_mode)
 
 
+def _projection_overlaps(left, right):
+    from b12x.sequence._shared.tensors import overlaps
+
+    if left.device != right.device or not left.numel() or not right.numel() or not overlaps(left, right):
+        return False
+    # Byte envelopes include holes between row-concatenated output slices.
+    if (left.ndim == right.ndim == 2 and left.stride(1) == right.stride(1) == 1
+            and left.stride(0) * left.element_size() == right.stride(0) * right.element_size()
+            and left.stride(0) >= left.shape[1] and right.stride(0) >= right.shape[1]):
+        stride = left.stride(0) * left.element_size()
+        offset = (right.data_ptr() - left.data_ptr()) % stride
+        return offset < left.shape[1] * left.element_size() or stride - offset < right.shape[1] * right.element_size()
+    left_ranges, right_ranges = tensor_ranges(left), tensor_ranges(right)
+    return not left_ranges or not right_ranges or subtract_ranges(left_ranges, right_ranges) != left_ranges
+
+
 class PreparedProjectionGroup:
-    """Project one source into ordered output slices with compatible weights fused."""
+    """Project into row-concatenated storage or an explicit tuple of part outputs."""
 
     def __init__(self, source, weight, output, *, session, name, workspace, activation_mode, staging):
         from .block_fp8 import BlockFP8Weight
 
+        if isinstance(output, torch.Tensor):
+            targets = output.split(weight.widths, dim=-1)
+        elif isinstance(output, tuple):
+            targets = output
+        else:
+            raise TypeError("grouped projection output must be a tensor or a tuple of tensors")
+        if len(targets) != len(weight.parts) or len(targets) != len(weight.widths):
+            raise ValueError("grouped projection outputs must match the weight partitions")
+        if not targets or any(not isinstance(target, torch.Tensor) for target in targets):
+            raise TypeError("grouped projection outputs must be tensors")
+        if any(target.shape != (*source.shape[:-1], width) or target.device != source.device
+               or target.dtype != targets[0].dtype
+               for target, width in zip(targets, weight.widths, strict=True)):
+            raise ValueError("grouped projection outputs require matching rows, widths, dtype, and device")
+        inputs = (source, *(tensor for _, _, tensor in weight_views({"weight": weight})))
+        if any(_projection_overlaps(target, tensor) for target in targets for tensor in inputs):
+            raise ValueError("grouped projection outputs must not overlap source or weights")
+        if isinstance(output, tuple) and any(_projection_overlaps(target, other)
+                for index, target in enumerate(targets) for other in targets[:index]):
+            raise ValueError("grouped projection part outputs must not overlap")
         self.output = output
         self.projections, self.copies = [], []
-        for index, (part, target) in enumerate(zip(weight.parts, output.split(weight.widths, dim=-1), strict=True)):
+        for index, (part, target) in enumerate(zip(weight.parts, targets, strict=True)):
             destination = target
             if not isinstance(part, (torch.Tensor, BlockFP8Weight)) and not target.is_contiguous():
                 if (staging is None or not staging.is_contiguous() or staging.numel() < target.numel()

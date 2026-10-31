@@ -77,6 +77,9 @@ def test_learned_kda_verification_commits_each_prefix_before_plain_decode():
         sources[6].copy_(chain[:6])
         operators[6](sources[6])
         op.commit_state(slots.long(), counts)
+        # Plain decode runs eagerly after the freeze, so its programs load first.
+        sources[1].copy_(chain[:1])
+        operators[1](sources[1])
         graph = torch.cuda.CUDAGraph()
         with session.capture(), torch.cuda.graph(graph):
             operators[6](sources[6])

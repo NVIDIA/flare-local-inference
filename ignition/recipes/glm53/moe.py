@@ -80,6 +80,12 @@ class PreparedGlmMoe:
         if self.concurrent_shared is not None:
             self.concurrent_shared.start(source)
         self.routing(self.scratch.router_logits)
+        if self.concurrent_shared is None and getattr(self.experts, "reduces_into_shared", False):
+            # SM103 serial order: the shared expert runs first, then one kernel sums the routed FC2
+            # rows (rounded to BF16) with it, so the routed sum is never materialized.
+            shared = self.shared(source)
+            self.experts.stage_rows()
+            return self.experts.reduce(shared, self.output)
         routed = self.experts()
         shared = (self.shared(source) if self.concurrent_shared is None
                   else self.concurrent_shared.finish(source, routed))

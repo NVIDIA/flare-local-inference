@@ -95,9 +95,14 @@ class PreparedGlmLayer:
             self.attention = PreparedGlmMLA(*attention_args, mode=mode, session=session, name=f"{name}.mla",
                                             workspace=workspace, max_cache_pages=max_cache_pages,
                                             context=context)
-        self.attention_reduce = PreparedAllReduce(scratch.attention.output, scratch.attention_output, runtime=runtime,
+        # One rank reduces nothing, so its consumers read each sub-block's output in place. The attention
+        # output is dead once the FFN mixing has read it, and the MLP output is dead once the post mixing
+        # (here, or fused into the next layer's mixing) has read it; no operation between a producer and
+        # its consumer writes either, so overlaid scratch cannot reuse their storage in between.
+        self.attention_reduce = PreparedAllReduce(scratch.attention.output,
+            None if runtime is None else scratch.attention_output, runtime=runtime,
             session=session, coordinator=coordinator, name=f"{name}.attention_reduce")
-        self.mlp_hc = PreparedMHC((scratch.attention_output, scratch.attention_hc.residual,
+        self.mlp_hc = PreparedMHC((self.attention_reduce.output, scratch.attention_hc.residual,
                                   scratch.attention_hc.post, scratch.attention_hc.comb),
             mlp_mhc, scratch.mlp_hc, session=session, name=f"{name}.ffn_hc", workspace=workspace, **options)
         if isinstance(mlp_weights, MoEWeights):
@@ -108,9 +113,12 @@ class PreparedGlmLayer:
             self.mlp = PreparedMLP(scratch.mlp_hc.normalized, mlp_weights, scratch.mlp.gate_up,
                 scratch.mlp.intermediate, scratch.mlp.output, session=session, name=f"{name}.mlp", workspace=workspace,
                 swiglu_limit=module.mlp.swiglu_limit)
-        self.mlp_reduce = PreparedAllReduce(scratch.mlp.output, scratch.mlp_output, runtime=runtime,
+        self.mlp_reduce = PreparedAllReduce(scratch.mlp.output,
+            None if runtime is None else scratch.mlp_output, runtime=runtime,
             session=session, coordinator=coordinator, name=f"{name}.mlp_reduce")
-        self.post = None if defer_post else PreparedMHCPost(scratch.mlp_output, scratch.mlp_hc.residual,
+        # The reduced MLP output the following layer's mixing, or the final post mixing, reads.
+        self.result = self.mlp_reduce.output
+        self.post = None if defer_post else PreparedMHCPost(self.result, scratch.mlp_hc.residual,
             scratch.mlp_hc.post, scratch.mlp_hc.comb, output, session=session, name=f"{name}.post")
 
     def __call__(self, source):
@@ -118,8 +126,8 @@ class PreparedGlmLayer:
         inputs = (source,) if self.carry is None else (
             source, self.carry.residual, self.carry.post, self.carry.comb)
         self.attention_reduce(self.attention(self.attention_hc(*inputs)))
-        self.mlp_hc(s.attention_output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
+        self.mlp_hc(self.attention_reduce.output, s.attention_hc.residual, s.attention_hc.post, s.attention_hc.comb)
         self.mlp_reduce(self.mlp(s.mlp_hc.normalized))
         if self.post is None:
-            return s.mlp_output
-        return self.post(s.mlp_output, s.mlp_hc.residual, s.mlp_hc.post, s.mlp_hc.comb)
+            return self.result
+        return self.post(self.result, s.mlp_hc.residual, s.mlp_hc.post, s.mlp_hc.comb)

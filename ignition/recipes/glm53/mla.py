@@ -6,7 +6,7 @@
 
 import itertools
 import weakref
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import torch
 from b12x.attention import sparse_mla
@@ -16,6 +16,7 @@ from ignition.components.linear import (
     BatchedQuantizedProjection, BatchedUnquantizedProjection, QuantizedProjection, prepare_projection,
 )
 from ignition.components import sm103
+from ignition.components.weights import GroupedLinearWeights
 from ignition.components.sparse_mla import PreparedLatentCacheWriter, PreparedSparseMLA
 from ignition.components.sparse_mla_sm103 import Sm103PrefillSparseMLA, Sm103SparseMLA
 from ignition.preparation.tuning import register_finalizer
@@ -107,6 +108,42 @@ class MLAScratch:
             self.expanded[:tokens], self.output[:tokens], self.visible[:tokens], self.index.rows(tokens, mode),
             self.gathered[:tokens], self.partial[:tokens], self.lse[:tokens], self.slab,
             self.exchange_send[:tokens], self.exchange_received[:tokens], self.records, self.record_counts)
+
+
+# Columns of the fused layer-input projection read by each consumer: query latent, KV latent, index key
+# and index head weights.
+_QKV_A_COLUMNS = ((0, 1536), (1536, 2048), (2048, 2176), (2176, 2208))
+
+
+def _input_projection_views(scratch, weight):
+    """Give each part of a grouped layer-input projection a contiguous output inside `projected_input`.
+
+    Block-FP8 GEMMs write a contiguous output in place; a column slice of the row-concatenated buffer
+    needs a result tensor and a copy. The parts occupy the same allocation, one part after another, for
+    the capacity's rows, and every consumer reads one part. When a consumer would cross parts, or the
+    weight is not grouped, the row-concatenated layout remains. Returns the scratch whose input views
+    follow the layout, the projection output, and the index key and head-weight inputs.
+    """
+    consumers = tuple(scratch.projected_input[:, start:end] for start, end in _QKV_A_COLUMNS)
+    original = scratch, scratch.projected_input, consumers[2], consumers[3]
+    if not isinstance(weight, GroupedLinearWeights):
+        return original
+    tokens, features = scratch.projected_input.shape
+    if sum(weight.widths) != features or features != _QKV_A_COLUMNS[-1][1]:
+        raise ValueError("GLM MLA input projection partitions must cover the projected input")
+    boundaries = [0]
+    for width in weight.widths:
+        boundaries.append(boundaries[-1] + width)
+    owners = [next((index for index, (left, right) in enumerate(itertools.pairwise(boundaries))
+                    if left <= start and end <= right), None) for start, end in _QKV_A_COLUMNS]
+    if None in owners or not scratch.projected_input.is_contiguous():
+        return original
+    storage = scratch.projected_input.view(-1)
+    outputs = tuple(storage[tokens * left:tokens * right].view(tokens, right - left)
+                    for left, right in itertools.pairwise(boundaries))
+    query, latent, key, weights = (outputs[owner][:, start - boundaries[owner]:end - boundaries[owner]]
+                                   for (start, end), owner in zip(_QKV_A_COLUMNS, owners, strict=True))
+    return replace(scratch, query_input=query, latent_input=latent), outputs, key, weights
 
 
 _CHAINS = weakref.WeakValueDictionary()
@@ -225,6 +262,7 @@ class PreparedGlmMLA:
                 or (weights["kv_b_proj"].shape[0] if isinstance(weights["kv_b_proj"], torch.Tensor)
                     else weights["kv_b_proj"].out_features) != heads * 512):
             raise ValueError("GLM MLA cache or head partition geometry mismatch")
+        scratch, projected_output, key_input, weight_input = _input_projection_views(scratch, weights["qkv_a_proj"])
         self.module, self.scratch, self.state, self.metadata = module, scratch, state, metadata
         # Decode projects and absorbs queries while records are selected; shared RoCE gathers follow the join.
         self.query_chain = None
@@ -232,7 +270,7 @@ class PreparedGlmMLA:
             module.get_submodule(key).weight = torch.nn.Parameter(weights[f"{key}.weight"], requires_grad=False)
         self.projections = {}
         for key, input, output in (
-            ("qkv_a_proj", source, scratch.projected_input),
+            ("qkv_a_proj", source, projected_output),
             ("q_b_proj", scratch.query_residual, scratch.query.view(rows, -1)),
             ("o_proj", scratch.expanded.view(rows, -1), scratch.output),
         ):
@@ -256,7 +294,7 @@ class PreparedGlmMLA:
                 self.expand_weights, scratch.expanded.transpose(0, 1), major="k",
                 session=session, name=f"{name}.expand_value")
         self.indexer = PreparedGlmIndexer(module.indexer, weights, source, scratch.query_residual,
-            scratch.projected_input[:, 2048:2176], scratch.projected_input[:, 2176:2208],
+            key_input, weight_input,
             scratch.index, state.index, metadata, mode=mode, session=session, name=f"{name}.indexer",
             workspace=workspace, max_cache_pages=max_cache_pages, context=context)
         self.writer = PreparedLatentCacheWriter(scratch.latent, state.cache, metadata.token_slots,

@@ -299,12 +299,19 @@ def _w4a16_tactics(query: RoutedExpertsQuery):
 
 TRTLLM_CONTRACT = native_contract(component_id="flare.moe.sm103_trtllm_nvfp4",
                                   query_type=RoutedExpertsQuery, tactics=_trtllm_tactics,
-                                  semantic_version=3)
+                                  semantic_version=4)
 # Bump a contract's semantic version whenever its tactic space or launch semantics change,
 # so cached selections from earlier spaces are never looked up.
 W4A16_CONTRACT = native_contract(component_id="flare.moe.sm103_cute_w4a16",
                                  query_type=RoutedExpertsQuery, tactics=_w4a16_tactics,
                                  semantic_version=3)
+
+
+def _require_vector_aligned(**operands):
+    """Planned Triton programs assume 16-byte-aligned pointers; a misaligned operand reads or writes garbage."""
+    for name, tensor in operands.items():
+        if tensor.data_ptr() % 16:
+            raise RuntimeError(f"SM103 routed-expert operand {name} is not 16-byte aligned")
 
 
 def _aligned(nbytes):
@@ -322,47 +329,68 @@ def _scratch_bytes(query):
 _REDUCE_BLOCK = 512
 
 
+_QUANTIZE_BLOCK = 1024
+_QUANTIZE_WARPS = 4
+
+
 @triton.jit
 def _quantize_routes(Source, Ids, Globals, Values, Scales, ROWS: tl.constexpr,
-                     HIDDEN: tl.constexpr, TOP_K: tl.constexpr):
-    """NVFP4 rows in token/route order, preserving each routed expert's FC1 scale."""
-    rows = tl.program_id(0) * 4 + tl.arange(0, 4)
-    columns = tl.program_id(1) * 512 + tl.arange(0, 512)
-    valid = rows < ROWS
-    expert = tl.load(Ids + rows, valid, 0)
-    global_scale = tl.load(Globals + expert)
-    reciprocal = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", constraints="=f,f",
-        args=[global_scale], dtype=tl.float32, is_pure=True, pack=1)
-    a = tl.load(Source + (rows // TOP_K)[:, None] * HIDDEN + columns[None, :] * 2,
-        valid[:, None] & (columns[None, :] * 2 < HIDDEN), 0).to(tl.float32).reshape(4, 64, 8)
-    b = tl.load(Source + (rows // TOP_K)[:, None] * HIDDEN + columns[None, :] * 2 + 1,
-        valid[:, None] & (columns[None, :] * 2 < HIDDEN), 0).to(tl.float32).reshape(4, 64, 8)
-    maximum = tl.max(tl.maximum(tl.abs(a), tl.abs(b)), 2)
-    scale = tl.minimum(global_scale[:, None] * (maximum * (1.0 / 6.0)), 448.).to(tl.float8e4nv)
-    effective = scale.to(tl.float32) * reciprocal[:, None]
-    multiplier = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", constraints="=f,f",
-        args=[effective], dtype=tl.float32, is_pure=True, pack=1)
-    multiplier = tl.where(maximum == 0, 0., multiplier)
-    a, b = (a * multiplier[:, :, None]).reshape(4, 512), (b * multiplier[:, :, None]).reshape(4, 512)
-    packed = tl.inline_asm_elementwise(
-        "{ .reg .b8 v; cvt.rn.satfinite.e2m1x2.f32 v, $2, $1; cvt.u32.u8 $0, v; }",
-        constraints="=r,f,f", args=[a, b], dtype=tl.uint32, is_pure=True, pack=1)
-    tl.store(Values + rows[:, None] * (HIDDEN // 2) + columns[None, :], packed.to(tl.uint8),
-        valid[:, None] & (columns[None, :] * 2 < HIDDEN))
-    groups = tl.program_id(1) * 64 + tl.arange(0, 64)
-    tl.store(Scales + rows[:, None] * (HIDDEN // 16) + groups[None, :],
-        scale.to(tl.uint8, bitcast=True), valid[:, None] & (groups[None, :] < HIDDEN // 16))
+                     HIDDEN: tl.constexpr, TOP_K: tl.constexpr, BLOCK: tl.constexpr):
+    """NVFP4 rows in token/route order, preserving each routed expert's FC1 scale.
+
+    One program reads ``BLOCK`` elements of one token once, takes each 16-element block's maximum once,
+    and emits that span of the token's ``TOP_K`` route rows. Each route quantizes with its own expert's
+    scale: block scale ``E4M3(g * (amax / 6))``, multiplier ``1 / (scale / g)`` (zero for an all-zero
+    block), and E2M1 pairs with the even element in the low nibble. Launch ``(tokens, cdiv(HIDDEN, BLOCK))``
+    programs; route rows at or beyond ``ROWS`` are not written.
+    """
+    GROUPS: tl.constexpr = BLOCK // 16
+    token = tl.program_id(0).to(tl.int64)
+    groups = tl.program_id(1) * GROUPS + tl.arange(0, GROUPS)
+    columns = groups[:, None] * 16 + tl.arange(0, 16)[None, :]
+    x = tl.load(Source + token * HIDDEN + columns, columns < HIDDEN, 0).to(tl.float32)
+    maximum = tl.max(tl.abs(x), 1)
+    even, odd = tl.split(tl.reshape(x, (GROUPS, 8, 2)))
+    pairs = tl.program_id(1) * (BLOCK // 2) + tl.arange(0, GROUPS)[:, None] * 8 + tl.arange(0, 8)[None, :]
+    zero = tl.zeros((GROUPS,), dtype=tl.int32)
+    for route in tl.static_range(TOP_K):
+        row = token * TOP_K + route
+        # Scalars are broadcast to the block axis so the PTX reciprocals run on tensors.
+        expert = tl.load(Ids + row + zero, row < ROWS, 0)
+        global_scale = tl.load(Globals + expert)
+        reciprocal = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", constraints="=f,f",
+            args=[global_scale], dtype=tl.float32, is_pure=True, pack=1)
+        scale = tl.minimum(global_scale * (maximum * (1.0 / 6.0)), 448.).to(tl.float8e4nv)
+        effective = scale.to(tl.float32) * reciprocal
+        multiplier = tl.inline_asm_elementwise("rcp.approx.ftz.f32 $0, $1;", constraints="=f,f",
+            args=[effective], dtype=tl.float32, is_pure=True, pack=1)
+        multiplier = tl.where(maximum == 0, 0., multiplier)
+        packed = tl.inline_asm_elementwise(
+            "{ .reg .b8 v; cvt.rn.satfinite.e2m1x2.f32 v, $2, $1; cvt.u32.u8 $0, v; }",
+            constraints="=r,f,f", args=[even * multiplier[:, None], odd * multiplier[:, None]],
+            dtype=tl.uint32, is_pure=True, pack=1)
+        tl.store(Values + row * (HIDDEN // 2) + pairs, packed.to(tl.uint8),
+                 (row < ROWS) & (groups[:, None] * 16 < HIDDEN))
+        tl.store(Scales + row * (HIDDEN // 16) + groups, scale.to(tl.uint8, bitcast=True),
+                 (row < ROWS) & (groups < HIDDEN // 16))
 
 
 _NATIVE_JITS.add(_quantize_routes)
 
 
+def route_quantization_grid(tokens, hidden):
+    """Launch grid of ``_quantize_routes``: one program per token and ``_QUANTIZE_BLOCK`` columns."""
+    return (tokens, triton.cdiv(hidden, _QUANTIZE_BLOCK), 1)
+
+
 @program_cache(scope="preparation")
 def compile_route_quantization(tokens, hidden, top_k, ordinal):
+    if hidden % 16:
+        raise ValueError("NVFP4 route quantization requires a hidden size divisible by 16")
     with torch.cuda.device(ordinal):
         return _quantize_routes.warmup(torch.bfloat16, torch.int32, torch.float32,
             torch.uint8, torch.uint8, ROWS=tokens * top_k, HIDDEN=hidden, TOP_K=top_k,
-            grid=(1, 1, 1), num_warps=4)
+            BLOCK=_QUANTIZE_BLOCK, grid=(1, 1, 1), num_warps=_QUANTIZE_WARPS)
 
 
 @triton.jit
@@ -451,8 +479,10 @@ class _TrtllmNvfp4State:
         offset = _aligned(tokens * hidden // 2)
         scales = scratch[offset:offset + (tokens + 15) // 16 * 16 * hidden // 16]
         if q.routed_inputs:
-            self.routed_quantize[(triton.cdiv(tokens, 4), triton.cdiv(hidden, 1024), 1)](
-                a, topk_ids, e.input_global_scale, values, scales, tokens, hidden, q.top_k)
+            _require_vector_aligned(source=a, ids=topk_ids, scales_in=e.input_global_scale, values=values,
+                                    scales=scales)
+            self.routed_quantize[route_quantization_grid(a.shape[0], hidden)](
+                a, topk_ids, e.input_global_scale, values, scales, tokens, hidden, q.top_k, _QUANTIZE_BLOCK)
             topk_ids, topk_weights = topk_ids.view(tokens, 1), self.unit_weights
         else:
             self.quantize(a, e.input_global_scale, values, scales, 16, False, False, False, False, True, 0)
@@ -472,6 +502,7 @@ class _TrtllmNvfp4State:
         self.stage_rows(a, topk_ids, topk_weights, scratch)
         (rows, permuted), self.staged = self.staged, None
         tokens, hidden = output.shape
+        _require_vector_aligned(rows=rows, permuted=permuted, weights=topk_weights, output=output)
         self.routed_reduction[(tokens, hidden // _REDUCE_BLOCK, 1)](
             rows, permuted, topk_weights, output, output, hidden, self.query.top_k, _REDUCE_BLOCK, False)
 
@@ -492,6 +523,7 @@ class _TrtllmNvfp4State:
             raise RuntimeError("SM103 routed reduction requires staged FC2 rows")
         (rows, permuted), self.staged = self.staged, None
         tokens, hidden = output.shape
+        _require_vector_aligned(rows=rows, permuted=permuted, weights=topk_weights, shared=shared, output=output)
         self.reduction[(tokens, hidden // _REDUCE_BLOCK, 1)](
             rows, permuted, topk_weights, shared, output, hidden, self.query.top_k, _REDUCE_BLOCK, True)
 
