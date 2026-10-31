@@ -2477,6 +2477,32 @@ fn lock_package(directory: &Path) -> Result<PackageLock> {
             )));
         }
     }
+    // Without a lock here, concurrent emission reads the same metadata, appends its own
+    // derivation and rewrites the package, so one writer's derivation is lost.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if locked == 0 {
+            return Err(invalid(format!(
+                "lock package: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
     Ok(PackageLock { _file: file })
 }
 
