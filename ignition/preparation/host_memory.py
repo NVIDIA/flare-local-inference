@@ -10,7 +10,9 @@ import os
 from pathlib import Path
 
 _WORKER_BYTES = 2 << 30
-_HEADROOM_BYTES = 8 << 30
+# System memory left free beside compiler processes and tuning races, unless a larger preparation
+# headroom applies. `[preparation] compile_headroom` and `--compile-headroom` select another value.
+COMPILE_HEADROOM_BYTES = 8 << 30
 # Kernel modules and temporary compiler objects retained by each tuning rank.
 _TUNING_GROWTH_BYTES = 1 << 30
 # One Inductor compile subprocess inside a forward compiler.
@@ -36,7 +38,7 @@ def cpu_workers(requested=None, *, pools=1):
 
 def release_unused(*, generation=2):
     """Collect preparation temporaries and release unused glibc arenas on Linux."""
-    if generation == 0 and available_bytes() < _HEADROOM_BYTES:
+    if generation == 0 and available_bytes() < COMPILE_HEADROOM_BYTES:
         generation = 2
     gc.collect(generation)
     if os.name == "nt":
@@ -102,33 +104,37 @@ def virtual_device_memory(device, group=None, *, tuning_replica=None):
     return min(int(store.get(key)) for key in keys)
 
 
-def worker_limit(limit, *, pools=1, available=None, device_bytes=0, headroom_bytes=0):
-    """Bound worker RAM after the greater of system headroom and the requested reserve."""
-    if limit <= 0 or pools <= 0 or device_bytes < 0 or headroom_bytes < 0:
+def worker_limit(limit, *, pools=1, available=None, device_bytes=0, headroom_bytes=0,
+                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
+    """Bound worker RAM after the greater of the compile headroom and the requested reserve."""
+    if limit <= 0 or pools <= 0 or device_bytes < 0 or headroom_bytes < 0 or compile_headroom_bytes < 0:
         raise ValueError("compiler and pool limits must be positive; device bytes and headroom must be nonnegative")
     available = available_bytes() if available is None else available
-    headroom = max(_HEADROOM_BYTES, headroom_bytes)
+    headroom = max(compile_headroom_bytes, headroom_bytes)
     worker_bytes = _WORKER_BYTES + device_bytes
     capacity = (available - headroom) // (pools * worker_bytes)
     if capacity < 1:
         raise MemoryError(f"preparation requires at least {(headroom + pools * worker_bytes) >> 20} MiB "
-                          f"available host memory; found {available >> 20} MiB")
+                          f"available host memory; found {available >> 20} MiB ({headroom >> 20} MiB headroom, "
+                          f"{worker_bytes >> 20} MiB per worker in each of {pools} local pools)")
     return min(limit, capacity)
 
 
-def compile_threads(limit, *, workers, available, device_bytes=0, headroom_bytes=0):
+def compile_threads(limit, *, workers, available, device_bytes=0, headroom_bytes=0,
+                    compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
     """Bound each forward compiler's Inductor subprocesses by the RAM its workers leave.
 
     On GB10 a worker compiling a GLM forward holds about 2.8 GB, and each of its
     Inductor compile subprocesses about 0.4 GB; sixteen threads in one worker exhaust
     the memory a TP2 rank has left.
     """
-    headroom = max(_HEADROOM_BYTES, headroom_bytes)
+    headroom = max(compile_headroom_bytes, headroom_bytes)
     spare = available - headroom - workers * (_WORKER_BYTES + device_bytes)
     return max(1, min(limit, spare // (workers * _COMPILE_THREAD_BYTES)))
 
 
-def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=None):
+def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=None,
+                  compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
     """Size compiler pools and candidate races against their physical memory supply."""
     import torch
 
@@ -140,11 +146,11 @@ def tuning_limits(device, workers, *, pools=1, headroom_bytes=0, race_budget=Non
         race = max(1, usable // 4)
         if race_budget is not None:
             race = min(race, race_budget)
-        return worker_limit(workers, pools=pools) if workers else 0, race
+        return worker_limit(workers, pools=pools, compile_headroom_bytes=compile_headroom_bytes) if workers else 0, race
     available = device_memory_info(device)[0]
     if os.name == "nt":
         available = min(available, available_bytes())
-    headroom = max(_HEADROOM_BYTES, headroom_bytes)
+    headroom = max(compile_headroom_bytes, headroom_bytes)
     usable = (available - headroom) // pools - _TUNING_GROWTH_BYTES
     if usable <= 0:
         raise MemoryError(f"kernel tuning needs more than {(headroom + pools * _TUNING_GROWTH_BYTES) >> 20} MiB "

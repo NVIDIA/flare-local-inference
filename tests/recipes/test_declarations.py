@@ -401,3 +401,33 @@ def test_parallel_recipe_defaults_capture_ragged_rows_at_declared_width(alias, o
     assert all(batch <= packed <= min(128, batch * width) for batch, width, packed in shapes)
     assert config.decode_tokens == 128
     assert config.decode_samples == 32 * (selected.draft_tokens + 1)
+
+
+@pytest.mark.parametrize("alias,gpus", [
+    ("qwen3.8-flash", 2), ("qwen3.8-27b", 1), ("glm-5.3-flash", 2), ("deepseek-v4-flash", 2),
+    ("deepseek-v4.1-flash", 3), ("mimo-v2.6-pro-mopd", 2), ("kimi-k3", 16), ("gemma-4-e2b", 2),
+    ("step5-preview-nvfp4", 4), ("nemotron-bolt-24gb", 1), ("minimax-m3-1-flash", 4),
+    ("muse-spark-open-nvfp4", 8),
+])
+def test_adapters_carry_compile_headroom_into_the_preparation_config(monkeypatch, tmp_path, alias, gpus):
+    from dataclasses import replace
+
+    from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES
+
+    seen = []
+    def record(snapshot, config, *args, **options):
+        seen.append(config)
+        return "prepared"
+    model = resolve(alias)
+    monkeypatch.setattr("ignition.preparation.rank_group.prepare_group", record)
+    if gpus == 1:
+        monkeypatch.setattr(f"ignition.recipes.{model.recipe.name}.bootstrap.prepare", record)
+    plan = fitted(model, gpus, speculation=None)
+    assert plan.compile_headroom_bytes == COMPILE_HEADROOM_BYTES
+    for headroom in (COMPILE_HEADROOM_BYTES, 6 << 30, 0):
+        prepared = model.recipe.prepare(tmp_path, replace(plan, compile_headroom_bytes=headroom),
+                                        compile_forwards=True, kernel_cache=None, progress=None)
+        assert prepared == "prepared" and seen.pop().compile_headroom_bytes == headroom
+    with pytest.raises(ValueError, match="headroom"):
+        model.recipe.prepare(tmp_path, replace(plan, compile_headroom_bytes=-1),
+                             compile_forwards=True, kernel_cache=None, progress=None)

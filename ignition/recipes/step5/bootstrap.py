@@ -47,7 +47,7 @@ from ignition.preparation.collectives import (
 from ignition.preparation.disposable import storage_ranges
 from ignition.preparation.execution import GraphSignature
 from ignition.preparation.fixtures.recurrent import register_benchmark_state
-from ignition.preparation.host_memory import release_unused
+from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES, release_unused
 from ignition.preparation.model import PreparedModel
 from ignition.preparation.rank_group import minimum_across_ranks
 from ignition.preparation.scratch import GraphBufferPool, ScratchArena
@@ -80,6 +80,7 @@ class PreparationConfig:
     prompt_logprobs: bool = False
     image_concurrency: int | None = None
     compile_workers: int | None = None
+    compile_headroom_bytes: int = COMPILE_HEADROOM_BYTES
     native_dense_activations: bool = False
     lock_gpu_clocks: bool = False
     autotune_effort: str = "default"
@@ -118,7 +119,7 @@ class PreparationConfig:
             raise ValueError("Step-5 MTP supports at most three draft tokens")
         if self.speculative_fixed_width is not None and self.speculative_fixed_width not in self.speculative_widths:
             raise ValueError("fixed verification width must belong to the prepared catalog")
-        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0:
+        if self.snapshot_budget_bytes <= 0 or self.headroom_bytes < 0 or self.compile_headroom_bytes < 0:
             raise ValueError("snapshot budget must be positive and headroom nonnegative")
 
 
@@ -185,6 +186,7 @@ def prepare_rank(snapshot, config, *, rank, group, progress=None, package_storag
             "contract": "step5.graph-inputs.v1"}, sort_keys=True).encode()).hexdigest()
         session = RecordedPreparationSession(
             compile_workers=config.compile_workers, collective_tuning=config.collective_tuning, collective_ladder=config.collective_ladder, autotune_effort=config.autotune_effort, tuning_replica=config.tuning_replica,
+            compile_headroom_bytes=config.compile_headroom_bytes,
             native_dense_activations=config.native_dense_activations, lock_gpu_clocks=config.lock_gpu_clocks,
             device=device, checkpoint=identity, workload_schema="step5",
             numerical_policy="default", coordinator=coordinator, headroom_bytes=config.headroom_bytes,

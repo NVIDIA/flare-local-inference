@@ -17,7 +17,7 @@ from ignition.preparation.collective_ladder import resolve as resolve_collective
 
 from . import display, environment
 
-from .preparation import (Host, collective_tuning_mode, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
+from .preparation import (Host, collective_tuning_mode, compiler_headroom, compiler_workers, context_parallel, derive, fetch, image_capacity_setting, resolve_model, speculation,
                           stream_overlap, tuning_devices, tuning_effort)
 from .config import Configuration
 
@@ -202,6 +202,7 @@ def _export_hosts(args):
                          mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   compile_headroom_bytes=compiler_headroom(configuration, args.compile_headroom),
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),
@@ -269,7 +270,7 @@ def _prepare(args):
                                                     args.max_concurrency)
         host = Host.discover()
         plan = derive(configuration, model, host, gpus=args.gpus, concurrency=concurrency,
-                      compile_workers=args.compile_workers, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
+                      compile_workers=args.compile_workers, compile_headroom=args.compile_headroom, tuning_gpus=args.tuning_gpus, autotune_effort=args.autotune_effort,
                       collective_tuning=args.collective_tuning, collective_ladder=args.collective_ladder,
                       lock_gpu_clocks=args.lock_gpu_clocks, native_dense_activations=args.native_dense_activations,
                       shard_hyperconnections=args.shard_hyperconnections, joint_tuning=args.joint_tuning,
@@ -302,6 +303,7 @@ def _prepare(args):
                      f"{' · online MXFP8' if plan.online_mxfp8 else ''}"
                      f"{' · language model only' if plan.language_model_only else ''}"
                      f" · compile workers {plan.compile_workers or 'auto'} per host{tuning}"
+                     f" · compile headroom {plan.compile_headroom_bytes / (1 << 30):g} GiB"
                      f" · autotune effort {plan.autotune_effort} · collective tuning {plan.collective_tuning}{ladder_name}"
                      f"{' · native dense activations' if plan.native_dense_activations else ''}"
                      f"{' · joint tuning' if plan.joint_tuning else ''}"
@@ -460,6 +462,7 @@ def debug_serve(args) -> int:
                          language_model_only=args.language_model_only, mla_compute_mode=args.mla_compute_mode)
     collective_mode = collective_tuning_mode(configuration, model, args.collective_tuning)
     plan = replace(plan, compile_workers=compiler_workers(configuration, args.compile_workers), hub_cache=hub_cache,
+                   compile_headroom_bytes=compiler_headroom(configuration, args.compile_headroom),
                    autotune_effort=tuning_effort(configuration, args.autotune_effort),
                    collective_tuning=collective_mode,
                    collective_ladder=resolve_collective_ladder(collective_mode, args.collective_ladder),

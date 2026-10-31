@@ -84,6 +84,7 @@ def prepare(
         collective_tuning=plan.collective_tuning, collective_ladder=plan.collective_ladder,
         prompt_logprobs=plan.prompt_logprobs,
         compile_workers=plan.compile_workers, native_dense_activations=plan.native_dense_activations,
+        compile_headroom_bytes=plan.compile_headroom_bytes,
         lock_gpu_clocks=plan.lock_gpu_clocks and plan.autotune_effort != "off",
         tuning_replica=plan.tuning_replica,
         devices=tuple(range(plan.world_size)) if ranks is None else (0,) * plan.world_size,

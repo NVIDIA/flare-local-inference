@@ -673,3 +673,35 @@ def test_runtime_collective_policy_requires_ladder_before_preparation(host, caps
     assert main([command, "qwen3.8-flash", "--collective-tuning", "runtime"]) == 2
     assert "requires --collective-ladder PATH" in capsys.readouterr().err
     assert "prepared" not in host and host["exports"] == 0
+
+
+@pytest.mark.parametrize("arguments,configured,expected", [
+    ((), None, 8 << 30),
+    (("--compile-headroom", "6G"), None, 6 << 30),
+    ((), "12G", 12 << 30),
+    (("--compile-headroom", "6.5GiB"), "12G", 13 << 29),
+])
+def test_compile_headroom_reaches_plan_and_startup_line(host, capsys, monkeypatch, tmp_path,
+                                                         arguments, configured, expected):
+    monkeypatch.setenv("COLUMNS", "400")
+    if configured is not None:
+        config = tmp_path / "headroom.toml"
+        config.write_text(f'[preparation]\ncompile_headroom = "{configured}"\n')
+        arguments = (*arguments, "--config", str(config))
+    assert export("qwen3.8-flash", *arguments) == 0
+    assert host["plan"].compile_headroom_bytes == expected
+    assert host["plan"].to_dict()["compile_headroom_bytes"] == expected
+    assert f"compile headroom {expected / (1 << 30):g} GiB" in capsys.readouterr().err
+
+
+def test_debug_serve_carries_compile_headroom_into_plan(host, monkeypatch):
+    monkeypatch.setattr(serve, "_serve_prepared", lambda *args: 0)
+    assert main(["debug-serve", "qwen3.8-flash", "--port", str(free_port()), "--compile-headroom", "6G"]) == 0
+    assert host["plan"].compile_headroom_bytes == 6 << 30
+
+
+@pytest.mark.parametrize("value", ["-6G", "lots"])
+def test_invalid_compile_headroom_fails_before_preparation(host, capsys, value):
+    assert export("qwen3.8-flash", f"--compile-headroom={value}") == 2
+    assert "--compile-headroom" in capsys.readouterr().err
+    assert "plan" not in host

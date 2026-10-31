@@ -110,6 +110,33 @@ def test_compiler_worker_flag_overrides_configured_host_budget(tmp_path):
         load(tmp_path, "[preparation]\ncompile_workers = 0\n")
 
 
+def test_compile_headroom_flag_overrides_configured_size(tmp_path):
+    from ignition.cli.preparation import compiler_headroom
+    from ignition.preparation.host_memory import COMPILE_HEADROOM_BYTES
+
+    assert compiler_headroom(load(tmp_path, "")) == COMPILE_HEADROOM_BYTES == 8 << 30
+    config = load(tmp_path, '[preparation]\ncompile_headroom = "6G"\n')
+    assert compiler_headroom(config) == 6 << 30
+    assert compiler_headroom(config, "12GiB") == 12 << 30
+    assert compiler_headroom(config, "0") == 0
+    for value in ("-1G", "", "lots", "6X"):
+        with pytest.raises(UsageError, match="--compile-headroom"):
+            compiler_headroom(config, value)
+    for text, message in (('"-6G"', "compile_headroom in \\[preparation\\]"), ('""', "compile_headroom"),
+                          ("6", "must be str")):
+        with pytest.raises(UsageError, match=message):
+            load(tmp_path, f"[preparation]\ncompile_headroom = {text}\n")
+
+
+def test_initial_file_documents_the_compile_headroom(tmp_path):
+    configuration = Configuration(tmp_path / "config.toml", {}, False)
+    configuration.write_initial("qwen3.8-flash", 4)
+    lines = configuration.path.read_text().splitlines()
+    example = next(line for line in lines if line.startswith("# compile_headroom"))
+    written = load(tmp_path, "[preparation]\n" + example.removeprefix("# ") + "\n")
+    assert written.get("preparation.compile_headroom") == Setting("8G", "[preparation]")
+
+
 @pytest.mark.parametrize("text, message", [
     ("[memory]\nfraction = 0.9\n", "unknown key fraction"),
     ("[engine]\npages = 4\n", "unknown section"),

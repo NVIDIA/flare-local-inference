@@ -41,6 +41,32 @@ def test_forward_compiler_uses_explicit_host_budget_without_eight_worker_cap(mon
     assert compile_pool.CompilePool("cuda:0", compile_workers=32, headroom_bytes=2 << 30).workers == 10
 
 
+@pytest.mark.parametrize("compile_headroom,workers,threads", [(None, 1, 2), (6 << 30, 1, 6), (4 << 30, 2, 1)])
+def test_forward_compilers_leave_the_compile_headroom_free(monkeypatch, compile_headroom, workers, threads):
+    from ignition.preparation import compile_pool, host_memory
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (13 << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 13 << 30)
+    monkeypatch.setitem(compile_pool._OPTIONS, "compile_threads", 16)
+    options = {} if compile_headroom is None else {"compile_headroom_bytes": compile_headroom}
+    pool = compile_pool.CompilePool("cuda:0", headroom_bytes=1 << 30, **options)
+    assert (pool.workers, pool.options["compile_threads"]) == (workers, threads)
+
+
+def test_compile_headroom_without_room_for_a_worker_reports_the_budget(monkeypatch):
+    from ignition.preparation import compile_pool, host_memory
+
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device: (13 << 30, 121 << 30))
+    monkeypatch.setattr(torch.cuda, "get_device_properties", lambda device: SimpleNamespace(is_integrated=True))
+    monkeypatch.setattr(host_memory, "available_bytes", lambda: 13 << 30)
+    with pytest.raises(MemoryError, match="12288 MiB headroom, 4096 MiB per worker"):
+        compile_pool.CompilePool("cuda:0", compile_headroom_bytes=12 << 30)
+    for value in (-1, 1.5, None):
+        with pytest.raises(ValueError, match="compile_headroom_bytes"):
+            compile_pool.CompilePool("cuda:0", compile_headroom_bytes=value)
+
+
 def test_metadata_preserves_tensor_aliases_and_offsets():
     storage = torch.empty(1024, dtype=torch.uint8)
     original = SimpleNamespace(storage=storage, part=storage.view(torch.float32)[16:48],

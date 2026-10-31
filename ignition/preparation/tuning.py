@@ -23,7 +23,7 @@ from b12x.preparation.session import _declaration_key
 from b12x.preparation.types import _CompositePlan
 
 from .scratch import ScratchArena
-from .host_memory import cpu_workers, release_unused, tuning_limits
+from .host_memory import COMPILE_HEADROOM_BYTES, cpu_workers, release_unused, tuning_limits
 
 
 # Requests per tuning job on an integrated GPU: collective declarations with a coordinator,
@@ -82,7 +82,8 @@ class RecordedPreparationSession(PreparationSession):
     def __init__(self, *, device, checkpoint: str, workload_schema: str,
                  numerical_policy: str, search_limits=None, namespace=None, race_budget=None,
                  coordinator=None, headroom_bytes=0, benchmark_storage=None, compile_workers=None,
-                 tuning_replica=None, autotune_effort="default", collective_tuning="static", collective_ladder=None, native_dense_activations=False, lock_gpu_clocks=False):
+                 tuning_replica=None, autotune_effort="default", collective_tuning="static", collective_ladder=None, native_dense_activations=False, lock_gpu_clocks=False,
+                 compile_headroom_bytes=COMPILE_HEADROOM_BYTES):
         if not isinstance(checkpoint, str) or not checkpoint:
             raise ValueError("tuning requires an exact checkpoint revision")
         if any(not isinstance(value, str) or not value for value in (workload_schema, numerical_policy)):
@@ -114,6 +115,9 @@ class RecordedPreparationSession(PreparationSession):
         if type(headroom_bytes) is not int or headroom_bytes < 0:
             raise ValueError("headroom_bytes must be a nonnegative byte count")
         self.headroom_bytes = headroom_bytes
+        if type(compile_headroom_bytes) is not int or compile_headroom_bytes < 0:
+            raise ValueError("compile_headroom_bytes must be a nonnegative byte count")
+        self.compile_headroom_bytes = compile_headroom_bytes
         cpu_workers(compile_workers)
         self.requested_compile_workers = compile_workers
         self.tuning_replica = tuning_replica
@@ -476,7 +480,8 @@ class RecordedPreparationSession(PreparationSession):
             self.configure_compile_workers(None if preserve_default else
                 cpu_workers(self.requested_compile_workers, pools=pools))
             bounded, self.race_budget = tuning_limits(self.device.ordinal, self.compile_workers,
-                pools=pools, headroom_bytes=self.headroom_bytes, race_budget=self.race_budget)
+                pools=pools, headroom_bytes=self.headroom_bytes, race_budget=self.race_budget,
+                compile_headroom_bytes=self.compile_headroom_bytes)
             if self._integrated and self.compile_workers:
                 # Compiling in this process would keep every program it compiles through serving;
                 # one compiler process returns its memory at the end of each tuning job.
@@ -562,6 +567,7 @@ class RecordedPreparationSession(PreparationSession):
                 "requests": len(requests), "compile_workers": self.compile_workers,
                 "tuning_replicas": 1 if self.tuning_replica is None else self.tuning_replica.replicas,
                 "race_budget_bytes": self.race_budget, "headroom_bytes": self.headroom_bytes,
+                "compile_headroom_bytes": self.compile_headroom_bytes,
                 "cache_hits": sum(result.cache_hits for result in results),
                 "benchmarked_candidates": sum(result.benchmarked_candidates for result in results),
                 "restored_candidates": sum(result.restored_candidates for result in results),
