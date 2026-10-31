@@ -201,6 +201,21 @@ def test_missing_quantization_recipe_rejected(snapshot):
     assert name in str(error.value)
 
 
+@pytest.mark.parametrize("entry", [
+    {"quant_algo": "FP8_PB_WO", "weight_block_size": [128, 128]},
+    {"quant_algo": "FP8"},
+    {"quant_algo": "IQ2_XXS", "group_size": 256, "block_payload_bytes": 66, "packing": "ggml"},
+    {"quant_algo": "Q8_0", "group_size": 32, "block_payload_bytes": 34, "packing": "ggml"},
+])
+def test_unsupported_dense_storage_rejected(snapshot, entry):
+    config = json.loads((snapshot / "config.json").read_text())
+    name = "model.language_model.layers.0.linear_attn.out_proj"
+    config["quantization_config"]["quantized_layers"][name] = entry
+    with pytest.raises(CheckpointError, match="dense") as error:
+        _validate_config(config)
+    assert name in str(error.value)
+
+
 def test_checkpoint_metadata_does_not_import_torch(snapshot, monkeypatch):
     original_import = builtins.__import__
 
