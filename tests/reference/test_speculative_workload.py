@@ -56,6 +56,22 @@ def test_native_normalization_preserves_wire_json_strings_and_tool_choice(worklo
     assert case["request"]["tools"]
 
 
+@pytest.mark.parametrize("system", [None, "Extract the requested record."])
+def test_schema_instruction_is_rendered_without_changing_wire_request(system):
+    request = deepcopy(next(c["request"] for c in sw.definitions() if c["id"] == "json-unicode"))
+    if system is not None:
+        request["messages"].insert(0, {"role": "system", "content": system})
+    before = sw.json_bytes(request)
+    messages, _ = sw.template_input(request)
+    instruction = (
+        "Return the final answer as a JSON value matching this schema. Do not wrap it in Markdown fences or add text outside the JSON value. Tool calls may precede the final answer.\n"
+        "JSON schema:\n" + sw.json_bytes(request["response_format"]["json_schema"]["schema"]).decode()
+    )
+    assert messages[0] == {"role": "system", "content": (system + "\n\n" if system else "") + instruction}
+    assert messages[1:] == request["messages"][1 if system is not None else 0:]
+    assert sw.json_bytes(request) == before
+
+
 @pytest.mark.parametrize("concurrency", [1, 2, 4])
 def test_every_context_runs_once_and_tool_turns_and_prefix_branches_are_ordered(workload, concurrency):
     groups = sw.request_groups(workload, concurrency)
