@@ -778,7 +778,7 @@ pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value
         _ => return Err("invalid tool parameter type declaration".into()),
     };
     let parsed: std::result::Result<Value, _> = serde_json::from_str(raw);
-    for kind in kinds {
+    for &kind in &kinds {
         if kind == "string" {
             return Ok(Value::String(raw.into()));
         }
@@ -797,5 +797,32 @@ pub(crate) fn parameter_value(raw: &str, schema: Option<&Value>) -> Result<Value
             }
         }
     }
+
+    // coercion fallback for array
+    if kinds.contains(&"array") {
+        if let Ok(Value::Array(_)) = &parsed {
+            return Ok(parsed.unwrap());
+        }
+        if let Ok(Value::String(s)) = &parsed {
+            if let Ok(Value::Array(a)) = serde_json::from_str(s) {
+                return Ok(Value::Array(a));
+            }
+        }
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() && !trimmed.starts_with('[') {
+            let parts: Vec<Value> = trimmed
+                .split(',')
+                .map(|p| Value::String(p.trim().trim_matches('"').to_string()))
+                .filter(|v| !v.as_str().unwrap_or("").is_empty())
+                .collect();
+            if !parts.is_empty() {
+                return Ok(Value::Array(parts));
+            }
+        }
+        if !trimmed.is_empty() {
+            return Ok(Value::Array(vec![Value::String(trimmed.to_string())]));
+        }
+    }
+
     Err("tool parameter value does not match its declared JSON type".into())
 }
