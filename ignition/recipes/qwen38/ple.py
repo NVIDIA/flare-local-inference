@@ -11,7 +11,7 @@ import math
 from dataclasses import dataclass, fields
 
 import torch
-from b12x.preparation import PreparationSession, PreparedCall
+from b12x.preparation import PreparationSession
 from b12x.sequence import ple_embedding, short_conv
 from safetensors import safe_open
 
@@ -19,8 +19,6 @@ from ignition.components.linear import UnquantizedProjection
 from ignition.preparation.checkpoint import CheckpointManifest
 from ignition.progress import phase
 from ignition.preparation.qwen38 import PLE_PREFIX, TEXT_PREFIX
-from ignition.preparation.scratch import planned_scratch, prime_owners
-from ignition.preparation.tuning import declare, register_finalizer
 
 PLE_LAYER_PREFIX = f"{TEXT_PREFIX}.layers.1.ple"
 TABLE_ROWS = 320001536
@@ -403,15 +401,19 @@ class PreparedPLE:
                 ),
                 invocation=short_conv.invocation_from_tensors(**args),
             )
-            self.convolution_binding = self._prepare_binding(
+            from ignition.components.recurrent import prepare_sequence_binding
+
+            self.convolution_binding = None
+            prepare_sequence_binding(
                 self.convolution_plan,
                 args,
-                session,
-                f"{name}.convolution",
-                short_conv.bind,
+                session=session,
+                name=f"{name}.convolution",
+                public_bind=short_conv.bind,
                 bind_plan=True,
-                attribute="convolution_binding",
                 workspace=workspace,
+                mode=mode,
+                set_binding=lambda binding: setattr(self, "convolution_binding", binding),
             )
         else:
             self.convolutions = tuple(PreparedPLEConvolution(module, part.scratch, convolution_state,
@@ -423,27 +425,6 @@ class PreparedPLE:
         self.sequence_rows = torch.arange(
             sequences, dtype=torch.int32, device=self.device
         ).view(1, -1)
-
-    def _prepare_binding(self, plan, args, session, name, public_bind, *,
-                         attribute, bind_plan=False, workspace=None):
-
-        def prepare_call(prepared):
-            specs = plan.scratch_specs() if bind_plan else prepared.layout.scratch_specs()
-            scratch = planned_scratch(specs, workspace)
-            binding = prepared.bind(
-                scratch=scratch, **args, **({"plan": plan} if bind_plan else {})
-            )
-            return PreparedCall(run=lambda: prepared.run(binding), owners=prime_owners(workspace, scratch, binding))
-
-        declare(session, (plan.request(name=name, prepare_call=prepare_call),))
-
-        def refresh():
-            scratch = planned_scratch(plan.scratch_specs(), workspace)
-            setattr(self, attribute, public_bind(plan, scratch=scratch, **args))
-        setattr(self, attribute, None)
-
-        register_finalizer(session, refresh, workspace=workspace)
-        return getattr(self, attribute)
 
     def __call__(self, source: torch.Tensor) -> torch.Tensor:
         if source is not self.source and (

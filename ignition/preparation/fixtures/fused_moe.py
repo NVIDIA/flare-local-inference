@@ -118,3 +118,40 @@ def scale_expansion_benchmark_call(state, *, source, experts, top_k, session, na
     return capture_benchmark_call(replace(call,
         produce=operands.producers[0], benchmark_producers=operands.producers,
         owners=(*call.owners, operands)))
+
+
+class RouteBenchmarkInputs:
+    """Private logits and route outputs; selection controls are shared read-only."""
+
+    def __init__(self, logits, scratch, *, valid_tokens):
+        self.logits = torch.empty_strided(
+            logits.shape, logits.stride(), dtype=logits.dtype, device=logits.device)
+        generator = torch.Generator(device=logits.device).manual_seed(104729)
+        self.seed = torch.randn(
+            logits.shape, dtype=torch.float32, device=logits.device, generator=generator
+        ).to(logits.dtype)
+        self.produce()
+        self.scratch = tuple(
+            torch.empty_strided(t.shape, t.stride(), dtype=t.dtype, device=t.device)
+            for t in (scratch.selected_logits, scratch.ids, scratch.weights))
+        self.count = (torch.full((1,), logits.shape[0], dtype=torch.int32, device=logits.device)
+                      if valid_tokens else None)
+
+    def produce(self):
+        self.logits.copy_(self.seed)
+
+
+def route_topk_benchmark_call(state, logits, scratch, options, *, session, name):
+    """Race call for standalone route top-k over private logits and outputs."""
+    operands = benchmark_resource(
+        session, ("route_topk_benchmark", name),
+        lambda: RouteBenchmarkInputs(logits, scratch, valid_tokens="num_valid_tokens" in options))
+    private = dict(options)
+    if operands.count is not None:
+        private["num_valid_tokens"] = operands.count
+    return PreparedCall(
+        run=lambda: state.run(operands.logits, *operands.scratch, **private),
+        output=operands.scratch,
+        produce=operands.produce,
+        owners=(operands,),
+    )

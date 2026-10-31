@@ -719,3 +719,19 @@ def benchmark_resource(session, key, factory):
     if isinstance(session, RecordedPreparationSession):
         return session.benchmark_resource(key, factory)
     return factory()
+
+
+def races_candidates(plan, device):
+    """Whether the plan offers several candidates on this device, so tuning measures it.
+
+    Fixed plans, and plans whose extra candidates are offered only on other
+    architectures, are declared without a benchmark and keep their prior behavior.
+    """
+    import torch
+
+    if torch.device(device).type != "cuda":
+        return False
+    from b12x.preparation.device import detect_device
+
+    identity = detect_device(device).identity
+    return len(plan.contract.eligible_plan(plan.query, identity).candidates) > 1

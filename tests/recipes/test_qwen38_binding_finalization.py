@@ -9,8 +9,8 @@ import pytest
 import torch
 
 from ignition.preparation.fixtures import varlen_attention as attention_fixtures
-from ignition.components import varlen_attention
-from ignition.recipes.qwen38 import attention, ple, vision
+from ignition.components import recurrent, varlen_attention
+from ignition.recipes.qwen38 import attention, vision
 from ignition.preparation.scratch import ScratchArena
 
 
@@ -85,7 +85,8 @@ def session(monkeypatch):
         else:
             session.finalizers.append(callback)
 
-    for module in (attention, vision, ple, varlen_attention):
+    # PLE binds through the shared sequence-binding helper, which owns its finalizer.
+    for module in (attention, vision, recurrent, varlen_attention):
         monkeypatch.setattr(module, "register_finalizer", finalizer)
     for module in (attention, vision):
         monkeypatch.setattr(module, "QuantizedProjection", lambda *args, **kwargs: None)
@@ -289,37 +290,40 @@ def test_vision_private_producer_preserves_padded_operand_strides():
     )
 
 
-@pytest.mark.parametrize(
-    "attribute,bind_plan", [("embedding_binding", False), ("convolution_binding", True)]
-)
-def test_ple_singleton_binding_refreshes_without_reinvoking_prepare_factory(
-    session, attribute, bind_plan
-):
-    operator = object.__new__(ple.PreparedPLE)
+@pytest.mark.parametrize("bind_plan", [False, True])
+def test_ple_singleton_binding_refreshes_without_reinvoking_prepare_factory(session, bind_plan):
     arena = ScratchArena("cpu")
     plan = Plan()
     output = torch.zeros((2, 2560), dtype=torch.bfloat16)
-    bound = operator._prepare_binding(
+    published = []
+    returned = recurrent.prepare_sequence_binding(
         plan,
         {"out": output},
-        session,
-        "ple." + attribute,
-        lambda plan, **kwargs: SimpleNamespace(version=plan.version, **kwargs),
-        attribute=attribute,
+        session=session,
+        name="ple.binding",
+        public_bind=lambda plan, **kwargs: SimpleNamespace(version=plan.version, **kwargs),
+        mode="prefill",
         bind_plan=bind_plan,
         workspace=arena,
+        set_binding=published.append,
     )
-    assert getattr(operator, attribute) is bound is None
+    assert returned is None and not published
     assert arena.nbytes == 0
+    request = session.requests["ple.binding"]
+    # The request carries a representative benchmark for multi-candidate plans.
+    assert request.benchmark_call is not None and request.prepare_call is not None
+    candidate = Materialized(plan)
     plan.version, plan.nbytes = 3, 32
     grown = arena.reserve(512)
     session.finalize()
     arena.freeze()
-    refreshed = getattr(operator, attribute)
-    assert refreshed is not bound and refreshed.version == 3
+    (refreshed,) = published
+    assert refreshed.version == 3
     assert refreshed.out is output
     assert refreshed.scratch.shape == (32,)
     assert refreshed.scratch.data_ptr() == grown.data_ptr()
+    # Refreshing the selected binding never re-invokes the prepare factory.
+    assert candidate.bindings == []
 
 
 def test_plain_preparation_session_keeps_workspace_without_finalizer_protocol():

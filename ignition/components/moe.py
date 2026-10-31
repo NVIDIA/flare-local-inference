@@ -17,7 +17,7 @@ from b12x.preparation import FrozenMapping, PreparationSession, PreparedCall
 from ignition.preparation.fixtures import fused_moe as moe_fixtures
 from ignition.preparation.scratch import ScratchArena, planned_scratch, prime_owners
 from ignition.preparation.tensor_metadata import record_numeric_tensor
-from ignition.preparation.tuning import declare, register_finalizer
+from ignition.preparation.tuning import declare, races_candidates, register_finalizer
 
 
 @dataclass(frozen=True)
@@ -87,7 +87,10 @@ class PreparedRouter:
             ids_row_stride=scratch.ids.stride(0), weights_row_stride=scratch.weights.stride(0)))
         declare(session, (self.plan.request(name=name, prepare_call=lambda state: PreparedCall(
             run=lambda: state.run(logits, scratch.selected_logits, scratch.ids, scratch.weights, **self.options),
-            owners=(logits, scratch))),))
+            owners=(logits, scratch)),
+            benchmark_call=(lambda state: moe_fixtures.route_topk_benchmark_call(
+                state, logits, scratch, self.options, session=session, name=name))
+            if races_candidates(self.plan, logits.device) else None),))
 
     def __call__(self, logits: torch.Tensor) -> None:
         if (logits.dtype != self.dtype or logits.shape != self.shape

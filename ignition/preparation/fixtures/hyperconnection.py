@@ -42,3 +42,36 @@ def benchmark_call(state, operation, arguments, kwargs):
         produce=operands.produce,
         owners=(operands,),
     )
+
+
+class SwigluBenchmarkInputs:
+    """Private finite gate/up activations and output with the caller's strides."""
+
+    def __init__(self, gate_up, output):
+        self.gate_up = torch.empty_strided(
+            gate_up.shape, gate_up.stride(), dtype=gate_up.dtype, device=gate_up.device)
+        self.output = torch.empty_strided(
+            output.shape, output.stride(), dtype=output.dtype, device=output.device)
+        self.generator = torch.Generator(device=gate_up.device)
+        self.produce()
+        self.output.zero_()
+
+    def produce(self):
+        """Refill the activations with the same finite values."""
+        self.generator.manual_seed(65537)
+        self.gate_up.normal_(generator=self.generator)
+
+
+def swiglu_benchmark_call(state, gate_up, output, *, session, name):
+    """Race call over private operands; the SwiGLU launch reads one gate_up tensor."""
+    from ignition.preparation.tuning import benchmark_resource
+
+    operands = benchmark_resource(
+        session, ("swiglu_benchmark", tuple(gate_up.shape), tuple(gate_up.stride()), name),
+        lambda: SwigluBenchmarkInputs(gate_up, output))
+    return PreparedCall(
+        run=lambda: state.launch(operands.gate_up, operands.gate_up, operands.output),
+        output=operands.output,
+        produce=operands.produce,
+        owners=(operands,),
+    )
