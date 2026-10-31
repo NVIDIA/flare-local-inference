@@ -4101,6 +4101,41 @@ mod tests {
     }
 
     #[test]
+    fn a_restart_after_the_io_uring_probe_reuses_the_regions() {
+        let name = format!(
+            "selene-unit-{}-eintr-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        );
+        let base = std::env::temp_dir().join(&name);
+        let config = || {
+            let mut config = Config::new(
+                base.join("records"),
+                base.join("manager.sock"),
+                1 << 20,
+                64 << 20,
+            );
+            config.name = name.clone();
+            config.staging = 8 << 20;
+            config
+        };
+        let first = Store::open(config()).unwrap();
+        let generation = first.local.regions_generation();
+        let directory = first.shm_directory();
+        drop(first);
+        // Opening a store with a root sets up io_uring on this thread just before the regions
+        // are checked, which used to interrupt the reservation and recreate them.
+        for _ in 0..30 {
+            let again = Store::open(config()).unwrap();
+            assert_eq!(again.local.regions_generation(), generation);
+            drop(again);
+        }
+        let _ = fs::remove_dir_all(&directory);
+        let _ = fs::remove_file(Path::new("/dev/shm/selene").join(format!("{name}.lock")));
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
     fn admission_classifies_shapes_and_retained_capacity() {
         use proto::Reason::{Budget, Oversize};
         const K: u64 = 1024;

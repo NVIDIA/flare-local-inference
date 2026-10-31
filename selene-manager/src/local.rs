@@ -178,9 +178,13 @@ impl Local {
         let staging_size = region_size_of(STAGING_FILE, staging_bytes)?;
         let arena_path = directory.join(ARENA_FILE);
         let staging_path = directory.join(STAGING_FILE);
-        let reused = match reusable(&directory, arena_size, staging_size) {
-            Ok(generation) => Some(generation),
-            Err(reason) => {
+        // Only a definite mismatch recreates the regions; an unexpected error refuses to start
+        // rather than destroy regions that running instances have registered.
+        let reuse = reusable(&directory, arena_size, staging_size)
+            .map_err(|error| step_error("check the shared regions in", &directory, error))?;
+        let reused = match reuse {
+            Regions::Reuse(generation) => Some(generation),
+            Regions::Recreate(reason) => {
                 let existed = arena_path.exists() || staging_path.exists();
                 for name in [ARENA_FILE, STAGING_FILE, GENERATION_FILE, HOLDERS_FILE] {
                     let _ = fs::remove_file(directory.join(name));
@@ -542,66 +546,95 @@ fn create_region(directory: &Path, name: &str, size: usize) -> Result<PathBuf> {
     if unsafe { libc::fchmod(file.as_raw_fd(), 0o660) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    while unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
-        let error = io::Error::last_os_error();
-        if error.kind() == io::ErrorKind::Interrupted {
-            continue;
-        }
+    if let Err(error) = retry_interrupted(|| unsafe {
+        libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t)
+    }) {
         let _ = fs::remove_file(&path);
         return Err(error);
     }
     Ok(path)
 }
 
-/// The generation of the region files a previous run left, if they can be used as they are:
-/// regular files of this user, exactly the configured sizes, with their memory reserved, and a
-/// readable generation. Otherwise why not.
-fn reusable(
-    directory: &Path,
-    arena_size: usize,
-    staging_size: usize,
-) -> std::result::Result<u64, String> {
+/// Runs a syscall that returns 0 on success, again while it fails with EINTR.
+fn retry_interrupted(mut call: impl FnMut() -> libc::c_int) -> io::Result<()> {
+    while call() != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() != io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
+    Ok(())
+}
+
+/// What to do with the region files a previous run left.
+enum Regions {
+    /// Usable as they are, with this generation.
+    Reuse(u64),
+    /// Definitely unusable, for this reason.
+    Recreate(String),
+}
+
+/// Whether the region files can be used as they are: regular files of this user, exactly the
+/// configured sizes, with their memory reserved, and a readable generation. An unexpected I/O
+/// error is the outer `Err`: it is not known that the files are unusable, so the caller must not
+/// delete them.
+fn reusable(directory: &Path, arena_size: usize, staging_size: usize) -> io::Result<Regions> {
     use std::os::unix::fs::MetadataExt;
     for (name, size) in [(ARENA_FILE, arena_size), (STAGING_FILE, staging_size)] {
         let path = directory.join(name);
+        let named = |error: io::Error| io::Error::new(error.kind(), format!("{name}: {error}"));
+        let missing = || Ok(Regions::Recreate(format!("no {name} file")));
         let metadata = match fs::symlink_metadata(&path) {
             Ok(metadata) => metadata,
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                return Err(format!("no {name} file"));
-            }
-            Err(error) => return Err(format!("{name}: {error}")),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return missing(),
+            Err(error) => return Err(named(error)),
         };
         if !metadata.is_file() {
-            return Err(format!("{name} is not a regular file"));
+            return Ok(Regions::Recreate(format!("{name} is not a regular file")));
         }
         if metadata.uid() != unsafe { libc::geteuid() } {
-            return Err(format!("{name} belongs to another user"));
+            return Ok(Regions::Recreate(format!("{name} belongs to another user")));
         }
         if metadata.len() != size as u64 {
-            return Err(format!(
+            return Ok(Regions::Recreate(format!(
                 "{name} is {} bytes and {size} are configured",
                 metadata.len()
-            ));
+            )));
         }
-        let file = OpenOptions::new()
+        let file = match OpenOptions::new()
             .read(true)
             .write(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
             .open(&path)
-            .map_err(|error| format!("{name}: {error}"))?;
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return missing(),
+            Err(error) => return Err(named(error)),
+        };
         if unsafe { libc::fchmod(file.as_raw_fd(), 0o660) } != 0 {
-            return Err(format!("{name}: {}", io::Error::last_os_error()));
+            return Err(named(io::Error::last_os_error()));
         }
-        if unsafe { libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t) } != 0 {
-            return Err(format!("{name}: {}", io::Error::last_os_error()));
+        retry_interrupted(|| unsafe {
+            libc::fallocate(file.as_raw_fd(), 0, 0, size as libc::off_t)
+        })
+        .map_err(named)?;
+    }
+    let text = match fs::read_to_string(directory.join(GENERATION_FILE)) {
+        Ok(text) => text,
+        Err(error)
+            if matches!(
+                error.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::InvalidData
+            ) =>
+        {
+            return Ok(Regions::Recreate(format!("generation: {error}")));
         }
-    }
-    let text = fs::read_to_string(directory.join(GENERATION_FILE))
-        .map_err(|error| format!("generation: {error}"))?;
-    match u64::from_str_radix(text.trim(), 16) {
-        Ok(generation) if generation != 0 => Ok(generation),
-        _ => Err("the generation file is unreadable".to_owned()),
-    }
+        Err(error) => return Err(io::Error::new(error.kind(), format!("generation: {error}"))),
+    };
+    Ok(match u64::from_str_radix(text.trim(), 16) {
+        Ok(generation) if generation != 0 => Regions::Reuse(generation),
+        _ => Regions::Recreate("the generation file is unreadable".to_owned()),
+    })
 }
 
 /// A random nonzero 64-bit identity for a new set of region files.
@@ -920,6 +953,28 @@ mod tests {
         let again = second.staging().allocate(4096).unwrap();
         assert_eq!(again.offset(), offset, "regions keep the same offsets");
         drop(cleanup);
+    }
+
+    #[test]
+    fn an_interrupted_syscall_is_retried_but_other_errors_are_not() {
+        let mut calls = 0;
+        let result = retry_interrupted(|| {
+            calls += 1;
+            if calls < 3 {
+                unsafe { *libc::__errno_location() = libc::EINTR };
+                -1
+            } else {
+                0
+            }
+        });
+        assert!(result.is_ok());
+        assert_eq!(calls, 3, "EINTR is retried until the call succeeds");
+
+        let result = retry_interrupted(|| {
+            unsafe { *libc::__errno_location() = libc::ENOSPC };
+            -1
+        });
+        assert_eq!(result.unwrap_err().raw_os_error(), Some(libc::ENOSPC));
     }
 
     #[test]
