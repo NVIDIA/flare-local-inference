@@ -55,7 +55,11 @@ request, so the requester recomputed it. When the first session of a scope arriv
 logs, once for that scope, how many tokens of context one export can hold in the configured
 staging and warns if that is under 262,144 tokens (Flare's usual per-request limit; the manager
 does not know a model's real maximum). The warning names the staging size that would hold it.
-Size `--staging` from that line and from your longest contexts.
+One export holds (`--staging` minus the row bytes) divided by the page bytes, rounded down,
+times the page tokens: about 143,000 tokens at 2 GiB and 294,000 at the 4 GiB default for a
+model with 905,216-byte pages of 64 tokens and a 122 MiB row. A longer context is refused
+`NO_WINDOWS` and recomputed, so size `--staging` from the figure the manager logs when a scope
+opens.
 
 `--nvme` bounds record reservations: the rounded arena extent for an in-memory
 record, or the padded file plus the two-window hold for a streamed put. It must exceed the
