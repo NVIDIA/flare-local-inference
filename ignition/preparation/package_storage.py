@@ -71,6 +71,11 @@ class PackageStorage:
         self.HOST_BASE = layout["host_base"]
         self._host_cursor = self.HOST_BASE
         self.low_reservations = []
+        # Sealing is what makes EXTERNAL_FLOOR a restorable floor: it reserves every free span
+        # below it so library allocations land above it. Windows cannot seal its low pool
+        # (WDDM owns it, and cuMemAddressReserve does not constrain cuMemAlloc there), so the
+        # export asserts no floor rather than one this storage never established.
+        self.sealed = False
         # WDDM retains its low allocation pool; export rejects retained storage below the floor.
         if self.integrated and os.name != "nt":
             self._reserve_low_window()
@@ -106,6 +111,7 @@ class PackageStorage:
         self.cuda.call("cuMemFree_v2", probe)
         if above < self.EXTERNAL_FLOOR:
             raise RuntimeError(f"device allocations still start at {above:#x} below {self.EXTERNAL_FLOOR:#x}")
+        self.sealed = True
 
     def _reserve_at(self, address, size):
         """Reserve exactly [address, address + size), or nothing when any of it is taken."""
@@ -133,6 +139,7 @@ class PackageStorage:
         """
         if not self.integrated or os.name == "nt":
             return
+        self.sealed = True
         granule = self.granularity
         address = -(-self.LOW_SCAN_START // granule) * granule
         while address < self.EXTERNAL_FLOOR:
@@ -153,6 +160,18 @@ class PackageStorage:
                 size = max(granule, size // 2 // granule * granule)
             # A granule taken since the probe is skipped.
             address += size
+
+    @property
+    def address_floor(self):
+        """Lowest device address package storage can restore; zero when it never sealed.
+
+        Sealing reserves every free span below EXTERNAL_FLOOR, which is what lets export
+        assert that retained storage above it is restorable. A storage that could not seal
+        (Windows keeps its low pool) asserts nothing: library allocations legitimately sit
+        below EXTERNAL_FLOOR there, and a floor the storage never established would reject
+        every export.
+        """
+        return self.EXTERNAL_FLOOR if self.sealed else 0
 
     def _snapshot(self):
         pointer = self.library.flare_package_snapshot()

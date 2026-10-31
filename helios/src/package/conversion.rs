@@ -309,8 +309,7 @@ pub fn unpack_selected(source: &Path, output: &Path, selected: Option<&[usize]>)
             Source::Bytes(locations),
         )?;
         writer.finish()?;
-        File::open(&primary)
-            .and_then(|file| file.sync_all())
+        crate::package::cache::sync_file(&primary)
             .map_err(|e| invalid(format!("sync package primary: {e}")))?;
         // Companion entries must be durable before the directory becomes visible,
         // and an existing destination is never replaced.
@@ -2075,8 +2074,7 @@ fn inject_dependency_descriptors(
         writer.add(name, slice.len(), Source::Slice(slice))?;
     }
     writer.finish()?;
-    File::open(&temporary)
-        .and_then(|file| file.sync_all())
+    crate::package::cache::sync_file(&temporary)
         .map_err(|e| invalid(format!("sync rewritten manifest: {e}")))?;
     fs::rename(&temporary, &primary)
         .map_err(|e| invalid(format!("publish rewritten manifest: {e}")))?;
@@ -2249,8 +2247,7 @@ pub fn emit_derivations(
         Source::Bytes(encoded_derivations),
     )?;
     writer.finish()?;
-    File::open(&staging)
-        .and_then(|file| file.sync_all())
+    crate::package::cache::sync_file(&staging)
         .map_err(|e| invalid(format!("sync rewritten primary: {e}")))?;
     fs::rename(&staging, &primary)
         .map_err(|e| invalid(format!("publish rewritten primary: {e}")))?;
@@ -2480,6 +2477,32 @@ fn lock_package(directory: &Path) -> Result<PackageLock> {
             )));
         }
     }
+    // Without a lock here, concurrent emission reads the same metadata, appends its own
+    // derivation and rewrites the package, so one writer's derivation is lost.
+    #[cfg(windows)]
+    {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::Foundation::HANDLE;
+        use windows_sys::Win32::Storage::FileSystem::{LOCKFILE_EXCLUSIVE_LOCK, LockFileEx};
+        use windows_sys::Win32::System::IO::OVERLAPPED;
+        let mut overlapped: OVERLAPPED = unsafe { std::mem::zeroed() };
+        let locked = unsafe {
+            LockFileEx(
+                file.as_raw_handle() as HANDLE,
+                LOCKFILE_EXCLUSIVE_LOCK,
+                0,
+                u32::MAX,
+                u32::MAX,
+                &mut overlapped,
+            )
+        };
+        if locked == 0 {
+            return Err(invalid(format!(
+                "lock package: {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+    }
     Ok(PackageLock { _file: file })
 }
 
@@ -2501,8 +2524,7 @@ fn sync_parent(_path: &Path) -> Result<()> {
 }
 
 fn publish_staged_file(staging: &Path, destination: &Path) -> Result<()> {
-    let result = File::open(staging)
-        .and_then(|file| file.sync_all())
+    let result = crate::package::cache::sync_file(staging)
         .map_err(|e| invalid(format!("sync packed package: {e}")))
         .and_then(|()| {
             fs::hard_link(staging, destination)

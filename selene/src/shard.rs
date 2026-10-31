@@ -1271,11 +1271,36 @@ pub fn decode_agreed(payload: &[u8]) -> Result<HashMap<PrefixKey, bool>> {
 ///
 /// Failing here stops startup: a predictable token would let any host on the
 /// network claim a peer's record connection.
+#[cfg(unix)]
 pub fn nonce() -> Result<[u8; 16]> {
     let mut random = [0u8; 16];
     std::fs::File::open("/dev/urandom")
         .and_then(|mut source| source.read_exact(&mut random))
         .map_err(|error| record::io_failure("read a prefix record token", error))?;
+    Ok(random)
+}
+
+/// Windows has no `/dev/urandom`; the system-preferred CSPRNG fills the same token.
+#[cfg(windows)]
+pub fn nonce() -> Result<[u8; 16]> {
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_USE_SYSTEM_PREFERRED_RNG, BCryptGenRandom,
+    };
+    let mut random = [0u8; 16];
+    let status = unsafe {
+        BCryptGenRandom(
+            std::ptr::null_mut(),
+            random.as_mut_ptr(),
+            random.len() as u32,
+            BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        )
+    };
+    if status < 0 {
+        return Err(record::io_failure(
+            "read a prefix record token",
+            std::io::Error::other(format!("BCryptGenRandom failed with NTSTATUS {status:#x}")),
+        ));
+    }
     Ok(random)
 }
 

@@ -225,7 +225,7 @@ def export_model(prepared, images, storage, path, *, options, progress=None, pub
         graphs=_graphs(prepared.graphs), allocations=[asdict(a) for a in allocations], discover_allocations=True,
         events=prepared.export_events, numeric=numeric, inactive=inactive,
         parameter_layouts=parameter_layouts, zero_ranges=zero_ranges, transports=transports,
-        device_address_floor=storage.EXTERNAL_FLOOR if storage.integrated else 0,
+        device_address_floor=storage.address_floor,
         execution=prepared.manifest(all_variants=True), server=None if bundle_only else {**prepared.server_config, **options},
         package_data=None if bundle_only or prepared.package_data is None else prepared.package_data.export_metadata(),
         rebuild_weights=None if getattr(prepared, "rebuild_weights", None) is None else

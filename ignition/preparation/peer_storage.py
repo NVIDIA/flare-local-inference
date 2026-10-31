@@ -4,9 +4,16 @@
 """Symmetric VMM mappings for b12x collectives during rank preparation."""
 
 import ctypes as C
-from multiprocessing.reduction import DupFd
 import os
 import pickle
+
+try:
+    from multiprocessing.reduction import DupFd
+except ImportError:
+    # Descriptor duplication is POSIX-only. Peer storage hands CUDA shareable handles to other
+    # ranks as file descriptors, so it cannot run on Windows; keeping the module importable lets
+    # the forward pickler recognise (and elide) peer storage without failing the whole import.
+    DupFd = None
 
 from b12x.comm.pcie._cuda_ipc import CudaRTLibrary
 
@@ -47,6 +54,8 @@ class PeerStorage(CudaRTLibrary):
         del self.owned[pointer]
 
     def cudaIpcGetMemHandleBytes(self, pointer):
+        if DupFd is None:
+            raise RuntimeError("peer storage requires POSIX descriptor passing")
         cuda = self.storage.cuda
         region = self.dynamic.get(pointer)
         mappings = [(pointer, self.owned[pointer])] if region is None else region.mappings

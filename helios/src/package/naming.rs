@@ -22,12 +22,16 @@ pub const GB202_DEVICES: [u32; 9] = [
     0x2b85, 0x2b87, 0x2b8c, 0x2bb1, 0x2bb2, 0x2bb3, 0x2bb4, 0x2bb5, 0x2bb9,
 ];
 
+/// GB10 device identifiers. `0x2e12` is the DGX Spark part; `0x2e03` is the
+/// RTX Spark N1X part, which NVML reports for the same SM121 platform.
+pub const GB10_DEVICES: [u32; 2] = [0x2e12, 0x2e03];
+
 pub fn platform_from_pci(pci_id: u32) -> Option<&'static str> {
     if pci_id & 0xffff != 0x10de {
         return None;
     }
     let device = pci_id >> 16;
-    if device == 0x2e12 {
+    if GB10_DEVICES.contains(&device) {
         return Some("gb10");
     }
     GB202_DEVICES.contains(&device).then_some("gb202")
@@ -162,7 +166,13 @@ mod tests {
 
     #[test]
     fn pci_ids_select_the_platform_identifier() {
-        assert_eq!(platform_from_pci(0x2e12_10de), Some("gb10"));
+        for device in GB10_DEVICES {
+            assert_eq!(
+                platform_from_pci(device << 16 | 0x10de),
+                Some("gb10"),
+                "{device:#06x}"
+            );
+        }
         for device in GB202_DEVICES {
             assert_eq!(
                 platform_from_pci(device << 16 | 0x10de),

@@ -705,6 +705,28 @@ fn slice<'a>(
     }
 }
 
+#[cfg(not(windows))]
+use libc::strftime;
+
+/// MSVC's CRT exports `strftime`, but the `libc` crate does not declare it for Windows.
+#[cfg(windows)]
+unsafe fn strftime(
+    output: *mut std::ffi::c_char,
+    capacity: usize,
+    format: *const std::ffi::c_char,
+    local: *const libc::tm,
+) -> usize {
+    unsafe extern "C" {
+        fn strftime(
+            output: *mut std::ffi::c_char,
+            capacity: usize,
+            format: *const std::ffi::c_char,
+            local: *const libc::tm,
+        ) -> usize;
+    }
+    unsafe { strftime(output, capacity, format, local) }
+}
+
 fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Result<Value<'a>> {
     match name {
         "strftime_now" => {
@@ -718,7 +740,7 @@ fn function<'a>(name: &str, args: &[Value<'a>], kw: &[(&str, Value<'a>)]) -> Res
                 if libc::localtime_r(&now, local.as_mut_ptr()).is_null() { return Err(Error::new("local time is unavailable")); }
                 #[cfg(windows)]
                 if libc::localtime_s(local.as_mut_ptr(), &now) != 0 { return Err(Error::new("local time is unavailable")); }
-                libc::strftime(output.as_mut_ptr().cast(), output.len(), format.as_ptr(), local.as_ptr())
+                strftime(output.as_mut_ptr().cast(), output.len(), format.as_ptr(), local.as_ptr())
             };
             if length == 0 && !format.as_bytes().is_empty() { return Err(Error::new("strftime_now output exceeds 4095 bytes")); }
             output.truncate(length);

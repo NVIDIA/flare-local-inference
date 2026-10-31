@@ -94,6 +94,17 @@ impl Reachability {
         Ok(())
     }
 
+    /// Drop an allocation from further consideration.
+    ///
+    /// A recorder-derived record can outlive the memory it describes. Forgetting it keeps a released
+    /// range from being retained and stops later pointer hits inside that range from re-adding it.
+    pub(crate) fn forget(&mut self, name: &str) {
+        self.allocations.remove(name);
+        self.intervals.retain(|(_, _, existing)| existing != name);
+        self.reached.remove(name);
+        self.pending.retain(|existing| existing != name);
+    }
+
     pub(crate) fn pointer(&mut self, value: u64) -> ExportResult<()> {
         let inactive = self.inactive.partition_point(|&(start, _)| start <= value);
         if inactive > 0 && value < self.inactive[inactive - 1].1 {
@@ -326,6 +337,22 @@ mod tests {
         reach.contents(&allocations[0], 9, &bytes[9..]).unwrap();
         assert!(reach.reached.contains("target"));
     }
+    #[test]
+    fn forgotten_allocation_is_not_referenced_by_a_later_pointer_hit() {
+        let allocations = [allocation("source", 0x1000), allocation("released", 0x2000)];
+        let mut reach = Reachability::new(&allocations, &[], &[], &[]).unwrap();
+        reach.pointer(0x2040).unwrap();
+        assert!(reach.reached.contains("released"));
+        reach.forget("released");
+        assert!(!reach.reached.contains("released"));
+        assert!(reach.take().unwrap().is_none(), "a forgotten allocation is never scanned");
+        reach.pointer(0x2040).unwrap();
+        assert!(
+            !reach.reached.contains("released"),
+            "a forgotten range must not be re-referenced"
+        );
+    }
+
     #[test]
     fn arbitrary_chunk_widths_preserve_pointer_hits_across_numeric_ranges_and_gaps() {
         let mut source = allocation("source", 0x0800_0000_0000);

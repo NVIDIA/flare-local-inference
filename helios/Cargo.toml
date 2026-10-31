@@ -59,10 +59,15 @@ crossterm = { version = "0.28", default-features = false, optional = true }
 twox-hash = { version = "2.1", default-features = false, features = ["xxhash3_64"] }
 
 [dev-dependencies]
-flare-selene-manager = { path = "../selene-manager", features = ["test-support"] }
 flare-selene = { path = "../selene", features = ["test-support"] }
 minijinja = { version = "=2.24.0", features = ["loader", "preserve_order", "loop_controls"] }
 minijinja-contrib = { version = "=2.24.0", features = ["pycompat"] }
+
+# The pool tests drive a real Selene manager over a Unix-domain socket, so the
+# dependency and its one consumer stay Unix-only; declaring it unconditionally
+# made the whole test profile uncompilable on Windows.
+[target.'cfg(unix)'.dev-dependencies]
+flare-selene-manager = { path = "../selene-manager", features = ["test-support"] }
 
 [build-dependencies]
 prost-build = { version = "0.14", optional = true }

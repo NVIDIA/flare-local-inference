@@ -85,6 +85,8 @@ pub(crate) struct RecordedAllocation {
     pub nbytes: u64,
     pub memory: String,
     pub context: Option<usize>,
+    /// The memory pool an async allocation came from; destroying the pool releases its allocations.
+    pub pool: Option<u64>,
 }
 #[derive(Default)]
 struct State {
@@ -393,10 +395,9 @@ impl State {
                 self.drop_library(value(0));
             }
             "cuMemAlloc_v2"
+            | "cuMemAlloc"
             | "cuMemAllocAsync"
-            | "cuMemAllocAsync_ptsz"
-            | "cuMemAllocFromPoolAsync"
-            | "cuMemAllocFromPoolAsync_ptsz" => {
+            | "cuMemAllocAsync_ptsz" => {
                 let address = output(0)? as u64;
                 self.allocations.insert(
                     address,
@@ -405,10 +406,32 @@ impl State {
                         nbytes: value(1) as u64,
                         memory: "device".into(),
                         context: Some(call.context),
+                        pool: None,
                     },
                 );
             }
+            "cuMemAllocFromPoolAsync" | "cuMemAllocFromPoolAsync_ptsz" => {
+                let address = output(0)? as u64;
+                self.allocations.insert(
+                    address,
+                    RecordedAllocation {
+                        address,
+                        nbytes: value(1) as u64,
+                        memory: "device".into(),
+                        context: Some(call.context),
+                        pool: Some(value(2) as u64),
+                    },
+                );
+            }
+            // Destroying a pool releases every allocation made from it, so those recordings are
+            // stale: their addresses can no longer be copied or restored.
+            "cuMemPoolDestroy" => {
+                let pool = value(0) as u64;
+                self.allocations
+                    .retain(|_, allocation| allocation.pool != Some(pool));
+            }
             "cuMemFree_v2"
+            | "cuMemFree"
             | "cuMemFreeAsync"
             | "cuMemFreeAsync_ptsz"
             | "cuMemUnmap"
@@ -425,6 +448,7 @@ impl State {
                         nbytes: value(1) as u64,
                         memory: "device".into(),
                         context: Some(call.context),
+                        pool: None,
                     },
                 );
             }
@@ -437,6 +461,7 @@ impl State {
                         nbytes: value(1) as u64,
                         memory: "mapped_host".into(),
                         context: None,
+                        pool: None,
                     },
                 );
             }
@@ -449,6 +474,7 @@ impl State {
                         nbytes: value(1) as u64,
                         memory: "mapped_host".into(),
                         context: None,
+                        pool: None,
                     },
                 );
             }
@@ -1085,6 +1111,43 @@ mod tests {
         );
         call(&owner, "cuMemUnmap", 1, &[address, 8192], 0, 0x1000);
         assert!(owner.state.lock().unwrap().allocations.is_empty());
+    }
+    #[test]
+    fn pool_destruction_drops_only_its_allocations() {
+        let owner = CallbackState::new();
+        let pooled = 0x8000usize;
+        let ordinary = 0x9000usize;
+        call(
+            &owner,
+            "cuMemAllocFromPoolAsync",
+            1,
+            &[&pooled as *const _ as usize, 4096, 0xAA, 0],
+            0,
+            0x1000,
+        );
+        call(
+            &owner,
+            "cuMemAllocAsync",
+            1,
+            &[&ordinary as *const _ as usize, 4096, 0],
+            0,
+            0x1000,
+        );
+        {
+            let state = owner.state.lock().unwrap();
+            assert_eq!(state.allocations[&0x8000].pool, Some(0xAA));
+            assert_eq!(state.allocations[&0x9000].pool, None);
+        }
+        call(&owner, "cuMemPoolDestroy", 0, &[0xAA], 0, 0x1000);
+        let state = owner.state.lock().unwrap();
+        assert!(
+            !state.allocations.contains_key(&0x8000),
+            "an allocation cannot outlive the pool that backs it"
+        );
+        assert!(
+            state.allocations.contains_key(&0x9000),
+            "destroying a pool must not drop other allocations"
+        );
     }
     #[test]
     fn callback_failure_is_retained_without_crossing_ffi_boundary() {

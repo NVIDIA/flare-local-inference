@@ -1,3 +1,8 @@
 # Preserve upstream license and notice bytes, including original line endings.
 third_party/rust/** -text
 packaging/license-supplements/** -text
+
+# Chat templates are hashed byte-for-byte: the Qwen and Step patch JSONs carry a
+# result_sha256 over the annotated source, and the Kimi template is embedded with
+# include_str! and split on "#}\n". A CRLF checkout breaks both, so keep LF.
+ignition/recipes/*/assets/*.jinja text eol=lf
