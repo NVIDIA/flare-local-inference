@@ -111,29 +111,39 @@ def _validate_trailing(Sources, Destinations, Operations, Expected, Count, Error
                        WIDTH: tl.constexpr, MemoryCapacity, PAGE_TOKENS: tl.constexpr,
                        LIVE: tl.constexpr):
     row = tl.program_id(0)
-    source, destination = tl.load(Sources + row), tl.load(Destinations + row)
+    source = tl.load(Sources + row)
     PAGES = tl.load(MemoryCapacity + 1)
-    endpoint = tl.maximum(0, tl.load(Expected + row) - 1)
+    endpoint = tl.load(Expected + row)
     slot = tl.load(RequestSlots + row)
     state = tl.load(StateRows + slot * 8, (slot >= 0) & (slot < LIVE), other=0)
     snapshot = source == state
     active = (row < tl.load(Count)) & (tl.load(Errors + row) == 0) & (tl.load(Operations + row) == 0)
-    tail = active & (endpoint % PAGE_TOKENS != 0)
-    page = tl.load(Tables + slot * WIDTH + endpoint // PAGE_TOKENS, tail, other=-1)
     others = tl.arange(0, LIVE)
-    other_source, other_dest = tl.load(Sources + others), tl.load(Destinations + others)
+    other_source = tl.load(Sources + others)
     other_slot = tl.load(RequestSlots + others)
     other_state = tl.load(StateRows + other_slot * 8, (other_slot >= 0) & (other_slot < LIVE), other=0)
     other_snapshot = other_source == other_state
-    other_endpoint = tl.maximum(0, tl.load(Expected + others) - 1)
+    other_endpoint = tl.load(Expected + others)
     other_active = (others < tl.load(Count)) & (others != row) & (tl.load(Operations + others) == 0)
-    other_active &= (other_slot >= 0) & (other_slot < LIVE) & (other_endpoint // PAGE_TOKENS < WIDTH)
-    other_active &= other_endpoint % PAGE_TOKENS != 0
-    other_page = tl.load(Tables + other_slot * WIDTH + other_endpoint // PAGE_TOKENS, other_active, other=-1)
-    conflict = tl.sum((other_active & (page == other_page) & (~snapshot | ~other_snapshot)).to(tl.int32), 0) > 0
+    other_active &= (other_slot >= 0) & (other_slot < LIVE)
     error = tl.load(Errors + row)
-    error = tl.where(tail & ((page < 0) | (page >= PAGES)), 6, error)
-    error = tl.where(tail & conflict, 4, error)
+    for part in tl.static_range(2):
+        logical = endpoint // PAGE_TOKENS + part - 1
+        tail = active & (endpoint > 1) & (logical >= 0)
+        if part == 1:
+            tail &= endpoint % PAGE_TOKENS >= 2
+        bounded = (logical >= 0) & (logical < WIDTH)
+        page = tl.load(Tables + slot * WIDTH + logical, tail & bounded, other=-1)
+        conflict = tl.full((), False, tl.int1)
+        for other_part in tl.static_range(2):
+            other_logical = other_endpoint // PAGE_TOKENS + other_part - 1
+            used = other_active & (other_endpoint > 1) & (other_logical >= 0) & (other_logical < WIDTH)
+            if other_part == 1:
+                used &= other_endpoint % PAGE_TOKENS >= 2
+            other_page = tl.load(Tables + other_slot * WIDTH + other_logical, used, other=-1)
+            conflict |= tl.sum((used & (page == other_page) & (~snapshot | ~other_snapshot)).to(tl.int32), 0) > 0
+        error = tl.where(tail & ((page < 0) | (page >= PAGES)), 6, error)
+        error = tl.where(tail & conflict, 4, error)
     tl.store(Errors + row, error)
 
 
@@ -156,18 +166,28 @@ def _copy_rows(Backing, Sources, Destinations, Operations, Count, Errors,
 def _copy_pages(Pointers, Backing, Tables, Sources, Destinations, Operations, Expected, Count, Errors, RequestSlots, StateRows,
                 ROW_BYTES: tl.constexpr, PAGE_BYTES: tl.constexpr, WIDTH: tl.constexpr,
                 PAGE_TOKENS: tl.constexpr, BLOCK: tl.constexpr, LIVE: tl.constexpr = 4,
-                ENDPOINT_SHIFT: tl.constexpr = 0):
+                DRAFT_PART: tl.constexpr = -1):
     row, region, tile = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     source, destination = tl.load(Sources + row), tl.load(Destinations + row)
-    endpoint = tl.maximum(0, tl.load(Expected + row) + ENDPOINT_SHIFT)
+    endpoint = tl.load(Expected + row)
     slot = tl.load(RequestSlots + row)
     state = tl.load(StateRows + slot * 8, (slot >= 0) & (slot < LIVE), other=0)
     snapshot = source == state
     active = (row < tl.load(Count)) & (tl.load(Errors + row) == 0)
-    active &= (tl.load(Operations + row) == 0) & (endpoint % PAGE_TOKENS != 0)
-    page = tl.load(Tables + slot * WIDTH + endpoint // PAGE_TOKENS, active, other=0)
+    active &= tl.load(Operations + row) == 0
+    logical = endpoint // PAGE_TOKENS
+    if DRAFT_PART < 0:
+        active &= endpoint % PAGE_TOKENS != 0
+    else:
+        logical += DRAFT_PART - 1
+        active &= (endpoint > 1) & (logical >= 0)
+        if DRAFT_PART == 1:
+            active &= endpoint % PAGE_TOKENS >= 2
+    page = tl.load(Tables + slot * WIDTH + logical, active, other=0)
     cache = tl.load(Pointers + region * 2).to(tl.pointer_type(tl.uint8))
     offset = tl.load(Pointers + region * 2 + 1)
+    if DRAFT_PART >= 0:
+        offset += DRAFT_PART * PAGE_BYTES
     saved_slot = tl.where(snapshot, destination, source)
     index = tile * BLOCK + tl.arange(0, BLOCK)
     saved = Backing + saved_slot * ROW_BYTES + offset + index
@@ -185,6 +205,9 @@ class PreparedStateTransfer:
 
     ``pages`` contains (state region name, contiguous uint8 [pages, page_bytes]
     cache) pairs. Cache owners and pointer tables remain alive until graph drain.
+    ``trailing_pages`` uses a one-page-shifted table with a one-token lag. Each
+    saved region holds two pages: the preceding boundary page, then the current
+    one. Both may be private even when the preceding draft page is complete.
     These maintenance operations are captured directly. Tensor-parallel callers
     must combine validation failures across ranks between validate() and apply().
     A nonzero command error suppresses both row and external-page writes.
@@ -233,11 +256,11 @@ class PreparedStateTransfer:
             _check_tensor(trailing_tables, tables.shape, torch.int32, device, "trailing_page_tables")
             for name, cache in trailing_pages:
                 region = pool.layout.region(name)
-                if name in names or region.dtype != torch.uint8 or cache.shape != (page_count, region.nbytes):
-                    raise ValueError("trailing partial pages must match the model page capacity and state regions")
+                if name in names or region.dtype != torch.uint8 or cache.shape != (page_count, region.nbytes // 2) or region.nbytes % 2:
+                    raise ValueError("shifted draft pages require two saved pages per cache plane")
                 _check_tensor(cache, cache.shape, torch.uint8, device, name)
                 names.add(name)
-                trailing_groups[region.nbytes].append((cache.data_ptr(), region.offset))
+                trailing_groups[cache.shape[1]].append((cache.data_ptr(), region.offset))
         self.trailing_pointers = {size: torch.tensor(values, dtype=torch.int64, device=device)
                                  for size, values in trailing_groups.items()}
         self.pointers = {size: torch.tensor(values, dtype=torch.int64, device=device) for size, values in groups.items()}
@@ -253,7 +276,7 @@ class PreparedStateTransfer:
             for size, pointer in self.pointers.items()]
         self.page_args.extend((pointer, pool.backing, trailing_tables, c.source_slots, c.destination_slots, c.operation,
             c.expected_consumed, c.num_ops, c.errors, c.request_slots, state_rows, pool.layout.row_bytes, size, tables.shape[1], page_tokens,
-            1024, self.capacity, -1) for size, pointer in self.trailing_pointers.items())
+            1024, self.capacity, part) for size, pointer in self.trailing_pointers.items() for part in (0, 1))
         self.trailing_validation_args = None if not trailing_pages else (
             c.source_slots, c.destination_slots, c.operation, c.expected_consumed, c.num_ops, c.errors,
             trailing_tables, c.request_slots, state_rows, tables.shape[1], pool.memory_capacity, page_tokens, self.capacity)

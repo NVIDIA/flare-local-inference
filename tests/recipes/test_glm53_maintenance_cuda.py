@@ -64,7 +64,7 @@ def _run(rank, world, rendezvous=None):
                         pages=pool.partial_pages(), page_tokens=256, state_rows=inputs.request_state_rows, requests=requests)
                     slots, epochs, count = (inputs.row_slot_ids, inputs.row_generations, inputs.live_rows) if mode == "snapshot" else (
                         admission.admission_slots, admission.admission_generations, admission.admission_count)
-                    local = LocalMaintenance(mode, requests, transfer, slots, epochs, count, records, frame, sequence,
+                    local = LocalMaintenance(mode, requests, transfer, slots, epochs, count, completion_outputs(records), frame, sequence,
                                               world_size=1, admission_buffers=admission)
                     local.prepare()
                     def call(local=local):
