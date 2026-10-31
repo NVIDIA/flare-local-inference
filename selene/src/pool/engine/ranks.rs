@@ -456,6 +456,9 @@ impl Ranks {
                     events.push(RankEvent::Detached);
                 }
             }
+            // A peer's close is final: the link ends right after it. Record
+            // the rank as lost without the warning a lost link would raise.
+            Msg::Close => self.peers[index].state = State::Lost,
             Msg::WindowDone {
                 xfer,
                 index,

@@ -44,6 +44,30 @@ needs only Flare, the driver, and the package.
 - Free GPU memory and disk space on each selected node. Spark shares host and
   GPU memory; see [DGX Spark preparation](model-preparation.md#dgx-spark).
 
+Linux aarch64 builds include RoCE transport by default. To enable it on Linux
+x86_64, install the libibverbs development package and build with
+`cargo build --release --locked --manifest-path flare/Cargo.toml --features roce`.
+The resulting executable requires libibverbs at runtime. Default x86_64 builds
+do not link it and reject multi-host serving before loading GPU resources.
+Staging (`--stage-only`) does not need RoCE. x86_64 RoCE serving has been
+tested functionally only (Soft-RoCE).
+The separate `rdma` feature enables the prefix pool's data channel.
+
+### Prefix cache pool
+
+A multi-host instance can use a Selene prefix cache pool (see
+[prefix cache offload](prefix-cache-offload.md)).
+
+- Pass the same `--prefix-cache-pool` setting to every rank, or to none.
+- Local retention is disk only; `--prefix-cache-memory` is rejected.
+- If any rank's registration is refused, every rank uses its local tiers.
+- The pool and record links connect to rank zero's ephemeral TCP port and carry
+  session secrets in plaintext, so secure the cluster fabric.
+- Build with `rdma` only if the manager offers RDMA.
+- Restarting with wiped local disks restores nothing unless records had already
+  cascaded to the manager; see
+  [sharing through a pool](prefix-cache-offload.md#215-sharing-through-a-pool).
+
 ### Network connections
 
 | Connection | Destination | Port |
@@ -52,6 +76,7 @@ needs only Flare, the driver, and the package.
 | Serving package payloads | Serving ranks' CX7 interfaces | Dynamically allocated TCP listener per rank |
 | Serving rendezvous | Rank zero, reachable from every peer | TCP 29800 for Orbit launches |
 | Host prefix record service | Rank zero, reachable from every peer | Dynamically allocated TCP listener per launch; peers connect during startup when a disk prefix cache is configured |
+| Prefix pool and record links | Rank zero, reachable from every peer | Dynamically allocated TCP listener per launch, on the rendezvous interface |
 | HTTP API | Rank zero, reachable from clients | TCP 8000 in this guide |
 | Ignition preparation rendezvous | Preparation rank zero | The selected port; examples use TCP 29630 |
 | Ignition preparation coordination | Preparation hosts | Additional dynamically allocated TCPStore and Gloo ports |

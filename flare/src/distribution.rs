@@ -35,7 +35,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const VERSION: u32 = 3;
+// Version 4 adds the prefix pool offer and approval to the rendezvous.
+const VERSION: u32 = 4;
 const TIMEOUT: Duration = Duration::from_secs(1800);
 const IO_TIMEOUT: Duration = Duration::from_secs(120);
 const MAX_FRAME: usize = 16 << 20;
