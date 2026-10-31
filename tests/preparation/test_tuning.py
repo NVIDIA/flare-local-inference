@@ -579,6 +579,46 @@ def test_tp_ranks_shard_tuning_across_identical_gpus(backend, monkeypatch, ident
     assert (shards, shared, coordinated) == expected
 
 
+@pytest.mark.parametrize("peer_name,one_gpu", [
+    ("NVIDIA RTX PRO 6000 Blackwell Workstation Edition", True),
+    ("NVIDIA GB10", False)])
+def test_max_q_rank_shares_and_shards_tuning_only_with_same_silicon(backend, monkeypatch, peer_name, one_gpu):
+    import torch.distributed as dist
+
+    local_name = "NVIDIA RTX PRO 6000 Blackwell Max-Q Workstation Edition"
+    catalog = _local_tuning_catalog((declaration("op"),))
+    monkeypatch.setattr(torch.cuda, "get_device_properties",
+                        lambda device: SimpleNamespace(is_integrated=False, name=local_name))
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    shards, shared, coordinated, agreed = [], [], [], []
+    monkeypatch.setattr(PreparationSession, "configure_tuning_shard",
+                        lambda self, rank, ranks: shards.append((rank, ranks)), raising=False)
+    monkeypatch.setattr(PreparationSession, "_selection_cache", lambda self: "rank cache", raising=False)
+
+    def prepare(session, requests, *, progress, autotune):
+        coordinated.append(tuple(request.name for request in requests))
+        return PreparationSession.prepare(session, requests, autotune=autotune)
+
+    # Rank zero is the Max-Q card and reports the same local races; the peer reports the
+    # same GB202 silicon without the token, or a different GPU. The all-gather compares the
+    # values the ranks report, so only the peer's name is needed here.
+    coordinator = SimpleNamespace(ranks=(0, 1), barrier=lambda: None, local_ranks=2, spans_hosts=False,
+        same_on_every_rank=lambda value: value == (peer_name, catalog),
+        share_selections=shared.append,
+        agree_selections=lambda selections: agreed.append(tuple(item["name"] for item in selections)),
+        prepare=prepare)
+    session = make_session(device=0, checkpoint="revision", coordinator=coordinator, compile_workers=4)
+    session.declare((declaration("op"),))
+    session.tune()
+    if one_gpu:
+        # The peer's name differs only by Max-Q: adopt rank zero's cached selections, shard
+        # new races so both ranks take one winner, and verify the result before compilation.
+        assert (shards, shared, coordinated, agreed) == (
+            [(0, (0, 1))], ["rank cache"], [("op",)], [("op",)])
+    else:
+        assert (shards, shared, coordinated, agreed) == ([], [], [], [])
+
+
 def test_helpers_preserve_ordinary_session_behavior():
     session = object.__new__(PreparationSession)
     value = object()
