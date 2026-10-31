@@ -180,7 +180,6 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     }
     // Bind every listener before any thread starts, so a startup failure leaves no threads
     // and no locks behind; the guard below also removes the socket it creates.
-    let metrics_text = Arc::new(Mutex::new(String::new()));
     let metrics_address = config.metrics.map(|address| address.to_string());
     let metrics_listener = bind_metrics(metrics_address.as_deref())?;
     let network_listener = match config.listen {
@@ -211,12 +210,11 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
     if let Some(listener) = metrics_listener {
         cleanup.metrics = Some(serve_metrics(
             listener,
-            metrics_text.clone(),
+            commands.clone(),
             pool_handle.shared.clone(),
             stop.clone(),
         ));
     }
-    let owner_metrics = metrics_text.clone();
     let region_error = Arc::new(Mutex::new(None));
     let owner_error = region_error.clone();
     let owner_stop = stop.clone();
@@ -253,7 +251,6 @@ pub fn serve(config: Config, stop: Arc<AtomicBool>) -> Result<()> {
                 }
             }
             store.pump();
-            *owner_metrics.lock().unwrap() = store.metrics_text();
         }
     }));
     let stop_notice = Arc::new(Notify::new());
@@ -454,11 +451,12 @@ fn bind_metrics(address: Option<&str>) -> Result<Option<TcpListener>> {
 
 fn serve_metrics(
     listener: TcpListener,
-    text: Arc<Mutex<String>>,
+    commands: tokio::sync::mpsc::Sender<StoreCommand>,
     pool: Arc<crate::pool::Shared>,
     stop: Arc<AtomicBool>,
 ) -> thread::JoinHandle<()> {
     thread::spawn(move || {
+        let mut store_text = String::new();
         while !stop.load(Ordering::Acquire) {
             match listener.accept() {
                 Ok((mut stream, _)) => {
@@ -468,7 +466,17 @@ fn serve_metrics(
                     let count = stream.read(&mut request).unwrap_or(0);
                     let (status, body) = if request[..count].starts_with(b"GET /metrics ") {
                         ("200 OK", {
-                            let mut body = text.lock().unwrap().clone();
+                            // The owner builds the store's text at scrape time; if it does
+                            // not answer within 1 s, the last text is served again.
+                            let (reply, text) = std::sync::mpsc::channel();
+                            if let Some(fresh) = commands
+                                .try_send(StoreCommand::Metrics { reply })
+                                .ok()
+                                .and_then(|()| text.recv_timeout(Duration::from_secs(1)).ok())
+                            {
+                                store_text = fresh;
+                            }
+                            let mut body = store_text.clone();
                             body.push_str(&pool.metrics.lock().unwrap());
                             body
                         })
