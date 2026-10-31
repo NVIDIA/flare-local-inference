@@ -25,6 +25,7 @@ prepare = [
     "flashinfer-python[b12x] @ git+https://github.com/local-inference-lab/flashinfer.git@main",
     "cuda-python==13.3.1",
     "cuda-tile[tileiras]==1.6.0",
+    "tilelang==0.1.15",
     "safetensors==0.8.0",
     "tokenizers==0.23.2",
     "huggingface-hub==1.33.0",

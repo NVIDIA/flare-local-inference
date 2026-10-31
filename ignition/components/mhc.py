@@ -11,7 +11,7 @@ from b12x.norm import mhc
 from b12x.norm.mhc import _impl
 from b12x.preparation import PreparedCall
 
-from ignition.components import mhc_sm103, sm103
+from ignition.components import mhc_sm103, mhc_tilelang, sm103
 from ignition.preparation.scratch import planned_scratch, prime_owners
 from ignition.preparation.tuning import declare, register_finalizer
 from ignition.preparation.fixtures.resources import candidate_inputs
@@ -119,19 +119,36 @@ class PreparedMHC:
             raise ValueError("lagged mHC requires incoming and outgoing coefficient buffers")
         if pre_mix is not None:
             self.options.update(pre_mix=pre_mix)
-        self.composed = self.row_calls = None
+        self.composed = self.row_calls = self.tilelang = None
         if pre_mix is None and tokens > mhc_sm103.MIN_ROWS and sm103.is_sm103(residual.device):
             # SM103 prefill composes FlashInfer's mHC kernels; b12x's fused launches stay for decode.
             self.composed = mhc_sm103.ComposedMHC(self.operation, weights, scratch, rms_eps=rms_eps,
                 hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps)
             return
+        block_h = None if (pre_mix is None or max_rows_per_call is not None
+                           or weights.norm.dtype != torch.bfloat16) else mhc_tilelang.tiling(
+            tokens, residual.device)
+        if block_h is not None:
+            # SM120/121 keep lagged mixing in one fused TileLang pair: one CTA owns a
+            # hidden slice for every row, so the projection weights load once per call.
+            # An FP32 norm weight keeps b12x, which applies it at its own precision.
+            self.tilelang = mhc_tilelang.PreparedTileLangMHC(inputs, weights, scratch,
+                session=session, name=name, workspace=workspace,
+                rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters, norm_eps=norm_eps,
+                pre_mix=pre_mix, pre_out=pre_out, block_h=block_h)
+            self.plan = self.tilelang.plan
+            return
         if max_rows_per_call is not None and tokens > max_rows_per_call:
             self.row_calls = []
             for start in range(0, tokens, max_rows_per_call):
                 end = min(start + max_rows_per_call, tokens)
+                # Each slice stays on the fused b12x path: a row-bounded call exists
+                # to cap one launch's working set, and several TileLang calls would
+                # mutate disjoint views of one output the graph also returns.
                 call = PreparedMHC(tuple(value[start:end] for value in inputs), weights,
                     scratch.rows(end - start, start=start), session=session,
                     name=f"{name}.rows{start}_{end}", workspace=workspace,
+                    max_rows_per_call=end - start,
                     rms_eps=rms_eps, hc_eps=hc_eps, sinkhorn_iters=sinkhorn_iters,
                     norm_eps=norm_eps,
                     pre_mix=None if pre_mix is None else pre_mix[start:end],
@@ -176,6 +193,8 @@ class PreparedMHC:
         register_finalizer(session, finalize, workspace=workspace)
 
     def __call__(self, *inputs):
+        if self.tilelang is not None:
+            return self.tilelang(*inputs)
         if self.composed is not None:
             return self.composed(*inputs)
         if self.row_calls is not None:

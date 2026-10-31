@@ -486,6 +486,25 @@ expansion buffers reused by serial expert layers. Planning conservatively estima
 `--expert-scale-compression native` preserves native scales. MLA arithmetic defaults
 to BF16; `--mla-compute-mode auto` lets b12x select arithmetic while preserving
 packed KV storage.
+On SM120 and SM121, mHC's lagged pre and post/pre calls run through a TileLang
+kernel pair. One CTA owns a hidden slice for every row, so the 24-wide projection
+weights load once per call, and the projection runs on tensor cores as an FP16
+high/low split. Mixing, collapse, and the Sinkhorn coefficients keep b12x's FP32
+arithmetic, and the split reproduces the FP32 weights to 1e-7 relative. On GB10
+one post/pre call costs 9.5 us at eight rows against b12x's tuned 14.7. The
+packed planes add 2.5 MiB per mHC weight set and are shared by every prepared
+shape that uses them.
+The pair's grid is one CTA per hidden slice and each CTA loops row tiles
+serially, so the slice width follows the part and the row count. A part with at
+least 128 multiprocessors is already under-filled at 160 CTAs and keeps a
+32-wide slice up to 256 rows; a part with 64 or fewer still fills at 80 CTAs, so
+it keeps 32 up to 64 rows, leaves 128 to 1023 rows on b12x, and uses a 64-wide
+slice from 1024 rows, where halving the split count halves the FP32 partials
+and the finalize reduction. On GB10 that is 0.80-0.84 of b12x's cost at 7168
+and 8192 rows, saving about 84-94 ms per 80-call prefill chunk, while a 32-wide
+slice costs 33-49 ms more than b12x at those sizes. Calls below four rows, calls
+without lagged coefficients, and calls with a row bound or an FP32 norm weight
+keep b12x's fused launches.
 DSpark is its learned draft method. Preparation defaults to seven draft tokens,
 32 concurrent requests, a 4096-token prefill chunk, a 128-row physical target
 capacity, and a budget of 64 packed round graphs. Positive-depth DSpark uses

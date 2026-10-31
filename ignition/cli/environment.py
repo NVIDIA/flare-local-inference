@@ -42,6 +42,7 @@ def apply(configuration, gpus, b12x=()) -> None:
         "B12X_COMPILE_CACHE_DIR": str(kernel_cache / "b12x"),
         "FLASHINFER_WORKSPACE_BASE": str(flashinfer_workspace(kernel_cache)),
         "TRITON_CACHE_DIR": str(kernel_cache / "triton"),
+        "TILELANG_CACHE_DIR": str(kernel_cache / "tilelang"),
         "TORCHINDUCTOR_CACHE_DIR": str(kernel_cache / "inductor"),
         **dict(b12x),
     })
