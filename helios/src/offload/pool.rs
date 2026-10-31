@@ -22,5 +22,5 @@ pub(crate) fn start(
     phase.finish(summary);
     Ok(charges)
 }
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests;

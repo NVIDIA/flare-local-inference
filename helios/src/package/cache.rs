@@ -4578,8 +4578,10 @@ mod tests {
         let transport = root.path().join("staging/trees/transfer-writer");
         let blobs = transport.join("models--org--name/blobs");
         fs::create_dir_all(&blobs).unwrap();
-        fs::write(blobs.join("sha256:abc"), b"complete").unwrap();
-        fs::write(blobs.join("sha256:abc.part"), b"partial").unwrap();
+        // A colon is not a legal regular-file name on Windows, so the fixtures use the
+        // hyphen form; no production code emits either prefix.
+        fs::write(blobs.join("sha256-abc"), b"complete").unwrap();
+        fs::write(blobs.join("sha256-abc.part"), b"partial").unwrap();
         let export = root.path().join("staging/trees/export-writer");
         fs::create_dir_all(&export).unwrap();
         fs::write(export.join("model.safetensors"), b"partial").unwrap();
@@ -4601,7 +4603,7 @@ mod tests {
         fs::create_dir_all(&blobs).unwrap();
         fs::hard_link(
             object.path(),
-            blobs.join("sha256:0123456789abcdef"),
+            blobs.join("sha256-0123456789abcdef"),
         )
         .unwrap();
         drop(object);
