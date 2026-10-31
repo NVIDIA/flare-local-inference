@@ -44,9 +44,10 @@ thread_local! {
     static PAYLOAD_OPENS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 use crate::Result;
+use crate::os::FileReadAt;
 use crate::package::container::{
-    COMPANION_TENSOR, Container, PAYLOAD_FORMAT, Slice, Source, Writer, open_relative,
-    validate_relative_path, write_companion,
+    COMPANION_TENSOR, Container, PAYLOAD_FORMAT, Slice, Source, Writer, companion_prefix,
+    open_relative, validate_relative_path, write_companion,
 };
 
 const MAX_NAME: usize = 128;
@@ -1503,11 +1504,7 @@ impl Root {
             )
             .into());
         }
-        if let Some(object) = self.payload(id)? {
-            if object.length() != slice.len() {
-                return Err(format!("cached object {id} has a different length").into());
-            }
-            verify_slice(object.slice(), id, None)?;
+        if let Some(object) = self.cached_slice(id, slice.len())? {
             return Ok(object);
         }
         let transaction = Transaction::begin(self)?;
@@ -1527,6 +1524,59 @@ impl Root {
             let _ = fs::remove_file(&staged);
         }
         result
+    }
+
+    /// Adopt a complete, durable companion wrapper file as a payload object
+    /// without copying it.
+    ///
+    /// The file is linked into staging only when its framing is byte-for-byte
+    /// the wrapper `store_slice` would write and its payload hashes to
+    /// `declared`; publication verifies the installed object again. `None`
+    /// means the file is not that canonical wrapper or lives on another file
+    /// system, and the caller stores its slice instead. The caller must have
+    /// synced the file and must not modify it afterwards: it becomes the object.
+    pub fn adopt_companion(&self, declared: PayloadId, path: &Path) -> Result<Option<PayloadObject>> {
+        let slice = Container::open(path)?.tensor(COMPANION_TENSOR)?;
+        let prefix = companion_prefix(slice.len())?;
+        let file = File::open(path).map_err(failure)?;
+        if file.metadata().map_err(failure)?.len() != prefix.len() as u64 + slice.len() {
+            return Ok(None);
+        }
+        let mut framing = vec![0; prefix.len()];
+        file.read_exact_at(&mut framing, 0).map_err(failure)?;
+        if framing != prefix {
+            return Ok(None);
+        }
+        let id = slice.digest()?;
+        if id != declared {
+            return Err(format!(
+                "payload digest {id} does not match its declared identity {declared}"
+            )
+            .into());
+        }
+        if let Some(object) = self.cached_slice(id, slice.len())? {
+            return Ok(Some(object));
+        }
+        let transaction = Transaction::begin(self)?;
+        let staged = transaction.staging_file("wrapped")?;
+        match fs::hard_link(path, &staged) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::CrossesDevices => return Ok(None),
+            Err(error) => return Err(failure(error)),
+        }
+        self.publish_payload(&transaction, &staged, id, slice.len()).map(Some)
+    }
+
+    /// A cached object for `id`, verified, when one is already installed.
+    fn cached_slice(&self, id: PayloadId, length: u64) -> Result<Option<PayloadObject>> {
+        let Some(object) = self.payload(id)? else {
+            return Ok(None);
+        };
+        if object.length() != length {
+            return Err(format!("cached object {id} has a different length").into());
+        }
+        verify_slice(object.slice(), id, None)?;
+        Ok(Some(object))
     }
 
     /// Insert an optional retention source while distinguishing a corrupt
@@ -4759,6 +4809,51 @@ mod tests {
         drop(object);
         drop(again);
         assert_eq!(root.collect().unwrap().objects, 1);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn adopt_companion_links_canonical_wrappers_and_declines_others() {
+        use std::os::unix::fs::MetadataExt;
+        let temporary = Temporary::new();
+        let root = temporary.root();
+        let bytes: Vec<u8> = (0..2 * 1024 * 1024 + 77).map(|i| (i % 241) as u8).collect();
+        let raw = temporary.0.join("slice.bin");
+        fs::write(&raw, &bytes).unwrap();
+        let slice = Slice::new(Arc::new(File::open(&raw).unwrap()), 0, bytes.len() as u64).unwrap();
+        let id = PayloadId::of(&bytes);
+
+        // A framing that is not the canonical wrapper is left to store_slice.
+        let framed = temporary.0.join("framed.safetensors");
+        let mut writer = Writer::new(File::create(&framed).unwrap(), PAYLOAD_FORMAT).unwrap();
+        writer.add(COMPANION_TENSOR, bytes.len() as u64, Source::Slice(slice.clone())).unwrap();
+        writer.add("extra.tail", 3, Source::Bytes(vec![1, 2, 3])).unwrap();
+        writer.finish().unwrap();
+        assert!(root.adopt_companion(id, &framed).unwrap().is_none());
+
+        let received = temporary.0.join("received.safetensors");
+        write_companion(&mut File::create(&received).unwrap(), &slice).unwrap();
+        assert!(root.adopt_companion(PayloadId::of(b"other"), &received).is_err());
+        assert!(root.payload(id).unwrap().is_none());
+
+        // The canonical wrapper becomes the object itself: no copy is written.
+        let object = root.adopt_companion(id, &received).unwrap().unwrap();
+        assert_eq!(object.id(), id);
+        assert_eq!(object.length(), bytes.len() as u64);
+        assert_eq!(
+            fs::metadata(object.path()).unwrap().ino(),
+            fs::metadata(&received).unwrap().ino()
+        );
+        fs::remove_file(&received).unwrap();
+        let mut copy = vec![0; bytes.len()];
+        object.slice().read_at(0, &mut copy).unwrap();
+        assert_eq!(copy, bytes);
+
+        // A second arrival of the same payload returns the cached object.
+        let again_path = temporary.0.join("again.safetensors");
+        write_companion(&mut File::create(&again_path).unwrap(), &slice).unwrap();
+        let again = root.adopt_companion(id, &again_path).unwrap().unwrap();
+        assert_eq!(again.path(), object.path());
     }
 
     #[test]

@@ -741,9 +741,10 @@ fn verify_cached_payload(
 
 /// Adopt a received cache payload object under its signed payload identity.
 ///
-/// The staged file is a complete companion container; its payload bytes are
-/// verified against the declared identity by the cache insertion path, so a
-/// corrupt or mislabelled object never enters the cache.
+/// The staged file is a complete, synced companion container; its payload bytes
+/// are verified against the declared identity by the cache insertion path, so a
+/// corrupt or mislabelled object never enters the cache. A canonical wrapper is
+/// linked into the cache as is; any other is copied through its slice.
 fn install_payload_object(
     cache: &Path,
     id: helios_core::package::PayloadId,
@@ -758,7 +759,10 @@ fn install_payload_object(
             "received payload object length differs from its declared group",
         ));
     }
-    let object = root.store_slice(Some(id), &slice)?;
+    let object = match root.adopt_companion(id, partial)? {
+        Some(object) => object,
+        None => root.store_slice(Some(id), &slice)?,
+    };
     if object.length() != length {
         return Err(invalid("received payload object has the wrong length"));
     }
